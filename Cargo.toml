@@ -1,0 +1,13 @@
+[package]
+name = "tracing-init"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tracing = { version = "0.1.27", features = ["log"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2.3"
+tracing-gelf = "0.7.1"
+tokio = { version = "1.13.0", features = ["full"] }
