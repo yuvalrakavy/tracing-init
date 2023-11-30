@@ -95,6 +95,13 @@ impl TracingInit {
         self
     }
 
+    /// Set the path to the log file (default: current directory)
+    /// 
+    pub fn log_file_path(&mut self, path: &str) -> &mut Self {
+        self.log_file_path = path.to_string();
+        self
+    }
+
     /// Set the default log file prefix (default: app name)
     ///
     pub fn log_file_prefix(&mut self, prefix: &str) -> &mut Self {
