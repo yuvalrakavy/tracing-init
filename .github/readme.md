@@ -47,7 +47,7 @@ and to log to console and to a log file, run the application with the following 
 
 The logs will be written to the console and to the file app.log in the current directory.
 
-This crate also implement the Display trait for the TracingInit structure so it is possible to print the current configuration using:
+This crate also implements the Display trait for the TracingInit structure so it is possible to print the current configuration using:
 
 ```rust
   println!("{}", TracingInit::builder("App").init().unwrap());
