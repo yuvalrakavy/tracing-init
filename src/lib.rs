@@ -30,7 +30,7 @@
 //!
 //! The application will log to console and file (named App<date>.log) using INFO level
 //! 
-//! This crate also implement the Display trait for the TracingInit structure so it is possible to print the current configuration using:
+//! This crate also implements the Display trait for the TracingInit structure so it is possible to print the current configuration using:
 //! ```
 //!   println!("{}", TracingInit::builder("App").init().unwrap());
 //! ```
@@ -359,8 +359,8 @@ impl Display for TracingInit {
         let file_part = if let Some(enable_log_file) = self.enable_log_file {
             if enable_log_file {
                 format!(
-                    "log to file {path}{app}.log, rotation {rotation}",
-                    path = self.log_file_path.as_ref().unwrap_or(&String::from("")),
+                    "log to file {path}/{app}.log, rotation {rotation}",
+                    path = self.log_file_path.as_ref().unwrap_or(&String::from(".")),
                     app = self.log_file_prefix,
                     rotation = self.get_rotation_description()
                 )
