@@ -358,9 +358,11 @@ impl Display for TracingInit {
 
         let file_part = if let Some(enable_log_file) = self.enable_log_file {
             if enable_log_file {
+                let path = self.log_file_path.clone().unwrap_or(String::from("lof_file_path not initialized"));
+
                 format!(
                     "log to file {path}/{app}.log, rotation {rotation}",
-                    path = self.log_file_path.as_ref().unwrap_or(&String::from(".")),
+                    path = if path.is_empty() { "." } else { &path },
                     app = self.log_file_prefix,
                     rotation = self.get_rotation_description()
                 )
