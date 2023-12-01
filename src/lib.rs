@@ -29,6 +29,11 @@
 //! ```
 //!
 //! The application will log to console and file (named App<date>.log) using INFO level
+//! 
+//! This crate also implement the Display trait for the TracingInit structure so it is possible to print the current configuration using:
+//! ```
+//!   println!("{}", TracingInit::builder("App").init().unwrap());
+//! ```
 //!
 use std::fmt::Display;
 
