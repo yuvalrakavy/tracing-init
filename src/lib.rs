@@ -126,6 +126,13 @@ impl TracingInit {
         self
     }
 
+    /// Set the filter to use for the tracing subscriber (default: from environment variable RUST_LOG)
+    /// Sett [filter syntax](https://docs.rs/tracing-subscriber/0.2.14/tracing_subscriber/filter/struct.EnvFilter.html#filter-syntax) for details
+    pub fn filter(&mut self, filter: &str) -> &mut Self {
+        self.filter = Some(filter.to_string());
+        self
+    }
+
     /// Set the path to the log file (default: current directory)
     ///
     pub fn log_file_path(&mut self, path: &str) -> &mut Self {
