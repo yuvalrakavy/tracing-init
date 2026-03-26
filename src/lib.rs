@@ -617,6 +617,7 @@ impl TracingInit {
                 tracing_appender::rolling::Rotation::HOURLY => "hourly",
                 tracing_appender::rolling::Rotation::MINUTELY => "minutely",
                 tracing_appender::rolling::Rotation::NEVER => "",
+                _ => "other",
             };
             if *rotation != tracing_appender::rolling::Rotation::NEVER {
                 format!("rotation: {}:{}", rotation_name, self.log_file_backups)
