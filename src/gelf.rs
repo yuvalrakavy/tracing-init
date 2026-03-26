@@ -1,7 +1,23 @@
-//! Simple GELF UDP layer for tracing-subscriber.
+//! Lightweight GELF (Graylog Extended Log Format) layer for [`tracing-subscriber`].
 //!
-//! Sends JSON-encoded GELF messages over a std::net::UdpSocket.
-//! No async runtime, no channels, no background tasks.
+//! Sends JSON-encoded [GELF 1.1](https://go2docs.graylog.org/current/getting_in_log_data/gelf.html)
+//! messages over a `std::net::UdpSocket`. The implementation is deliberately simple:
+//!
+//! - **No async runtime required** -- uses blocking UDP sends.
+//! - **No background threads or channels** -- each event is serialized and sent inline.
+//! - **Best-effort delivery** -- send failures are silently ignored (standard for UDP logging).
+//!
+//! # GELF Field Mapping
+//!
+//! | Tracing concept | GELF field |
+//! |-----------------|------------|
+//! | Event message | `short_message` |
+//! | Level (ERROR/WARN/INFO/DEBUG/TRACE) | `level` (syslog numeric: 3/4/6/7/7) |
+//! | Level name | `_level` (string, distinguishes DEBUG from TRACE) |
+//! | Source file | `_file` |
+//! | Source line | `_line` |
+//! | Module path | `_module_path` |
+//! | Other fields | `_<field_name>` |
 
 use serde_json::{json, Map, Value};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -11,6 +27,10 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
+/// A [`tracing_subscriber::Layer`] that sends events as GELF messages over UDP.
+///
+/// Create with [`GelfLayer::new`] and register it with a
+/// [`tracing_subscriber::Registry`].
 pub struct GelfLayer {
     socket: UdpSocket,
     addr: SocketAddr,
@@ -18,6 +38,14 @@ pub struct GelfLayer {
 }
 
 impl GelfLayer {
+    /// Create a new GELF layer that sends to the given `host:port` address.
+    ///
+    /// The `additional_fields` are included in every GELF message as `_<key>` fields.
+    /// The local hostname is automatically resolved and included as the GELF `host` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address cannot be resolved or the UDP socket cannot be bound.
     pub fn new(
         addr: &str,
         additional_fields: Vec<(&str, String)>,
@@ -54,7 +82,10 @@ impl GelfLayer {
     }
 }
 
-/// Visitor that collects event fields into a serde_json Map.
+/// Visitor that collects tracing event fields into a serde_json [`Map`].
+///
+/// The `message` field is mapped to GELF's `short_message`; all other fields
+/// are prefixed with `_` per the GELF spec for additional fields.
 struct FieldVisitor<'a> {
     fields: &'a mut Map<String, Value>,
 }
@@ -107,7 +138,7 @@ where
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let mut fields = self.base_fields.clone();
 
-        // Level → GELF numeric level (syslog mapping)
+        // Map tracing level to GELF/syslog numeric level
         let level_num = match *event.metadata().level() {
             Level::ERROR => 3,
             Level::WARN => 4,
@@ -117,13 +148,13 @@ where
         };
         fields.insert("level".into(), json!(level_num));
 
-        // Also include the tracing level name for TRACE vs DEBUG distinction
+        // Include the tracing level name for TRACE vs DEBUG distinction
         fields.insert(
             "_level".into(),
             json!(event.metadata().level().to_string()),
         );
 
-        // Source location
+        // Source location metadata
         if let Some(file) = event.metadata().file() {
             fields.insert("_file".into(), json!(file));
         }
@@ -134,18 +165,18 @@ where
             fields.insert("_module_path".into(), json!(module));
         }
 
-        // Event fields
+        // Collect event fields
         let mut visitor = FieldVisitor {
             fields: &mut fields,
         };
         event.record(&mut visitor);
 
-        // Ensure short_message exists
+        // GELF requires short_message
         if !fields.contains_key("short_message") {
             fields.insert("short_message".into(), json!(""));
         }
 
-        // Serialize and send (best-effort, silently drop on failure)
+        // Best-effort send -- silently drop on failure
         if let Ok(bytes) = serde_json::to_vec(&Value::Object(fields)) {
             let _ = self.socket.send_to(&bytes, self.addr);
         }

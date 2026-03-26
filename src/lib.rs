@@ -1,9 +1,17 @@
 //! Simple tracing subscriber initialization with optional TOML configuration.
 //!
+//! `tracing-init` provides a builder-based API to set up [`tracing`] subscribers with
+//! multiple output destinations: console, rotating log files, and a GELF-over-UDP server
+//! (compatible with Graylog and other GELF consumers).
+//!
+//! Configuration is resolved from multiple sources with a clear precedence order,
+//! making it easy to ship sensible defaults while allowing per-environment and
+//! per-application overrides.
+//!
 //! # Quick Start
 //!
 //! ```no_run
-//! // Minimal — auto-discovers logging.toml if present
+//! // Minimal -- auto-discovers logging.toml if present
 //! let summary = tracing_init::TracingInit::builder("myapp").init().unwrap();
 //! println!("Logging: {summary}");
 //! ```
@@ -70,13 +78,35 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tracing_subscriber::{EnvFilter, Layer};
 
+/// Where the TOML configuration comes from — either a file path or a pre-parsed value.
 #[derive(Debug, Clone)]
 enum ConfigSource {
+    /// A filesystem path to a TOML file.
     File(String),
+    /// A pre-parsed [`toml::Value`] (useful when the caller already loaded the file).
     Toml(toml::Value),
 }
 
-/// Holds the configuration for the tracing subscriber
+/// Builder and initializer for a multi-destination [`tracing`] subscriber.
+///
+/// Create an instance with [`TracingInit::builder`], configure it with the chainable
+/// setter methods, and finalize with [`TracingInit::init`]. Each setter records an
+/// explicit value that takes the highest precedence; unset fields are filled from
+/// environment variables, TOML config, and finally built-in defaults.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Console + file, debug level, no TOML lookup
+/// tracing_init::TracingInit::builder("myapp")
+///     .log_to_console(true)
+///     .log_to_file(true)
+///     .level(tracing::Level::DEBUG)
+///     .log_file_path("logs")
+///     .no_auto_config_file()
+///     .init()
+///     .unwrap();
+/// ```
 #[derive(Debug, Clone)]
 pub struct TracingInit {
     app_name: String,
@@ -105,11 +135,15 @@ pub struct TracingInit {
 type BoxedLayer<S> = Option<Box<dyn Layer<S> + Send + Sync + 'static>>;
 
 impl TracingInit {
-    /// Create a new TraceInit with default values
+    /// Create a new builder with the given application name.
     ///
-    /// # Arguments
-    ///    app_name - The application name. When sending logs to server, this name will be used as for the app field
+    /// The `app_name` is used as:
+    /// - The GELF `_app` additional field when logging to a server.
+    /// - The default log-file prefix (e.g. `myapp.2024-01-15.log`).
+    /// - The key for per-app TOML overrides (`[logging.<app_name>]`).
     ///
+    /// All output destinations start as *unset*; call the `log_to_*` methods or
+    /// provide configuration via TOML / environment variables to enable them.
     pub fn builder(app_name: &str) -> TracingInit {
         TracingInit {
             app_name: app_name.to_string(),
@@ -139,63 +173,87 @@ impl TracingInit {
         }
     }
 
-    /// determine if the console should be used for logging (default true if LOG_DESTINATION environment variable's value contains 'c' otherwise false)
+    /// Enable or disable console (stdout) logging.
     ///
+    /// When not called, the value is determined from `LOG_DESTINATION` (contains `c`)
+    /// or the TOML `destination` field.
     pub fn log_to_console(&mut self, v: bool) -> &mut Self {
         self.enable_console = Some(v);
         self
     }
 
-    /// determine if the log file should be used for logging (default true if LOG_DESTINATION environment variable's value contains 'f' otherwise false)
+    /// Enable or disable rotating file logging.
     ///
+    /// When not called, the value is determined from `LOG_DESTINATION` (contains `f`)
+    /// or the TOML `destination` field. See [`log_file_path`](Self::log_file_path),
+    /// [`log_file_rotation`](Self::log_file_rotation), and
+    /// [`log_file_backups`](Self::log_file_backups) for related settings.
     pub fn log_to_file(&mut self, v: bool) -> &mut Self {
         self.enable_log_file = Some(v);
         self
     }
 
-    /// determine if the logs should be send using GELF protocol (default true if LOG_DESTINATION environment variable's value contains 's' otherwise false)
+    /// Enable or disable GELF-over-UDP server logging.
     ///
-    /// # Notes
-    /// Sending log to server works only if working under async runtime (e.g. tokio)
+    /// When not called, the value is determined from `LOG_DESTINATION` (contains `s`)
+    /// or the TOML `destination` field. The server address can be set with
+    /// [`log_server_address`](Self::log_server_address).
     ///
+    /// GELF messages are sent synchronously over a `std::net::UdpSocket`; no async
+    /// runtime is required.
     pub fn log_to_server(&mut self, v: bool) -> &mut Self {
         self.enable_log_server = Some(v);
         self
     }
 
-    /// Set the default log level (default: INFO)
+    /// Set the default log level (default: `INFO`).
     ///
+    /// This is used as the default directive for the [`EnvFilter`] when no explicit
+    /// `RUST_LOG` or [`filter`](Self::filter) is provided. Can also be set via the
+    /// `LOG_LEVEL` environment variable or the TOML `level` field.
     pub fn level(&mut self, level: Level) -> &mut Self {
         self.level = Some(level);
         self
     }
 
-    /// Set the filter to use for the tracing subscriber (default: from environment variable RUST_LOG)
-    /// Sett [filter syntax](https://docs.rs/tracing-subscriber/0.2.14/tracing_subscriber/filter/struct.EnvFilter.html#filter-syntax) for details
+    /// Set an explicit [`EnvFilter`] directive string.
+    ///
+    /// When set, this overrides the default level and `RUST_LOG`. See the
+    /// [`EnvFilter` documentation](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
+    /// for the directive syntax.
     pub fn filter(&mut self, filter: &str) -> &mut Self {
         self.filter = Some(filter.to_string());
         self
     }
 
-    /// Set the path to the log file (default: current directory)
+    /// Set the directory for log files (default: current directory).
     ///
+    /// Can also be set via `LOG_FILE_PATH` or the TOML `file_path` field.
     pub fn log_file_path(&mut self, path: &str) -> &mut Self {
         self.log_file_path = Some(path.to_string());
         self
     }
 
-    /// Set the default log file prefix (default: app name)
+    /// Set the log file name prefix (default: the `app_name`).
     ///
+    /// The final filename is `<prefix>.<date>.log` (or similar, depending on rotation).
     pub fn log_file_prefix(&mut self, prefix: &str) -> &mut Self {
         self.log_file_prefix = prefix.to_string();
         self
     }
 
-    /// Set the log file rotation (default: DAILY)
+    /// Set the log file rotation policy (default: `DAILY`).
     ///
-    /// # Notes
-    ///  Th possible values are: DAILY, HOURLY, MINUTELY, NEVER
+    /// Accepted values: [`Rotation::DAILY`], [`Rotation::HOURLY`],
+    /// [`Rotation::MINUTELY`], [`Rotation::NEVER`].
     ///
+    /// Can also be set via `LOG_FILE_ROTATION` (format: `d`, `h`, `m`, or `n`,
+    /// optionally followed by `:<count>`) or the TOML `file_rotation` field.
+    ///
+    /// [`Rotation::DAILY`]: tracing_appender::rolling::Rotation::DAILY
+    /// [`Rotation::HOURLY`]: tracing_appender::rolling::Rotation::HOURLY
+    /// [`Rotation::MINUTELY`]: tracing_appender::rolling::Rotation::MINUTELY
+    /// [`Rotation::NEVER`]: tracing_appender::rolling::Rotation::NEVER
     pub fn log_file_rotation(
         &mut self,
         rotation: tracing_appender::rolling::Rotation,
@@ -204,26 +262,34 @@ impl TracingInit {
         self
     }
 
-    /// Set the log file backups (default: 3)
+    /// Set the maximum number of rotated log files to keep (default: 3).
     ///
-    /// # Notes
-    /// The number of log file backups is relevant only if the log file rotation is not set to NEVER
+    /// Only meaningful when rotation is not [`Rotation::NEVER`].
     ///
+    /// [`Rotation::NEVER`]: tracing_appender::rolling::Rotation::NEVER
     pub fn log_file_backups(&mut self, backups: usize) -> &mut Self {
         self.log_file_backups = backups;
         self
     }
 
-    /// Set the address of the logging server (default is the value of environment variable LOG_SERVER or "logging-server:12201" if the environment variable is not set)
+    /// Set the GELF server address as `host:port` (default: `"logging-server:12201"`).
     ///
-    /// # Notes
-    /// It is advisable to add CNAME record to your DNS to point logging-server to the actual logging server (or use LOGGING_SERVER environment variable)
-    ///
+    /// Can also be set via `LOG_SERVER` or the TOML `server` field. Using a DNS CNAME
+    /// for `logging-server` is a convenient way to avoid hard-coding addresses.
     pub fn log_server_address(&mut self, name: &str) -> &mut Self {
         self.log_server_address = Some(name.to_string());
         self
     }
 
+    /// Provide a pre-parsed [`toml::Value`] as the configuration source.
+    ///
+    /// The value must contain a `[logging]` table. This is useful when the caller
+    /// has already loaded a multi-purpose config file and wants to pass the parsed
+    /// TOML directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`config_file`](Self::config_file) was already called.
     pub fn config_toml(&mut self, value: &toml::Value) -> &mut Self {
         if self.config_source.is_some() {
             panic!("Cannot call both config_toml() and config_file()");
@@ -232,6 +298,16 @@ impl TracingInit {
         self
     }
 
+    /// Set a TOML config file path to load logging configuration from.
+    ///
+    /// Relative paths are resolved by searching upward from the current working
+    /// directory. If the file exists but has no `[logging]` section, the builder
+    /// falls back to a `logging.toml` in the same directory (unless
+    /// [`no_auto_config_file`](Self::no_auto_config_file) is set).
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`config_toml`](Self::config_toml) was already called.
     pub fn config_file(&mut self, path: &str) -> &mut Self {
         if self.config_source.is_some() {
             panic!("Cannot call both config_file() and config_toml()");
@@ -240,18 +316,34 @@ impl TracingInit {
         self
     }
 
+    /// Disable automatic discovery of `logging.toml`.
+    ///
+    /// By default, when no explicit config source is provided, the builder searches
+    /// upward for a `logging.toml` file. Call this to suppress that behavior.
     pub fn no_auto_config_file(&mut self) -> &mut Self {
         self.no_auto_config_file = true;
         self
     }
 
+    /// Ignore all `LOG_*` and `RUST_LOG` environment variables.
+    ///
+    /// Useful for testing or when full programmatic control is desired.
     pub fn ignore_environment_variables(&mut self) -> &mut Self {
         self.ignore_env_vars = true;
         self
     }
 
-    /// Initialize the tracing subscriber based on the configuration
+    /// Resolve all configuration sources and install the global tracing subscriber.
     ///
+    /// Returns a human-readable summary of the active configuration (destinations,
+    /// level, config source) suitable for startup logging.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The log file directory cannot be created or written to.
+    /// - The GELF server address cannot be resolved.
+    /// - The filter directive string is invalid.
     pub fn init(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         if !self.ignore_env_vars {
             self.apply_environment_variables();
@@ -389,6 +481,10 @@ impl TracingInit {
         }
     }
 
+    /// Parse a rotation string like `"d:3"` into a rotation policy and backup count.
+    ///
+    /// Format: `<letter>[:<count>]` where letter is `d` (daily), `h` (hourly),
+    /// `m` (minutely), or `n` (never). Count defaults to 3.
     fn parse_rotation_string(s: &str) -> (tracing_appender::rolling::Rotation, usize) {
         let mut parts = s.split(':');
         let rotation = parts.next().unwrap_or("d");
@@ -521,7 +617,6 @@ impl TracingInit {
                 tracing_appender::rolling::Rotation::HOURLY => "hourly",
                 tracing_appender::rolling::Rotation::MINUTELY => "minutely",
                 tracing_appender::rolling::Rotation::NEVER => "",
-                _ => "weekly",
             };
             if *rotation != tracing_appender::rolling::Rotation::NEVER {
                 format!("rotation: {}:{}", rotation_name, self.log_file_backups)

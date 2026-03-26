@@ -235,7 +235,7 @@ fn test_discover_auto_logging_toml() {
     let logging_path = dir.path().join("logging.toml");
     std::fs::write(&logging_path, "[logging]\ndestination = \"cs\"\n").unwrap();
 
-    let (config, source) = discover_config(Some(logging_path.to_str().unwrap()), "myapp", false).unwrap();
+    let (config, _source) = discover_config(Some(logging_path.to_str().unwrap()), "myapp", false).unwrap();
     assert_eq!(config.destination.as_deref(), Some("cs"));
 }
 

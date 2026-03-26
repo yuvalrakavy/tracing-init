@@ -2,8 +2,11 @@
 name = "tracing-init"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Simple tracing subscriber initialization with TOML config, file rotation, and GELF server output"
+license = "MIT"
+repository = "https://github.com/yuvalrakavy/tracing-init"
+keywords = ["tracing", "logging", "gelf", "toml", "subscriber"]
+categories = ["development-tools::debugging"]
 
 [dependencies]
 tracing = { version = "0.1.41", features = ["log"] }

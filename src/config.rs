@@ -1,11 +1,29 @@
 //! TOML configuration parsing, layering, and destination modifier logic.
+//!
+//! This module handles loading a `[logging]` section from TOML configuration,
+//! with support for per-application overrides and destination modifier syntax.
+//! Config file discovery searches upward from the current working directory
+//! for relative paths.
+
+use std::path::{Path, PathBuf};
 
 /// Apply a destination modifier to a base destination string.
 ///
 /// If `modifier` starts with `+` or `-`, it modifies `base` by adding/removing
-/// characters left-to-right. Otherwise it replaces `base` entirely.
+/// destination characters left-to-right. Otherwise it replaces `base` entirely.
 ///
-/// Applying a modifier when `base` is `None` is a no-op (returns empty string).
+/// # Examples
+///
+/// ```ignore
+/// // Absolute replacement
+/// assert_eq!(apply_destination_modifier(Some("csf"), "cf"), "cf");
+///
+/// // Add server, remove file
+/// assert_eq!(apply_destination_modifier(Some("cf"), "+s-f"), "cs");
+///
+/// // Modifier on None base is a no-op
+/// assert_eq!(apply_destination_modifier(None, "+s"), "s");
+/// ```
 pub fn apply_destination_modifier(base: Option<&str>, modifier: &str) -> String {
     let is_modifier = modifier.starts_with('+') || modifier.starts_with('-');
 
@@ -37,19 +55,31 @@ pub fn apply_destination_modifier(base: Option<&str>, modifier: &str) -> String 
 }
 
 /// Parsed and layered logging configuration from TOML.
+///
+/// All fields are optional; `None` means "not configured" and the caller
+/// should fall through to the next precedence level (environment variables,
+/// then defaults).
 #[derive(Debug, Clone, Default)]
 pub struct LoggingConfig {
+    /// Destination flags: a string containing `c` (console), `f` (file), and/or `s` (server).
     pub destination: Option<String>,
+    /// Log level name: `error`, `warn`, `info`, `debug`, or `trace`.
     pub level: Option<String>,
+    /// An [`EnvFilter`](tracing_subscriber::EnvFilter) directive string.
     pub filter: Option<String>,
+    /// GELF server address as `host:port`.
     pub server: Option<String>,
+    /// Directory path for log files.
     pub file_path: Option<String>,
+    /// Log file name prefix (overrides the app name default).
     pub file_prefix: Option<String>,
+    /// Rotation spec: `d` (daily), `h` (hourly), `m` (minutely), `n` (never),
+    /// optionally followed by `:<count>`.
     pub file_rotation: Option<String>,
 }
 
-/// Raw TOML section — used for deserialization before layering.
-/// Fields are extracted manually to tolerate unknown sub-table keys in [logging].
+/// Raw TOML section -- used for deserialization before layering.
+/// Fields are extracted manually to tolerate unknown sub-table keys in `[logging]`.
 #[derive(Debug, Clone, Default)]
 struct RawLoggingSection {
     destination: Option<String>,
@@ -65,9 +95,12 @@ impl LoggingConfig {
     /// Parse and layer config from a TOML value using the given app name.
     ///
     /// Returns `None` if there is no `[logging]` section.
+    ///
     /// When a `[logging.<app_name>]` sub-table is present, its fields override
-    /// the base `[logging]` fields. `file_prefix` is not inherited from base when
-    /// a per-app section exists — the app must set it explicitly.
+    /// the base `[logging]` fields with the following rules:
+    /// - Most fields: app value wins; if absent, inherit from base; empty string clears.
+    /// - `destination`: supports modifier syntax (`+s`, `-f`, `-f+s`).
+    /// - `file_prefix`: never inherited from base -- the app must set it explicitly.
     pub fn from_toml(value: &toml::Value, app_name: &str) -> Option<LoggingConfig> {
         let logging = value.get("logging")?;
         let logging_table = logging.as_table()?;
@@ -111,9 +144,6 @@ impl LoggingConfig {
     }
 
     /// Layer an app section on top of a base section.
-    ///
-    /// Most fields: app value wins; if absent, inherit from base; empty string clears.
-    /// `file_prefix`: never inherited from base — only set if app explicitly provides it.
     fn layer(base: RawLoggingSection, app: RawLoggingSection) -> LoggingConfig {
         LoggingConfig {
             destination: Self::layer_destination(
@@ -159,8 +189,6 @@ impl LoggingConfig {
     }
 }
 
-use std::path::{Path, PathBuf};
-
 /// Search upward from `start_dir` for a file with the given name.
 /// Returns the full path if found, or `None`.
 fn find_file_upward(filename: &str, start_dir: &Path) -> Option<PathBuf> {
@@ -188,6 +216,17 @@ fn resolve_config_path(path: &str) -> Option<PathBuf> {
     }
 }
 
+/// Discover and load a logging configuration from a TOML file.
+///
+/// The discovery process:
+/// 1. If `path` is provided, resolve it (with upward search for relative paths).
+/// 2. If the file exists and contains a `[logging]` section, use it.
+/// 3. If the file exists but has no `[logging]` section and `no_auto` is false,
+///    try `logging.toml` in the same directory as a fallback.
+/// 4. If the file doesn't exist and `no_auto` is false, try `logging.toml`
+///    via upward search.
+///
+/// Returns the parsed config and a human-readable source description, or `None`.
 pub fn discover_config(
     path: Option<&str>,
     app_name: &str,
@@ -202,7 +241,7 @@ pub fn discover_config(
             return Some((result, source));
         }
 
-        // File found but no [logging] section — fall back to logging.toml in same directory
+        // File found but no [logging] section -- fall back to logging.toml in same directory
         if !no_auto {
             let parent = resolved.parent().unwrap_or(Path::new("."));
             let fallback_path = parent.join("logging.toml");
@@ -213,7 +252,7 @@ pub fn discover_config(
             }
         }
     } else if !no_auto {
-        // File not found at all — try logging.toml via upward search
+        // File not found at all -- try logging.toml via upward search
         if let Some(resolved) = resolve_config_path("logging.toml") {
             if let Some(result) = try_load_config(&resolved, app_name) {
                 let source = format!("Config from {} (fallback)", resolved.display());
@@ -225,6 +264,9 @@ pub fn discover_config(
     None
 }
 
+/// Try to load a [`LoggingConfig`] from a specific file path.
+///
+/// Returns `None` if the file cannot be read, parsed, or has no `[logging]` section.
 pub fn try_load_config(path: &Path, app_name: &str) -> Option<LoggingConfig> {
     let content = std::fs::read_to_string(path).ok()?;
     let value: toml::Value = content.parse().ok()?;
