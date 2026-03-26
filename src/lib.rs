@@ -1,46 +1,80 @@
-//! Simple tracing subscriber initialization
+//! Simple tracing subscriber initialization with optional TOML configuration.
 //!
-//! # Example
-//! ```
-//!     TracingInit::builder("App")
-//!        .log_to_console(true)
-//!        .log_to_file(true)
-//!        .log_to_server(true)
-//!        .init()
-//! ```
+//! # Quick Start
 //!
-//! It is possible to specify the values of the tracing subscriber using environment variables:
-//! * LOG_DESTINATION - the value should contain one or more of the following characters: 'c' - console, 'f' - file, 's' - server
-//! * LOG_FILE_PATH - the path to the log file
-//! * LOG_FILE_ROTATION - the rotation of the log file. The value should be in the format:
-//!   <rotation>[:<count>] where rotation is one of the following: d - daily, h - hourly, m - minutely, n - never and count is the number of backups to keep
-//! * LOG_SERVER - the address of the logging server in the format <host>:<port>
-//! * LOG_LEVEL - the log level for the tracing subscriber (error, warn, info, debug, trace)
-//! * RUST_LOG - logging filter ()
-//!
-//! So if you use the code:
-//! ```
-//!    TracingInit::builder("App").init().unwrap();
+//! ```no_run
+//! // Minimal — auto-discovers logging.toml if present
+//! let summary = tracing_init::TracingInit::builder("myapp").init().unwrap();
+//! println!("Logging: {summary}");
 //! ```
 //!
-//! And run the application using the command:
-//! ```
-//!   LOG_DESTINATION=cf app
+//! # TOML Configuration
+//!
+//! ```no_run
+//! // Load from a config file (falls back to logging.toml if no [logging] section)
+//! let summary = tracing_init::TracingInit::builder("myapp")
+//!     .config_file("server.toml")
+//!     .init()
+//!     .unwrap();
 //! ```
 //!
-//! The application will log to console and file (named App<date>.log) using INFO level
-//! 
-//! This crate also implements the Display trait for the TracingInit structure so it is possible to print the current configuration using:
+//! ## TOML Structure
+//!
+//! ```toml
+//! [logging]
+//! destination = "csf"          # c=console, f=file, s=server
+//! level = "info"
+//! server = "localhost:12201"
+//! file_path = "logs"
+//! file_rotation = "d:3"        # d=daily, h=hourly, m=minutely, n=never
+//!
+//! [logging.myapp]              # Per-app overrides
+//! destination = "-f+s"         # Remove file, add server from base
+//! level = "debug"
 //! ```
-//!   println!("{}", TracingInit::builder("App").init().unwrap());
-//! ```
+//!
+//! ## Destination Modifiers
+//!
+//! - Absolute: `"csf"` replaces the inherited value
+//! - Modifier: `"-f"`, `"+s"`, `"-f+s"` adds/removes from inherited value
+//!
+//! ## Precedence (highest to lowest)
+//!
+//! 1. Explicit builder calls
+//! 2. Environment variables (`LOG_DESTINATION`, `LOG_LEVEL`, `LOG_FILE_PATH`,
+//!    `LOG_FILE_ROTATION`, `LOG_SERVER`, `RUST_LOG`)
+//!    - `LOG_CONFIG` specifies a TOML config file path (used during auto-discovery)
+//! 3. TOML config (app-specific over base)
+//! 4. Defaults
+//!
+//! ## Environment Variables
+//!
+//! * `LOG_DESTINATION` — contains `c`, `f`, and/or `s`
+//! * `LOG_FILE_PATH` — path to the log file directory
+//! * `LOG_FILE_ROTATION` — `<rotation>[:<count>]` (d/h/m/n, default d:3)
+//! * `LOG_SERVER` — GELF server address (host:port)
+//! * `LOG_LEVEL` — error, warn, info, debug, trace
+//! * `RUST_LOG` — filter directive
+//! * `LOG_CONFIG` — path to a TOML config file (used during auto-discovery)
 //!
 use std::fmt::Display;
+
+mod config;
+mod gelf;
+
+#[cfg(test)]
+mod tests;
 
 use tracing::Level;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tracing_subscriber::{EnvFilter, Layer};
+
+#[derive(Debug, Clone)]
+enum ConfigSource {
+    File(String),
+    Toml(toml::Value),
+}
 
 /// Holds the configuration for the tracing subscriber
 #[derive(Debug, Clone)]
@@ -61,6 +95,11 @@ pub struct TracingInit {
     log_server_address: Option<String>,
 
     filter: Option<String>,
+
+    config_source: Option<ConfigSource>,
+    no_auto_config_file: bool,
+    ignore_env_vars: bool,
+    config_summary: Option<String>,
 }
 
 type BoxedLayer<S> = Option<Box<dyn Layer<S> + Send + Sync + 'static>>;
@@ -92,6 +131,11 @@ impl TracingInit {
             log_server_address: None,
 
             filter: None,
+
+            config_source: None,
+            no_auto_config_file: false,
+            ignore_env_vars: false,
+            config_summary: None,
         }
     }
 
@@ -180,88 +224,40 @@ impl TracingInit {
         self
     }
 
-    /// Set unspecified values of trace initialization structure based on values of the environment variables
-    ///
-    pub fn set_from_environment_variables(&mut self) -> &mut Self {
-        let log_destination = &std::env::var("LOG_DESTINATION");
+    pub fn config_toml(&mut self, value: &toml::Value) -> &mut Self {
+        if self.config_source.is_some() {
+            panic!("Cannot call both config_toml() and config_file()");
+        }
+        self.config_source = Some(ConfigSource::Toml(value.clone()));
+        self
+    }
 
-        self.enable_console = self.enable_console.or_else(|| {
-            Some(
-                log_destination
-                    .as_ref()
-                    .map(|v| v.contains('c'))
-                    .unwrap_or(false),
-            )
-        });
+    pub fn config_file(&mut self, path: &str) -> &mut Self {
+        if self.config_source.is_some() {
+            panic!("Cannot call both config_file() and config_toml()");
+        }
+        self.config_source = Some(ConfigSource::File(path.to_string()));
+        self
+    }
 
-        self.enable_log_file = self.enable_log_file.or_else(|| {
-            Some(
-                log_destination
-                    .as_ref()
-                    .map(|v| v.contains('f'))
-                    .unwrap_or(false),
-            )
-        });
+    pub fn no_auto_config_file(&mut self) -> &mut Self {
+        self.no_auto_config_file = true;
+        self
+    }
 
-        self.enable_log_server = self.enable_log_server.or_else(|| {
-            Some(
-                log_destination
-                    .as_ref()
-                    .map(|v| v.contains('s'))
-                    .unwrap_or(false),
-            )
-        });
-
-        self.log_file_path = self
-            .log_file_path
-            .clone()
-            .or_else(|| Some(std::env::var("LOG_FILE_PATH").unwrap_or_default()));
-
-        self.level = self.level.or_else(|| {
-            Some(
-                std::env::var("LOG_LEVEL")
-                    .unwrap_or(String::from("INFO"))
-                    .parse()
-                    .unwrap_or(Level::INFO),
-            )
-        });
-
-        (self.log_file_rotation, self.log_file_backups) =
-            if let Some(rotation) = self.log_file_rotation.clone() {
-                (Some(rotation), self.log_file_backups)
-            } else if let Ok(rotation_value) = std::env::var("LOG_FILE_ROTATION") {
-                let mut rotation_value = rotation_value.split(':');
-                let rotation = rotation_value.next().unwrap_or("d");
-                let count = rotation_value
-                    .next()
-                    .map(|v| v.parse().unwrap_or(3))
-                    .unwrap_or(3);
-
-                match rotation {
-                    "d" => (Some(tracing_appender::rolling::Rotation::DAILY), count),
-                    "h" => (Some(tracing_appender::rolling::Rotation::HOURLY), count),
-                    "m" => (Some(tracing_appender::rolling::Rotation::MINUTELY), count),
-                    "n" => (Some(tracing_appender::rolling::Rotation::NEVER), count),
-                    _ => (Some(tracing_appender::rolling::Rotation::DAILY), count),
-                }
-            } else {
-                (
-                    Some(tracing_appender::rolling::Rotation::DAILY),
-                    self.log_file_backups,
-                )
-            };
-
-        self.log_server_address = self.log_server_address.clone().or_else(|| {
-            Some(std::env::var("LOG_SERVER").unwrap_or(String::from("logging-server:12201")))
-        });
-
+    pub fn ignore_environment_variables(&mut self) -> &mut Self {
+        self.ignore_env_vars = true;
         self
     }
 
     /// Initialize the tracing subscriber based on the configuration
     ///
-    pub fn init(&mut self) -> Result<&Self, Box<dyn std::error::Error>> {
-        self.set_from_environment_variables();
+    pub fn init(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        if !self.ignore_env_vars {
+            self.apply_environment_variables();
+        }
+        self.apply_toml_config();
+        self.apply_defaults();
 
         let console_layer = self.get_console_layer();
         let log_file_layer = self.get_log_file_layer()?;
@@ -282,7 +278,139 @@ impl TracingInit {
             .with(env_filter)
             .init();
 
-        Ok(self)
+        Ok(self.build_summary())
+    }
+
+    fn apply_environment_variables(&mut self) {
+        // Only apply LOG_DESTINATION when the env var is actually set,
+        // so unset env vars don't block TOML config from filling in values.
+        if let Ok(log_destination) = std::env::var("LOG_DESTINATION") {
+            if self.enable_console.is_none() {
+                self.enable_console = Some(log_destination.contains('c'));
+            }
+            if self.enable_log_file.is_none() {
+                self.enable_log_file = Some(log_destination.contains('f'));
+            }
+            if self.enable_log_server.is_none() {
+                self.enable_log_server = Some(log_destination.contains('s'));
+            }
+        }
+        if self.log_file_path.is_none() {
+            if let Ok(path) = std::env::var("LOG_FILE_PATH") {
+                self.log_file_path = Some(path);
+            }
+        }
+        if self.level.is_none() {
+            if let Ok(level_str) = std::env::var("LOG_LEVEL") {
+                self.level = level_str.parse().ok();
+            }
+        }
+        if self.log_file_rotation.is_none() {
+            if let Ok(rotation_value) = std::env::var("LOG_FILE_ROTATION") {
+                let (rotation, count) = Self::parse_rotation_string(&rotation_value);
+                self.log_file_rotation = Some(rotation);
+                self.log_file_backups = count;
+            }
+        }
+        if self.log_server_address.is_none() {
+            if let Ok(server) = std::env::var("LOG_SERVER") {
+                self.log_server_address = Some(server);
+            }
+        }
+    }
+
+    fn apply_toml_config(&mut self) {
+        let (config, source) = match &self.config_source {
+            Some(ConfigSource::Toml(value)) => {
+                match config::LoggingConfig::from_toml(value, &self.app_name) {
+                    Some(cfg) => (cfg, "Config from pre-parsed TOML".to_string()),
+                    None => {
+                        self.config_summary = Some("No [logging] section in provided TOML".to_string());
+                        return;
+                    }
+                }
+            }
+            Some(ConfigSource::File(path)) => {
+                match config::discover_config(Some(path), &self.app_name, self.no_auto_config_file) {
+                    Some((cfg, source)) => (cfg, source),
+                    None => {
+                        self.config_summary = Some("No config file".to_string());
+                        return;
+                    }
+                }
+            }
+            None => {
+                if self.no_auto_config_file {
+                    self.config_summary = Some("No config file".to_string());
+                    return;
+                }
+                if let Ok(env_path) = std::env::var("LOG_CONFIG") {
+                    match config::discover_config(Some(&env_path), &self.app_name, self.no_auto_config_file) {
+                        Some((cfg, source)) => (cfg, format!("{} (via LOG_CONFIG)", source)),
+                        None => {
+                            self.config_summary = Some("No config file (LOG_CONFIG set but no [logging] found)".to_string());
+                            return;
+                        }
+                    }
+                } else {
+                    match config::discover_config(Some("logging.toml"), &self.app_name, true) {
+                        Some((cfg, source)) => (cfg, format!("{} (auto-discovered)", source)),
+                        None => {
+                            self.config_summary = Some("No config file".to_string());
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        self.config_summary = Some(source);
+
+        if let Some(dest) = &config.destination {
+            if self.enable_console.is_none() { self.enable_console = Some(dest.contains('c')); }
+            if self.enable_log_file.is_none() { self.enable_log_file = Some(dest.contains('f')); }
+            if self.enable_log_server.is_none() { self.enable_log_server = Some(dest.contains('s')); }
+        }
+        if self.level.is_none() {
+            if let Some(ref level_str) = config.level { self.level = level_str.parse().ok(); }
+        }
+        if self.filter.is_none() { self.filter = config.filter.clone(); }
+        if self.log_server_address.is_none() { self.log_server_address = config.server.clone(); }
+        if self.log_file_path.is_none() { self.log_file_path = config.file_path.clone(); }
+        if let Some(ref prefix) = config.file_prefix {
+            if self.log_file_prefix == self.app_name { self.log_file_prefix = prefix.clone(); }
+        }
+        if self.log_file_rotation.is_none() {
+            if let Some(ref rotation_str) = config.file_rotation {
+                let (rotation, count) = Self::parse_rotation_string(rotation_str);
+                self.log_file_rotation = Some(rotation);
+                self.log_file_backups = count;
+            }
+        }
+    }
+
+    fn parse_rotation_string(s: &str) -> (tracing_appender::rolling::Rotation, usize) {
+        let mut parts = s.split(':');
+        let rotation = parts.next().unwrap_or("d");
+        let count = parts.next().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let rotation = match rotation {
+            "d" => tracing_appender::rolling::Rotation::DAILY,
+            "h" => tracing_appender::rolling::Rotation::HOURLY,
+            "m" => tracing_appender::rolling::Rotation::MINUTELY,
+            "n" => tracing_appender::rolling::Rotation::NEVER,
+            _ => tracing_appender::rolling::Rotation::DAILY,
+        };
+        (rotation, count)
+    }
+
+    fn apply_defaults(&mut self) {
+        if self.enable_console.is_none() { self.enable_console = Some(false); }
+        if self.enable_log_file.is_none() { self.enable_log_file = Some(false); }
+        if self.enable_log_server.is_none() { self.enable_log_server = Some(false); }
+        if self.level.is_none() { self.level = Some(Level::INFO); }
+        if self.log_file_path.is_none() { self.log_file_path = Some(String::new()); }
+        if self.log_file_rotation.is_none() { self.log_file_rotation = Some(tracing_appender::rolling::Rotation::DAILY); }
+        if self.log_server_address.is_none() { self.log_server_address = Some("logging-server:12201".to_string()); }
     }
 
     fn get_console_layer<S>(&self) -> Option<Box<dyn Layer<S> + Send + Sync + 'static>>
@@ -332,109 +460,60 @@ impl TracingInit {
         for<'a> S: LookupSpan<'a>,
     {
         if self.enable_log_server.unwrap_or(false) {
-            let (gelf_layer, mut connection_task) = tracing_gelf::Logger::builder()
-                .additional_field("app", self.app_name.clone())
-                .connect_udp(self.log_server_address.as_ref().unwrap().clone())?;
-
-            tokio::spawn(async move {
-                let connection_errors = connection_task.connect().await;
-
-                if !connection_errors.0.is_empty() {
-                    println!("Failed to connect to log server: {:?}", connection_errors);
-                }
-            });
-
-            Ok(Some(gelf_layer.boxed()))
+            let addr = self.log_server_address.as_ref().unwrap();
+            let layer = gelf::GelfLayer::new(
+                addr,
+                vec![("app", self.app_name.clone())],
+            )?;
+            Ok(Some(layer.boxed()))
         } else {
             Ok(None)
         }
     }
 }
 
-impl Display for TracingInit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let console_part = if let Some(enable_console) = self.enable_console {
-            if enable_console {
-                "log to console"
-            } else {
-                ""
-            }
-        } else {
-            "enable_console: not initialized"
-        };
-
-        let file_part = if let Some(enable_log_file) = self.enable_log_file {
-            if enable_log_file {
-                let path = self.log_file_path.clone().unwrap_or(String::from("lof_file_path not initialized"));
-
-                format!(
-                    "log to file {path}/{app}.log, rotation {rotation}",
-                    path = if path.is_empty() { "." } else { &path },
-                    app = self.log_file_prefix,
-                    rotation = self.get_rotation_description()
-                )
-            } else {
-                String::new()
-            }
-        } else {
-            String::from("enable_log_file not initialized")
-        };
-
-        let server_part = if let Some(enable_log_server) = self.enable_log_server {
-            if enable_log_server {
-                format!(
-                    "log to server {}",
-                    self.log_server_address.as_ref().unwrap()
-                )
-            } else {
-                String::new()
-            }
-        } else {
-            String::from("enable_log_server not initialized")
-        };
-
-        let mut logging = Vec::<String>::new();
-
-        if !console_part.is_empty() {
-            logging.push(console_part.to_string());
-        }
-
-        if !file_part.is_empty() {
-            logging.push(file_part);
-        }
-
-        if !server_part.is_empty() {
-            logging.push(server_part);
-        }
-
-        let logging = logging.join(", ");
-
-        if !logging.is_empty() {
-            write!(f, "{}", logging)?;
-            write!(
-                f,
-                "{level}",
-                level = if let Some(level) = self.level {
-                    format!(", default level: {}", level)
-                } else {
-                    String::from(", level not initialized")
-                }
-            )?;
-            write!(
-                f,
-                "{filter}",
-                filter = if let Some(filter) = self.filter.as_ref() {
-                    format!(", ({filter})")
-                } else {
-                    String::new()
-                }
-            )?;
-        }
-        Ok(())
-    }
-}
-
 impl TracingInit {
+    fn build_summary(&self) -> String {
+        let mut parts = Vec::new();
+
+        if self.enable_console.unwrap_or(false) {
+            parts.push("log to console".to_string());
+        }
+        if self.enable_log_file.unwrap_or(false) {
+            let path = self.log_file_path.as_deref().unwrap_or(".");
+            let path = if path.is_empty() { "." } else { path };
+            let rotation = self.get_rotation_description();
+            let mut file_part = format!("log to file {}/{}.log", path, self.log_file_prefix);
+            if !rotation.is_empty() {
+                file_part.push_str(&format!(", {}", rotation));
+            }
+            parts.push(file_part);
+        }
+        if self.enable_log_server.unwrap_or(false) {
+            parts.push(format!("log to server {}", self.log_server_address.as_deref().unwrap_or("unknown")));
+        }
+
+        let mut summary = parts.join(", ");
+        if !summary.is_empty() {
+            if let Some(level) = self.level {
+                summary.push_str(&format!(", default level: {}", level));
+            }
+            if let Some(ref filter) = self.filter {
+                summary.push_str(&format!(", ({})", filter));
+            }
+        }
+
+        if let Some(ref config_source) = self.config_summary {
+            if summary.is_empty() {
+                summary = config_source.clone();
+            } else {
+                summary.push_str(&format!(", {}", config_source));
+            }
+        }
+
+        summary
+    }
+
     fn get_rotation_description(&self) -> String {
         if let Some(ref rotation) = self.log_file_rotation {
             let rotation_name = match *rotation {
@@ -442,46 +521,21 @@ impl TracingInit {
                 tracing_appender::rolling::Rotation::HOURLY => "hourly",
                 tracing_appender::rolling::Rotation::MINUTELY => "minutely",
                 tracing_appender::rolling::Rotation::NEVER => "",
+                _ => "weekly",
             };
-
             if *rotation != tracing_appender::rolling::Rotation::NEVER {
                 format!("rotation: {}:{}", rotation_name, self.log_file_backups)
             } else {
                 String::new()
             }
         } else {
-            String::from("log_file_rotation not initialized")
+            String::new()
         }
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tracing::event;
 
-    #[tokio::test]
-    async fn test_full_logging() {
-        let t = TracingInit::builder("App")
-            .log_to_console(true)
-            .log_to_file(true)
-            .log_to_server(true)
-            .init()
-            .unwrap()
-            .to_string();
-
-        println!("{}", t);
-
-        event!(Level::INFO, "test");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+impl Display for TracingInit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.build_summary())
     }
-
-    #[tokio::test]
-    async fn test_default_logging() {
-        let t = TracingInit::builder("App").init().unwrap().to_string();
-
-        println!("{}", t);
-
-        event!(Level::INFO, "test");
-    }
-
 }
