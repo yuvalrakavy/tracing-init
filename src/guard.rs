@@ -18,6 +18,8 @@ pub struct TracingGuard {
     pub(crate) tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     #[cfg(feature = "otel")]
     pub(crate) logger_provider: Option<opentelemetry_sdk::logs::SdkLoggerProvider>,
+    #[cfg(feature = "otel")]
+    pub(crate) beacon_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TracingGuard {
@@ -32,6 +34,8 @@ impl TracingGuard {
             tracer_provider: None,
             #[cfg(feature = "otel")]
             logger_provider: None,
+            #[cfg(feature = "otel")]
+            beacon_handle: None,
         }
     }
 
@@ -45,6 +49,10 @@ impl Drop for TracingGuard {
     fn drop(&mut self) {
         #[cfg(feature = "otel")]
         {
+            // Abort beacon listener before shutting down providers
+            if let Some(handle) = self.beacon_handle.take() {
+                handle.abort();
+            }
             if let Some(ref provider) = self.tracer_provider {
                 let _ = provider.shutdown();
             }

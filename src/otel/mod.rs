@@ -2,6 +2,8 @@
 
 pub mod traces;
 pub mod logs;
+pub mod circuit_breaker;
+pub mod beacon;
 
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::Resource;

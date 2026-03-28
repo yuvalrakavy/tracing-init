@@ -171,6 +171,14 @@ pub struct TracingInit {
     otel_transport: Option<types::Transport>,
     #[cfg(feature = "otel")]
     otel_resource_attrs: Vec<(String, String)>,
+    #[cfg(feature = "otel")]
+    otel_reprobe_interval: Option<u64>,
+    #[cfg(feature = "otel")]
+    otel_failure_threshold: Option<u32>,
+    #[cfg(feature = "otel")]
+    otel_beacon_group: Option<String>,
+    #[cfg(feature = "otel")]
+    otel_beacon_port: Option<u16>,
 
     // Config
     #[cfg(feature = "config")]
@@ -222,6 +230,14 @@ impl TracingInit {
             otel_transport: None,
             #[cfg(feature = "otel")]
             otel_resource_attrs: Vec::new(),
+            #[cfg(feature = "otel")]
+            otel_reprobe_interval: None,
+            #[cfg(feature = "otel")]
+            otel_failure_threshold: None,
+            #[cfg(feature = "otel")]
+            otel_beacon_group: None,
+            #[cfg(feature = "otel")]
+            otel_beacon_port: None,
 
             #[cfg(feature = "config")]
             config_source: None,
@@ -348,6 +364,16 @@ impl TracingInit {
         self
     }
 
+    /// Resolve circuit breaker config: (reprobe_interval_secs, failure_threshold, beacon_group, beacon_port)
+    #[cfg(feature = "otel")]
+    fn otel_circuit_breaker_config(&self) -> (u64, u32, String, u16) {
+        let reprobe = self.otel_reprobe_interval.unwrap_or(30);
+        let threshold = self.otel_failure_threshold.unwrap_or(3);
+        let group = self.otel_beacon_group.clone().unwrap_or_else(|| "239.255.77.1".to_string());
+        let port = self.otel_beacon_port.unwrap_or(4399);
+        (reprobe, threshold, group, port)
+    }
+
     // ── Legacy enable methods ──
 
     /// Enable or disable console (stdout) logging.
@@ -459,6 +485,8 @@ impl TracingInit {
 
         // OTel layers
         #[cfg(feature = "otel")]
+        let mut beacon_handle: Option<tokio::task::JoinHandle<()>> = None;
+        #[cfg(feature = "otel")]
         {
             if self.is_dest_enabled('o') {
                 let endpoint = self.otel_endpoint.as_deref().unwrap_or("http://localhost:4318");
@@ -466,8 +494,27 @@ impl TracingInit {
                 let service = self.service_name.as_deref().unwrap_or(&self.app_name);
                 let resource = otel::build_resource(service, &self.otel_resource_attrs);
 
-                let (tp, trace_layer) = otel::traces::create_trace_layer(endpoint, &transport, resource.clone())?;
-                let (lp, log_layer) = otel::logs::create_log_layer(endpoint, &transport, resource)?;
+                // Circuit breaker config from TOML or defaults
+                let (reprobe_interval, failure_threshold, beacon_group, beacon_port) =
+                    self.otel_circuit_breaker_config();
+
+                let circuit_state = std::sync::Arc::new(
+                    otel::circuit_breaker::CircuitState::new(failure_threshold, reprobe_interval),
+                );
+
+                let (tp, trace_layer) = otel::traces::create_trace_layer(
+                    endpoint, &transport, resource.clone(), circuit_state.clone(),
+                )?;
+                let (lp, log_layer) = otel::logs::create_log_layer(
+                    endpoint, &transport, resource, circuit_state.clone(),
+                )?;
+
+                // Start beacon listener
+                beacon_handle = Some(otel::beacon::start_beacon_listener(
+                    circuit_state,
+                    &beacon_group,
+                    beacon_port,
+                ));
 
                 // Build separate filters — EnvFilter is not Clone
                 let otel_filter = self.build_env_filter("otel")?;
@@ -501,6 +548,8 @@ impl TracingInit {
             tracer_provider,
             #[cfg(feature = "otel")]
             logger_provider,
+            #[cfg(feature = "otel")]
+            beacon_handle,
         })
     }
 
@@ -897,6 +946,19 @@ impl TracingInit {
                         self.otel_resource_attrs.push((key.clone(), v.to_string()));
                     }
                 }
+            }
+            // Circuit breaker config from TOML
+            if self.otel_reprobe_interval.is_none() {
+                self.otel_reprobe_interval = otel.reprobe_interval;
+            }
+            if self.otel_failure_threshold.is_none() {
+                self.otel_failure_threshold = otel.failure_threshold;
+            }
+            if self.otel_beacon_group.is_none() {
+                self.otel_beacon_group = otel.beacon_group.clone();
+            }
+            if self.otel_beacon_port.is_none() {
+                self.otel_beacon_port = otel.beacon_port;
             }
         }
     }

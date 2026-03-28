@@ -1,13 +1,16 @@
 //! OTel log exporter layer construction.
 
+use std::sync::Arc;
+
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use tracing_subscriber::Layer;
 
 use super::OtelBoxedLayer;
+use super::circuit_breaker::{CircuitBreakerLogExporter, CircuitState};
 
-/// Create a LoggerProvider with OTLP exporter.
+/// Create a LoggerProvider with OTLP exporter wrapped in a circuit breaker.
 ///
 /// Returns the provider (held in TracingGuard for shutdown)
 /// and the log bridge layer as a boxed trait object.
@@ -16,6 +19,7 @@ pub fn create_log_layer(
     #[allow(unused_variables)]
     transport: &str,
     resource: Resource,
+    circuit_state: Arc<CircuitState>,
 ) -> Result<(SdkLoggerProvider, OtelBoxedLayer), Box<dyn std::error::Error>>
 {
     let exporter = match transport {
@@ -30,8 +34,10 @@ pub fn create_log_layer(
             .build()?,
     };
 
+    let wrapped = CircuitBreakerLogExporter::new(exporter, circuit_state);
+
     let provider = SdkLoggerProvider::builder()
-        .with_batch_exporter(exporter)
+        .with_batch_exporter(wrapped)
         .with_resource(resource)
         .build();
 

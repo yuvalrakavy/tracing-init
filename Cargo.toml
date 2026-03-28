@@ -19,6 +19,9 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
     "dep:opentelemetry-appender-tracing",
+    "dep:socket2",
+    "dep:tokio",
+    "dep:futures-util",
 ]
 otel-grpc = ["otel", "opentelemetry-otlp/grpc-tonic"]
 
@@ -44,6 +47,9 @@ opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"], optional = true
 opentelemetry-otlp = { version = "0.28", features = ["http-json"], optional = true }
 tracing-opentelemetry = { version = "0.29", optional = true }
 opentelemetry-appender-tracing = { version = "0.28", optional = true }
+socket2 = { version = "0.5", features = ["all"], optional = true }
+tokio = { version = "1", features = ["net", "time", "rt"], optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

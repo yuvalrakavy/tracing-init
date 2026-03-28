@@ -100,6 +100,14 @@ pub struct OtelConfig {
     pub endpoint: Option<String>,
     pub transport: Option<String>,
     pub resource: Option<toml::value::Table>,
+    /// Seconds between reprobe attempts when circuit is open (default 30).
+    pub reprobe_interval: Option<u64>,
+    /// Consecutive failures before opening the circuit (default 3).
+    pub failure_threshold: Option<u32>,
+    /// UDP multicast group for beacon listener (default "239.255.77.1").
+    pub beacon_group: Option<String>,
+    /// UDP port for beacon listener (default 4399).
+    pub beacon_port: Option<u16>,
 }
 
 /// Parsed and layered logging configuration from nested TOML.
@@ -213,6 +221,18 @@ impl LoggingConfig {
         table.get(key).and_then(|v| v.as_bool())
     }
 
+    fn get_u64(table: &toml::value::Table, key: &str) -> Option<u64> {
+        table.get(key).and_then(|v| v.as_integer()).map(|v| v as u64)
+    }
+
+    fn get_u32(table: &toml::value::Table, key: &str) -> Option<u32> {
+        table.get(key).and_then(|v| v.as_integer()).map(|v| v as u32)
+    }
+
+    fn get_u16(table: &toml::value::Table, key: &str) -> Option<u16> {
+        table.get(key).and_then(|v| v.as_integer()).map(|v| v as u16)
+    }
+
     fn parse_console(value: Option<&toml::Value>) -> Option<ConsoleConfig> {
         let table = value?.as_table()?;
         Some(ConsoleConfig {
@@ -263,6 +283,10 @@ impl LoggingConfig {
             endpoint: Self::get_str(table, "endpoint"),
             transport: Self::get_str(table, "transport"),
             resource,
+            reprobe_interval: Self::get_u64(table, "reprobe_interval"),
+            failure_threshold: Self::get_u32(table, "failure_threshold"),
+            beacon_group: Self::get_str(table, "beacon_group"),
+            beacon_port: Self::get_u16(table, "beacon_port"),
         })
     }
 
@@ -345,6 +369,10 @@ impl LoggingConfig {
                     endpoint: a.endpoint.or(b.endpoint),
                     transport: a.transport.or(b.transport),
                     resource,
+                    reprobe_interval: a.reprobe_interval.or(b.reprobe_interval),
+                    failure_threshold: a.failure_threshold.or(b.failure_threshold),
+                    beacon_group: a.beacon_group.or(b.beacon_group),
+                    beacon_port: a.beacon_port.or(b.beacon_port),
                 })
             }
         }

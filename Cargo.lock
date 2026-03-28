@@ -1570,6 +1570,7 @@ name = "tracing-init"
 version = "0.2.0"
 dependencies = [
  "bitflags",
+ "futures-util",
  "hostname",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -1577,7 +1578,9 @@ dependencies = [
  "opentelemetry_sdk",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "tempfile",
+ "tokio",
  "toml",
  "tracing",
  "tracing-appender",
