@@ -19,11 +19,14 @@
 //! # TOML Configuration
 //!
 //! ```no_run
+//! # #[cfg(feature = "config")]
+//! # {
 //! // Load from a config file (falls back to logging.toml if no [logging] section)
 //! let summary = tracing_init::TracingInit::builder("myapp")
 //!     .config_file("server.toml")
 //!     .init()
 //!     .unwrap();
+//! # }
 //! ```
 //!
 //! ## TOML Structure
@@ -100,6 +103,8 @@ enum ConfigSource {
 /// # Examples
 ///
 /// ```no_run
+/// # #[cfg(all(feature = "file", feature = "config"))]
+/// # {
 /// // Console + file, debug level, no TOML lookup
 /// tracing_init::TracingInit::builder("myapp")
 ///     .log_to_console(true)
@@ -109,6 +114,7 @@ enum ConfigSource {
 ///     .no_auto_config_file()
 ///     .init()
 ///     .unwrap();
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct TracingInit {
