@@ -84,6 +84,31 @@ level = "debug"
 
 Per-app override sections (`[logging.myapp]`) inherit from the base `[logging]` section and can override any field. Destination modifiers (`-f+o`) continue to work as before.
 
+Per-app sections also support nested destination overrides:
+
+```toml
+[logging]
+level = "info"
+
+[logging.console]
+format = "pretty"
+
+[logging.myapp]
+destination = "co"
+level = "debug"
+
+[logging.myapp.console]
+format = "json"
+level = "trace"
+
+[logging.myapp.otel]
+level = "error"
+```
+
+**Inheritance chain:** `[logging.myapp.console]` inherits from `[logging.myapp]`, which inherits from `[logging.console]`, which inherits from `[logging]`. Most specific wins.
+
+This supports use cases where a single config file (e.g., `server.toml`) configures logging for multiple services (the main server and sub-services like `ht_server`) with different per-destination settings.
+
 **Reserved section names:** `console`, `file`, `gelf`, `otel` are reserved for destination configuration. App names must not collide with these. If a collision occurs, the section is treated as destination config, not an app override.
 
 ## Builder API
