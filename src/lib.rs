@@ -440,6 +440,11 @@ impl TracingInit {
 
         let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync + 'static>> = Vec::new();
 
+        #[cfg(feature = "otel")]
+        let mut tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider> = None;
+        #[cfg(feature = "otel")]
+        let mut logger_provider: Option<opentelemetry_sdk::logs::SdkLoggerProvider> = None;
+
         if let Some(layer) = self.get_console_layer()? {
             layers.push(layer);
         }
@@ -452,6 +457,38 @@ impl TracingInit {
             layers.push(layer);
         }
 
+        // OTel layers
+        #[cfg(feature = "otel")]
+        {
+            if self.is_dest_enabled('o') {
+                let endpoint = self.otel_endpoint.as_deref().unwrap_or("http://localhost:4318");
+                let transport = self.otel_transport.map(|t| t.to_string()).unwrap_or_else(|| "http".to_string());
+                let service = self.service_name.as_deref().unwrap_or(&self.app_name);
+                let resource = otel::build_resource(service, &self.otel_resource_attrs);
+
+                let (tp, trace_layer) = otel::traces::create_trace_layer(endpoint, &transport, resource.clone())?;
+                let (lp, log_layer) = otel::logs::create_log_layer(endpoint, &transport, resource)?;
+
+                // Build separate filters — EnvFilter is not Clone
+                let otel_filter = self.build_env_filter("otel")?;
+                let otel_filter2 = self.build_env_filter("otel")?;
+
+                layers.push(trace_layer.with_filter(otel_filter).boxed());
+                layers.push(log_layer.with_filter(otel_filter2).boxed());
+
+                // Store providers in guard for shutdown
+                tracer_provider = Some(tp);
+                logger_provider = Some(lp);
+            }
+        }
+
+        #[cfg(not(feature = "otel"))]
+        {
+            if self.destination.as_ref().is_some_and(|d| d.contains('o')) {
+                eprintln!("Warning: Destination 'o' requested but 'otel' feature not enabled — skipping");
+            }
+        }
+
         tracing_subscriber::registry()
             .with(layers)
             .init();
@@ -461,9 +498,9 @@ impl TracingInit {
             #[cfg(feature = "file")]
             _file_guard: None, // TODO: use non_blocking writer in future
             #[cfg(feature = "otel")]
-            tracer_provider: None,
+            tracer_provider,
             #[cfg(feature = "otel")]
-            logger_provider: None,
+            logger_provider,
         })
     }
 
