@@ -28,7 +28,7 @@ The TOML config moves from flat keys to nested sections. All fields are optional
 
 ```toml
 [logging]
-destination = "cfo"                   # c=console, f=file, s=gelf, o=otel
+destination = "cfo"                   # c=console, f=file, g=gelf, o=otel
 level = "info"                        # default for all destinations
 filter = "my_crate=debug,tower=warn"  # default EnvFilter for all
 service_name = "my-service"           # OTel resource + GELF _service
@@ -67,6 +67,10 @@ level = "error"
 filter = "my_crate=warn"
 endpoint = "http://localhost:4318"
 transport = "http"                   # http | grpc (grpc requires "otel-grpc" feature)
+
+[logging.otel.resource]              # additional OTel resource attributes
+"service.version" = "1.2.3"
+"deployment.environment" = "staging"
 
 [logging.myapp]                      # per-app overrides (existing feature)
 destination = "-f+o"
@@ -111,6 +115,28 @@ This supports use cases where a single config file (e.g., `server.toml`) configu
 
 **Reserved section names:** `console`, `file`, `gelf`, `otel` are reserved for destination configuration. App names must not collide with these. If a collision occurs, the section is treated as destination config, not an app override.
 
+## Init Return Type
+
+`init()` returns a `TracingGuard` instead of a plain `String`:
+
+```rust
+let guard = TracingInit::builder("myapp")
+    .destination("cgo")
+    .init()?;
+
+println!("Logging: {}", guard.summary());
+
+// guard must be held for the lifetime of the application.
+// On drop: flushes pending OTel spans/logs, flushes file appender.
+```
+
+`TracingGuard` holds:
+- The `tracing-appender` `WorkerGuard` (if file logging is active)
+- The OTel `TracerProvider` and `LoggerProvider` (if OTel is active)
+- The configuration summary string
+
+On drop, it calls `TracerProvider::shutdown()` and `LoggerProvider::shutdown()` to flush pending data, and drops the file appender guard to flush buffered writes.
+
 ## Builder API
 
 The builder uses a destination-keyed API to avoid method proliferation:
@@ -132,10 +158,27 @@ TracingInit::builder()
     .span_events("console", SpanEvents::All)
     .otel_endpoint("http://localhost:4318")
     .otel_transport(Transport::Http)
+    .otel_resource_attribute("service.version", "1.2.3")
     .file_path("logs")
     .file_rotation("d:3")
-    .init()
+    .init()?;
 ```
+
+### Legacy Methods (Kept)
+
+The existing `log_to_console(bool)`, `log_to_file(bool)`, `log_to_server(bool)` methods are retained for convenience. They are equivalent to setting individual destination flags and take the same precedence as other builder calls.
+
+### `service_name` and `app_name`
+
+- `app_name` (required, passed to `builder()`) — used for per-app TOML lookup, file prefix, and GELF `_app` field
+- `service_name` (optional) — used for OTel resource identity and GELF `_service` field. Defaults to `app_name` if not set.
+- Internal sub-services within a process should use span attributes (e.g., `tracing::info_span!("request", service = "ht_server")`) rather than separate `service_name` values. These flow into GELF as `_span_service` and into OTel span attributes automatically.
+
+### Level and Filter Interaction
+
+- `level()` sets the base log level for a destination (e.g., `level("*", Level::INFO)`)
+- `filter()` sets an `EnvFilter` directive for a destination (e.g., `filter("console", "my_crate=debug,tower=warn")`)
+- When both are set for a destination, the filter is used as the `EnvFilter` with the level as the default directive. This means the level acts as a floor — everything at that level or above passes, and the filter provides additional per-module overrides on top.
 
 ### API Conventions
 
@@ -195,6 +238,16 @@ Registry
 
 Each layer gets its own `EnvFilter` constructed from the per-destination level and filter settings.
 
+### Shutdown
+
+When `TracingGuard` is dropped, it performs an orderly shutdown:
+
+1. Flush and shut down `TracerProvider` (exports pending spans)
+2. Flush and shut down `LoggerProvider` (exports pending log records)
+3. Drop the file appender `WorkerGuard` (flushes buffered file writes)
+
+This ensures no data is lost on process exit. The guard must be held for the lifetime of the application — dropping it early stops all logging.
+
 ## GELF Enrichment
 
 The `GelfLayer` currently sends basic event fields (message, level, timestamp, host). It will be enriched with all available span context.
@@ -208,7 +261,8 @@ The `GelfLayer` currently sends basic event fields (message, level, timestamp, h
 - `_span_*` — span fields flattened as individual GELF additional fields (e.g., `_span_user_id`, `_span_request_method`)
 
 **From builder/config:**
-- `_service` — from `service_name`
+- `_app` — from `app_name` (existing, kept)
+- `_service` — from `service_name` (defaults to `app_name` if not set)
 
 **From tracing metadata:**
 - `_target` — module path
