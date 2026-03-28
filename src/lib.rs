@@ -67,7 +67,9 @@
 //!
 use std::fmt::Display;
 
+#[cfg(feature = "config")]
 mod config;
+#[cfg(feature = "gelf")]
 mod gelf;
 
 #[cfg(test)]
@@ -79,6 +81,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tracing_subscriber::{EnvFilter, Layer};
 
 /// Where the TOML configuration comes from — either a file path or a pre-parsed value.
+#[cfg(feature = "config")]
 #[derive(Debug, Clone)]
 enum ConfigSource {
     /// A filesystem path to a TOML file.
@@ -117,18 +120,26 @@ pub struct TracingInit {
 
     level: Option<Level>,
 
+    #[cfg(feature = "file")]
     log_file_path: Option<String>,
+    #[cfg(feature = "file")]
     log_file_prefix: String,
+    #[cfg(feature = "file")]
     log_file_rotation: Option<tracing_appender::rolling::Rotation>,
+    #[cfg(feature = "file")]
     log_file_backups: usize,
 
+    #[cfg(feature = "gelf")]
     log_server_address: Option<String>,
 
     filter: Option<String>,
 
+    #[cfg(feature = "config")]
     config_source: Option<ConfigSource>,
+    #[cfg(feature = "config")]
     no_auto_config_file: bool,
     ignore_env_vars: bool,
+    #[cfg(feature = "config")]
     config_summary: Option<String>,
 }
 
@@ -154,21 +165,29 @@ impl TracingInit {
             // Default: INFO
             level: None,
 
+            #[cfg(feature = "file")]
             log_file_path: None,
+            #[cfg(feature = "file")]
             log_file_prefix: app_name.to_string(),
 
             // Default: tracing_appender::rolling::Rotation::DAILY
+            #[cfg(feature = "file")]
             log_file_rotation: None,
+            #[cfg(feature = "file")]
             log_file_backups: 3,
 
             // Default: "logging-server:12201"
+            #[cfg(feature = "gelf")]
             log_server_address: None,
 
             filter: None,
 
+            #[cfg(feature = "config")]
             config_source: None,
+            #[cfg(feature = "config")]
             no_auto_config_file: false,
             ignore_env_vars: false,
+            #[cfg(feature = "config")]
             config_summary: None,
         }
     }
@@ -188,6 +207,7 @@ impl TracingInit {
     /// or the TOML `destination` field. See [`log_file_path`](Self::log_file_path),
     /// [`log_file_rotation`](Self::log_file_rotation), and
     /// [`log_file_backups`](Self::log_file_backups) for related settings.
+    #[cfg(feature = "file")]
     pub fn log_to_file(&mut self, v: bool) -> &mut Self {
         self.enable_log_file = Some(v);
         self
@@ -201,6 +221,7 @@ impl TracingInit {
     ///
     /// GELF messages are sent synchronously over a `std::net::UdpSocket`; no async
     /// runtime is required.
+    #[cfg(feature = "gelf")]
     pub fn log_to_server(&mut self, v: bool) -> &mut Self {
         self.enable_log_server = Some(v);
         self
@@ -229,6 +250,7 @@ impl TracingInit {
     /// Set the directory for log files (default: current directory).
     ///
     /// Can also be set via `LOG_FILE_PATH` or the TOML `file_path` field.
+    #[cfg(feature = "file")]
     pub fn log_file_path(&mut self, path: &str) -> &mut Self {
         self.log_file_path = Some(path.to_string());
         self
@@ -237,6 +259,7 @@ impl TracingInit {
     /// Set the log file name prefix (default: the `app_name`).
     ///
     /// The final filename is `<prefix>.<date>.log` (or similar, depending on rotation).
+    #[cfg(feature = "file")]
     pub fn log_file_prefix(&mut self, prefix: &str) -> &mut Self {
         self.log_file_prefix = prefix.to_string();
         self
@@ -254,6 +277,7 @@ impl TracingInit {
     /// [`Rotation::HOURLY`]: tracing_appender::rolling::Rotation::HOURLY
     /// [`Rotation::MINUTELY`]: tracing_appender::rolling::Rotation::MINUTELY
     /// [`Rotation::NEVER`]: tracing_appender::rolling::Rotation::NEVER
+    #[cfg(feature = "file")]
     pub fn log_file_rotation(
         &mut self,
         rotation: tracing_appender::rolling::Rotation,
@@ -267,6 +291,7 @@ impl TracingInit {
     /// Only meaningful when rotation is not [`Rotation::NEVER`].
     ///
     /// [`Rotation::NEVER`]: tracing_appender::rolling::Rotation::NEVER
+    #[cfg(feature = "file")]
     pub fn log_file_backups(&mut self, backups: usize) -> &mut Self {
         self.log_file_backups = backups;
         self
@@ -276,6 +301,7 @@ impl TracingInit {
     ///
     /// Can also be set via `LOG_SERVER` or the TOML `server` field. Using a DNS CNAME
     /// for `logging-server` is a convenient way to avoid hard-coding addresses.
+    #[cfg(feature = "gelf")]
     pub fn log_server_address(&mut self, name: &str) -> &mut Self {
         self.log_server_address = Some(name.to_string());
         self
@@ -290,6 +316,7 @@ impl TracingInit {
     /// # Panics
     ///
     /// Panics if [`config_file`](Self::config_file) was already called.
+    #[cfg(feature = "config")]
     pub fn config_toml(&mut self, value: &toml::Value) -> &mut Self {
         if self.config_source.is_some() {
             panic!("Cannot call both config_toml() and config_file()");
@@ -308,6 +335,7 @@ impl TracingInit {
     /// # Panics
     ///
     /// Panics if [`config_toml`](Self::config_toml) was already called.
+    #[cfg(feature = "config")]
     pub fn config_file(&mut self, path: &str) -> &mut Self {
         if self.config_source.is_some() {
             panic!("Cannot call both config_file() and config_toml()");
@@ -320,6 +348,7 @@ impl TracingInit {
     ///
     /// By default, when no explicit config source is provided, the builder searches
     /// upward for a `logging.toml` file. Call this to suppress that behavior.
+    #[cfg(feature = "config")]
     pub fn no_auto_config_file(&mut self) -> &mut Self {
         self.no_auto_config_file = true;
         self
@@ -348,12 +377,19 @@ impl TracingInit {
         if !self.ignore_env_vars {
             self.apply_environment_variables();
         }
+        #[cfg(feature = "config")]
         self.apply_toml_config();
         self.apply_defaults();
 
         let console_layer = self.get_console_layer();
+        #[cfg(feature = "file")]
         let log_file_layer = self.get_log_file_layer()?;
+        #[cfg(not(feature = "file"))]
+        let log_file_layer: BoxedLayer<_> = None;
+        #[cfg(feature = "gelf")]
         let log_server_layer = self.get_log_server_layer()?;
+        #[cfg(not(feature = "gelf"))]
+        let log_server_layer: BoxedLayer<_> = None;
 
         let env_filter = if let Some(ref filter) = self.filter {
             EnvFilter::try_new(filter)?
@@ -387,6 +423,7 @@ impl TracingInit {
                 self.enable_log_server = Some(log_destination.contains('s'));
             }
         }
+        #[cfg(feature = "file")]
         if self.log_file_path.is_none() {
             if let Ok(path) = std::env::var("LOG_FILE_PATH") {
                 self.log_file_path = Some(path);
@@ -397,6 +434,7 @@ impl TracingInit {
                 self.level = level_str.parse().ok();
             }
         }
+        #[cfg(feature = "file")]
         if self.log_file_rotation.is_none() {
             if let Ok(rotation_value) = std::env::var("LOG_FILE_ROTATION") {
                 let (rotation, count) = Self::parse_rotation_string(&rotation_value);
@@ -404,6 +442,7 @@ impl TracingInit {
                 self.log_file_backups = count;
             }
         }
+        #[cfg(feature = "gelf")]
         if self.log_server_address.is_none() {
             if let Ok(server) = std::env::var("LOG_SERVER") {
                 self.log_server_address = Some(server);
@@ -411,6 +450,7 @@ impl TracingInit {
         }
     }
 
+    #[cfg(feature = "config")]
     fn apply_toml_config(&mut self) {
         let (config, source) = match &self.config_source {
             Some(ConfigSource::Toml(value)) => {
@@ -467,16 +507,20 @@ impl TracingInit {
             if let Some(ref level_str) = config.level { self.level = level_str.parse().ok(); }
         }
         if self.filter.is_none() { self.filter = config.filter.clone(); }
+        #[cfg(feature = "gelf")]
         if self.log_server_address.is_none() { self.log_server_address = config.server.clone(); }
-        if self.log_file_path.is_none() { self.log_file_path = config.file_path.clone(); }
-        if let Some(ref prefix) = config.file_prefix {
-            if self.log_file_prefix == self.app_name { self.log_file_prefix = prefix.clone(); }
-        }
-        if self.log_file_rotation.is_none() {
-            if let Some(ref rotation_str) = config.file_rotation {
-                let (rotation, count) = Self::parse_rotation_string(rotation_str);
-                self.log_file_rotation = Some(rotation);
-                self.log_file_backups = count;
+        #[cfg(feature = "file")]
+        {
+            if self.log_file_path.is_none() { self.log_file_path = config.file_path.clone(); }
+            if let Some(ref prefix) = config.file_prefix {
+                if self.log_file_prefix == self.app_name { self.log_file_prefix = prefix.clone(); }
+            }
+            if self.log_file_rotation.is_none() {
+                if let Some(ref rotation_str) = config.file_rotation {
+                    let (rotation, count) = Self::parse_rotation_string(rotation_str);
+                    self.log_file_rotation = Some(rotation);
+                    self.log_file_backups = count;
+                }
             }
         }
     }
@@ -485,6 +529,7 @@ impl TracingInit {
     ///
     /// Format: `<letter>[:<count>]` where letter is `d` (daily), `h` (hourly),
     /// `m` (minutely), or `n` (never). Count defaults to 3.
+    #[cfg(feature = "file")]
     fn parse_rotation_string(s: &str) -> (tracing_appender::rolling::Rotation, usize) {
         let mut parts = s.split(':');
         let rotation = parts.next().unwrap_or("d");
@@ -504,8 +549,12 @@ impl TracingInit {
         if self.enable_log_file.is_none() { self.enable_log_file = Some(false); }
         if self.enable_log_server.is_none() { self.enable_log_server = Some(false); }
         if self.level.is_none() { self.level = Some(Level::INFO); }
-        if self.log_file_path.is_none() { self.log_file_path = Some(String::new()); }
-        if self.log_file_rotation.is_none() { self.log_file_rotation = Some(tracing_appender::rolling::Rotation::DAILY); }
+        #[cfg(feature = "file")]
+        {
+            if self.log_file_path.is_none() { self.log_file_path = Some(String::new()); }
+            if self.log_file_rotation.is_none() { self.log_file_rotation = Some(tracing_appender::rolling::Rotation::DAILY); }
+        }
+        #[cfg(feature = "gelf")]
         if self.log_server_address.is_none() { self.log_server_address = Some("logging-server:12201".to_string()); }
     }
 
@@ -526,6 +575,7 @@ impl TracingInit {
         }
     }
 
+    #[cfg(feature = "file")]
     fn get_log_file_layer<S>(&self) -> Result<BoxedLayer<S>, Box<dyn std::error::Error>>
     where
         S: tracing::Subscriber,
@@ -550,6 +600,7 @@ impl TracingInit {
         }
     }
 
+    #[cfg(feature = "gelf")]
     fn get_log_server_layer<S>(&self) -> Result<BoxedLayer<S>, Box<dyn std::error::Error>>
     where
         S: tracing::Subscriber,
@@ -575,6 +626,7 @@ impl TracingInit {
         if self.enable_console.unwrap_or(false) {
             parts.push("log to console".to_string());
         }
+        #[cfg(feature = "file")]
         if self.enable_log_file.unwrap_or(false) {
             let path = self.log_file_path.as_deref().unwrap_or(".");
             let path = if path.is_empty() { "." } else { path };
@@ -585,6 +637,7 @@ impl TracingInit {
             }
             parts.push(file_part);
         }
+        #[cfg(feature = "gelf")]
         if self.enable_log_server.unwrap_or(false) {
             parts.push(format!("log to server {}", self.log_server_address.as_deref().unwrap_or("unknown")));
         }
@@ -599,6 +652,7 @@ impl TracingInit {
             }
         }
 
+        #[cfg(feature = "config")]
         if let Some(ref config_source) = self.config_summary {
             if summary.is_empty() {
                 summary = config_source.clone();
@@ -610,6 +664,7 @@ impl TracingInit {
         summary
     }
 
+    #[cfg(feature = "file")]
     fn get_rotation_description(&self) -> String {
         if let Some(ref rotation) = self.log_file_rotation {
             let rotation_name = match *rotation {

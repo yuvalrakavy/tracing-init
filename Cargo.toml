@@ -1,21 +1,49 @@
 [package]
 name = "tracing-init"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Simple tracing subscriber initialization with TOML config, file rotation, and GELF server output"
+description = "Simple tracing subscriber initialization with TOML config, file rotation, GELF, and OpenTelemetry support"
 license = "MIT"
 repository = "https://github.com/yuvalrakavy/tracing-init"
-keywords = ["tracing", "logging", "gelf", "toml", "subscriber"]
+keywords = ["tracing", "logging", "gelf", "opentelemetry", "subscriber"]
 categories = ["development-tools::debugging"]
 
+[features]
+default = ["config", "file", "gelf"]
+config = ["dep:toml", "dep:serde"]
+file = ["dep:tracing-appender"]
+gelf = ["dep:serde_json", "dep:hostname"]
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry-appender-tracing",
+]
+otel-grpc = ["otel", "opentelemetry-otlp/grpc-tonic"]
+
 [dependencies]
-tracing = { version = "0.1.41", features = ["log"] }
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
-tracing-appender = "0.2"
-hostname = "0.4"
-serde_json = "1"
-toml = "0.8"
-serde = { version = "1", features = ["derive"] }
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+bitflags = "2"
+
+# Optional - config
+toml = { version = "0.8", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+# Optional - file
+tracing-appender = { version = "0.2", optional = true }
+
+# Optional - gelf
+serde_json = { version = "1", optional = true }
+hostname = { version = "0.4", optional = true }
+
+# Optional - otel
+opentelemetry = { version = "0.28", optional = true }
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.28", features = ["http-json"], optional = true }
+tracing-opentelemetry = { version = "0.29", optional = true }
+opentelemetry-appender-tracing = { version = "0.28", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
