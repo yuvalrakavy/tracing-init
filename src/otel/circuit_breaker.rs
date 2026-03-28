@@ -5,7 +5,7 @@
 //! are logged once via `eprintln!`.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -32,6 +32,8 @@ pub struct CircuitState {
     /// Milliseconds since `epoch` when the circuit last opened or was last probed.
     last_probe_ms: AtomicU64,
     reprobe_interval_ms: u64,
+    /// Guard to ensure the offline message is printed exactly once per offline period.
+    has_logged_offline: AtomicBool,
 }
 
 impl fmt::Debug for CircuitState {
@@ -62,6 +64,7 @@ impl CircuitState {
             epoch: Instant::now(),
             last_probe_ms: AtomicU64::new(0),
             reprobe_interval_ms: reprobe_interval_secs * 1000,
+            has_logged_offline: AtomicBool::new(false),
         }
     }
 
@@ -100,6 +103,7 @@ impl CircuitState {
     fn record_success(&self) {
         let prev = self.state.swap(CLOSED, Ordering::Release);
         self.failure_count.store(0, Ordering::Relaxed);
+        self.has_logged_offline.store(false, Ordering::Relaxed);
         if prev != CLOSED {
             eprintln!("OTel collector online, sending traces");
         }
@@ -124,13 +128,11 @@ impl CircuitState {
     }
 
     fn open_circuit(&self) {
-        let prev = self.state.swap(OPEN, Ordering::Release);
+        self.state.store(OPEN, Ordering::Release);
         self.failure_count.store(0, Ordering::Relaxed);
         self.last_probe_ms.store(self.now_ms(), Ordering::Relaxed);
-        // Only log on the initial transition from Closed → Open.
-        // HalfOpen → Open (failed re-probe) is silent — the user already
-        // saw the message and doesn't need a repeat.
-        if prev == CLOSED {
+        // Log exactly once per offline period using atomic flag
+        if !self.has_logged_offline.swap(true, Ordering::AcqRel) {
             let secs = self.reprobe_interval_ms / 1000;
             eprintln!(
                 "OTel collector not online. Start the collector and traces will begin flowing within {secs}s"
@@ -142,6 +144,7 @@ impl CircuitState {
     pub fn force_close(&self) {
         let prev = self.state.swap(CLOSED, Ordering::Release);
         self.failure_count.store(0, Ordering::Relaxed);
+        self.has_logged_offline.store(false, Ordering::Relaxed);
         if prev != CLOSED {
             eprintln!("OTel collector online, sending traces");
         }
@@ -149,12 +152,10 @@ impl CircuitState {
 
     /// Force the circuit open (e.g. from beacon OFFLINE message).
     pub fn force_open(&self) {
-        let prev = self.state.swap(OPEN, Ordering::Release);
+        self.state.store(OPEN, Ordering::Release);
         self.failure_count.store(0, Ordering::Relaxed);
         self.last_probe_ms.store(self.now_ms(), Ordering::Relaxed);
-        // Log when transitioning from Closed (was working, now offline).
-        // Don't log if already Open or HalfOpen (user already knows).
-        if prev == CLOSED {
+        if !self.has_logged_offline.swap(true, Ordering::AcqRel) {
             let secs = self.reprobe_interval_ms / 1000;
             eprintln!(
                 "OTel collector not online. Start the collector and traces will begin flowing within {secs}s"
