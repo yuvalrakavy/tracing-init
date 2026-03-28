@@ -189,6 +189,8 @@ TracingInit::builder("myapp")
 
 The existing `log_to_console(bool)`, `log_to_file(bool)` methods are retained. `log_to_server(bool)` is renamed to `log_to_gelf_server(bool)` to match the `g` destination character. A new `log_to_otel(bool)` method is added (feature-gated behind `otel`). These are equivalent to setting individual destination flags and take the same precedence as other builder calls.
 
+Other existing methods retained as-is: `ignore_environment_variables()`, `no_auto_config_file()`, `config_file()`, `config_toml()`.
+
 ### `service_name` and `app_name`
 
 - `app_name` (required, passed to `builder()`) — used for per-app TOML lookup, file prefix, and GELF `_app` field
@@ -349,6 +351,10 @@ Span attributes are flattened as individual GELF additional fields (`_span_user_
 
 When the `otel` feature is not enabled, `_trace_id` and `_span_id` are simply absent. All other span context (name, attributes, service, target, file, line) remains available from the tracing span system.
 
+### Cross-Feature Note
+
+`gelf.rs` contains `#[cfg(feature = "otel")]` blocks to conditionally extract OTel trace/span IDs from `tracing-opentelemetry`'s span extensions. No feature dependency between `gelf` and `otel` is needed — Rust's `cfg` handles the conditional compilation. When both features are enabled, the GELF layer gains trace context; when only `gelf` is enabled, those fields are simply absent.
+
 ## Feature Flags & Dependencies
 
 ```toml
@@ -370,6 +376,7 @@ otel-grpc = ["otel", "opentelemetry-otlp/grpc-tonic"]
 # Core (always)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+bitflags = "2"
 
 # Optional
 tracing-appender = { version = "0.2", optional = true }
