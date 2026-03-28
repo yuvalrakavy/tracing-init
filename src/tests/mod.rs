@@ -2,3 +2,4 @@
 mod config_tests;
 #[cfg(feature = "config")]
 mod integration_tests;
+mod types_tests;

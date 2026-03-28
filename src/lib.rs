@@ -78,6 +78,8 @@ mod gelf;
 #[cfg(test)]
 mod tests;
 
+pub mod types;
+
 use tracing::Level;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
