@@ -54,137 +54,299 @@ pub fn apply_destination_modifier(base: Option<&str>, modifier: &str) -> String 
     result.into_iter().collect()
 }
 
-/// Parsed and layered logging configuration from TOML.
+/// Console output configuration parsed from `[logging.console]`.
+#[derive(Debug, Clone, Default)]
+pub struct ConsoleConfig {
+    pub level: Option<String>,
+    pub filter: Option<String>,
+    pub format: Option<String>,
+    pub ansi: Option<bool>,
+    pub timestamps: Option<bool>,
+    pub target: Option<bool>,
+    pub thread_names: Option<bool>,
+    pub file_line: Option<bool>,
+    pub span_events: Option<String>,
+}
+
+/// File output configuration parsed from `[logging.file]`.
+#[derive(Debug, Clone, Default)]
+pub struct FileConfig {
+    pub level: Option<String>,
+    pub filter: Option<String>,
+    pub format: Option<String>,
+    pub timestamps: Option<bool>,
+    pub target: Option<bool>,
+    pub thread_names: Option<bool>,
+    pub file_line: Option<bool>,
+    pub span_events: Option<String>,
+    pub path: Option<String>,
+    pub prefix: Option<String>,
+    pub rotation: Option<String>,
+}
+
+/// GELF server output configuration parsed from `[logging.gelf]`.
+#[derive(Debug, Clone, Default)]
+pub struct GelfConfig {
+    pub level: Option<String>,
+    pub filter: Option<String>,
+    pub address: Option<String>,
+}
+
+/// OpenTelemetry output configuration parsed from `[logging.otel]`.
+#[derive(Debug, Clone, Default)]
+pub struct OtelConfig {
+    pub level: Option<String>,
+    pub filter: Option<String>,
+    pub endpoint: Option<String>,
+    pub transport: Option<String>,
+    pub resource: Option<toml::value::Table>,
+}
+
+/// Parsed and layered logging configuration from nested TOML.
 ///
 /// All fields are optional; `None` means "not configured" and the caller
 /// should fall through to the next precedence level (environment variables,
 /// then defaults).
+///
+/// Destination-specific settings live in sub-configs (`console`, `file`,
+/// `gelf`, `otel`). The builder resolves the full inheritance chain at
+/// runtime: destination config fields override top-level fields.
 #[derive(Debug, Clone, Default)]
 pub struct LoggingConfig {
-    /// Destination flags: a string containing `c` (console), `f` (file), and/or `s` (server).
+    /// Destination flags: a string containing `c` (console), `f` (file),
+    /// `g` (gelf), and/or `o` (otel).
     pub destination: Option<String>,
-    /// Log level name: `error`, `warn`, `info`, `debug`, or `trace`.
+    /// Default log level name: `error`, `warn`, `info`, `debug`, or `trace`.
     pub level: Option<String>,
     /// An [`EnvFilter`](tracing_subscriber::EnvFilter) directive string.
     pub filter: Option<String>,
-    /// GELF server address as `host:port`.
-    pub server: Option<String>,
-    /// Directory path for log files.
-    pub file_path: Option<String>,
-    /// Log file name prefix (overrides the app name default).
-    pub file_prefix: Option<String>,
-    /// Rotation spec: `d` (daily), `h` (hourly), `m` (minutely), `n` (never),
-    /// optionally followed by `:<count>`.
-    pub file_rotation: Option<String>,
+    /// Service name for telemetry.
+    pub service_name: Option<String>,
+    /// Console-specific settings.
+    pub console: Option<ConsoleConfig>,
+    /// File-specific settings.
+    pub file: Option<FileConfig>,
+    /// GELF-specific settings.
+    pub gelf: Option<GelfConfig>,
+    /// OpenTelemetry-specific settings.
+    pub otel: Option<OtelConfig>,
 }
 
-/// Raw TOML section -- used for deserialization before layering.
-/// Fields are extracted manually to tolerate unknown sub-table keys in `[logging]`.
-#[derive(Debug, Clone, Default)]
-struct RawLoggingSection {
-    destination: Option<String>,
-    level: Option<String>,
-    filter: Option<String>,
-    server: Option<String>,
-    file_path: Option<String>,
-    file_prefix: Option<String>,
-    file_rotation: Option<String>,
-}
+/// Reserved section names that are destination configs, not app names.
+const RESERVED_SECTIONS: &[&str] = &["console", "file", "gelf", "otel"];
 
 impl LoggingConfig {
     /// Parse and layer config from a TOML value using the given app name.
     ///
     /// Returns `None` if there is no `[logging]` section.
     ///
-    /// When a `[logging.<app_name>]` sub-table is present, its fields override
-    /// the base `[logging]` fields with the following rules:
-    /// - Most fields: app value wins; if absent, inherit from base; empty string clears.
-    /// - `destination`: supports modifier syntax (`+s`, `-f`, `-f+s`).
-    /// - `file_prefix`: never inherited from base -- the app must set it explicitly.
+    /// When a `[logging.<app_name>]` sub-table is present, its scalar fields
+    /// override the base `[logging]` fields (destination uses modifier logic,
+    /// others use first-non-None). Destination sub-sections are merged
+    /// separately: `[logging.<app>.<dest>]` overrides `[logging.<dest>]`.
     pub fn from_toml(value: &toml::Value, app_name: &str) -> Option<LoggingConfig> {
         let logging = value.get("logging")?;
         let logging_table = logging.as_table()?;
 
-        let base = Self::parse_section(logging)?;
+        // Parse base scalar fields from [logging]
+        let mut dest = Self::get_str(logging_table, "destination");
+        let mut level = Self::get_str(logging_table, "level");
+        let mut filter = Self::get_str(logging_table, "filter");
+        let mut service_name = Self::get_str(logging_table, "service_name");
 
-        let app_section = logging_table
-            .get(app_name)
-            .and_then(Self::parse_section);
+        // Parse base destination sections
+        let base_console = Self::parse_console(logging_table.get("console"));
+        let base_file = Self::parse_file(logging_table.get("file"));
+        let base_gelf = Self::parse_gelf(logging_table.get("gelf"));
+        let base_otel = Self::parse_otel(logging_table.get("otel"));
 
-        if let Some(app) = app_section {
-            Some(Self::layer(base, app))
+        // Check for app-specific section (skip reserved names)
+        let app_table = if !RESERVED_SECTIONS.contains(&app_name) {
+            logging_table.get(app_name).and_then(|v| v.as_table())
         } else {
-            Some(LoggingConfig {
-                destination: base.destination,
-                level: base.level,
-                filter: base.filter,
-                server: base.server,
-                file_path: base.file_path,
-                file_prefix: base.file_prefix,
-                file_rotation: base.file_rotation,
-            })
-        }
-    }
-
-    /// Extract scalar string fields from a TOML table value, ignoring any sub-tables.
-    fn parse_section(value: &toml::Value) -> Option<RawLoggingSection> {
-        let table = value.as_table()?;
-        let get_str = |key: &str| -> Option<String> {
-            table.get(key).and_then(|v| v.as_str()).map(String::from)
+            None
         };
-        Some(RawLoggingSection {
-            destination: get_str("destination"),
-            level: get_str("level"),
-            filter: get_str("filter"),
-            server: get_str("server"),
-            file_path: get_str("file_path"),
-            file_prefix: get_str("file_prefix"),
-            file_rotation: get_str("file_rotation"),
+
+        let (console, file, gelf, otel) = if let Some(app) = app_table {
+            // Layer app base fields on top of logging base
+            if let Some(app_dest) = Self::get_str(app, "destination") {
+                let resolved = apply_destination_modifier(dest.as_deref(), &app_dest);
+                dest = if resolved.is_empty() { None } else { Some(resolved) };
+            }
+            if let Some(v) = Self::get_str(app, "level") { level = Some(v); }
+            if let Some(v) = Self::get_str(app, "filter") { filter = Some(v); }
+            if let Some(v) = Self::get_str(app, "service_name") { service_name = Some(v); }
+
+            // Parse app destination sections and layer over base
+            let app_console = Self::parse_console(app.get("console"));
+            let app_file = Self::parse_file(app.get("file"));
+            let app_gelf = Self::parse_gelf(app.get("gelf"));
+            let app_otel = Self::parse_otel(app.get("otel"));
+
+            (
+                Self::merge_console(base_console, app_console),
+                Self::merge_file(base_file, app_file),
+                Self::merge_gelf(base_gelf, app_gelf),
+                Self::merge_otel(base_otel, app_otel),
+            )
+        } else {
+            (base_console, base_file, base_gelf, base_otel)
+        };
+
+        Some(LoggingConfig {
+            destination: dest,
+            level,
+            filter,
+            service_name,
+            console,
+            file,
+            gelf,
+            otel,
         })
     }
 
-    /// Layer an app section on top of a base section.
-    fn layer(base: RawLoggingSection, app: RawLoggingSection) -> LoggingConfig {
-        LoggingConfig {
-            destination: Self::layer_destination(
-                base.destination.as_deref(),
-                app.destination.as_deref(),
-            ),
-            level: Self::layer_field(base.level, app.level),
-            filter: Self::layer_field(base.filter, app.filter),
-            server: Self::layer_field(base.server, app.server),
-            file_path: Self::layer_field(base.file_path, app.file_path),
-            file_prefix: Self::clear_empty(app.file_prefix),
-            file_rotation: Self::layer_field(base.file_rotation, app.file_rotation),
+    fn get_str(table: &toml::value::Table, key: &str) -> Option<String> {
+        table.get(key).and_then(|v| v.as_str()).map(String::from)
+    }
+
+    fn get_bool(table: &toml::value::Table, key: &str) -> Option<bool> {
+        table.get(key).and_then(|v| v.as_bool())
+    }
+
+    fn parse_console(value: Option<&toml::Value>) -> Option<ConsoleConfig> {
+        let table = value?.as_table()?;
+        Some(ConsoleConfig {
+            level: Self::get_str(table, "level"),
+            filter: Self::get_str(table, "filter"),
+            format: Self::get_str(table, "format"),
+            ansi: Self::get_bool(table, "ansi"),
+            timestamps: Self::get_bool(table, "timestamps"),
+            target: Self::get_bool(table, "target"),
+            thread_names: Self::get_bool(table, "thread_names"),
+            file_line: Self::get_bool(table, "file_line"),
+            span_events: Self::get_str(table, "span_events"),
+        })
+    }
+
+    fn parse_file(value: Option<&toml::Value>) -> Option<FileConfig> {
+        let table = value?.as_table()?;
+        Some(FileConfig {
+            level: Self::get_str(table, "level"),
+            filter: Self::get_str(table, "filter"),
+            format: Self::get_str(table, "format"),
+            timestamps: Self::get_bool(table, "timestamps"),
+            target: Self::get_bool(table, "target"),
+            thread_names: Self::get_bool(table, "thread_names"),
+            file_line: Self::get_bool(table, "file_line"),
+            span_events: Self::get_str(table, "span_events"),
+            path: Self::get_str(table, "path"),
+            prefix: Self::get_str(table, "prefix"),
+            rotation: Self::get_str(table, "rotation"),
+        })
+    }
+
+    fn parse_gelf(value: Option<&toml::Value>) -> Option<GelfConfig> {
+        let table = value?.as_table()?;
+        Some(GelfConfig {
+            level: Self::get_str(table, "level"),
+            filter: Self::get_str(table, "filter"),
+            address: Self::get_str(table, "address"),
+        })
+    }
+
+    fn parse_otel(value: Option<&toml::Value>) -> Option<OtelConfig> {
+        let table = value?.as_table()?;
+        let resource = table.get("resource").and_then(|v| v.as_table()).cloned();
+        Some(OtelConfig {
+            level: Self::get_str(table, "level"),
+            filter: Self::get_str(table, "filter"),
+            endpoint: Self::get_str(table, "endpoint"),
+            transport: Self::get_str(table, "transport"),
+            resource,
+        })
+    }
+
+    // Merge helpers: app.dest overrides dest (first non-None wins)
+
+    fn merge_console(base: Option<ConsoleConfig>, app: Option<ConsoleConfig>) -> Option<ConsoleConfig> {
+        match (base, app) {
+            (None, None) => None,
+            (Some(b), None) => Some(b),
+            (None, Some(a)) => Some(a),
+            (Some(b), Some(a)) => Some(ConsoleConfig {
+                level: a.level.or(b.level),
+                filter: a.filter.or(b.filter),
+                format: a.format.or(b.format),
+                ansi: a.ansi.or(b.ansi),
+                timestamps: a.timestamps.or(b.timestamps),
+                target: a.target.or(b.target),
+                thread_names: a.thread_names.or(b.thread_names),
+                file_line: a.file_line.or(b.file_line),
+                span_events: a.span_events.or(b.span_events),
+            }),
         }
     }
 
-    fn layer_destination(base: Option<&str>, app: Option<&str>) -> Option<String> {
-        match app {
-            Some(modifier) => {
-                let result = apply_destination_modifier(base, modifier);
-                if result.is_empty() {
-                    None
-                } else {
-                    Some(result)
-                }
+    fn merge_file(base: Option<FileConfig>, app: Option<FileConfig>) -> Option<FileConfig> {
+        match (base, app) {
+            (None, None) => None,
+            (Some(b), None) => Some(b),
+            (None, Some(a)) => Some(a),
+            (Some(b), Some(a)) => Some(FileConfig {
+                level: a.level.or(b.level),
+                filter: a.filter.or(b.filter),
+                format: a.format.or(b.format),
+                timestamps: a.timestamps.or(b.timestamps),
+                target: a.target.or(b.target),
+                thread_names: a.thread_names.or(b.thread_names),
+                file_line: a.file_line.or(b.file_line),
+                span_events: a.span_events.or(b.span_events),
+                path: a.path.or(b.path),
+                prefix: a.prefix.or(b.prefix),
+                rotation: a.rotation.or(b.rotation),
+            }),
+        }
+    }
+
+    fn merge_gelf(base: Option<GelfConfig>, app: Option<GelfConfig>) -> Option<GelfConfig> {
+        match (base, app) {
+            (None, None) => None,
+            (Some(b), None) => Some(b),
+            (None, Some(a)) => Some(a),
+            (Some(b), Some(a)) => Some(GelfConfig {
+                level: a.level.or(b.level),
+                filter: a.filter.or(b.filter),
+                address: a.address.or(b.address),
+            }),
+        }
+    }
+
+    fn merge_otel(base: Option<OtelConfig>, app: Option<OtelConfig>) -> Option<OtelConfig> {
+        match (base, app) {
+            (None, None) => None,
+            (Some(b), None) => Some(b),
+            (None, Some(a)) => Some(a),
+            (Some(b), Some(a)) => {
+                // For resource tables, merge app entries over base
+                let resource = match (b.resource, a.resource) {
+                    (None, None) => None,
+                    (Some(b_r), None) => Some(b_r),
+                    (None, Some(a_r)) => Some(a_r),
+                    (Some(mut b_r), Some(a_r)) => {
+                        for (k, v) in a_r {
+                            b_r.insert(k, v);
+                        }
+                        Some(b_r)
+                    }
+                };
+                Some(OtelConfig {
+                    level: a.level.or(b.level),
+                    filter: a.filter.or(b.filter),
+                    endpoint: a.endpoint.or(b.endpoint),
+                    transport: a.transport.or(b.transport),
+                    resource,
+                })
             }
-            None => base.map(String::from),
-        }
-    }
-
-    fn layer_field(base: Option<String>, app: Option<String>) -> Option<String> {
-        match app {
-            Some(v) if v.is_empty() => None,
-            Some(v) => Some(v),
-            None => base,
-        }
-    }
-
-    fn clear_empty(value: Option<String>) -> Option<String> {
-        match value {
-            Some(v) if v.is_empty() => None,
-            other => other,
         }
     }
 }

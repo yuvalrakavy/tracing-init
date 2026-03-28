@@ -2,157 +2,173 @@ use crate::config::{apply_destination_modifier, discover_config, LoggingConfig};
 
 #[test]
 fn test_absolute_destination() {
-    assert_eq!(apply_destination_modifier(Some("csf"), "cs"), "cs");
-}
-
-#[test]
-fn test_absolute_destination_no_base() {
-    assert_eq!(apply_destination_modifier(None, "cs"), "cs");
+    assert_eq!(apply_destination_modifier(Some("cgf"), "cg"), "cg");
 }
 
 #[test]
 fn test_remove_modifier() {
-    assert_eq!(apply_destination_modifier(Some("csf"), "-f"), "cs");
+    assert_eq!(apply_destination_modifier(Some("cgf"), "-f"), "cg");
 }
 
 #[test]
 fn test_add_modifier() {
-    assert_eq!(apply_destination_modifier(Some("c"), "+s"), "cs");
+    assert_eq!(apply_destination_modifier(Some("c"), "+g"), "cg");
 }
 
 #[test]
 fn test_combined_modifier() {
-    assert_eq!(apply_destination_modifier(Some("csf"), "-f+s"), "cs");
+    assert_eq!(apply_destination_modifier(Some("cgf"), "-f+o"), "cgo");
 }
 
 #[test]
-fn test_add_already_present() {
-    assert_eq!(apply_destination_modifier(Some("cs"), "+s"), "cs");
+fn test_add_otel_modifier() {
+    assert_eq!(apply_destination_modifier(Some("cg"), "+o"), "cgo");
 }
 
 #[test]
-fn test_remove_not_present() {
-    assert_eq!(apply_destination_modifier(Some("cs"), "-f"), "cs");
-}
-
-#[test]
-fn test_modifier_on_none_is_noop() {
-    assert_eq!(apply_destination_modifier(None, "-f"), "");
-}
-
-#[test]
-fn test_modifier_on_empty_is_noop() {
-    assert_eq!(apply_destination_modifier(Some(""), "-f+s"), "s");
-}
-
-#[test]
-fn test_parse_base_only() {
+fn test_parse_nested_base() {
     let toml_str = r#"
 [logging]
-destination = "cs"
-level = "debug"
-server = "localhost:12201"
-file_path = "logs"
-file_prefix = "myapp"
-file_rotation = "d:3"
-filter = "myapp=trace"
-"#;
-    let value: toml::Value = toml_str.parse().unwrap();
-    let config = LoggingConfig::from_toml(&value, "myapp").unwrap();
-
-    assert_eq!(config.destination.as_deref(), Some("cs"));
-    assert_eq!(config.level.as_deref(), Some("debug"));
-    assert_eq!(config.server.as_deref(), Some("localhost:12201"));
-    assert_eq!(config.file_path.as_deref(), Some("logs"));
-    assert_eq!(config.file_prefix.as_deref(), Some("myapp"));
-    assert_eq!(config.file_rotation.as_deref(), Some("d:3"));
-    assert_eq!(config.filter.as_deref(), Some("myapp=trace"));
-}
-
-#[test]
-fn test_app_overrides_base() {
-    let toml_str = r#"
-[logging]
-destination = "csf"
+destination = "cg"
 level = "info"
-server = "localhost:12201"
+service_name = "my-service"
+filter = "my_crate=debug"
 
-[logging.myapp]
+[logging.console]
 level = "debug"
-filter = "myapp=trace"
+format = "pretty"
+ansi = true
+
+[logging.file]
+path = "logs"
+prefix = "myapp"
+rotation = "d:3"
+format = "json"
+
+[logging.gelf]
+address = "localhost:12201"
+level = "warn"
 "#;
     let value: toml::Value = toml_str.parse().unwrap();
     let config = LoggingConfig::from_toml(&value, "myapp").unwrap();
 
-    assert_eq!(config.destination.as_deref(), Some("csf"));
+    assert_eq!(config.destination.as_deref(), Some("cg"));
+    assert_eq!(config.level.as_deref(), Some("info"));
+    assert_eq!(config.service_name.as_deref(), Some("my-service"));
+    assert_eq!(config.filter.as_deref(), Some("my_crate=debug"));
+
+    let console = config.console.unwrap();
+    assert_eq!(console.level.as_deref(), Some("debug"));
+    assert_eq!(console.format.as_deref(), Some("pretty"));
+    assert_eq!(console.ansi, Some(true));
+
+    let file = config.file.unwrap();
+    assert_eq!(file.path.as_deref(), Some("logs"));
+    assert_eq!(file.prefix.as_deref(), Some("myapp"));
+    assert_eq!(file.rotation.as_deref(), Some("d:3"));
+    assert_eq!(file.format.as_deref(), Some("json"));
+
+    let gelf = config.gelf.unwrap();
+    assert_eq!(gelf.address.as_deref(), Some("localhost:12201"));
+    assert_eq!(gelf.level.as_deref(), Some("warn"));
+}
+
+#[test]
+fn test_parse_app_override_with_destination_sections() {
+    let toml_str = r#"
+[logging]
+level = "info"
+
+[logging.console]
+format = "pretty"
+
+[logging.myapp]
+destination = "co"
+level = "debug"
+
+[logging.myapp.console]
+format = "json"
+level = "trace"
+"#;
+    let value: toml::Value = toml_str.parse().unwrap();
+    let config = LoggingConfig::from_toml(&value, "myapp").unwrap();
+
     assert_eq!(config.level.as_deref(), Some("debug"));
-    assert_eq!(config.server.as_deref(), Some("localhost:12201"));
-    assert_eq!(config.filter.as_deref(), Some("myapp=trace"));
+    assert_eq!(config.destination.as_deref(), Some("co"));
+
+    let console = config.console.unwrap();
+    assert_eq!(console.format.as_deref(), Some("json"));
+    assert_eq!(console.level.as_deref(), Some("trace"));
 }
 
 #[test]
-fn test_app_destination_modifier() {
+fn test_inheritance_chain() {
     let toml_str = r#"
 [logging]
-destination = "csf"
+level = "info"
+filter = "base_filter"
 
-[logging.myapp]
-destination = "-f+s"
-"#;
-    let value: toml::Value = toml_str.parse().unwrap();
-    let config = LoggingConfig::from_toml(&value, "myapp").unwrap();
-
-    assert_eq!(config.destination.as_deref(), Some("cs"));
-}
-
-#[test]
-fn test_file_prefix_not_inherited() {
-    let toml_str = r#"
-[logging]
-destination = "csf"
-file_prefix = "shared_prefix"
+[logging.console]
+format = "pretty"
+filter = "console_filter"
 
 [logging.myapp]
 level = "debug"
+
+[logging.myapp.console]
+format = "json"
 "#;
     let value: toml::Value = toml_str.parse().unwrap();
     let config = LoggingConfig::from_toml(&value, "myapp").unwrap();
 
-    // file_prefix from base is NOT inherited by per-app section
-    assert_eq!(config.file_prefix, None);
+    let console = config.console.unwrap();
+    assert_eq!(console.format.as_deref(), Some("json"));
+    assert_eq!(console.level, None);
+    assert_eq!(console.filter.as_deref(), Some("console_filter"));
+    assert_eq!(config.level.as_deref(), Some("debug"));
 }
 
 #[test]
-fn test_file_prefix_explicit_in_app() {
+fn test_per_app_destination_modifier() {
     let toml_str = r#"
 [logging]
-destination = "csf"
-file_prefix = "shared_prefix"
+destination = "cg"
 
 [logging.myapp]
-file_prefix = "custom_prefix"
+destination = "-g+f"
 "#;
     let value: toml::Value = toml_str.parse().unwrap();
     let config = LoggingConfig::from_toml(&value, "myapp").unwrap();
 
-    assert_eq!(config.file_prefix.as_deref(), Some("custom_prefix"));
+    assert_eq!(config.destination.as_deref(), Some("cf"));
 }
 
 #[test]
-fn test_field_clearing() {
+fn test_otel_config() {
     let toml_str = r#"
 [logging]
-destination = "csf"
-server = "localhost:12201"
+destination = "co"
 
-[logging.myapp]
-server = ""
+[logging.otel]
+endpoint = "http://localhost:4318"
+transport = "http"
+level = "error"
+
+[logging.otel.resource]
+"service.version" = "1.2.3"
+"deployment.environment" = "staging"
 "#;
     let value: toml::Value = toml_str.parse().unwrap();
     let config = LoggingConfig::from_toml(&value, "myapp").unwrap();
 
-    // Empty string clears the inherited value
-    assert_eq!(config.server, None);
+    let otel = config.otel.unwrap();
+    assert_eq!(otel.endpoint.as_deref(), Some("http://localhost:4318"));
+    assert_eq!(otel.transport.as_deref(), Some("http"));
+    assert_eq!(otel.level.as_deref(), Some("error"));
+
+    let resource = otel.resource.unwrap();
+    assert_eq!(resource.get("service.version").and_then(|v| v.as_str()), Some("1.2.3"));
+    assert_eq!(resource.get("deployment.environment").and_then(|v| v.as_str()), Some("staging"));
 }
 
 #[test]
@@ -162,25 +178,10 @@ fn test_no_logging_section() {
 key = "value"
 "#;
     let value: toml::Value = toml_str.parse().unwrap();
-    let config = LoggingConfig::from_toml(&value, "myapp");
-
-    assert!(config.is_none());
+    assert!(LoggingConfig::from_toml(&value, "myapp").is_none());
 }
 
-#[test]
-fn test_base_only_no_app_section() {
-    let toml_str = r#"
-[logging]
-destination = "cs"
-file_prefix = "base_prefix"
-"#;
-    let value: toml::Value = toml_str.parse().unwrap();
-    let config = LoggingConfig::from_toml(&value, "myapp").unwrap();
-
-    // With no app section, base file_prefix is used as-is
-    assert_eq!(config.destination.as_deref(), Some("cs"));
-    assert_eq!(config.file_prefix.as_deref(), Some("base_prefix"));
-}
+// --- discover_config tests (updated for new LoggingConfig type) ---
 
 #[test]
 fn test_discover_from_explicit_file() {

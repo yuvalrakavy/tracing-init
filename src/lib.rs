@@ -510,6 +510,8 @@ impl TracingInit {
 
         self.config_summary = Some(source);
 
+        // TODO(task-11): Fully wire nested config into builder fields.
+        // For now, apply only the top-level fields that existed before.
         if let Some(dest) = &config.destination {
             if self.enable_console.is_none() { self.enable_console = Some(dest.contains('c')); }
             if self.enable_log_file.is_none() { self.enable_log_file = Some(dest.contains('f')); }
@@ -520,18 +522,24 @@ impl TracingInit {
         }
         if self.filter.is_none() { self.filter = config.filter.clone(); }
         #[cfg(feature = "gelf")]
-        if self.log_server_address.is_none() { self.log_server_address = config.server.clone(); }
+        if self.log_server_address.is_none() {
+            if let Some(ref gelf) = config.gelf {
+                self.log_server_address = gelf.address.clone();
+            }
+        }
         #[cfg(feature = "file")]
         {
-            if self.log_file_path.is_none() { self.log_file_path = config.file_path.clone(); }
-            if let Some(ref prefix) = config.file_prefix {
-                if self.log_file_prefix == self.app_name { self.log_file_prefix = prefix.clone(); }
-            }
-            if self.log_file_rotation.is_none() {
-                if let Some(ref rotation_str) = config.file_rotation {
-                    let (rotation, count) = Self::parse_rotation_string(rotation_str);
-                    self.log_file_rotation = Some(rotation);
-                    self.log_file_backups = count;
+            if let Some(ref file) = config.file {
+                if self.log_file_path.is_none() { self.log_file_path = file.path.clone(); }
+                if let Some(ref prefix) = file.prefix {
+                    if self.log_file_prefix == self.app_name { self.log_file_prefix = prefix.clone(); }
+                }
+                if self.log_file_rotation.is_none() {
+                    if let Some(ref rotation_str) = file.rotation {
+                        let (rotation, count) = Self::parse_rotation_string(rotation_str);
+                        self.log_file_rotation = Some(rotation);
+                        self.log_file_backups = count;
+                    }
                 }
             }
         }
