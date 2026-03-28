@@ -9,6 +9,18 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+fn now_timestamp() -> String {
+    // Use chrono if available, otherwise fall back to a simple format
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{hours:02}:{mins:02}:{s:02}")
+}
+
 use futures_util::future::BoxFuture;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::{LogBatch, LogExporter};
@@ -103,9 +115,12 @@ impl CircuitState {
     fn record_success(&self) {
         let prev = self.state.swap(CLOSED, Ordering::Release);
         self.failure_count.store(0, Ordering::Relaxed);
-        self.has_logged_offline.store(false, Ordering::Relaxed);
         if prev != CLOSED {
-            eprintln!("OTel collector online, sending traces");
+            // Only clear the offline flag on a genuine reconnection
+            // (transition from Open/HalfOpen to Closed), not on every
+            // successful export while already Closed.
+            self.has_logged_offline.store(false, Ordering::Relaxed);
+            eprintln!("[{}] OTel collector online, sending traces", now_timestamp());
         }
     }
 
@@ -135,7 +150,8 @@ impl CircuitState {
         if !self.has_logged_offline.swap(true, Ordering::AcqRel) {
             let secs = self.reprobe_interval_ms / 1000;
             eprintln!(
-                "OTel collector not online. Start the collector and traces will begin flowing within {secs}s"
+                "[{}] OTel collector not online. Start the collector and traces will begin flowing within {secs}s",
+                now_timestamp()
             );
         }
     }
@@ -146,7 +162,7 @@ impl CircuitState {
         self.failure_count.store(0, Ordering::Relaxed);
         self.has_logged_offline.store(false, Ordering::Relaxed);
         if prev != CLOSED {
-            eprintln!("OTel collector online, sending traces");
+            eprintln!("[{}] OTel collector online, sending traces", now_timestamp());
         }
     }
 
@@ -158,7 +174,8 @@ impl CircuitState {
         if !self.has_logged_offline.swap(true, Ordering::AcqRel) {
             let secs = self.reprobe_interval_ms / 1000;
             eprintln!(
-                "OTel collector not online. Start the collector and traces will begin flowing within {secs}s"
+                "[{}] OTel collector not online. Start the collector and traces will begin flowing within {secs}s",
+                now_timestamp()
             );
         }
     }
