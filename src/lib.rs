@@ -984,11 +984,12 @@ impl TracingInit {
         if self.is_dest_enabled('f') {
             let path = self.file_path.as_deref().unwrap_or(".");
             let path = if path.is_empty() { "." } else { path };
+            let format = self.dest_settings.resolve_format("file").unwrap_or(types::Format::Full);
             let level = self.dest_settings.resolve_level("file")
                 .or_else(|| self.dest_settings.resolve_level("*"))
                 .unwrap_or(Level::INFO);
             let rotation_str = self.file_rotation.as_deref().unwrap_or("d:3");
-            parts.push(format!("file({}/{}.log, {}, rot:{})", path, self.file_prefix, level, rotation_str));
+            parts.push(format!("file({}/{}.log, {}, {}, rot:{})", path, self.file_prefix, format, level, rotation_str));
         }
         #[cfg(feature = "gelf")]
         if self.is_dest_enabled('g') {
@@ -1007,22 +1008,20 @@ impl TracingInit {
             parts.push(format!("otel({}, {})", endpoint, level));
         }
 
-        let mut summary = parts.join(", ");
+        // Service name
+        let service = self.service_name.as_deref().unwrap_or(&self.app_name);
+        parts.push(format!("service: {}", service));
 
         #[cfg(feature = "config")]
         if let Some(ref config_source) = self.config_summary {
-            if summary.is_empty() {
-                summary = config_source.clone();
-            } else {
-                summary.push_str(&format!(", {}", config_source));
-            }
+            parts.push(format!("config: {}", config_source));
         }
 
-        if summary.is_empty() {
-            summary = "no destinations enabled".to_string();
+        if parts.is_empty() {
+            "no destinations enabled".to_string()
+        } else {
+            parts.join(", ")
         }
-
-        summary
     }
 }
 
