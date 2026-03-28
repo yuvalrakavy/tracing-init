@@ -82,6 +82,9 @@ level = "debug"
 - **Flat to nested:** `file_path` becomes `[logging.file] path`, `server` becomes `[logging.gelf] address`, etc.
 - **New sections:** `[logging.console]`, `[logging.otel]`
 - **New fields:** `service_name`, per-destination `level`/`filter`, display options
+- **Destination character `s` replaced by `g`** for GELF (matches section name `[logging.gelf]`)
+- **New destination character `o`** for OpenTelemetry
+- **Destination modifiers** updated accordingly: `"-g+o"`, `"+g"`, etc.
 - **Breaking:** single consumer (store-server), migration is trivial
 
 ### Per-App Overrides
@@ -113,7 +116,7 @@ level = "error"
 
 This supports use cases where a single config file (e.g., `server.toml`) configures logging for multiple services (the main server and sub-services like `ht_server`) with different per-destination settings.
 
-**Reserved section names:** `console`, `file`, `gelf`, `otel` are reserved for destination configuration. App names must not collide with these. If a collision occurs, the section is treated as destination config, not an app override.
+**Reserved section names:** `console`, `file`, `gelf`, `otel` are reserved for destination configuration. Within `[logging.otel]`, `resource` is reserved for OTel resource attributes. App names must not collide with reserved names. If a collision occurs, the section is treated as destination config, not an app override.
 
 ## Init Return Type
 
@@ -137,12 +140,14 @@ println!("Logging: {}", guard.summary());
 
 On drop, it calls `TracerProvider::shutdown()` and `LoggerProvider::shutdown()` to flush pending data, and drops the file appender guard to flush buffered writes.
 
+`TracingGuard` implements `Display`, delegating to `summary()`, so both `guard.summary()` and `format!("{guard}")` work.
+
 ## Builder API
 
 The builder uses a destination-keyed API to avoid method proliferation:
 
 ```rust
-TracingInit::builder()
+TracingInit::builder("myapp")
     .service_name("my-service")
     .destination("cfo")
     .level("*", Level::INFO)
@@ -166,7 +171,7 @@ TracingInit::builder()
 
 ### Legacy Methods (Kept)
 
-The existing `log_to_console(bool)`, `log_to_file(bool)`, `log_to_server(bool)` methods are retained for convenience. They are equivalent to setting individual destination flags and take the same precedence as other builder calls.
+The existing `log_to_console(bool)`, `log_to_file(bool)` methods are retained. `log_to_server(bool)` is renamed to `log_to_gelf_server(bool)` to match the `g` destination character. These are equivalent to setting individual destination flags and take the same precedence as other builder calls.
 
 ### `service_name` and `app_name`
 
@@ -208,7 +213,32 @@ Only variables that make sense as per-run overrides:
 
 Everything else (endpoints, formats, service name, per-destination levels) belongs in TOML or builder API.
 
+**`RUST_LOG` interaction with per-destination filters:** `RUST_LOG` overrides the base `[logging]` filter only. Destinations that have their own explicit `filter` setting (via TOML or builder) keep their filter unchanged. This preserves carefully configured per-destination filters while allowing a quick per-run override of the default.
+
 **Precedence:** builder > env vars > TOML > defaults (unchanged).
+
+## Defaults
+
+| Setting | Default |
+|---|---|
+| `destination` | (none — no destinations enabled) |
+| `level` | `info` |
+| `filter` | (none) |
+| `service_name` | value of `app_name` |
+| `console.ansi` | auto-detect (true if stdout is a terminal) |
+| `console.format` | `full` |
+| `file.format` | `full` |
+| `file.path` | current directory |
+| `file.prefix` | value of `app_name` |
+| `file.rotation` | `d:3` (daily, 3 backups) |
+| `gelf.address` | `localhost:12201` |
+| `otel.endpoint` | `http://localhost:4318` |
+| `otel.transport` | `http` |
+| `timestamps` | `true` |
+| `target` | `true` |
+| `thread_names` | `false` |
+| `file_line` | `false` |
+| `span_events` | `none` |
 
 ## Architecture & Module Structure
 
@@ -317,6 +347,17 @@ When a destination is requested but its feature is not enabled, log a warning at
 
 No panics — graceful degradation.
 
+### Error Handling
+
+`init()` fails fast (returns `Err`) if any enabled destination cannot be set up:
+
+- GELF address resolution fails → `Err`
+- OTel endpoint is unreachable or exporter creation fails → `Err`
+- File log directory cannot be created → `Err`
+- Invalid filter directive → `Err`
+
+No lenient/retry behavior. If a destination is requested, it must work at startup. This keeps the behavior predictable — the caller sees immediately whether logging is fully operational.
+
 ### Async Runtime
 
 OTLP exporters require a tokio runtime. Consumers are expected to already be running tokio. No internal runtime spawning.
@@ -326,7 +367,7 @@ OTLP exporters require a tokio runtime. Consumers are expected to already be run
 ### Unit Tests
 
 - **Config parsing:** nested TOML sections, per-destination overrides, field inheritance
-- **Destination modifiers:** existing logic extended with `o` destination
+- **Destination modifiers:** `s` replaced by `g`, new `o` destination added
 - **Per-destination level/filter:** resolution and precedence
 - **Feature-gated config:** GELF/OTel fields ignored when feature off
 - **Builder API:** `level("*", ...)` / `level("console", ...)` precedence and override behavior
