@@ -127,7 +127,10 @@ impl CircuitState {
         let prev = self.state.swap(OPEN, Ordering::Release);
         self.failure_count.store(0, Ordering::Relaxed);
         self.last_probe_ms.store(self.now_ms(), Ordering::Relaxed);
-        if prev != OPEN {
+        // Only log on the initial transition from Closed → Open.
+        // HalfOpen → Open (failed re-probe) is silent — the user already
+        // saw the message and doesn't need a repeat.
+        if prev == CLOSED {
             let secs = self.reprobe_interval_ms / 1000;
             eprintln!(
                 "OTel collector not online. Start the collector and traces will begin flowing within {secs}s"
@@ -149,7 +152,9 @@ impl CircuitState {
         let prev = self.state.swap(OPEN, Ordering::Release);
         self.failure_count.store(0, Ordering::Relaxed);
         self.last_probe_ms.store(self.now_ms(), Ordering::Relaxed);
-        if prev != OPEN {
+        // Log when transitioning from Closed (was working, now offline).
+        // Don't log if already Open or HalfOpen (user already knows).
+        if prev == CLOSED {
             let secs = self.reprobe_interval_ms / 1000;
             eprintln!(
                 "OTel collector not online. Start the collector and traces will begin flowing within {secs}s"
