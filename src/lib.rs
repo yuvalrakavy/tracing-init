@@ -839,6 +839,133 @@ impl TracingInit {
                 }
             }
         }
+
+        // Apply per-destination settings from nested TOML sections
+        if let Some(ref console) = config.console {
+            self.apply_dest_config("console", console.level.as_deref(), console.filter.as_deref(),
+                console.format.as_deref(), console.ansi, console.timestamps,
+                console.target, console.thread_names, console.file_line,
+                console.span_events.as_deref());
+        }
+        if let Some(ref file) = config.file {
+            self.apply_dest_config("file", file.level.as_deref(), file.filter.as_deref(),
+                file.format.as_deref(), None, file.timestamps,
+                file.target, file.thread_names, file.file_line,
+                file.span_events.as_deref());
+        }
+        #[cfg(feature = "gelf")]
+        if let Some(ref gelf) = config.gelf {
+            if let Some(ref level_str) = gelf.level {
+                if self.dest_settings.resolve_level("gelf").is_none() {
+                    if let Ok(level) = level_str.parse() {
+                        self.dest_settings.set_level("gelf", level);
+                    }
+                }
+            }
+            if let Some(ref filter) = gelf.filter {
+                if self.dest_settings.resolve_filter("gelf").is_none() {
+                    self.dest_settings.set_filter("gelf", filter);
+                }
+            }
+        }
+        #[cfg(feature = "otel")]
+        if let Some(ref otel) = config.otel {
+            if self.otel_endpoint.is_none() {
+                self.otel_endpoint = otel.endpoint.clone();
+            }
+            if self.otel_transport.is_none() {
+                if let Some(ref t) = otel.transport {
+                    self.otel_transport = t.parse().ok();
+                }
+            }
+            if let Some(ref level_str) = otel.level {
+                if self.dest_settings.resolve_level("otel").is_none() {
+                    if let Ok(level) = level_str.parse() {
+                        self.dest_settings.set_level("otel", level);
+                    }
+                }
+            }
+            if let Some(ref filter) = otel.filter {
+                if self.dest_settings.resolve_filter("otel").is_none() {
+                    self.dest_settings.set_filter("otel", filter);
+                }
+            }
+            // Apply resource attributes from TOML
+            if let Some(ref resource) = otel.resource {
+                for (key, value) in resource {
+                    if let Some(v) = value.as_str() {
+                        self.otel_resource_attrs.push((key.clone(), v.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "config")]
+    fn apply_dest_config(
+        &mut self,
+        dest: &str,
+        level: Option<&str>,
+        filter: Option<&str>,
+        format: Option<&str>,
+        ansi: Option<bool>,
+        timestamps: Option<bool>,
+        target: Option<bool>,
+        thread_names: Option<bool>,
+        file_line: Option<bool>,
+        span_events: Option<&str>,
+    ) {
+        if let Some(level_str) = level {
+            if self.dest_settings.resolve_level(dest).is_none() {
+                if let Ok(level) = level_str.parse() {
+                    self.dest_settings.set_level(dest, level);
+                }
+            }
+        }
+        if let Some(filter_str) = filter {
+            if self.dest_settings.resolve_filter(dest).is_none() {
+                self.dest_settings.set_filter(dest, filter_str);
+            }
+        }
+        if let Some(format_str) = format {
+            if self.dest_settings.resolve_format(dest).is_none() {
+                if let Ok(fmt) = format_str.parse() {
+                    self.dest_settings.set_format(dest, fmt);
+                }
+            }
+        }
+        if let Some(v) = ansi {
+            if self.dest_settings.resolve_ansi(dest).is_none() {
+                self.dest_settings.set_ansi(dest, v);
+            }
+        }
+        if let Some(v) = timestamps {
+            if self.dest_settings.resolve_timestamps(dest).is_none() {
+                self.dest_settings.set_timestamps(dest, v);
+            }
+        }
+        if let Some(v) = target {
+            if self.dest_settings.resolve_target(dest).is_none() {
+                self.dest_settings.set_target(dest, v);
+            }
+        }
+        if let Some(v) = thread_names {
+            if self.dest_settings.resolve_thread_names(dest).is_none() {
+                self.dest_settings.set_thread_names(dest, v);
+            }
+        }
+        if let Some(v) = file_line {
+            if self.dest_settings.resolve_file_line(dest).is_none() {
+                self.dest_settings.set_file_line(dest, v);
+            }
+        }
+        if let Some(se_str) = span_events {
+            if self.dest_settings.resolve_span_events(dest).is_none() {
+                if let Ok(se) = se_str.parse() {
+                    self.dest_settings.set_span_events(dest, se);
+                }
+            }
+        }
     }
 }
 
