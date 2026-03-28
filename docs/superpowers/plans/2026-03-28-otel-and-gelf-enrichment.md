@@ -228,6 +228,7 @@ Expected: compilation error — `types` module doesn't exist
 
 ```rust
 use std::str::FromStr;
+use bitflags;
 
 /// Output format for console and file logging layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -974,12 +975,30 @@ format = "json"
     let console = config.console.unwrap();
     // format from myapp.console (level 1)
     assert_eq!(console.format.as_deref(), Some("json"));
-    // level from myapp (level 2) — not console's level
-    // (console doesn't set level, myapp does)
+    // console doesn't set level directly — level comes from myapp (level 2)
+    // The resolved console config should NOT have a level set (it inherits from app/base
+    // at resolution time in the builder, not in config parsing)
+    assert_eq!(console.level, None);
     // filter from console (level 3)
     assert_eq!(console.filter.as_deref(), Some("console_filter"));
     // base level overridden by app
     assert_eq!(config.level.as_deref(), Some("debug"));
+}
+
+#[test]
+fn test_per_app_destination_modifier() {
+    let toml_str = r#"
+[logging]
+destination = "cg"
+
+[logging.myapp]
+destination = "-g+f"
+"#;
+    let value: toml::Value = toml_str.parse().unwrap();
+    let config = LoggingConfig::from_toml(&value, "myapp").unwrap();
+
+    // -g removes gelf, +f adds file
+    assert_eq!(config.destination.as_deref(), Some("cf"));
 }
 
 #[test]
@@ -1209,6 +1228,15 @@ Major changes:
 5. Change `init()` to return `TracingGuard`
 6. Use per-layer `EnvFilter` via `Layer::with_filter()`
 7. Rename `log_to_server` to `log_to_gelf_server`
+    - Update the GELF layer construction call to pass `service_name`:
+      ```rust
+      let service = self.service_name.as_deref().unwrap_or(&self.app_name);
+      let layer = gelf::GelfLayer::new(
+          &gelf_addr,
+          vec![("app", self.app_name.clone())],
+          Some(service.to_string()),
+      )?;
+      ```
 8. Add destination-keyed methods: `level(&str, Level)`, `filter(&str, &str)`, `format(&str, Format)`, etc.
 9. Keep legacy methods: `log_to_console`, `log_to_file`, `ignore_environment_variables`, `no_auto_config_file`, `config_file`, `config_toml`
 10. Build summary string with per-destination details
@@ -1513,12 +1541,73 @@ fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
 }
 ```
 
-The `GelfLayer` also needs to implement `on_new_span` to store span fields in extensions for later retrieval. Add a `SpanFields` struct stored in span extensions:
+Add the helper functions as `pub(crate)` for testability:
 
 ```rust
+/// Add service name to GELF fields if set.
+pub(crate) fn add_service_field(fields: &mut Map<String, Value>, service_name: Option<&str>) {
+    if let Some(service) = service_name {
+        fields.insert("_service".into(), json!(service));
+    }
+}
+
+/// Add tracing metadata to GELF fields (replaces existing _file, _line, _module_path insertions).
+pub(crate) fn add_metadata_fields(
+    fields: &mut Map<String, Value>,
+    target: Option<&str>,
+    file: Option<&str>,
+    line: Option<u32>,
+) {
+    if let Some(target) = target {
+        fields.insert("_target".into(), json!(target));
+    }
+    if let Some(file) = file {
+        fields.insert("_file".into(), json!(file));
+    }
+    if let Some(line) = line {
+        fields.insert("_line".into(), json!(line));
+    }
+}
+```
+
+The `GelfLayer` also needs `SpanFieldVisitor` to collect span attributes, and `on_new_span` to store them in extensions:
+
+```rust
+/// Stored in span extensions to hold span field values for GELF enrichment.
 #[derive(Debug)]
 struct SpanFields {
     fields: Vec<(String, Value)>,
+}
+
+/// Visitor that collects span attributes as (name, Value) pairs.
+struct SpanFieldVisitor<'a> {
+    fields: &'a mut Vec<(String, Value)>,
+}
+
+impl<'a> Visit for SpanFieldVisitor<'a> {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.fields.push((field.name().to_string(), json!(format!("{value:?}"))));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.fields.push((field.name().to_string(), json!(value)));
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields.push((field.name().to_string(), json!(value)));
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields.push((field.name().to_string(), json!(value)));
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.fields.push((field.name().to_string(), json!(value)));
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.fields.push((field.name().to_string(), json!(value)));
+    }
 }
 
 impl<S> Layer<S> for GelfLayer
@@ -1600,19 +1689,22 @@ pub fn build_resource(
 use opentelemetry::trace::TracerProvider as _;  // Required for .tracer() method
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use tracing_subscriber::Layer;
+use tracing_subscriber::Registry;
 
 /// Create a TracerProvider with OTLP exporter.
 ///
 /// Returns the provider (to be held in TracingGuard for shutdown)
-/// and the tracing-opentelemetry layer.
-pub fn create_trace_layer<S>(
+/// and the tracing-opentelemetry layer as a boxed trait object.
+///
+/// NOTE: Returns Box<dyn Layer<Registry>> (concrete Registry), not generic S,
+/// because per-layer filtering requires concrete subscriber types for boxing.
+pub fn create_trace_layer(
     endpoint: &str,
     #[allow(unused_variables)]
     transport: &str,
     resource: Resource,
-) -> Result<(SdkTracerProvider, tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>), Box<dyn std::error::Error>>
-where
-    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+) -> Result<(SdkTracerProvider, Box<dyn Layer<Registry> + Send + Sync>), Box<dyn std::error::Error>>
 {
     let exporter = match transport {
         #[cfg(feature = "otel-grpc")]
@@ -1634,7 +1726,7 @@ where
     let tracer = provider.tracer("tracing-init");
     let layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-    Ok((provider, layer))
+    Ok((provider, layer.boxed()))
 }
 ```
 
@@ -1672,17 +1764,25 @@ git commit -m "feat: add OTel trace exporter layer"
 
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
+use tracing_subscriber::Layer;
+use tracing_subscriber::Registry;
 
 /// Create a LoggerProvider with OTLP exporter.
 ///
 /// Returns the provider (to be held in TracingGuard for shutdown)
-/// and the opentelemetry-appender-tracing layer.
+/// and the log bridge layer as a boxed trait object.
+///
+/// NOTE: The exact import path for OpenTelemetryTracingBridge may vary by
+/// crate version. Verify against the published `opentelemetry-appender-tracing`
+/// 0.28 API before implementing. Common paths:
+///   - `opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge`
+///   - `opentelemetry_appender_tracing::OpenTelemetryTracingBridge`
 pub fn create_log_layer(
     endpoint: &str,
     #[allow(unused_variables)]
     transport: &str,
     resource: Resource,
-) -> Result<(SdkLoggerProvider, opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge<SdkLoggerProvider>), Box<dyn std::error::Error>>
+) -> Result<(SdkLoggerProvider, Box<dyn Layer<Registry> + Send + Sync>), Box<dyn std::error::Error>>
 {
     let exporter = match transport {
         #[cfg(feature = "otel-grpc")]
@@ -1703,7 +1803,7 @@ pub fn create_log_layer(
 
     let layer = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider);
 
-    Ok((provider, layer))
+    Ok((provider, layer.boxed()))
 }
 ```
 
@@ -1738,9 +1838,12 @@ let (otel_trace_layer, otel_log_layer, tracer_provider, logger_provider) = if se
     let service = self.service_name.as_deref().unwrap_or(&self.app_name);
     let resource = otel::build_resource(service, &self.otel_resource_attrs);
 
+    // create_trace_layer and create_log_layer return Box<dyn Layer<Registry>>
+    // (already boxed), so we just apply the filter and re-box.
     let (tp, trace_layer) = otel::traces::create_trace_layer(endpoint, &transport, resource.clone())?;
     let (lp, log_layer) = otel::logs::create_log_layer(endpoint, &transport, resource)?;
 
+    // Build separate filters — EnvFilter is not Clone.
     let otel_filter = self.build_env_filter("otel")?;
     let otel_filter2 = self.build_env_filter("otel")?;
 
@@ -1755,12 +1858,15 @@ let (otel_trace_layer, otel_log_layer, tracer_provider, logger_provider) = if se
 };
 
 #[cfg(not(feature = "otel"))]
-let (otel_trace_layer, otel_log_layer): (BoxedLayer<_>, BoxedLayer<_>) = {
+{
     if self.destination.as_ref().map_or(false, |d| d.contains('o')) {
         eprintln!("Warning: Destination 'o' requested but 'otel' feature not enabled — skipping");
     }
-    (None, None)
-};
+}
+#[cfg(not(feature = "otel"))]
+let otel_trace_layer: BoxedLayer = None;
+#[cfg(not(feature = "otel"))]
+let otel_log_layer: BoxedLayer = None;
 ```
 
 Assembly:
