@@ -112,7 +112,13 @@ level = "trace"
 level = "error"
 ```
 
-**Inheritance chain:** `[logging.myapp.console]` inherits from `[logging.myapp]`, which inherits from `[logging.console]`, which inherits from `[logging]`. Most specific wins.
+**Inheritance chain (most specific wins):**
+1. `[logging.myapp.console]` — app + destination specific
+2. `[logging.myapp]` — app-level defaults
+3. `[logging.console]` — destination defaults
+4. `[logging]` — global defaults
+
+For each field, the first level in this chain that defines it wins. For example, if `[logging.console]` sets `format = "pretty"` and `[logging.myapp]` sets `level = "warn"`, then myapp's console gets `format = "pretty"` (from level 3) and `level = "warn"` (from level 2).
 
 This supports use cases where a single config file (e.g., `server.toml`) configures logging for multiple services (the main server and sub-services like `ht_server`) with different per-destination settings.
 
@@ -141,6 +147,16 @@ println!("Logging: {}", guard.summary());
 On drop, it calls `TracerProvider::shutdown()` and `LoggerProvider::shutdown()` to flush pending data, and drops the file appender guard to flush buffered writes.
 
 `TracingGuard` implements `Display`, delegating to `summary()`, so both `guard.summary()` and `format!("{guard}")` work.
+
+### Summary Content
+
+The summary string describes the active logging setup. Example:
+
+```
+console (pretty, DEBUG), file logs/myapp.log (json, INFO, daily:3), gelf localhost:12201 (WARN), otel http://localhost:4318 (ERROR), service: my-service, config: server.toml
+```
+
+Each active destination shows its key settings (format, level, endpoint). Inactive destinations are omitted.
 
 ## Builder API
 
@@ -171,7 +187,7 @@ TracingInit::builder("myapp")
 
 ### Legacy Methods (Kept)
 
-The existing `log_to_console(bool)`, `log_to_file(bool)` methods are retained. `log_to_server(bool)` is renamed to `log_to_gelf_server(bool)` to match the `g` destination character. These are equivalent to setting individual destination flags and take the same precedence as other builder calls.
+The existing `log_to_console(bool)`, `log_to_file(bool)` methods are retained. `log_to_server(bool)` is renamed to `log_to_gelf_server(bool)` to match the `g` destination character. A new `log_to_otel(bool)` method is added (feature-gated behind `otel`). These are equivalent to setting individual destination flags and take the same precedence as other builder calls.
 
 ### `service_name` and `app_name`
 
@@ -196,8 +212,18 @@ The existing `log_to_console(bool)`, `log_to_file(bool)` methods are retained. `
 
 ```rust
 pub enum Format { Full, Compact, Pretty, Json }
-pub enum SpanEvents { None, New, Close, Active, All }  // or bitflags
 pub enum Transport { Http, Grpc }  // feature-gated
+
+bitflags! {
+    pub struct SpanEvents: u8 {
+        const NEW    = 0b001;
+        const CLOSE  = 0b010;
+        const ACTIVE = 0b100;
+        const NONE   = 0b000;
+        const ALL    = Self::NEW.bits() | Self::CLOSE.bits() | Self::ACTIVE.bits();
+    }
+}
+// TOML: span_events = "new,close" → SpanEvents::NEW | SpanEvents::CLOSE
 ```
 
 ## Environment Variables
@@ -214,6 +240,8 @@ Only variables that make sense as per-run overrides:
 Everything else (endpoints, formats, service name, per-destination levels) belongs in TOML or builder API.
 
 **`RUST_LOG` interaction with per-destination filters:** `RUST_LOG` overrides the base `[logging]` filter only. Destinations that have their own explicit `filter` setting (via TOML or builder) keep their filter unchanged. This preserves carefully configured per-destination filters while allowing a quick per-run override of the default.
+
+**Env vars and the `config` feature:** `LOG_DESTINATION`, `LOG_LEVEL`, and `RUST_LOG` always work regardless of the `config` feature — they don't require TOML or serde. `LOG_CONFIG` is silently ignored when the `config` feature is off (log a warning: "LOG_CONFIG set but 'config' feature not enabled — ignoring").
 
 **Precedence:** builder > env vars > TOML > defaults (unchanged).
 
@@ -266,7 +294,21 @@ Registry
   + EnvFilter (otel) + OtelLogLayer                [feature: otel]
 ```
 
-Each layer gets its own `EnvFilter` constructed from the per-destination level and filter settings.
+Each layer gets its own `EnvFilter` via `Layer::with_filter()` (per-layer filtering), replacing the current global `EnvFilter` approach. This is a significant change from the current architecture where a single `EnvFilter` is added to the registry:
+
+```rust
+// Current: single global filter
+registry.with(console).with(file).with(gelf).with(env_filter).init()
+
+// New: per-layer filters
+registry
+    .with(console.with_filter(console_filter))
+    .with(file.with_filter(file_filter))
+    .with(gelf.with_filter(gelf_filter))
+    .with(otel_traces.with_filter(otel_filter))
+    .with(otel_logs.with_filter(otel_filter))
+    .init()
+```
 
 ### Shutdown
 
@@ -320,6 +362,7 @@ otel = [
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
+    "dep:opentelemetry-appender-tracing",
 ]
 otel-grpc = ["otel", "opentelemetry-otlp/grpc-tonic"]
 
@@ -338,6 +381,7 @@ opentelemetry = { version = "0.28", optional = true }
 opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.28", features = ["http-json"], optional = true }
 tracing-opentelemetry = { version = "0.29", optional = true }
+opentelemetry-appender-tracing = { version = "0.28", optional = true }
 ```
 
 ### Runtime Behavior When Feature Is Off
