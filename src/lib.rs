@@ -79,6 +79,7 @@ mod gelf;
 mod tests;
 
 pub mod types;
+pub mod dest_config;
 
 use tracing::Level;
 use tracing_subscriber::registry::LookupSpan;
