@@ -43,10 +43,13 @@
 
 ---
 
-## Task 1: Update Cargo.toml with Feature Flags and Dependencies
+## Task 1: Update Cargo.toml with Feature Flags, Dependencies, and cfg Gates
 
 **Files:**
 - Modify: `Cargo.toml`
+- Modify: `src/lib.rs` (add cfg gates to existing module declarations)
+
+**IMPORTANT:** Making existing deps optional will immediately break compilation because `src/lib.rs`, `src/config.rs`, and `src/gelf.rs` import them unconditionally. This task MUST also add `#[cfg]` gates to the existing module declarations and imports, or compilation will fail.
 
 - [ ] **Step 1: Update Cargo.toml**
 
@@ -102,21 +105,50 @@ opentelemetry-appender-tracing = { version = "0.28", optional = true }
 tempfile = "3"
 ```
 
-- [ ] **Step 2: Verify it compiles with default features**
+- [ ] **Step 2: Add cfg gates to existing module declarations in `src/lib.rs`**
+
+Change the existing module declarations:
+```rust
+// Before:
+mod config;
+mod gelf;
+
+// After:
+#[cfg(feature = "config")]
+mod config;
+#[cfg(feature = "gelf")]
+mod gelf;
+```
+
+Also gate the `ConfigSource` enum and any `use` statements that reference `toml::Value` behind `#[cfg(feature = "config")]`. Gate `tracing_appender` imports behind `#[cfg(feature = "file")]`.
+
+The existing code that uses these modules in `init()`, `apply_toml_config()`, etc. must also be wrapped in corresponding `#[cfg]` blocks. This is a mechanical but important step — every reference to `config::`, `gelf::`, `toml::`, `tracing_appender::`, `serde_json::`, and `hostname::` needs a feature gate.
+
+- [ ] **Step 3: Verify it compiles with default features**
 
 Run: `cargo check`
-Expected: compiles with warnings (existing code still references non-optional imports unconditionally — that's OK, we'll fix in later tasks)
+Expected: compiles cleanly (default features enable config, file, gelf — so all existing code paths are active)
 
-- [ ] **Step 3: Verify it compiles with all features**
+- [ ] **Step 4: Verify it compiles with no default features**
+
+Run: `cargo check --no-default-features`
+Expected: compiles (console-only logging, all optional modules gated out)
+
+- [ ] **Step 5: Verify it compiles with all features**
 
 Run: `cargo check --all-features`
 Expected: compiles (OTel crates download and resolve)
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Run existing tests**
+
+Run: `cargo test`
+Expected: all existing tests pass (default features match previous behavior)
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock
-git commit -m "feat: add feature flags and OTel dependencies"
+git add Cargo.toml Cargo.lock src/lib.rs
+git commit -m "feat: add feature flags, OTel dependencies, and cfg gates"
 ```
 
 ---
@@ -659,6 +691,8 @@ Expected: compilation error — `guard` module doesn't exist
 
 - [ ] **Step 3: Create `src/guard.rs`**
 
+**IMPORTANT:** `#[cfg]` on function parameters is NOT stable Rust. Do NOT use cfg attributes on constructor parameters. Instead, `TracingGuard` is constructed directly via struct literal by `init()` (which knows which features are enabled), and a `summary_only()` constructor is provided for testing.
+
 ```rust
 //! Guard returned by [`TracingInit::init()`] that holds resources and flushes on drop.
 
@@ -670,41 +704,30 @@ use std::fmt;
 /// 1. Flush and shut down OTel TracerProvider (if active)
 /// 2. Flush and shut down OTel LoggerProvider (if active)
 /// 3. Drop the file appender WorkerGuard (flushes buffered writes)
-pub struct TracingGuard {
-    summary_text: String,
+///
+/// Constructed directly via struct literal in `init()`. Use `summary_only()` for testing.
+pub(crate) struct TracingGuard {
+    pub(crate) summary_text: String,
     #[cfg(feature = "file")]
-    _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    pub(crate) _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
     #[cfg(feature = "otel")]
-    tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    pub(crate) tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     #[cfg(feature = "otel")]
-    logger_provider: Option<opentelemetry_sdk::logs::SdkLoggerProvider>,
+    pub(crate) logger_provider: Option<opentelemetry_sdk::logs::SdkLoggerProvider>,
 }
 
 impl TracingGuard {
-    /// Create a new guard with the given summary and optional resource handles.
-    pub fn new(
-        summary_text: String,
-        #[cfg(feature = "file")]
-        file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
-        #[cfg(not(feature = "file"))]
-        _file_guard: Option<()>,
-        #[cfg(feature = "otel")]
-        tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
-        #[cfg(not(feature = "otel"))]
-        _tracer_provider: Option<()>,
-        #[cfg(feature = "otel")]
-        logger_provider: Option<opentelemetry_sdk::logs::SdkLoggerProvider>,
-        #[cfg(not(feature = "otel"))]
-        _logger_provider: Option<()>,
-    ) -> Self {
+    /// Create a guard with only a summary string (for testing).
+    #[cfg(test)]
+    pub(crate) fn summary_only(summary: String) -> Self {
         TracingGuard {
-            summary_text,
+            summary_text: summary,
             #[cfg(feature = "file")]
-            _file_guard: file_guard,
+            _file_guard: None,
             #[cfg(feature = "otel")]
-            tracer_provider,
+            tracer_provider: None,
             #[cfg(feature = "otel")]
-            logger_provider,
+            logger_provider: None,
         }
     }
 
@@ -744,11 +767,25 @@ impl fmt::Debug for TracingGuard {
 }
 ```
 
+In `init()`, construct via struct literal:
+```rust
+let guard = TracingGuard {
+    summary_text: self.build_summary(),
+    #[cfg(feature = "file")]
+    _file_guard: file_guard,
+    #[cfg(feature = "otel")]
+    tracer_provider,
+    #[cfg(feature = "otel")]
+    logger_provider,
+};
+```
+
 - [ ] **Step 4: Wire up the module**
 
 Add to `src/lib.rs`:
 ```rust
-pub mod guard;
+mod guard;
+pub use guard::TracingGuard;
 ```
 
 Add to `src/tests/mod.rs`:
@@ -756,37 +793,25 @@ Add to `src/tests/mod.rs`:
 mod guard_tests;
 ```
 
-- [ ] **Step 5: Update guard_tests.rs to match the actual constructor**
-
-The constructor signature differs by feature flags. Update the test to work with default features:
+- [ ] **Step 5: Write guard tests using `summary_only()`**
 
 ```rust
 use crate::guard::TracingGuard;
 
 #[test]
 fn test_summary_console_only() {
-    let guard = TracingGuard::new(
-        "console (full, INFO)".to_string(),
-        None, // file_guard
-        None, // tracer_provider
-        None, // logger_provider
-    );
+    let guard = TracingGuard::summary_only("console (full, INFO)".to_string());
     assert_eq!(guard.summary(), "console (full, INFO)");
 }
 
 #[test]
 fn test_display_delegates_to_summary() {
-    let guard = TracingGuard::new(
-        "console (full, INFO)".to_string(),
-        None,
-        None,
-        None,
-    );
+    let guard = TracingGuard::summary_only("console (full, INFO)".to_string());
     assert_eq!(format!("{guard}"), "console (full, INFO)");
 }
 ```
 
-Note: The constructor needs to be designed so that it works cleanly regardless of which features are enabled. The implementer should review the `TracingGuard::new` signature to ensure ergonomic construction — consider using a builder pattern or separate `with_file_guard()`, `with_tracer_provider()` methods instead of many optional parameters with cfg attributes. The key requirement is: it holds the resources, implements `summary()`, `Display`, and flushes on `Drop`.
+This works regardless of which features are enabled.
 
 - [ ] **Step 6: Run tests**
 
@@ -1008,21 +1033,7 @@ Replace the `LoggingConfig` and `RawLoggingSection` structs with nested config t
 New structs needed:
 
 ```rust
-/// Per-destination config for console/file (shared display options).
-#[derive(Debug, Clone, Default)]
-pub struct FmtDestConfig {
-    pub level: Option<String>,
-    pub filter: Option<String>,
-    pub format: Option<String>,
-    pub ansi: Option<bool>,
-    pub timestamps: Option<bool>,
-    pub target: Option<bool>,
-    pub thread_names: Option<bool>,
-    pub file_line: Option<bool>,
-    pub span_events: Option<String>,
-}
-
-/// Console-specific config (extends FmtDestConfig).
+/// Console-specific config.
 #[derive(Debug, Clone, Default)]
 pub struct ConsoleConfig {
     pub level: Option<String>,
@@ -1242,9 +1253,14 @@ pub struct TracingInit {
     // Config
     #[cfg(feature = "config")]
     config_source: Option<ConfigSource>,
+    #[cfg(feature = "config")]
+    config_summary: Option<String>,
     no_auto_config_file: bool,
     ignore_env_vars: bool,
 }
+// NOTE: config_file() and config_toml() methods must be behind #[cfg(feature = "config")]
+// since ConfigSource uses toml::Value. The integration test that calls these also needs
+// #[cfg(feature = "config")].
 ```
 
 Layer assembly changes from global filter to per-layer:
@@ -1259,32 +1275,37 @@ fn build_env_filter(&self, dest: &str) -> Result<EnvFilter, Box<dyn std::error::
             .with_default_directive(level.into())
             .parse(filter)?);
     }
-    // Fall back to destination-specific level
+    // Destination has its own level but no filter — use level only.
+    // IMPORTANT: Do NOT call from_env_lossy() here. Per the spec, RUST_LOG
+    // only overrides the base filter, not per-destination filters.
     if let Some(level) = self.dest_settings.resolve_level(dest) {
-        return Ok(EnvFilter::builder()
-            .with_default_directive(level.into())
-            .from_env_lossy());
+        return Ok(EnvFilter::new(level.to_string()));
     }
-    // Fall back to global defaults
+    // No destination-specific settings — use base level with RUST_LOG override.
+    // This is the ONLY path where RUST_LOG applies.
+    let base_level = self.dest_settings.resolve_level("*").unwrap_or(Level::INFO);
     Ok(EnvFilter::builder()
-        .with_default_directive(Level::INFO.into())
+        .with_default_directive(base_level.into())
         .from_env_lossy())
 }
 ```
 
-Console layer construction with display options:
+**IMPORTANT: `BoxedLayer` type must use concrete `Registry`**, not generic `S`. Per-layer filtering via `.with_filter()` returns `Filtered<L, F, S>` which can only be boxed as `Box<dyn Layer<S>>` when `S` is concrete. Change the type alias:
 
 ```rust
-fn get_console_layer<S>(&self) -> Result<BoxedLayer<S>, Box<dyn std::error::Error>>
-where
-    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-{
+use tracing_subscriber::Registry;
+type BoxedLayer = Option<Box<dyn Layer<Registry> + Send + Sync + 'static>>;
+```
+
+All `get_*_layer` methods lose the generic `<S>` parameter and return `BoxedLayer` directly. Example for console:
+
+```rust
+fn get_console_layer(&self) -> Result<BoxedLayer, Box<dyn std::error::Error>> {
     if !self.is_dest_enabled('c') { return Ok(None); }
 
     let filter = self.build_env_filter("console")?;
     let format = self.dest_settings.resolve_format("console").unwrap_or(Format::Full);
     let ansi = self.dest_settings.resolve_ansi("console").unwrap_or(true);
-    let timestamps = self.dest_settings.resolve_timestamps("console").unwrap_or(true);
     let target = self.dest_settings.resolve_target("console").unwrap_or(true);
     let thread_names = self.dest_settings.resolve_thread_names("console").unwrap_or(false);
     let file_line = self.dest_settings.resolve_file_line("console").unwrap_or(false);
@@ -1441,18 +1462,15 @@ impl GelfLayer {
 
 In `on_event`:
 
+**IMPORTANT:** The existing code already inserts `_file`, `_line`, and `_module_path`. Replace those existing insertions with the new helper to avoid duplication. Do NOT add `add_metadata_fields` alongside the existing metadata code — replace it.
+
 ```rust
 fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
     let mut fields = self.base_fields.clone();
 
     // ... existing level, _level code ...
 
-    // Target (module path from event metadata)
-    if let Some(target) = Some(event.metadata().target()) {
-        fields.insert("_target".into(), json!(target));
-    }
-
-    // Source location
+    // Metadata fields — REPLACES the existing _file, _line, _module_path insertions
     add_metadata_fields(&mut fields,
         Some(event.metadata().target()),
         event.metadata().file(),
@@ -1579,6 +1597,7 @@ pub fn build_resource(
 ```rust
 //! OTel trace exporter layer construction.
 
+use opentelemetry::trace::TracerProvider as _;  // Required for .tracer() method
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 
@@ -1875,6 +1894,7 @@ fn build_summary(&self) -> String {
         parts.push(format!("console ({format}, {level})"));
     }
 
+    #[cfg(feature = "file")]
     if self.is_dest_enabled('f') {
         let format = self.dest_settings.resolve_format("file").unwrap_or(Format::Full);
         let level = self.dest_settings.resolve_level("file")
@@ -1885,6 +1905,7 @@ fn build_summary(&self) -> String {
         parts.push(format!("file {path}/{prefix}.log ({format}, {level})"));
     }
 
+    #[cfg(feature = "gelf")]
     if self.is_dest_enabled('g') {
         let level = self.dest_settings.resolve_level("gelf")
             .or_else(|| self.dest_settings.resolve_level("*"))
@@ -1966,13 +1987,26 @@ git commit -m "chore: final cleanup and verification"
 
 ---
 
+## Task Dependencies
+
+Tasks MUST be executed sequentially in order. Key dependencies:
+- Task 1 (Cargo.toml + cfg gates) must complete before any other task
+- Tasks 2, 3, 4 are independent of each other but all depend on Task 1
+- Task 5 (config rewrite) depends on Task 1
+- Task 6 (builder refactor) depends on Tasks 2, 3, 4, and 5
+- Task 7 (GELF enrichment) depends on Task 6 (for updated GelfLayer::new signature)
+- Tasks 8, 9 (OTel modules) depend on Task 1
+- Task 10 (wire OTel into init) depends on Tasks 6, 8, 9
+- Tasks 11, 12 depend on Tasks 5, 6
+- Task 13 depends on all previous tasks
+
 ## Notes for Implementer
 
 ### Key Implementation Details
 
-1. **Per-layer filtering requires `tracing-subscriber` 0.3+** with the `registry` feature (enabled by default). Each layer is wrapped with `.with_filter(filter)` before being added to the registry.
+1. **`BoxedLayer` type** must use concrete `Registry`, not generic `S`. Per-layer filters return `Filtered<L, F, S>` which requires a concrete subscriber type for boxing: `type BoxedLayer = Option<Box<dyn Layer<Registry> + Send + Sync>>;`
 
-2. **`BoxedLayer` type** must change to accommodate per-layer filters. The type becomes `Option<Box<dyn Layer<Registry> + Send + Sync>>` since layers with filters are no longer generic over `S`.
+2. **Do NOT use `#[cfg]` on function parameters** — it's unstable. Use struct literal construction, conditional method calls, or the builder pattern instead.
 
 3. **OTel trace/span ID extraction in GELF** requires looking up `tracing_opentelemetry::OtelData` in span extensions. This type is only available when the `otel` feature is enabled. Use `#[cfg(feature = "otel")]` blocks.
 
@@ -1980,4 +2014,10 @@ git commit -m "chore: final cleanup and verification"
 
 5. **`opentelemetry-appender-tracing`** bridges `tracing` log events to OTel log records. It creates an `OpenTelemetryTracingBridge` layer that captures events and forwards them as OTel logs. This is separate from the `tracing-opentelemetry` layer which handles spans/traces.
 
-6. **Config feature gating**: when `config` feature is off, `config_source` field and all TOML-related code should be behind `#[cfg(feature = "config")]`. The builder should still work with just programmatic configuration.
+6. **Config feature gating**: `config_file()`, `config_toml()`, `ConfigSource`, `config_summary`, and all TOML-related code must be behind `#[cfg(feature = "config")]`. The builder should still work with just programmatic configuration.
+
+7. **`RUST_LOG` must only apply to the base filter.** In `build_env_filter`, only call `from_env_lossy()` when a destination has NO explicit level or filter set (falling through to the `"*"` wildcard). Destinations with their own level should use `EnvFilter::new(level.to_string())` — no env var reading.
+
+8. **GELF metadata deduplication**: The existing `on_event` code inserts `_file`, `_line`, and `_module_path`. When adding the enrichment, REPLACE these with the new `add_metadata_fields` helper — do not add alongside them or you get duplicate keys.
+
+9. **`TracerProvider` trait import**: `provider.tracer("name")` requires `use opentelemetry::trace::TracerProvider;` — it's a trait method, not inherent.
