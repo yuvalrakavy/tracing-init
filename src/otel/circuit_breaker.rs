@@ -46,6 +46,8 @@ pub struct CircuitState {
     reprobe_interval_ms: u64,
     /// Guard to ensure the offline message is printed exactly once per offline period.
     has_logged_offline: AtomicBool,
+    /// Application name for log messages.
+    app_name: String,
 }
 
 impl fmt::Debug for CircuitState {
@@ -68,7 +70,7 @@ impl CircuitState {
     ///
     /// - `failure_threshold`: consecutive failures before opening the circuit.
     /// - `reprobe_interval_secs`: seconds to wait in Open state before probing.
-    pub fn new(failure_threshold: u32, reprobe_interval_secs: u64) -> Self {
+    pub fn new(failure_threshold: u32, reprobe_interval_secs: u64, app_name: &str) -> Self {
         Self {
             state: AtomicU8::new(CLOSED),
             failure_count: AtomicU32::new(0),
@@ -77,6 +79,7 @@ impl CircuitState {
             last_probe_ms: AtomicU64::new(0),
             reprobe_interval_ms: reprobe_interval_secs * 1000,
             has_logged_offline: AtomicBool::new(false),
+            app_name: app_name.to_string(),
         }
     }
 
@@ -120,7 +123,7 @@ impl CircuitState {
             // (transition from Open/HalfOpen to Closed), not on every
             // successful export while already Closed.
             self.has_logged_offline.store(false, Ordering::Relaxed);
-            eprintln!("[{}] OTel collector online, sending traces", now_timestamp());
+            eprintln!("[{}] [{}] OTel collector online, sending traces", now_timestamp(), self.app_name);
         }
     }
 
@@ -150,8 +153,8 @@ impl CircuitState {
         if !self.has_logged_offline.swap(true, Ordering::AcqRel) {
             let secs = self.reprobe_interval_ms / 1000;
             eprintln!(
-                "[{}] OTel collector not online. Start the collector and traces will begin flowing within {secs}s",
-                now_timestamp()
+                "[{}] [{}] OTel collector not online. Start the collector and traces will begin flowing within {secs}s",
+                now_timestamp(), self.app_name
             );
         }
     }
@@ -162,7 +165,7 @@ impl CircuitState {
         self.failure_count.store(0, Ordering::Relaxed);
         self.has_logged_offline.store(false, Ordering::Relaxed);
         if prev != CLOSED {
-            eprintln!("[{}] OTel collector online, sending traces", now_timestamp());
+            eprintln!("[{}] [{}] OTel collector online, sending traces", now_timestamp(), self.app_name);
         }
     }
 
@@ -174,8 +177,8 @@ impl CircuitState {
         if !self.has_logged_offline.swap(true, Ordering::AcqRel) {
             let secs = self.reprobe_interval_ms / 1000;
             eprintln!(
-                "[{}] OTel collector not online. Start the collector and traces will begin flowing within {secs}s",
-                now_timestamp()
+                "[{}] [{}] OTel collector not online. Start the collector and traces will begin flowing within {secs}s",
+                now_timestamp(), self.app_name
             );
         }
     }

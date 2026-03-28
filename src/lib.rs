@@ -499,7 +499,7 @@ impl TracingInit {
                     self.otel_circuit_breaker_config();
 
                 let circuit_state = std::sync::Arc::new(
-                    otel::circuit_breaker::CircuitState::new(failure_threshold, reprobe_interval),
+                    otel::circuit_breaker::CircuitState::new(failure_threshold, reprobe_interval, &self.app_name),
                 );
 
                 let (tp, trace_layer) = otel::traces::create_trace_layer(
