@@ -74,9 +74,12 @@ use std::fmt::Display;
 mod config;
 #[cfg(feature = "gelf")]
 mod gelf;
+mod guard;
 
 #[cfg(test)]
 mod tests;
+
+pub use guard::TracingGuard;
 
 pub mod types;
 pub mod dest_config;
