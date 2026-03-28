@@ -90,6 +90,8 @@ mod config;
 #[cfg(feature = "gelf")]
 mod gelf;
 mod guard;
+#[cfg(feature = "otel")]
+mod otel;
 
 #[cfg(test)]
 mod tests;
