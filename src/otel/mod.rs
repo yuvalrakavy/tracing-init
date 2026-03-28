@@ -5,6 +5,10 @@ pub mod logs;
 
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::Resource;
+use tracing_subscriber::{Layer, Registry};
+
+/// Boxed layer type for OTel layer construction functions.
+pub type OtelBoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
 
 /// Build an OTel Resource from service name and additional attributes.
 pub fn build_resource(

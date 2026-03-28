@@ -537,7 +537,7 @@ impl TracingInit {
             _ => {}
         }
         // Fall back to destination string
-        self.destination.as_ref().map_or(false, |d| d.contains(ch))
+        self.destination.as_ref().is_some_and(|d| d.contains(ch))
     }
 
     /// Build an EnvFilter for a specific destination.
@@ -902,6 +902,7 @@ impl TracingInit {
     }
 
     #[cfg(feature = "config")]
+    #[allow(clippy::too_many_arguments)]
     fn apply_dest_config(
         &mut self,
         dest: &str,

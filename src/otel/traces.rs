@@ -5,7 +5,8 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::Layer;
-use tracing_subscriber::Registry;
+
+use super::OtelBoxedLayer;
 
 /// Create a TracerProvider with OTLP exporter.
 ///
@@ -16,7 +17,7 @@ pub fn create_trace_layer(
     #[allow(unused_variables)]
     transport: &str,
     resource: Resource,
-) -> Result<(SdkTracerProvider, Box<dyn Layer<Registry> + Send + Sync>), Box<dyn std::error::Error>>
+) -> Result<(SdkTracerProvider, OtelBoxedLayer), Box<dyn std::error::Error>>
 {
     let exporter = match transport {
         #[cfg(feature = "otel-grpc")]
