@@ -505,9 +505,18 @@ impl TracingInit {
                 let (tp, trace_layer) = otel::traces::create_trace_layer(
                     endpoint, &transport, resource.clone(), circuit_state.clone(),
                 )?;
-                let (lp, log_layer) = otel::logs::create_log_layer(
-                    endpoint, &transport, resource, circuit_state.clone(),
-                )?;
+                // Only create OTel log bridge if GELF is NOT enabled.
+                // When GELF is active, logs are already delivered with trace context
+                // (_trace_id, _span_id), so the OTel log bridge would cause duplication.
+                let gelf_active = self.is_dest_enabled('g');
+                if !gelf_active {
+                    let (lp, log_layer) = otel::logs::create_log_layer(
+                        endpoint, &transport, resource, circuit_state.clone(),
+                    )?;
+                    let otel_log_filter = self.build_env_filter("otel")?;
+                    layers.push(log_layer.with_filter(otel_log_filter).boxed());
+                    logger_provider = Some(lp);
+                }
 
                 // Start beacon listener
                 beacon_handle = Some(otel::beacon::start_beacon_listener(
@@ -516,16 +525,11 @@ impl TracingInit {
                     beacon_port,
                 ));
 
-                // Build separate filters — EnvFilter is not Clone
                 let otel_filter = self.build_env_filter("otel")?;
-                let otel_filter2 = self.build_env_filter("otel")?;
-
                 layers.push(trace_layer.with_filter(otel_filter).boxed());
-                layers.push(log_layer.with_filter(otel_filter2).boxed());
 
                 // Store providers in guard for shutdown
                 tracer_provider = Some(tp);
-                logger_provider = Some(lp);
             }
         }
 
@@ -1068,7 +1072,8 @@ impl TracingInit {
             let level = self.dest_settings.resolve_level("otel")
                 .or_else(|| self.dest_settings.resolve_level("*"))
                 .unwrap_or(Level::INFO);
-            parts.push(format!("otel({}, {})", endpoint, level));
+            let mode = if self.is_dest_enabled('g') { "traces" } else { "traces+logs" };
+            parts.push(format!("otel({}, {}, {})", endpoint, level, mode));
         }
 
         // Service name
