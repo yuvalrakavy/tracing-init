@@ -35,7 +35,7 @@ pub fn create_trace_layer(
             .build()?,
     };
 
-    let wrapped = CircuitBreakerSpanExporter::new(Box::new(exporter), circuit_state);
+    let wrapped = CircuitBreakerSpanExporter::new(exporter, circuit_state);
 
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(wrapped)

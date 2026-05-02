@@ -21,7 +21,6 @@ fn now_timestamp() -> String {
     format!("{hours:02}:{mins:02}:{s:02}")
 }
 
-use futures_util::future::BoxFuture;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::{LogBatch, LogExporter};
 use opentelemetry_sdk::trace::{SpanData, SpanExporter};
@@ -187,36 +186,44 @@ impl CircuitState {
 // ── Span Exporter Wrapper ──
 
 /// Wraps a `SpanExporter`, silently dropping spans when the circuit is open.
-pub struct CircuitBreakerSpanExporter {
-    inner: Box<dyn SpanExporter>,
+///
+/// Generic over the inner exporter type because `SpanExporter` is no longer
+/// dyn-compatible in opentelemetry_sdk 0.31 (its `export` method returns
+/// `impl Future`). Mirrors the pattern used for `LogExporter` below.
+pub struct CircuitBreakerSpanExporter<E> {
+    inner: E,
     state: Arc<CircuitState>,
 }
 
-impl fmt::Debug for CircuitBreakerSpanExporter {
+impl<E: fmt::Debug> fmt::Debug for CircuitBreakerSpanExporter<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CircuitBreakerSpanExporter")
+            .field("inner", &self.inner)
             .field("state", &self.state)
             .finish()
     }
 }
 
-impl CircuitBreakerSpanExporter {
-    pub fn new(inner: Box<dyn SpanExporter>, state: Arc<CircuitState>) -> Self {
+impl<E> CircuitBreakerSpanExporter<E> {
+    pub fn new(inner: E, state: Arc<CircuitState>) -> Self {
         Self { inner, state }
     }
 }
 
-impl SpanExporter for CircuitBreakerSpanExporter {
-    fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, OTelSdkResult> {
-        if !self.state.should_export() {
-            return Box::pin(std::future::ready(Ok(())));
-        }
-
+impl<E: SpanExporter> SpanExporter for CircuitBreakerSpanExporter<E> {
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        let should = self.state.should_export();
         let state = self.state.clone();
-        let fut = self.inner.export(batch);
 
-        Box::pin(async move {
-            match fut.await {
+        async move {
+            if !should {
+                return Ok(());
+            }
+
+            match self.inner.export(batch).await {
                 Ok(()) => {
                     state.record_success();
                     Ok(())
@@ -226,7 +233,7 @@ impl SpanExporter for CircuitBreakerSpanExporter {
                     Ok(()) // Never propagate errors
                 }
             }
-        })
+        }
     }
 
     fn shutdown(&mut self) -> OTelSdkResult {
@@ -293,7 +300,9 @@ impl<E: LogExporter> LogExporter for CircuitBreakerLogExporter<E> {
         }
     }
 
-    fn shutdown(&mut self) -> OTelSdkResult {
+    fn shutdown(&self) -> OTelSdkResult {
+        // LogExporter::shutdown is `&self` in opentelemetry_sdk 0.31; the
+        // inner exporter is also `&self`-shutdown so we just delegate.
         self.inner.shutdown()
     }
 

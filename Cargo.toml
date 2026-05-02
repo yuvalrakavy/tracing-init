@@ -42,11 +42,11 @@ serde_json = { version = "1", optional = true }
 hostname = { version = "0.4", optional = true }
 
 # Optional - otel
-opentelemetry = { version = "0.28", optional = true }
-opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.28", features = ["http-json"], optional = true }
-tracing-opentelemetry = { version = "0.29", optional = true }
-opentelemetry-appender-tracing = { version = "0.28", optional = true }
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["http-json"], optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
+opentelemetry-appender-tracing = { version = "0.31", optional = true }
 socket2 = { version = "0.5", features = ["all"], optional = true }
 tokio = { version = "1", features = ["net", "time", "rt"], optional = true }
 futures-util = { version = "0.3", optional = true }

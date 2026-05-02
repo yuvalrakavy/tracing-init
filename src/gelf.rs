@@ -258,24 +258,44 @@ where
                 }
             }
 
-            // OTel trace context (only with otel feature)
+            // OTel trace context (only with otel feature).
+            //
+            // tracing-opentelemetry 0.32 changed the OtelData layout:
+            // `parent_cx` is no longer a public field — it's now inside
+            // an `OtelDataState::Builder { parent_cx, .. }` enum variant
+            // that's only valid before the span is activated. After
+            // activation the data lives in `OtelDataState::Context`
+            // and parent_cx is consumed.
+            //
+            // The right API now is the public `OtelData::trace_id()` /
+            // `OtelData::span_id()` accessors (both `Option`-returning),
+            // which read from the active context after the span has
+            // started. They're populated as soon as the span is entered
+            // for the first time (or `OpenTelemetrySpanExt::context()`
+            // is called on it), which always happens by the time
+            // `on_event` fires for events emitted inside the span.
             #[cfg(feature = "otel")]
             {
-                use opentelemetry::trace::TraceContextExt;
                 if let Some(otel_data) =
                     extensions.get::<tracing_opentelemetry::OtelData>()
                 {
-                    let span_ctx =
-                        otel_data.parent_cx.span().span_context().clone();
-                    if span_ctx.is_valid() {
-                        fields.insert(
-                            "_trace_id".into(),
-                            json!(format!("{:032x}", span_ctx.trace_id())),
-                        );
-                        fields.insert(
-                            "_span_id".into(),
-                            json!(format!("{:016x}", span_ctx.span_id())),
-                        );
+                    if let (Some(trace_id), Some(span_id)) =
+                        (otel_data.trace_id(), otel_data.span_id())
+                    {
+                        // Skip the all-zero invalid trace_id — that's what
+                        // an unparented span looks like when no remote
+                        // context was attached. Emitting it would mislead
+                        // log correlation tools.
+                        if trace_id != opentelemetry::trace::TraceId::INVALID {
+                            fields.insert(
+                                "_trace_id".into(),
+                                json!(format!("{trace_id:032x}")),
+                            );
+                            fields.insert(
+                                "_span_id".into(),
+                                json!(format!("{span_id:016x}")),
+                            );
+                        }
                     }
                 }
             }
