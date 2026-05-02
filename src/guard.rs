@@ -53,11 +53,22 @@ impl Drop for TracingGuard {
             if let Some(handle) = self.beacon_handle.take() {
                 handle.abort();
             }
+            // opentelemetry_sdk 0.31's default `provider.shutdown()` blocks
+            // up to 30s waiting for the BatchSpanProcessor to flush its
+            // pending queue. When the OTel collector is unreachable
+            // (which is the common case for short-lived CLI tools and
+            // test runners), that's a 30-second hang on every program
+            // exit. Use `shutdown_with_timeout(1s)` instead — the
+            // circuit breaker has already filtered out broken
+            // destinations during the run, so anything still queued is
+            // fine to drop.
+            const SHUTDOWN_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(1);
             if let Some(ref provider) = self.tracer_provider {
-                let _ = provider.shutdown();
+                let _ = provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
             }
             if let Some(ref provider) = self.logger_provider {
-                let _ = provider.shutdown();
+                let _ = provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
             }
         }
         // File guard dropped automatically after OTel shutdown
