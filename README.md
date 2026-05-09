@@ -30,19 +30,41 @@ println!("Logging: {guard}");
 | `gelf` | yes | GELF over UDP output |
 | `otel` | no | OpenTelemetry trace + log export via OTLP/HTTP |
 | `otel-grpc` | no | Adds gRPC transport for OTLP (pulls in `tonic`) |
+| `tokio-console` | no | `console-subscriber` layer for the `tokio-console` CLI (requires `RUSTFLAGS="--cfg tokio_unstable"` in the consuming crate) |
 
 ```toml
 # Cargo.toml
 [dependencies]
 tracing-init = "0.2"                          # default: config + file + gelf
 tracing-init = { version = "0.2", features = ["otel"] }  # add OpenTelemetry
+tracing-init = { version = "0.2", features = ["tokio-console"] }  # add tokio-console
 ```
+
+### Using the `tokio-console` feature
+
+The `tokio-console` feature adds a `console-subscriber` layer behind the
+destination character `t`. Tokio's instrumentation API is gated behind a
+`cfg` flag, so the consuming crate must build with the `tokio_unstable`
+flag for events to be emitted:
+
+```bash
+RUSTFLAGS="--cfg tokio_unstable" cargo run --features tokio-console
+```
+
+Without the flag the layer compiles but emits nothing. With it enabled,
+run `tokio-console` (a separate CLI; `cargo install tokio-console`)
+to inspect per-task scheduling, await points, and resource contention.
+
+The default bind address is `127.0.0.1:6669`; override via
+`[logging.tokio_console] bind = "..."` in TOML or
+`.tokio_console_bind("...")` on the builder.
 
 ## TOML Configuration
 
 ```toml
 [logging]
-destination = "cfo"                   # c=console, f=file, g=gelf, o=otel
+destination = "cfo"                   # c=console, f=file, g=gelf, o=otel,
+                                      # t=tokio-console (requires `tokio-console` feature)
 level = "info"                        # default for all destinations
 filter = "my_crate=debug,tower=warn"  # default EnvFilter for all
 service_name = "my-service"           # OTel resource + GELF _service
@@ -76,6 +98,9 @@ transport = "http"                   # http | grpc
 [logging.otel.resource]
 "service.version" = "1.2.3"
 "deployment.environment" = "staging"
+
+[logging.tokio_console]              # only consulted when feature enabled
+bind = "127.0.0.1:6669"              # default; override here or omit section
 
 [logging.myapp]                      # per-app overrides
 destination = "-f+o"                 # modifier: remove file, add otel

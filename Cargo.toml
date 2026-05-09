@@ -24,11 +24,19 @@ otel = [
     "dep:futures-util",
 ]
 otel-grpc = ["otel", "opentelemetry-otlp/grpc-tonic"]
+# Tokio runtime instrumentation for `tokio-console`. The consuming crate
+# must build with `RUSTFLAGS="--cfg tokio_unstable"` for this layer to do
+# anything — that flag is what tokio gates its public instrumentation API
+# behind. Without it the layer compiles but emits no events.
+tokio-console = ["dep:console-subscriber"]
 
 [dependencies]
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 bitflags = "2"
+
+# Optional - tokio-console
+console-subscriber = { version = "0.4", optional = true }
 
 # Optional - config
 toml = { version = "0.8", optional = true }
