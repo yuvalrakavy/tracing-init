@@ -62,8 +62,7 @@ impl Drop for TracingGuard {
             // circuit breaker has already filtered out broken
             // destinations during the run, so anything still queued is
             // fine to drop.
-            const SHUTDOWN_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(1);
+            const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
             if let Some(ref provider) = self.tracer_provider {
                 let _ = provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
             }

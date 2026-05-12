@@ -167,8 +167,16 @@ level = "error"
     assert_eq!(otel.level.as_deref(), Some("error"));
 
     let resource = otel.resource.unwrap();
-    assert_eq!(resource.get("service.version").and_then(|v| v.as_str()), Some("1.2.3"));
-    assert_eq!(resource.get("deployment.environment").and_then(|v| v.as_str()), Some("staging"));
+    assert_eq!(
+        resource.get("service.version").and_then(|v| v.as_str()),
+        Some("1.2.3")
+    );
+    assert_eq!(
+        resource
+            .get("deployment.environment")
+            .and_then(|v| v.as_str()),
+        Some("staging")
+    );
 }
 
 #[test]
@@ -187,12 +195,17 @@ key = "value"
 fn test_discover_from_explicit_file() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("server.toml");
-    std::fs::write(&config_path, r#"
+    std::fs::write(
+        &config_path,
+        r#"
 [logging]
 destination = "cs"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    let (config, source) = discover_config(Some(config_path.to_str().unwrap()), "myapp", false).unwrap();
+    let (config, source) =
+        discover_config(Some(config_path.to_str().unwrap()), "myapp", false).unwrap();
     assert_eq!(config.destination.as_deref(), Some("cs"));
     assert!(source.contains("server.toml"));
 }
@@ -201,18 +214,27 @@ destination = "cs"
 fn test_discover_fallback_to_logging_toml() {
     let dir = tempfile::tempdir().unwrap();
     let server_path = dir.path().join("server.toml");
-    std::fs::write(&server_path, r#"
+    std::fs::write(
+        &server_path,
+        r#"
 [other]
 key = "value"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let logging_path = dir.path().join("logging.toml");
-    std::fs::write(&logging_path, r#"
+    std::fs::write(
+        &logging_path,
+        r#"
 [logging]
 destination = "f"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    let (config, source) = discover_config(Some(server_path.to_str().unwrap()), "myapp", false).unwrap();
+    let (config, source) =
+        discover_config(Some(server_path.to_str().unwrap()), "myapp", false).unwrap();
     assert_eq!(config.destination.as_deref(), Some("f"));
     assert!(source.contains("logging.toml"));
     assert!(source.contains("fallback"));
@@ -236,7 +258,8 @@ fn test_discover_auto_logging_toml() {
     let logging_path = dir.path().join("logging.toml");
     std::fs::write(&logging_path, "[logging]\ndestination = \"cs\"\n").unwrap();
 
-    let (config, _source) = discover_config(Some(logging_path.to_str().unwrap()), "myapp", false).unwrap();
+    let (config, _source) =
+        discover_config(Some(logging_path.to_str().unwrap()), "myapp", false).unwrap();
     assert_eq!(config.destination.as_deref(), Some("cs"));
 }
 

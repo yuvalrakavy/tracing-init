@@ -147,6 +147,7 @@ pub struct LoggingConfig {
     /// GELF-specific settings.
     pub gelf: Option<GelfConfig>,
     /// OpenTelemetry-specific settings.
+    #[allow(dead_code)] // read only when the `otel` feature is compiled in
     pub otel: Option<OtelConfig>,
     /// `tokio-console` instrumentation settings.
     #[cfg(feature = "tokio-console")]
@@ -194,11 +195,21 @@ impl LoggingConfig {
             // Layer app base fields on top of logging base
             if let Some(app_dest) = Self::get_str(app, "destination") {
                 let resolved = apply_destination_modifier(dest.as_deref(), &app_dest);
-                dest = if resolved.is_empty() { None } else { Some(resolved) };
+                dest = if resolved.is_empty() {
+                    None
+                } else {
+                    Some(resolved)
+                };
             }
-            if let Some(v) = Self::get_str(app, "level") { level = Some(v); }
-            if let Some(v) = Self::get_str(app, "filter") { filter = Some(v); }
-            if let Some(v) = Self::get_str(app, "service_name") { service_name = Some(v); }
+            if let Some(v) = Self::get_str(app, "level") {
+                level = Some(v);
+            }
+            if let Some(v) = Self::get_str(app, "filter") {
+                filter = Some(v);
+            }
+            if let Some(v) = Self::get_str(app, "service_name") {
+                service_name = Some(v);
+            }
 
             // Parse app destination sections and layer over base
             let app_console = Self::parse_console(app.get("console"));
@@ -247,15 +258,24 @@ impl LoggingConfig {
     }
 
     fn get_u64(table: &toml::value::Table, key: &str) -> Option<u64> {
-        table.get(key).and_then(|v| v.as_integer()).map(|v| v as u64)
+        table
+            .get(key)
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u64)
     }
 
     fn get_u32(table: &toml::value::Table, key: &str) -> Option<u32> {
-        table.get(key).and_then(|v| v.as_integer()).map(|v| v as u32)
+        table
+            .get(key)
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u32)
     }
 
     fn get_u16(table: &toml::value::Table, key: &str) -> Option<u16> {
-        table.get(key).and_then(|v| v.as_integer()).map(|v| v as u16)
+        table
+            .get(key)
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u16)
     }
 
     fn parse_console(value: Option<&toml::Value>) -> Option<ConsoleConfig> {
@@ -325,7 +345,10 @@ impl LoggingConfig {
 
     // Merge helpers: app.dest overrides dest (first non-None wins)
 
-    fn merge_console(base: Option<ConsoleConfig>, app: Option<ConsoleConfig>) -> Option<ConsoleConfig> {
+    fn merge_console(
+        base: Option<ConsoleConfig>,
+        app: Option<ConsoleConfig>,
+    ) -> Option<ConsoleConfig> {
         match (base, app) {
             (None, None) => None,
             (Some(b), None) => Some(b),
@@ -447,7 +470,11 @@ fn find_file_upward(filename: &str, start_dir: &Path) -> Option<PathBuf> {
 fn resolve_config_path(path: &str) -> Option<PathBuf> {
     let file_path = Path::new(path);
     if file_path.is_absolute() {
-        if file_path.is_file() { Some(file_path.to_path_buf()) } else { None }
+        if file_path.is_file() {
+            Some(file_path.to_path_buf())
+        } else {
+            None
+        }
     } else {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         find_file_upward(path, &cwd)

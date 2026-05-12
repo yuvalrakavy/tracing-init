@@ -2,9 +2,11 @@
 name = "tracing-init"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.80"
 description = "Simple tracing subscriber initialization with TOML config, file rotation, GELF, and OpenTelemetry support"
 license = "MIT"
 repository = "https://github.com/yuvalrakavy/tracing-init"
+readme = "README.md"
 keywords = ["tracing", "logging", "gelf", "opentelemetry", "subscriber"]
 categories = ["development-tools::debugging"]
 
@@ -61,3 +63,14 @@ futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "console_only"
+
+[[example]]
+name = "full_toml"
+required-features = ["config"]
+
+[[example]]
+name = "otel_resilient"
+required-features = ["otel"]

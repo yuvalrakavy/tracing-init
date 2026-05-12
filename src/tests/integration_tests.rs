@@ -1,5 +1,5 @@
-use crate::TracingInit;
 use crate::types::Format;
+use crate::TracingInit;
 use tracing::Level;
 
 #[cfg(feature = "config")]
@@ -60,9 +60,7 @@ fn test_log_to_legacy_methods() {
 #[test]
 fn test_builder_defaults() {
     let mut builder = TracingInit::builder("testapp");
-    builder
-        .no_auto_config_file()
-        .ignore_environment_variables();
+    builder.no_auto_config_file().ignore_environment_variables();
 
     let debug = format!("{:?}", builder);
     assert!(debug.contains("testapp"));

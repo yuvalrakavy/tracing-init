@@ -231,10 +231,7 @@ where
         fields.insert("level".into(), json!(level_num));
 
         // Include the tracing level name for TRACE vs DEBUG distinction
-        fields.insert(
-            "_level".into(),
-            json!(event.metadata().level().to_string()),
-        );
+        fields.insert("_level".into(), json!(event.metadata().level().to_string()));
 
         // Metadata fields (target, file, line)
         add_metadata_fields(
@@ -276,9 +273,7 @@ where
             // `on_event` fires for events emitted inside the span.
             #[cfg(feature = "otel")]
             {
-                if let Some(otel_data) =
-                    extensions.get::<tracing_opentelemetry::OtelData>()
-                {
+                if let Some(otel_data) = extensions.get::<tracing_opentelemetry::OtelData>() {
                     if let (Some(trace_id), Some(span_id)) =
                         (otel_data.trace_id(), otel_data.span_id())
                     {
@@ -287,14 +282,8 @@ where
                         // context was attached. Emitting it would mislead
                         // log correlation tools.
                         if trace_id != opentelemetry::trace::TraceId::INVALID {
-                            fields.insert(
-                                "_trace_id".into(),
-                                json!(format!("{trace_id:032x}")),
-                            );
-                            fields.insert(
-                                "_span_id".into(),
-                                json!(format!("{span_id:016x}")),
-                            );
+                            fields.insert("_trace_id".into(), json!(format!("{trace_id:032x}")));
+                            fields.insert("_span_id".into(), json!(format!("{span_id:016x}")));
                         }
                     }
                 }

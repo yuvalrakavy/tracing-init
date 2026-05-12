@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::Resource;
 use tracing_subscriber::Layer;
 
-use super::OtelBoxedLayer;
 use super::circuit_breaker::{CircuitBreakerLogExporter, CircuitState};
+use super::OtelBoxedLayer;
 
 /// Create a LoggerProvider with OTLP exporter wrapped in a circuit breaker.
 ///
@@ -16,12 +16,10 @@ use super::circuit_breaker::{CircuitBreakerLogExporter, CircuitState};
 /// and the log bridge layer as a boxed trait object.
 pub fn create_log_layer(
     endpoint: &str,
-    #[allow(unused_variables)]
-    transport: &str,
+    #[allow(unused_variables)] transport: &str,
     resource: Resource,
     circuit_state: Arc<CircuitState>,
-) -> Result<(SdkLoggerProvider, OtelBoxedLayer), Box<dyn std::error::Error>>
-{
+) -> Result<(SdkLoggerProvider, OtelBoxedLayer), Box<dyn std::error::Error>> {
     let exporter = match transport {
         #[cfg(feature = "otel-grpc")]
         "grpc" => opentelemetry_otlp::LogExporter::builder()

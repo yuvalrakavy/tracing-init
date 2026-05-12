@@ -49,7 +49,7 @@
 //!
 //! ```toml
 //! [logging]
-//! destination = "cfg"           # c=console, f=file, g=gelf, o=otel,
+//! destination = "cfo"           # c=console, f=file, g=gelf, o=otel,
 //!                               # t=tokio-console (requires the
 //!                               # `tokio-console` feature + tokio_unstable cfg)
 //! level = "info"
@@ -106,8 +106,8 @@ mod tests;
 
 pub use guard::TracingGuard;
 
-pub mod types;
 pub mod dest_config;
+pub mod types;
 
 use tracing::Level;
 use tracing_subscriber::Registry;
@@ -376,7 +376,8 @@ impl TracingInit {
     /// Add an OTel resource attribute.
     #[cfg(feature = "otel")]
     pub fn otel_resource_attribute(&mut self, key: &str, value: &str) -> &mut Self {
-        self.otel_resource_attrs.push((key.to_string(), value.to_string()));
+        self.otel_resource_attrs
+            .push((key.to_string(), value.to_string()));
         self
     }
 
@@ -385,7 +386,10 @@ impl TracingInit {
     fn otel_circuit_breaker_config(&self) -> (u64, u32, String, u16) {
         let reprobe = self.otel_reprobe_interval.unwrap_or(30);
         let threshold = self.otel_failure_threshold.unwrap_or(3);
-        let group = self.otel_beacon_group.clone().unwrap_or_else(|| "239.255.77.1".to_string());
+        let group = self
+            .otel_beacon_group
+            .clone()
+            .unwrap_or_else(|| "239.255.77.1".to_string());
         let port = self.otel_beacon_port.unwrap_or(4399);
         (reprobe, threshold, group, port)
     }
@@ -539,8 +543,14 @@ impl TracingInit {
         #[cfg(feature = "otel")]
         {
             if self.is_dest_enabled('o') {
-                let endpoint = self.otel_endpoint.as_deref().unwrap_or("http://localhost:4318");
-                let transport = self.otel_transport.map(|t| t.to_string()).unwrap_or_else(|| "http".to_string());
+                let endpoint = self
+                    .otel_endpoint
+                    .as_deref()
+                    .unwrap_or("http://localhost:4318");
+                let transport = self
+                    .otel_transport
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "http".to_string());
                 let service = self.service_name.as_deref().unwrap_or(&self.app_name);
                 let resource = otel::build_resource(service, &self.otel_resource_attrs);
 
@@ -548,12 +558,17 @@ impl TracingInit {
                 let (reprobe_interval, failure_threshold, beacon_group, beacon_port) =
                     self.otel_circuit_breaker_config();
 
-                let circuit_state = std::sync::Arc::new(
-                    otel::circuit_breaker::CircuitState::new(failure_threshold, reprobe_interval, &self.app_name),
-                );
+                let circuit_state = std::sync::Arc::new(otel::circuit_breaker::CircuitState::new(
+                    failure_threshold,
+                    reprobe_interval,
+                    &self.app_name,
+                ));
 
                 let (tp, trace_layer) = otel::traces::create_trace_layer(
-                    endpoint, &transport, resource.clone(), circuit_state.clone(),
+                    endpoint,
+                    &transport,
+                    resource.clone(),
+                    circuit_state.clone(),
                 )?;
                 // Only create OTel log bridge if GELF is NOT enabled.
                 // When GELF is active, logs are already delivered with trace context
@@ -561,7 +576,10 @@ impl TracingInit {
                 let gelf_active = self.is_dest_enabled('g');
                 if !gelf_active {
                     let (lp, log_layer) = otel::logs::create_log_layer(
-                        endpoint, &transport, resource, circuit_state.clone(),
+                        endpoint,
+                        &transport,
+                        resource,
+                        circuit_state.clone(),
                     )?;
                     let otel_log_filter = self.build_env_filter("otel")?;
                     layers.push(log_layer.with_filter(otel_log_filter).boxed());
@@ -586,13 +604,13 @@ impl TracingInit {
         #[cfg(not(feature = "otel"))]
         {
             if self.destination.as_ref().is_some_and(|d| d.contains('o')) {
-                eprintln!("Warning: Destination 'o' requested but 'otel' feature not enabled — skipping");
+                eprintln!(
+                    "Warning: Destination 'o' requested but 'otel' feature not enabled — skipping"
+                );
             }
         }
 
-        tracing_subscriber::registry()
-            .with(layers)
-            .init();
+        tracing_subscriber::registry().with(layers).init();
 
         Ok(TracingGuard {
             summary_text: self.build_summary(),
@@ -619,25 +637,29 @@ impl TracingInit {
                     return v;
                 }
             }
-            'f' => {
+            'f' =>
+            {
                 #[cfg(feature = "file")]
                 if let Some(v) = self.enable_file {
                     return v;
                 }
             }
-            'g' => {
+            'g' =>
+            {
                 #[cfg(feature = "gelf")]
                 if let Some(v) = self.enable_gelf {
                     return v;
                 }
             }
-            'o' => {
+            'o' =>
+            {
                 #[cfg(feature = "otel")]
                 if let Some(v) = self.enable_otel {
                     return v;
                 }
             }
-            't' => {
+            't' =>
+            {
                 #[cfg(feature = "tokio-console")]
                 if let Some(v) = self.enable_tokio_console {
                     return v;
@@ -657,7 +679,10 @@ impl TracingInit {
     /// 3. No destination-specific settings -> base level + RUST_LOG via from_env_lossy
     fn build_env_filter(&self, dest: &str) -> Result<EnvFilter, Box<dyn std::error::Error>> {
         if let Some(filter) = self.dest_settings.resolve_filter(dest) {
-            let level = self.dest_settings.resolve_level(dest).unwrap_or(Level::INFO);
+            let level = self
+                .dest_settings
+                .resolve_level(dest)
+                .unwrap_or(Level::INFO);
             return Ok(EnvFilter::builder()
                 .with_default_directive(level.into())
                 .parse(filter)?);
@@ -678,12 +703,23 @@ impl TracingInit {
             return Ok(None);
         }
         let filter = self.build_env_filter("console")?;
-        let format = self.dest_settings.resolve_format("console").unwrap_or(types::Format::Full);
+        let format = self
+            .dest_settings
+            .resolve_format("console")
+            .unwrap_or(types::Format::Full);
         let ansi = self.dest_settings.resolve_ansi("console").unwrap_or(true);
         let target = self.dest_settings.resolve_target("console").unwrap_or(true);
-        let thread_names = self.dest_settings.resolve_thread_names("console").unwrap_or(false);
-        let file_line = self.dest_settings.resolve_file_line("console").unwrap_or(false);
-        let span_events = self.dest_settings.resolve_span_events("console")
+        let thread_names = self
+            .dest_settings
+            .resolve_thread_names("console")
+            .unwrap_or(false);
+        let file_line = self
+            .dest_settings
+            .resolve_file_line("console")
+            .unwrap_or(false);
+        let span_events = self
+            .dest_settings
+            .resolve_span_events("console")
             .unwrap_or(types::SpanEvents::NONE)
             .to_fmt_span();
 
@@ -739,9 +775,17 @@ impl TracingInit {
         let filter = self.build_env_filter("file")?;
         let ansi = self.dest_settings.resolve_ansi("file").unwrap_or(false);
         let target = self.dest_settings.resolve_target("file").unwrap_or(true);
-        let thread_names = self.dest_settings.resolve_thread_names("file").unwrap_or(false);
-        let file_line_setting = self.dest_settings.resolve_file_line("file").unwrap_or(false);
-        let span_events = self.dest_settings.resolve_span_events("file")
+        let thread_names = self
+            .dest_settings
+            .resolve_thread_names("file")
+            .unwrap_or(false);
+        let file_line_setting = self
+            .dest_settings
+            .resolve_file_line("file")
+            .unwrap_or(false);
+        let span_events = self
+            .dest_settings
+            .resolve_span_events("file")
             .unwrap_or(types::SpanEvents::NONE)
             .to_fmt_span();
 
@@ -756,7 +800,10 @@ impl TracingInit {
             .max_log_files(max_files)
             .build(file_path)?;
 
-        let format = self.dest_settings.resolve_format("file").unwrap_or(types::Format::Full);
+        let format = self
+            .dest_settings
+            .resolve_format("file")
+            .unwrap_or(types::Format::Full);
         let layer = match format {
             types::Format::Json => tracing_subscriber::fmt::layer()
                 .json()
@@ -865,8 +912,10 @@ impl TracingInit {
 
     fn apply_environment_variables(&mut self) {
         if let Ok(log_destination) = std::env::var("LOG_DESTINATION") {
-            if self.destination.is_none() && self.enable_console.is_none()
-                && self.enable_file.is_none() && self.enable_gelf.is_none()
+            if self.destination.is_none()
+                && self.enable_console.is_none()
+                && self.enable_file.is_none()
+                && self.enable_gelf.is_none()
             {
                 self.destination = Some(log_destination);
             }
@@ -889,13 +938,15 @@ impl TracingInit {
                 match config::LoggingConfig::from_toml(value, &self.app_name) {
                     Some(cfg) => (cfg, "Config from pre-parsed TOML".to_string()),
                     None => {
-                        self.config_summary = Some("No [logging] section in provided TOML".to_string());
+                        self.config_summary =
+                            Some("No [logging] section in provided TOML".to_string());
                         return;
                     }
                 }
             }
             Some(ConfigSource::File(path)) => {
-                match config::discover_config(Some(path), &self.app_name, self.no_auto_config_file) {
+                match config::discover_config(Some(path), &self.app_name, self.no_auto_config_file)
+                {
                     Some((cfg, source)) => (cfg, source),
                     None => {
                         self.config_summary = Some("No config file".to_string());
@@ -909,10 +960,17 @@ impl TracingInit {
                     return;
                 }
                 if let Ok(env_path) = std::env::var("LOG_CONFIG") {
-                    match config::discover_config(Some(&env_path), &self.app_name, self.no_auto_config_file) {
+                    match config::discover_config(
+                        Some(&env_path),
+                        &self.app_name,
+                        self.no_auto_config_file,
+                    ) {
                         Some((cfg, source)) => (cfg, format!("{} (via LOG_CONFIG)", source)),
                         None => {
-                            self.config_summary = Some("No config file (LOG_CONFIG set but no [logging] found)".to_string());
+                            self.config_summary = Some(
+                                "No config file (LOG_CONFIG set but no [logging] found)"
+                                    .to_string(),
+                            );
                             return;
                         }
                     }
@@ -981,16 +1039,32 @@ impl TracingInit {
 
         // Apply per-destination settings from nested TOML sections
         if let Some(ref console) = config.console {
-            self.apply_dest_config("console", console.level.as_deref(), console.filter.as_deref(),
-                console.format.as_deref(), console.ansi, console.timestamps,
-                console.target, console.thread_names, console.file_line,
-                console.span_events.as_deref());
+            self.apply_dest_config(
+                "console",
+                console.level.as_deref(),
+                console.filter.as_deref(),
+                console.format.as_deref(),
+                console.ansi,
+                console.timestamps,
+                console.target,
+                console.thread_names,
+                console.file_line,
+                console.span_events.as_deref(),
+            );
         }
         if let Some(ref file) = config.file {
-            self.apply_dest_config("file", file.level.as_deref(), file.filter.as_deref(),
-                file.format.as_deref(), None, file.timestamps,
-                file.target, file.thread_names, file.file_line,
-                file.span_events.as_deref());
+            self.apply_dest_config(
+                "file",
+                file.level.as_deref(),
+                file.filter.as_deref(),
+                file.format.as_deref(),
+                None,
+                file.timestamps,
+                file.target,
+                file.thread_names,
+                file.file_line,
+                file.span_events.as_deref(),
+            );
         }
         #[cfg(feature = "gelf")]
         if let Some(ref gelf) = config.gelf {
@@ -1135,8 +1209,13 @@ impl TracingInit {
         let mut parts = Vec::new();
 
         if self.is_dest_enabled('c') {
-            let format = self.dest_settings.resolve_format("console").unwrap_or(types::Format::Full);
-            let level = self.dest_settings.resolve_level("console")
+            let format = self
+                .dest_settings
+                .resolve_format("console")
+                .unwrap_or(types::Format::Full);
+            let level = self
+                .dest_settings
+                .resolve_level("console")
                 .or_else(|| self.dest_settings.resolve_level("*"))
                 .unwrap_or(Level::INFO);
             parts.push(format!("console({}, {})", format, level));
@@ -1145,33 +1224,55 @@ impl TracingInit {
         if self.is_dest_enabled('f') {
             let path = self.file_path.as_deref().unwrap_or(".");
             let path = if path.is_empty() { "." } else { path };
-            let format = self.dest_settings.resolve_format("file").unwrap_or(types::Format::Full);
-            let level = self.dest_settings.resolve_level("file")
+            let format = self
+                .dest_settings
+                .resolve_format("file")
+                .unwrap_or(types::Format::Full);
+            let level = self
+                .dest_settings
+                .resolve_level("file")
                 .or_else(|| self.dest_settings.resolve_level("*"))
                 .unwrap_or(Level::INFO);
             let rotation_str = self.file_rotation.as_deref().unwrap_or("d:3");
-            parts.push(format!("file({}/{}.log, {}, {}, rot:{})", path, self.file_prefix, format, level, rotation_str));
+            parts.push(format!(
+                "file({}/{}.log, {}, {}, rot:{})",
+                path, self.file_prefix, format, level, rotation_str
+            ));
         }
         #[cfg(feature = "gelf")]
         if self.is_dest_enabled('g') {
             let addr = self.gelf_address.as_deref().unwrap_or("localhost:12201");
-            let level = self.dest_settings.resolve_level("gelf")
+            let level = self
+                .dest_settings
+                .resolve_level("gelf")
                 .or_else(|| self.dest_settings.resolve_level("*"))
                 .unwrap_or(Level::INFO);
             parts.push(format!("gelf({}, {})", addr, level));
         }
         #[cfg(feature = "otel")]
         if self.is_dest_enabled('o') {
-            let endpoint = self.otel_endpoint.as_deref().unwrap_or("http://localhost:4318");
-            let level = self.dest_settings.resolve_level("otel")
+            let endpoint = self
+                .otel_endpoint
+                .as_deref()
+                .unwrap_or("http://localhost:4318");
+            let level = self
+                .dest_settings
+                .resolve_level("otel")
                 .or_else(|| self.dest_settings.resolve_level("*"))
                 .unwrap_or(Level::INFO);
-            let mode = if self.is_dest_enabled('g') { "traces" } else { "traces+logs" };
+            let mode = if self.is_dest_enabled('g') {
+                "traces"
+            } else {
+                "traces+logs"
+            };
             parts.push(format!("otel({}, {}, {})", endpoint, level, mode));
         }
         #[cfg(feature = "tokio-console")]
         if self.is_dest_enabled('t') {
-            let addr = self.tokio_console_bind.as_deref().unwrap_or("127.0.0.1:6669");
+            let addr = self
+                .tokio_console_bind
+                .as_deref()
+                .unwrap_or("127.0.0.1:6669");
             parts.push(format!("tokio-console({})", addr));
         }
 
