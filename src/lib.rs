@@ -49,7 +49,9 @@
 //!
 //! ```toml
 //! [logging]
-//! destination = "cfg"           # c=console, f=file, g=gelf, o=otel
+//! destination = "cfg"           # c=console, f=file, g=gelf, o=otel,
+//!                               # t=tokio-console (requires the
+//!                               # `tokio-console` feature + tokio_unstable cfg)
 //! level = "info"
 //!
 //! [logging.console]
@@ -62,6 +64,10 @@
 //!
 //! [logging.gelf]
 //! address = "localhost:12201"
+//!
+//! # Optional — only consulted if the `tokio-console` feature is enabled.
+//! [logging.tokio_console]
+//! bind = "127.0.0.1:6669"
 //!
 //! [logging.myapp]              # Per-app overrides
 //! destination = "-f+g"
@@ -78,7 +84,9 @@
 //!
 //! ## Environment Variables
 //!
-//! * `LOG_DESTINATION` — contains `c`, `f`, `g`, and/or `o`
+//! * `LOG_DESTINATION` — contains any of `c` (console), `f` (file),
+//!   `g` (gelf), `o` (otel), `t` (tokio-console; requires
+//!   `RUSTFLAGS="--cfg tokio_unstable"` and the `tokio-console` feature).
 //! * `LOG_LEVEL` — error, warn, info, debug, trace
 //! * `RUST_LOG` — filter directive (used by `build_env_filter` fallback)
 //! * `LOG_CONFIG` — path to a TOML config file (used during auto-discovery)
@@ -151,6 +159,10 @@ pub struct TracingInit {
     enable_gelf: Option<bool>,
     #[cfg(feature = "otel")]
     enable_otel: Option<bool>,
+    #[cfg(feature = "tokio-console")]
+    enable_tokio_console: Option<bool>,
+    #[cfg(feature = "tokio-console")]
+    tokio_console_bind: Option<String>,
 
     // File-specific
     #[cfg(feature = "file")]
@@ -213,6 +225,10 @@ impl TracingInit {
             enable_gelf: None,
             #[cfg(feature = "otel")]
             enable_otel: None,
+            #[cfg(feature = "tokio-console")]
+            enable_tokio_console: None,
+            #[cfg(feature = "tokio-console")]
+            tokio_console_bind: None,
 
             #[cfg(feature = "file")]
             file_path: None,
@@ -403,6 +419,30 @@ impl TracingInit {
         self
     }
 
+    /// Enable or disable the `tokio-console` instrumentation layer.
+    ///
+    /// When enabled, a `console-subscriber` layer is added that exposes
+    /// per-task scheduling, polling, and resource-contention data to the
+    /// `tokio-console` CLI. Default bind address is `127.0.0.1:6669`;
+    /// override with [`tokio_console_bind`](Self::tokio_console_bind).
+    ///
+    /// **Important:** the consuming crate must build with
+    /// `RUSTFLAGS="--cfg tokio_unstable"` for tokio's instrumentation
+    /// API to be available. Without that flag this layer compiles but
+    /// emits no events.
+    #[cfg(feature = "tokio-console")]
+    pub fn log_to_tokio_console(&mut self, v: bool) -> &mut Self {
+        self.enable_tokio_console = Some(v);
+        self
+    }
+
+    /// Set the address `tokio-console` listens on (default `127.0.0.1:6669`).
+    #[cfg(feature = "tokio-console")]
+    pub fn tokio_console_bind(&mut self, addr: &str) -> &mut Self {
+        self.tokio_console_bind = Some(addr.to_string());
+        self
+    }
+
     // ── Config methods ──
 
     /// Provide a pre-parsed [`toml::Value`] as the configuration source.
@@ -481,6 +521,16 @@ impl TracingInit {
         #[cfg(feature = "gelf")]
         if let Some(layer) = self.get_gelf_layer()? {
             layers.push(layer);
+        }
+        #[cfg(feature = "tokio-console")]
+        if let Some(layer) = self.get_tokio_console_layer() {
+            layers.push(layer);
+        }
+        #[cfg(not(feature = "tokio-console"))]
+        {
+            if self.destination.as_ref().is_some_and(|d| d.contains('t')) {
+                eprintln!("Warning: Destination 't' (tokio-console) requested but feature not enabled — skipping");
+            }
         }
 
         // OTel layers
@@ -584,6 +634,12 @@ impl TracingInit {
             'o' => {
                 #[cfg(feature = "otel")]
                 if let Some(v) = self.enable_otel {
+                    return v;
+                }
+            }
+            't' => {
+                #[cfg(feature = "tokio-console")]
+                if let Some(v) = self.enable_tokio_console {
                     return v;
                 }
             }
@@ -743,6 +799,36 @@ impl TracingInit {
                 .boxed(),
         };
         Ok(Some(layer.with_filter(filter).boxed()))
+    }
+
+    /// Build the `console-subscriber` layer.
+    ///
+    /// Returns `None` if the feature is enabled but the destination is off.
+    /// On error during `spawn()` (e.g., bind-address conflict), prints a
+    /// warning and returns `None` rather than failing the whole `init()`
+    /// — tokio-console is a development-time tool and the rest of tracing
+    /// shouldn't be blocked by its setup.
+    ///
+    /// Note this returns a plain `BoxedLayer` (no `Result`) because errors
+    /// are already swallowed-with-warning here; the signature mirrors the
+    /// fallible `get_*_layer` functions only in shape, for consistency.
+    #[cfg(feature = "tokio-console")]
+    fn get_tokio_console_layer(&self) -> BoxedLayer {
+        if !self.is_dest_enabled('t') {
+            return None;
+        }
+        let mut builder = console_subscriber::ConsoleLayer::builder().with_default_env();
+        if let Some(addr) = self.tokio_console_bind.as_deref() {
+            match addr.parse::<std::net::SocketAddr>() {
+                Ok(sa) => {
+                    builder = builder.server_addr(sa);
+                }
+                Err(e) => {
+                    eprintln!("Warning: tokio_console_bind '{}' is not a valid SocketAddr: {} — using default", addr, e);
+                }
+            }
+        }
+        Some(Box::new(builder.spawn()))
     }
 
     #[cfg(feature = "gelf")]
@@ -921,6 +1007,14 @@ impl TracingInit {
                 }
             }
         }
+        // Apply tokio-console settings from config
+        #[cfg(feature = "tokio-console")]
+        if let Some(ref tc) = config.tokio_console {
+            if self.tokio_console_bind.is_none() {
+                self.tokio_console_bind = tc.bind.clone();
+            }
+        }
+
         #[cfg(feature = "otel")]
         if let Some(ref otel) = config.otel {
             if self.otel_endpoint.is_none() {
@@ -1074,6 +1168,11 @@ impl TracingInit {
                 .unwrap_or(Level::INFO);
             let mode = if self.is_dest_enabled('g') { "traces" } else { "traces+logs" };
             parts.push(format!("otel({}, {}, {})", endpoint, level, mode));
+        }
+        #[cfg(feature = "tokio-console")]
+        if self.is_dest_enabled('t') {
+            let addr = self.tokio_console_bind.as_deref().unwrap_or("127.0.0.1:6669");
+            parts.push(format!("tokio-console({})", addr));
         }
 
         // Service name
