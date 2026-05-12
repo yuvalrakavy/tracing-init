@@ -92,6 +92,16 @@ pub struct GelfConfig {
     pub address: Option<String>,
 }
 
+/// `tokio-console` instrumentation configuration parsed from
+/// `[logging.tokio_console]`. Has no level/filter — `console-subscriber`
+/// uses its own internal filtering via `RUST_LOG`-style env vars.
+#[cfg(feature = "tokio-console")]
+#[derive(Debug, Clone, Default)]
+pub struct TokioConsoleConfig {
+    /// Optional override for the bind address (default `127.0.0.1:6669`).
+    pub bind: Option<String>,
+}
+
 /// OpenTelemetry output configuration parsed from `[logging.otel]`.
 #[derive(Debug, Clone, Default)]
 pub struct OtelConfig {
@@ -137,11 +147,15 @@ pub struct LoggingConfig {
     /// GELF-specific settings.
     pub gelf: Option<GelfConfig>,
     /// OpenTelemetry-specific settings.
+    #[allow(dead_code)] // read only when the `otel` feature is compiled in
     pub otel: Option<OtelConfig>,
+    /// `tokio-console` instrumentation settings.
+    #[cfg(feature = "tokio-console")]
+    pub tokio_console: Option<TokioConsoleConfig>,
 }
 
 /// Reserved section names that are destination configs, not app names.
-const RESERVED_SECTIONS: &[&str] = &["console", "file", "gelf", "otel"];
+const RESERVED_SECTIONS: &[&str] = &["console", "file", "gelf", "otel", "tokio_console"];
 
 impl LoggingConfig {
     /// Parse and layer config from a TOML value using the given app name.
@@ -167,6 +181,8 @@ impl LoggingConfig {
         let base_file = Self::parse_file(logging_table.get("file"));
         let base_gelf = Self::parse_gelf(logging_table.get("gelf"));
         let base_otel = Self::parse_otel(logging_table.get("otel"));
+        #[cfg(feature = "tokio-console")]
+        let base_tokio_console = Self::parse_tokio_console(logging_table.get("tokio_console"));
 
         // Check for app-specific section (skip reserved names)
         let app_table = if !RESERVED_SECTIONS.contains(&app_name) {
@@ -211,6 +227,14 @@ impl LoggingConfig {
             (base_console, base_file, base_gelf, base_otel)
         };
 
+        #[cfg(feature = "tokio-console")]
+        let tokio_console = if let Some(app) = app_table {
+            let app_tc = Self::parse_tokio_console(app.get("tokio_console"));
+            Self::merge_tokio_console(base_tokio_console, app_tc)
+        } else {
+            base_tokio_console
+        };
+
         Some(LoggingConfig {
             destination: dest,
             level,
@@ -220,6 +244,8 @@ impl LoggingConfig {
             file,
             gelf,
             otel,
+            #[cfg(feature = "tokio-console")]
+            tokio_console,
         })
     }
 
@@ -293,6 +319,14 @@ impl LoggingConfig {
         })
     }
 
+    #[cfg(feature = "tokio-console")]
+    fn parse_tokio_console(value: Option<&toml::Value>) -> Option<TokioConsoleConfig> {
+        let table = value?.as_table()?;
+        Some(TokioConsoleConfig {
+            bind: Self::get_str(table, "bind"),
+        })
+    }
+
     fn parse_otel(value: Option<&toml::Value>) -> Option<OtelConfig> {
         let table = value?.as_table()?;
         let resource = table.get("resource").and_then(|v| v.as_table()).cloned();
@@ -363,6 +397,21 @@ impl LoggingConfig {
                 level: a.level.or(b.level),
                 filter: a.filter.or(b.filter),
                 address: a.address.or(b.address),
+            }),
+        }
+    }
+
+    #[cfg(feature = "tokio-console")]
+    fn merge_tokio_console(
+        base: Option<TokioConsoleConfig>,
+        app: Option<TokioConsoleConfig>,
+    ) -> Option<TokioConsoleConfig> {
+        match (base, app) {
+            (None, None) => None,
+            (Some(b), None) => Some(b),
+            (None, Some(a)) => Some(a),
+            (Some(b), Some(a)) => Some(TokioConsoleConfig {
+                bind: a.bind.or(b.bind),
             }),
         }
     }

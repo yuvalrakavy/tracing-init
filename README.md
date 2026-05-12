@@ -29,13 +29,14 @@ It is intentionally small in scope: it does **not** invent a new logging facade,
 
 ## Highlights
 
-- **Four destinations, one builder** — console, rotating files, GELF/UDP, OTLP (HTTP or gRPC).
+- **Four production destinations, one builder** — console, rotating files, GELF/UDP, OTLP (HTTP or gRPC).
+- **Plus an optional dev destination** — `tokio-console` for runtime task inspection.
 - **Per-destination configuration** — independent levels, filters, formats, and span-event policies.
 - **TOML-first** — declare the whole logging setup in `logging.toml`; the binary just calls `init()`.
 - **Per-app overrides and destination modifiers** — share one config across a workspace of binaries.
 - **GELF ↔ OpenTelemetry correlation** — span and trace IDs are injected into every GELF record automatically.
 - **Resilient OTLP exporter** — built-in circuit breaker + multicast beacon so a missing collector never blocks startup, hangs shutdown, or floods stderr.
-- **Feature-gated dependencies** — you only pull in `tokio`, `tonic`, OTel, etc. if you actually use them.
+- **Feature-gated dependencies** — you only pull in `tokio`, `tonic`, OTel, `console-subscriber`, etc. if you actually use them.
 - **No new logging APIs** — your application keeps using `tracing::{info,warn,error,instrument}`.
 
 ## Quick Start
@@ -46,6 +47,7 @@ It is intentionally small in scope: it does **not** invent a new logging facade,
 tracing       = "0.1"
 tracing-init  = "0.2"                                       # console + file + gelf
 # tracing-init = { version = "0.2", features = ["otel"] }   # add OpenTelemetry
+# tracing-init = { version = "0.2", features = ["tokio-console"] }  # add tokio-console
 ```
 
 ```rust
@@ -96,6 +98,7 @@ address = "graylog.internal:12201"
 | `gelf`      | yes     | `serde_json`, `hostname`                                 | GELF 1.1 over UDP                              |
 | `otel`      | no      | `opentelemetry`, `opentelemetry_sdk`, `tokio`, …         | OTLP/HTTP traces + logs, circuit breaker, beacon |
 | `otel-grpc` | no      | adds `tonic` to `opentelemetry-otlp`                     | gRPC transport for OTLP                        |
+| `tokio-console` | no  | `console-subscriber`                                     | `tokio-console` instrumentation layer (requires `RUSTFLAGS="--cfg tokio_unstable"` in the consuming crate) |
 
 `default = ["config", "file", "gelf"]`. Disable defaults if you want a minimal console-only build:
 
@@ -151,6 +154,10 @@ transport = "http"                   # http | grpc (requires otel-grpc feature)
 "service.version"        = "1.2.3"
 "deployment.environment" = "staging"
 
+# Optional — only consulted when the `tokio-console` feature is enabled.
+[logging.tokio_console]
+bind = "127.0.0.1:6669"              # default; override or omit
+
 # Per-app overrides — useful in a workspace where several binaries share one TOML.
 [logging.myapp]
 destination = "-f+o"                 # modifier: drop file, add otel
@@ -162,12 +169,12 @@ format = "json"                      # per-app, per-destination override
 
 ### Destination strings
 
-A destination is a string of single-character flags: `c` (console), `f` (file), `g` (gelf), `o` (otel).
+A destination is a string of single-character flags: `c` (console), `f` (file), `g` (gelf), `o` (otel), `t` (tokio-console).
 
 - **Absolute** — `"cfo"` replaces the inherited value.
 - **Modifier** — `"-f"`, `"+o"`, `"-f+o"` apply on top of the inherited value.
 
-This means a single workspace config can say "everyone gets console + file" and a single app can opt into "also OTel" without restating the rest.
+This means a single workspace config can say "everyone gets console + file" and a single app can opt into "also OTel" without restating the rest. Adding `t` is the same shape: add to the destination, enable the `tokio-console` feature, and build the consumer with `RUSTFLAGS="--cfg tokio_unstable"`.
 
 ### Inheritance chain
 
@@ -180,12 +187,12 @@ Most specific wins:
 
 ### Environment variables
 
-| Variable          | Purpose                                                         |
-|-------------------|-----------------------------------------------------------------|
-| `LOG_DESTINATION` | Per-run destination string (e.g. add `c` for an interactive run) |
-| `LOG_LEVEL`       | Bump verbosity for a single invocation                          |
-| `RUST_LOG`        | Standard `EnvFilter` directives (base filter only)              |
-| `LOG_CONFIG`      | Path to a TOML file to use instead of `logging.toml`            |
+| Variable          | Purpose                                                                                |
+|-------------------|----------------------------------------------------------------------------------------|
+| `LOG_DESTINATION` | Per-run destination string of `c`/`f`/`g`/`o`/`t` (e.g. add `c` for an interactive run) |
+| `LOG_LEVEL`       | Bump verbosity for a single invocation                                                 |
+| `RUST_LOG`        | Standard `EnvFilter` directives (base filter only)                                     |
+| `LOG_CONFIG`      | Path to a TOML file to use instead of `logging.toml`                                   |
 
 ## Builder API
 
@@ -283,6 +290,35 @@ The beacon wire format is documented in [`docs/beacon.md`](docs/beacon.md) so ex
 
 This makes `tracing-init` a pragmatic choice for environments where the collector and the apps come up in any order (development laptops, k8s rollouts, edge devices).
 
+## `tokio-console` (developer-time runtime inspection)
+
+When the `tokio-console` feature is enabled and `t` is in the destination string, `tracing-init` adds a [`console-subscriber`](https://docs.rs/console-subscriber) layer that exposes per-task scheduling, polling, and resource-contention data to the standalone [`tokio-console`](https://github.com/tokio-rs/console) CLI.
+
+```toml
+[dependencies]
+tracing-init = { version = "0.2", features = ["tokio-console"] }
+```
+
+```toml
+# logging.toml
+[logging]
+destination = "ct"          # console + tokio-console
+
+[logging.tokio_console]
+bind = "127.0.0.1:6669"     # default; override or omit
+```
+
+```bash
+# tokio's instrumentation API is gated behind a cfg, so the consuming
+# crate must build with this flag for events to actually be emitted:
+RUSTFLAGS="--cfg tokio_unstable" cargo run --features tokio-console
+
+# in another terminal:
+tokio-console     # cargo install tokio-console
+```
+
+Without the `tokio_unstable` flag the layer compiles fine but stays silent. With it set, the CLI connects on the configured port (default `127.0.0.1:6669`) and surfaces async runtime state — stuck tasks, suspicious await points, lock contention — that no log line will ever show you. The feature is off by default and pulls in `console-subscriber` only when enabled.
+
 ## Use with logmon
 
 `tracing-init`'s GELF layer pairs naturally with [**logmon**](https://github.com/yuvalrakavy/logmon-mcp), a log-monitoring MCP server that ingests GELF (and OTLP) and exposes the buffered events to AI coding assistants via the [Model Context Protocol](https://modelcontextprotocol.io/).
@@ -321,6 +357,7 @@ Three runnable examples live under [`examples/`](examples/):
 - **`tracing-subscriber` directly** — the canonical answer for one binary with one output. `tracing-init` shines when you have several binaries, several destinations, and want the same TOML to drive them all.
 - **`tracing-bunyan-formatter`, `tracing-loki`, `tracing-gelf`** — single-destination crates. You can absolutely combine them by hand; `tracing-init` is the prebuilt composition.
 - **`tracing-opentelemetry`** — the underlying integration that `tracing-init` uses for the `otel` feature; we add the circuit breaker, the beacon, the GELF correlation, and the configuration model on top.
+- **`console-subscriber`** — used directly by the `tokio-console` feature; `tracing-init` adds destination-string/TOML/builder wiring so it shares the same lifecycle and configuration surface as the other layers.
 
 ## MSRV and stability
 

@@ -351,6 +351,35 @@ Graylog, Vector, Fluent Bit, anything that speaks the protocol — but if
 you're already pairing with an AI coding assistant, this is the fastest
 way I know to give it useful access to your service's runtime.
 
+## Bonus: peeking at the runtime with `tokio-console`
+
+There is one more destination — `t` — that doesn't fit the "structured
+logs" framing of the other four. With the `tokio-console` feature
+enabled, `tracing-init` adds a [`console-subscriber`](https://docs.rs/console-subscriber)
+layer that exposes per-task scheduling, polling, and resource-contention
+data to the standalone [`tokio-console`](https://github.com/tokio-rs/console)
+CLI:
+
+```toml
+[logging]
+destination = "ct"        # console + tokio-console
+```
+
+```bash
+RUSTFLAGS="--cfg tokio_unstable" cargo run --features tokio-console
+tokio-console             # cargo install tokio-console
+```
+
+Tokio's instrumentation API is gated behind a `cfg`, so the consumer has
+to opt in with `RUSTFLAGS="--cfg tokio_unstable"`; without it the layer
+compiles but stays silent. That keeps the feature properly off-by-default
+without invasive surgery on your build.
+
+I keep it under the same destination machinery as the other layers
+deliberately. When you suspect a stuck task or unexpected blocking, it's
+the same `logging.toml` change as flipping on the file appender — no
+parallel "debug runtime" wiring to maintain.
+
 ## What it doesn't try to do
 
 A few non-goals, in case they save you from raising the wrong issue:
@@ -370,8 +399,9 @@ A few non-goals, in case they save you from raising the wrong issue:
 ```toml
 [dependencies]
 tracing       = "0.1"
-tracing-init  = "0.2"                                      # console + file + gelf
-# tracing-init = { version = "0.2", features = ["otel"] }  # add OpenTelemetry
+tracing-init  = "0.2"                                              # console + file + gelf
+# tracing-init = { version = "0.2", features = ["otel"] }          # add OpenTelemetry
+# tracing-init = { version = "0.2", features = ["tokio-console"] } # add tokio-console
 ```
 
 Repo: <https://github.com/yuvalrakavy/tracing-init>

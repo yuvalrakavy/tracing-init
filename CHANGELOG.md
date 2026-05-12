@@ -8,8 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New optional `tokio-console` feature: a `console-subscriber` layer wired
+  in alongside the existing destinations behind the destination character
+  `t`. Adds `.log_to_tokio_console(bool)` and `.tokio_console_bind(&str)`
+  on the builder and a `[logging.tokio_console]` TOML section. Requires
+  the consuming crate to build with `RUSTFLAGS="--cfg tokio_unstable"` to
+  emit events.
 - Project documentation overhaul ahead of the open-source release: expanded
-  README, CONTRIBUTING guide, and CHANGELOG.
+  README, CONTRIBUTING guide, CHANGELOG, beacon-protocol spec, and Medium
+  intro article.
 
 ## [0.2.0]
 
