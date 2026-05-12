@@ -49,7 +49,7 @@
 //!
 //! ```toml
 //! [logging]
-//! destination = "cfg"           # c=console, f=file, g=gelf, o=otel
+//! destination = "cfo"           # c=console, f=file, g=gelf, o=otel
 //! level = "info"
 //!
 //! [logging.console]

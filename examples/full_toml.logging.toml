@@ -1,0 +1,35 @@
+# Companion config for `cargo run --example full_toml`.
+#
+# By default this enables console + a rotating file in `./logs/`. Add `g` to
+# `destination` and configure `[logging.gelf]` to also ship GELF; add `o`
+# and rebuild with `--features otel` to enable OTLP export.
+
+[logging]
+destination  = "cf"
+level        = "info"
+service_name = "tracing-init-example"
+
+[logging.console]
+format       = "pretty"
+ansi         = true
+span_events  = "new,close"
+
+[logging.file]
+path     = "logs"
+prefix   = "full_toml"
+rotation = "d:3"
+format   = "json"
+
+# Uncomment to enable GELF (destination must include "g"):
+# [logging.gelf]
+# address = "localhost:12201"
+# level   = "warn"
+
+# Uncomment to enable OTel (destination must include "o", build with
+# --features otel):
+# [logging.otel]
+# endpoint  = "http://localhost:4318"
+# transport = "http"
+#
+# [logging.otel.resource]
+# "deployment.environment" = "development"

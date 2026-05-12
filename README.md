@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tracing-init.svg)](https://crates.io/crates/tracing-init)
 [![Documentation](https://docs.rs/tracing-init/badge.svg)](https://docs.rs/tracing-init)
+[![CI](https://github.com/yuvalrakavy/tracing-init/actions/workflows/ci.yml/badge.svg)](https://github.com/yuvalrakavy/tracing-init/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **One call to stand up a real-world `tracing` subscriber: console, rotating files, GELF over UDP, and OpenTelemetry — wired up from a TOML file, environment, or a fluent builder.**
@@ -278,6 +279,8 @@ beacon_group       = "239.255.77.1"
 beacon_port        = 4399
 ```
 
+The beacon wire format is documented in [`docs/beacon.md`](docs/beacon.md) so external producers (collector lifecycle hooks, sidecars, ops scripts) can emit `OTEL:ONLINE` / `OTEL:OFFLINE` packets and flip every app on the network in well under a second.
+
 This makes `tracing-init` a pragmatic choice for environments where the collector and the apps come up in any order (development laptops, k8s rollouts, edge devices).
 
 ## Use with logmon
@@ -302,6 +305,16 @@ A typical local setup:
 3. Tell your editor's AI assistant things like *"check the logs around the cache error"* or *"set up a trigger for panics"*. Because `tracing-init` injects span and trace IDs, the assistant can pivot from a single error log to the full surrounding trace.
 
 You don't need logmon to use `tracing-init` — GELF works with Graylog, Vector, Fluent Bit, and anything else that speaks GELF — but if you want AI-native log access during development, this is the fastest path there.
+
+## Examples
+
+Three runnable examples live under [`examples/`](examples/):
+
+| Command                                                            | What it shows                                                    |
+|--------------------------------------------------------------------|------------------------------------------------------------------|
+| `cargo run --example console_only`                                 | Smallest builder-only setup with pretty console output and spans |
+| `cargo run --example full_toml`                                    | TOML-driven setup; edit `examples/full_toml.logging.toml` to flip destinations without recompiling |
+| `cargo run --example otel_resilient --features otel`               | OTLP export with the circuit breaker and multicast beacon active — run with and without a collector to see the behaviour |
 
 ## Comparison with alternatives
 
