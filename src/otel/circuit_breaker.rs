@@ -122,7 +122,11 @@ impl CircuitState {
             // (transition from Open/HalfOpen to Closed), not on every
             // successful export while already Closed.
             self.has_logged_offline.store(false, Ordering::Relaxed);
-            eprintln!("[{}] [{}] OTel collector online, sending traces", now_timestamp(), self.app_name);
+            eprintln!(
+                "[{}] [{}] OTel collector online, sending traces",
+                now_timestamp(),
+                self.app_name
+            );
         }
     }
 
@@ -164,7 +168,11 @@ impl CircuitState {
         self.failure_count.store(0, Ordering::Relaxed);
         self.has_logged_offline.store(false, Ordering::Relaxed);
         if prev != CLOSED {
-            eprintln!("[{}] [{}] OTel collector online, sending traces", now_timestamp(), self.app_name);
+            eprintln!(
+                "[{}] [{}] OTel collector online, sending traces",
+                now_timestamp(),
+                self.app_name
+            );
         }
     }
 

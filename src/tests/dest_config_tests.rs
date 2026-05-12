@@ -43,7 +43,10 @@ fn test_filter_resolution() {
     let mut settings = DestinationSettings::new();
     settings.set_filter("*", "my_crate=info");
     settings.set_filter("console", "my_crate=debug,tower=warn");
-    assert_eq!(settings.resolve_filter("console"), Some("my_crate=debug,tower=warn"));
+    assert_eq!(
+        settings.resolve_filter("console"),
+        Some("my_crate=debug,tower=warn")
+    );
     assert_eq!(settings.resolve_filter("file"), Some("my_crate=info"));
 }
 
@@ -70,6 +73,9 @@ fn test_bool_settings() {
 fn test_span_events() {
     let mut settings = DestinationSettings::new();
     settings.set_span_events("console", SpanEvents::NEW | SpanEvents::CLOSE);
-    assert_eq!(settings.resolve_span_events("console"), Some(SpanEvents::NEW | SpanEvents::CLOSE));
+    assert_eq!(
+        settings.resolve_span_events("console"),
+        Some(SpanEvents::NEW | SpanEvents::CLOSE)
+    );
     assert_eq!(settings.resolve_span_events("file"), None);
 }

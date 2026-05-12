@@ -22,7 +22,9 @@ impl FromStr for Format {
             "compact" => Ok(Format::Compact),
             "pretty" => Ok(Format::Pretty),
             "json" => Ok(Format::Json),
-            other => Err(format!("unknown format: '{other}' (expected full, compact, pretty, or json)")),
+            other => Err(format!(
+                "unknown format: '{other}' (expected full, compact, pretty, or json)"
+            )),
         }
     }
 }
@@ -56,7 +58,9 @@ impl FromStr for Transport {
         match s.to_lowercase().as_str() {
             "http" => Ok(Transport::Http),
             "grpc" => Ok(Transport::Grpc),
-            other => Err(format!("unknown transport: '{other}' (expected http or grpc)")),
+            other => Err(format!(
+                "unknown transport: '{other}' (expected http or grpc)"
+            )),
         }
     }
 }
@@ -108,7 +112,11 @@ impl FromStr for SpanEvents {
                 "new" => result |= SpanEvents::NEW,
                 "close" => result |= SpanEvents::CLOSE,
                 "active" => result |= SpanEvents::ACTIVE,
-                other => return Err(format!("unknown span event: '{other}' (expected new, close, active, none, or all)")),
+                other => {
+                    return Err(format!(
+                        "unknown span event: '{other}' (expected new, close, active, none, or all)"
+                    ))
+                }
             }
         }
         Ok(result)
@@ -124,9 +132,15 @@ impl std::fmt::Display for SpanEvents {
             return write!(f, "all");
         }
         let mut parts = Vec::new();
-        if self.contains(SpanEvents::NEW) { parts.push("new"); }
-        if self.contains(SpanEvents::CLOSE) { parts.push("close"); }
-        if self.contains(SpanEvents::ACTIVE) { parts.push("active"); }
+        if self.contains(SpanEvents::NEW) {
+            parts.push("new");
+        }
+        if self.contains(SpanEvents::CLOSE) {
+            parts.push("close");
+        }
+        if self.contains(SpanEvents::ACTIVE) {
+            parts.push("active");
+        }
         write!(f, "{}", parts.join(","))
     }
 }
@@ -136,9 +150,15 @@ impl SpanEvents {
     pub fn to_fmt_span(self) -> tracing_subscriber::fmt::format::FmtSpan {
         use tracing_subscriber::fmt::format::FmtSpan;
         let mut result = FmtSpan::NONE;
-        if self.contains(SpanEvents::NEW) { result |= FmtSpan::NEW; }
-        if self.contains(SpanEvents::CLOSE) { result |= FmtSpan::CLOSE; }
-        if self.contains(SpanEvents::ACTIVE) { result |= FmtSpan::ACTIVE; }
+        if self.contains(SpanEvents::NEW) {
+            result |= FmtSpan::NEW;
+        }
+        if self.contains(SpanEvents::CLOSE) {
+            result |= FmtSpan::CLOSE;
+        }
+        if self.contains(SpanEvents::ACTIVE) {
+            result |= FmtSpan::ACTIVE;
+        }
         result
     }
 }
