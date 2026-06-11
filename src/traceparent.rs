@@ -65,7 +65,7 @@ pub fn set_remote_parent(span: &tracing::Span, traceparent: &str) -> bool {
     let context = propagator.extract(&carrier);
     let valid = context.span().span_context().is_valid();
     if valid {
-        span.set_parent(context);
+        let _ = span.set_parent(context);
     }
     valid
 }
