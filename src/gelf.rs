@@ -19,15 +19,22 @@
 //! | Target (module path) | `_target` |
 //! | Service name | `_service` |
 //! | Current span name | `_span_name` |
-//! | Span fields | `_span_<field>` |
+//! | Span fields (full scope, root→leaf, inner wins) | `_span_<field>` |
 //! | OTel trace ID (otel feature) | `_trace_id` |
 //! | OTel span ID (otel feature) | `_span_id` |
 //! | Other fields | `_<field_name>` |
+//!
+//! Events forwarded from the [`log`] crate (via `tracing-log`'s `LogTracer`,
+//! which `tracing_subscriber`'s `init()` installs by default) carry the static
+//! metadata target `"log"`; this layer normalizes them so `_target`, `_file`
+//! and `_line` reflect the real emitting module, and the internal `log.*`
+//! carrier fields are not emitted.
 
 use serde_json::{json, Map, Value};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use tracing::field::{Field, Visit};
 use tracing::Level;
+use tracing_log::NormalizeEvent;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
@@ -156,9 +163,20 @@ struct FieldVisitor<'a> {
     fields: &'a mut Map<String, Value>,
 }
 
+/// `log.target`, `log.module_path`, `log.file`, `log.line` are internal
+/// carrier fields attached by `tracing-log`'s bridge; their content surfaces
+/// through [`NormalizeEvent`] as proper metadata, so emitting them as GELF
+/// fields would only duplicate it.
+fn is_log_carrier_field(name: &str) -> bool {
+    name.starts_with("log.")
+}
+
 impl<'a> Visit for FieldVisitor<'a> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         let key = field.name();
+        if is_log_carrier_field(key) {
+            return;
+        }
         let val = format!("{value:?}");
         if key == "message" {
             self.fields.insert("short_message".into(), json!(val));
@@ -169,6 +187,9 @@ impl<'a> Visit for FieldVisitor<'a> {
 
     fn record_str(&mut self, field: &Field, value: &str) {
         let key = field.name();
+        if is_log_carrier_field(key) {
+            return;
+        }
         if key == "message" {
             self.fields.insert("short_message".into(), json!(value));
         } else {
@@ -177,21 +198,33 @@ impl<'a> Visit for FieldVisitor<'a> {
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
+        if is_log_carrier_field(field.name()) {
+            return;
+        }
         self.fields
             .insert(format!("_{}", field.name()), json!(value));
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
+        if is_log_carrier_field(field.name()) {
+            return;
+        }
         self.fields
             .insert(format!("_{}", field.name()), json!(value));
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
+        if is_log_carrier_field(field.name()) {
+            return;
+        }
         self.fields
             .insert(format!("_{}", field.name()), json!(value));
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
+        if is_log_carrier_field(field.name()) {
+            return;
+        }
         self.fields
             .insert(format!("_{}", field.name()), json!(value));
     }
@@ -217,11 +250,44 @@ where
         }
     }
 
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: Context<'_, S>,
+    ) {
+        // Capture fields recorded after span creation (`field::Empty` +
+        // `span.record(...)`). A re-recorded name is pushed again; the map
+        // insert in `on_event` iterates in order, so the latest value wins.
+        if let Some(span) = ctx.span(id) {
+            let mut extensions = span.extensions_mut();
+            if let Some(span_fields) = extensions.get_mut::<SpanFields>() {
+                let mut visitor = SpanFieldVisitor {
+                    fields: &mut span_fields.fields,
+                };
+                values.record(&mut visitor);
+            } else {
+                let mut fields = Vec::new();
+                let mut visitor = SpanFieldVisitor {
+                    fields: &mut fields,
+                };
+                values.record(&mut visitor);
+                extensions.insert(SpanFields { fields });
+            }
+        }
+    }
+
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let mut fields = self.base_fields.clone();
 
+        // Events bridged from the `log` crate carry static metadata target
+        // "log"; normalized_metadata() reconstructs the real emitter's
+        // target/file/line from the bridge's carrier fields.
+        let normalized = event.normalized_metadata();
+        let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
+
         // Map tracing level to GELF/syslog numeric level
-        let level_num = match *event.metadata().level() {
+        let level_num = match *meta.level() {
             Level::ERROR => 3,
             Level::WARN => 4,
             Level::INFO => 6,
@@ -231,27 +297,27 @@ where
         fields.insert("level".into(), json!(level_num));
 
         // Include the tracing level name for TRACE vs DEBUG distinction
-        fields.insert("_level".into(), json!(event.metadata().level().to_string()));
+        fields.insert("_level".into(), json!(meta.level().to_string()));
 
         // Metadata fields (target, file, line)
-        add_metadata_fields(
-            &mut fields,
-            Some(event.metadata().target()),
-            event.metadata().file(),
-            event.metadata().line(),
-        );
+        add_metadata_fields(&mut fields, Some(meta.target()), meta.file(), meta.line());
 
         // Service name
         add_service_field(&mut fields, self.service_name.as_deref());
 
-        // Current span context
+        // Span context: walk the full scope root→leaf so a field set on an
+        // outer span (e.g. panel_id on a connection span) is inherited by
+        // events emitted in nested spans; an inner span re-using a field
+        // name overrides the outer value.
         if let Some(span) = ctx.lookup_current() {
             fields.insert("_span_name".into(), json!(span.name()));
 
-            let extensions = span.extensions();
-            if let Some(span_fields) = extensions.get::<SpanFields>() {
-                for (key, value) in &span_fields.fields {
-                    fields.insert(format!("_span_{key}"), value.clone());
+            for scope_span in span.scope().from_root() {
+                let extensions = scope_span.extensions();
+                if let Some(span_fields) = extensions.get::<SpanFields>() {
+                    for (key, value) in &span_fields.fields {
+                        fields.insert(format!("_span_{key}"), value.clone());
+                    }
                 }
             }
 
@@ -271,20 +337,25 @@ where
             // for the first time (or `OpenTelemetrySpanExt::context()`
             // is called on it), which always happens by the time
             // `on_event` fires for events emitted inside the span.
+            //
+            // Walk leaf→root and take the first span with a valid trace
+            // context, so an inner span the OTel layer skipped (filtered,
+            // or not yet activated) doesn't hide an outer span's trace.
+            // The all-zero invalid trace_id is what an unparented span
+            // looks like when no remote context was attached; emitting it
+            // would mislead log correlation tools.
             #[cfg(feature = "otel")]
-            {
-                if let Some(otel_data) = extensions.get::<tracing_opentelemetry::OtelData>() {
-                    if let (Some(trace_id), Some(span_id)) =
-                        (otel_data.trace_id(), otel_data.span_id())
-                    {
-                        // Skip the all-zero invalid trace_id — that's what
-                        // an unparented span looks like when no remote
-                        // context was attached. Emitting it would mislead
-                        // log correlation tools.
-                        if trace_id != opentelemetry::trace::TraceId::INVALID {
-                            fields.insert("_trace_id".into(), json!(format!("{trace_id:032x}")));
-                            fields.insert("_span_id".into(), json!(format!("{span_id:016x}")));
-                        }
+            for scope_span in span.scope() {
+                let extensions = scope_span.extensions();
+                let Some(otel_data) = extensions.get::<tracing_opentelemetry::OtelData>() else {
+                    continue;
+                };
+                if let (Some(trace_id), Some(span_id)) = (otel_data.trace_id(), otel_data.span_id())
+                {
+                    if trace_id != opentelemetry::trace::TraceId::INVALID {
+                        fields.insert("_trace_id".into(), json!(format!("{trace_id:032x}")));
+                        fields.insert("_span_id".into(), json!(format!("{span_id:016x}")));
+                        break;
                     }
                 }
             }

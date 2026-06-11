@@ -14,7 +14,7 @@ categories = ["development-tools::debugging"]
 default = ["config", "file", "gelf"]
 config = ["dep:toml", "dep:serde"]
 file = ["dep:tracing-appender"]
-gelf = ["dep:serde_json", "dep:hostname"]
+gelf = ["dep:serde_json", "dep:hostname", "dep:tracing-log"]
 otel = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
@@ -50,6 +50,7 @@ tracing-appender = { version = "0.2", optional = true }
 # Optional - gelf
 serde_json = { version = "1", optional = true }
 hostname = { version = "0.4", optional = true }
+tracing-log = { version = "0.2", optional = true }
 
 # Optional - otel
 opentelemetry = { version = "0.31", optional = true }
@@ -63,6 +64,7 @@ futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+log = "0.4"
 
 [[example]]
 name = "console_only"
