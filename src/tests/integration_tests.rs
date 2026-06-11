@@ -97,3 +97,33 @@ fn test_default_logging() {
     event!(Level::INFO, "test");
     drop(guard);
 }
+
+/// `on_destination_error = "skip"`: an unresolvable GELF host must not
+/// fail init(); the summary records the skipped destination and the
+/// remaining destinations stay active. (Runs init(), so it sets the
+/// global subscriber — ignored like the other init tests; run manually
+/// with `cargo test --all-features -- --ignored on_destination_error`.)
+#[test]
+#[ignore] // Global subscriber can only be set once per process
+fn test_on_destination_error_skip_survives_bad_gelf_host() {
+    let toml_value: toml::Value = r#"
+[logging]
+destination = "cg"
+on_destination_error = "skip"
+
+[logging.gelf]
+address = "definitely-not-a-real-host.invalid:12201"
+"#
+    .parse()
+    .unwrap();
+
+    let guard = TracingInit::builder("App")
+        .ignore_environment_variables()
+        .config_toml(&toml_value)
+        .init()
+        .expect("init must succeed with skip");
+    let summary = guard.summary().to_string();
+    assert!(summary.contains("gelf(SKIPPED:"), "summary: {summary}");
+    assert!(summary.contains("console("), "summary: {summary}");
+    drop(guard);
+}

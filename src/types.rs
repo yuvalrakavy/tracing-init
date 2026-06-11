@@ -75,6 +75,46 @@ impl std::fmt::Display for Transport {
     }
 }
 
+/// What to do when a destination fails to initialize — an unresolvable
+/// GELF host, an unwritable log directory, a bad filter directive.
+///
+/// Config key: `on_destination_error = "fail" | "skip"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnDestinationError {
+    /// Propagate the error: `init()` fails (the default). Right for
+    /// short-lived tools where silently-missing telemetry would mask
+    /// misconfiguration.
+    #[default]
+    Fail,
+    /// Print a note to stderr, record the failure in the startup
+    /// summary, and continue with the remaining destinations. Right for
+    /// long-lived daemons where telemetry must never prevent startup.
+    Skip,
+}
+
+impl FromStr for OnDestinationError {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "fail" => Ok(OnDestinationError::Fail),
+            "skip" => Ok(OnDestinationError::Skip),
+            other => Err(format!(
+                "unknown on_destination_error: '{other}' (expected fail or skip)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for OnDestinationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OnDestinationError::Fail => write!(f, "fail"),
+            OnDestinationError::Skip => write!(f, "skip"),
+        }
+    }
+}
+
 bitflags::bitflags! {
     /// Which span lifecycle events to log.
     ///

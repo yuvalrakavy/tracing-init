@@ -322,3 +322,58 @@ destination = "go"
     assert_eq!(builder.destination.as_deref(), Some("c"));
     assert!(!builder.is_dest_enabled('o'));
 }
+
+#[test]
+fn on_destination_error_parsed_from_config() {
+    let toml_value: toml::Value = r#"
+[logging]
+destination = "g"
+on_destination_error = "skip"
+"#
+    .parse()
+    .unwrap();
+
+    let mut builder = crate::TracingInit::builder("test_app");
+    builder.config_toml(&toml_value);
+    builder.apply_toml_config();
+    assert_eq!(
+        builder.on_destination_error,
+        Some(crate::types::OnDestinationError::Skip)
+    );
+}
+
+#[test]
+fn on_destination_error_builder_wins_over_config() {
+    let toml_value: toml::Value = r#"
+[logging]
+on_destination_error = "skip"
+"#
+    .parse()
+    .unwrap();
+
+    let mut builder = crate::TracingInit::builder("test_app");
+    builder
+        .on_destination_error(crate::types::OnDestinationError::Fail)
+        .config_toml(&toml_value);
+    builder.apply_toml_config();
+    assert_eq!(
+        builder.on_destination_error,
+        Some(crate::types::OnDestinationError::Fail)
+    );
+}
+
+#[test]
+fn on_destination_error_unknown_value_falls_back_to_default() {
+    let toml_value: toml::Value = r#"
+[logging]
+on_destination_error = "explode"
+"#
+    .parse()
+    .unwrap();
+
+    let mut builder = crate::TracingInit::builder("test_app");
+    builder.config_toml(&toml_value);
+    builder.apply_toml_config();
+    // Unknown value: warned on stderr, left unset (= Fail default).
+    assert_eq!(builder.on_destination_error, None);
+}

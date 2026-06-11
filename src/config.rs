@@ -140,6 +140,12 @@ pub struct LoggingConfig {
     pub filter: Option<String>,
     /// Service name for telemetry.
     pub service_name: Option<String>,
+    /// What to do when a destination fails to initialize: `"fail"`
+    /// (default — `init()` returns the error) or `"skip"` (print a note
+    /// to stderr, record it in the summary, continue with the remaining
+    /// destinations). For long-lived daemons where telemetry must never
+    /// prevent startup.
+    pub on_destination_error: Option<String>,
     /// Console-specific settings.
     pub console: Option<ConsoleConfig>,
     /// File-specific settings.
@@ -175,6 +181,7 @@ impl LoggingConfig {
         let mut level = Self::get_str(logging_table, "level");
         let mut filter = Self::get_str(logging_table, "filter");
         let mut service_name = Self::get_str(logging_table, "service_name");
+        let mut on_destination_error = Self::get_str(logging_table, "on_destination_error");
 
         // Parse base destination sections
         let base_console = Self::parse_console(logging_table.get("console"));
@@ -210,6 +217,9 @@ impl LoggingConfig {
             if let Some(v) = Self::get_str(app, "service_name") {
                 service_name = Some(v);
             }
+            if let Some(v) = Self::get_str(app, "on_destination_error") {
+                on_destination_error = Some(v);
+            }
 
             // Parse app destination sections and layer over base
             let app_console = Self::parse_console(app.get("console"));
@@ -240,6 +250,7 @@ impl LoggingConfig {
             level,
             filter,
             service_name,
+            on_destination_error,
             console,
             file,
             gelf,

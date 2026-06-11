@@ -53,6 +53,10 @@
 //!                               # t=tokio-console (requires the
 //!                               # `tokio-console` feature + tokio_unstable cfg)
 //! level = "info"
+//! on_destination_error = "skip" # "fail" (default): init() errors when a
+//!                               # destination can't initialize; "skip":
+//!                               # stderr note + summary entry, continue
+//!                               # with the remaining destinations
 //!
 //! [logging.console]
 //! format = "pretty"
@@ -153,6 +157,11 @@ pub struct TracingInit {
     app_name: String,
     service_name: Option<String>,
     destination: Option<String>,
+    on_destination_error: Option<types::OnDestinationError>,
+    /// Destinations that failed to initialize under
+    /// [`OnDestinationError::Skip`](types::OnDestinationError::Skip),
+    /// recorded as (destination name, error text) for the summary.
+    failed_destinations: Vec<(String, String)>,
     dest_settings: dest_config::DestinationSettings,
 
     // Legacy enable flags (set by log_to_* methods)
@@ -222,6 +231,8 @@ impl TracingInit {
             app_name: app_name.to_string(),
             service_name: None,
             destination: None,
+            on_destination_error: None,
+            failed_destinations: Vec::new(),
             dest_settings: dest_config::DestinationSettings::new(),
 
             enable_console: None,
@@ -283,6 +294,18 @@ impl TracingInit {
     /// Characters: `c` = console, `f` = file, `g` = gelf, `o` = otel.
     pub fn destination(&mut self, dest: &str) -> &mut Self {
         self.destination = Some(dest.to_string());
+        self
+    }
+
+    /// What to do when a destination fails to initialize (e.g. an
+    /// unresolvable GELF host, an unwritable log directory): `Fail`
+    /// propagates the error out of [`init`](Self::init) (the default);
+    /// `Skip` prints a note to stderr, records the failure in the
+    /// summary, and continues with the remaining destinations — for
+    /// long-lived daemons where telemetry must never prevent startup.
+    /// Config key: `on_destination_error = "fail" | "skip"`.
+    pub fn on_destination_error(&mut self, v: types::OnDestinationError) -> &mut Self {
+        self.on_destination_error = Some(v);
         self
     }
 
@@ -521,16 +544,28 @@ impl TracingInit {
         #[cfg(feature = "otel")]
         let mut logger_provider: Option<opentelemetry_sdk::logs::SdkLoggerProvider> = None;
 
-        if let Some(layer) = self.get_console_layer()? {
-            layers.push(layer);
+        let skip_on_error =
+            self.on_destination_error == Some(types::OnDestinationError::Skip);
+
+        match self.get_console_layer() {
+            Ok(Some(layer)) => layers.push(layer),
+            Ok(None) => {}
+            Err(e) if skip_on_error => self.note_destination_failure("console", &e),
+            Err(e) => return Err(e),
         }
         #[cfg(feature = "file")]
-        if let Some(layer) = self.get_file_layer()? {
-            layers.push(layer);
+        match self.get_file_layer() {
+            Ok(Some(layer)) => layers.push(layer),
+            Ok(None) => {}
+            Err(e) if skip_on_error => self.note_destination_failure("file", &e),
+            Err(e) => return Err(e),
         }
         #[cfg(feature = "gelf")]
-        if let Some(layer) = self.get_gelf_layer()? {
-            layers.push(layer);
+        match self.get_gelf_layer() {
+            Ok(Some(layer)) => layers.push(layer),
+            Ok(None) => {}
+            Err(e) if skip_on_error => self.note_destination_failure("gelf", &e),
+            Err(e) => return Err(e),
         }
         #[cfg(feature = "tokio-console")]
         if let Some(layer) = self.get_tokio_console_layer() {
@@ -549,61 +584,88 @@ impl TracingInit {
         #[cfg(feature = "otel")]
         {
             if self.is_dest_enabled('o') {
-                let endpoint = self
-                    .otel_endpoint
-                    .as_deref()
-                    .unwrap_or("http://localhost:4318");
-                let transport = self
-                    .otel_transport
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "http".to_string());
-                let service = self.service_name.as_deref().unwrap_or(&self.app_name);
-                let resource = otel::build_resource(service, &self.otel_resource_attrs);
+                // Build all OTel pieces fallibly, then commit them together —
+                // so an `on_destination_error = "skip"` failure leaves no
+                // half-installed OTel state behind.
+                type OtelPieces = (
+                    Vec<Box<dyn Layer<Registry> + Send + Sync + 'static>>,
+                    opentelemetry_sdk::trace::SdkTracerProvider,
+                    Option<opentelemetry_sdk::logs::SdkLoggerProvider>,
+                    tokio::task::JoinHandle<()>,
+                );
+                let build = || -> Result<OtelPieces, Box<dyn std::error::Error>> {
+                    let endpoint = self
+                        .otel_endpoint
+                        .as_deref()
+                        .unwrap_or("http://localhost:4318");
+                    let transport = self
+                        .otel_transport
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "http".to_string());
+                    let service = self.service_name.as_deref().unwrap_or(&self.app_name);
+                    let resource = otel::build_resource(service, &self.otel_resource_attrs);
 
-                // Circuit breaker config from TOML or defaults
-                let (reprobe_interval, failure_threshold, beacon_group, beacon_port) =
-                    self.otel_circuit_breaker_config();
+                    // Circuit breaker config from TOML or defaults
+                    let (reprobe_interval, failure_threshold, beacon_group, beacon_port) =
+                        self.otel_circuit_breaker_config();
 
-                let circuit_state = std::sync::Arc::new(otel::circuit_breaker::CircuitState::new(
-                    failure_threshold,
-                    reprobe_interval,
-                    &self.app_name,
-                ));
+                    let circuit_state =
+                        std::sync::Arc::new(otel::circuit_breaker::CircuitState::new(
+                            failure_threshold,
+                            reprobe_interval,
+                            &self.app_name,
+                        ));
 
-                let (tp, trace_layer) = otel::traces::create_trace_layer(
-                    endpoint,
-                    &transport,
-                    resource.clone(),
-                    circuit_state.clone(),
-                )?;
-                // Only create OTel log bridge if GELF is NOT enabled.
-                // When GELF is active, logs are already delivered with trace context
-                // (_trace_id, _span_id), so the OTel log bridge would cause duplication.
-                let gelf_active = self.is_dest_enabled('g');
-                if !gelf_active {
-                    let (lp, log_layer) = otel::logs::create_log_layer(
+                    let mut otel_layers: Vec<
+                        Box<dyn Layer<Registry> + Send + Sync + 'static>,
+                    > = Vec::new();
+
+                    let (tp, trace_layer) = otel::traces::create_trace_layer(
                         endpoint,
                         &transport,
-                        resource,
+                        resource.clone(),
                         circuit_state.clone(),
                     )?;
-                    let otel_log_filter = self.build_env_filter("otel")?;
-                    layers.push(log_layer.with_filter(otel_log_filter).boxed());
-                    logger_provider = Some(lp);
+                    // Only create OTel log bridge if GELF is NOT enabled.
+                    // When GELF is active, logs are already delivered with trace context
+                    // (_trace_id, _span_id), so the OTel log bridge would cause duplication.
+                    let gelf_active = self.is_dest_enabled('g');
+                    let mut lp = None;
+                    if !gelf_active {
+                        let (provider, log_layer) = otel::logs::create_log_layer(
+                            endpoint,
+                            &transport,
+                            resource,
+                            circuit_state.clone(),
+                        )?;
+                        let otel_log_filter = self.build_env_filter("otel")?;
+                        otel_layers.push(log_layer.with_filter(otel_log_filter).boxed());
+                        lp = Some(provider);
+                    }
+
+                    // Start beacon listener
+                    let beacon = otel::beacon::start_beacon_listener(
+                        circuit_state,
+                        &beacon_group,
+                        beacon_port,
+                    );
+
+                    let otel_filter = self.build_env_filter("otel")?;
+                    otel_layers.push(trace_layer.with_filter(otel_filter).boxed());
+
+                    Ok((otel_layers, tp, lp, beacon))
+                };
+
+                match build() {
+                    Ok((mut otel_layers, tp, lp, beacon)) => {
+                        layers.append(&mut otel_layers);
+                        tracer_provider = Some(tp);
+                        logger_provider = lp;
+                        beacon_handle = Some(beacon);
+                    }
+                    Err(e) if skip_on_error => self.note_destination_failure("otel", &e),
+                    Err(e) => return Err(e),
                 }
-
-                // Start beacon listener
-                beacon_handle = Some(otel::beacon::start_beacon_listener(
-                    circuit_state,
-                    &beacon_group,
-                    beacon_port,
-                ));
-
-                let otel_filter = self.build_env_filter("otel")?;
-                layers.push(trace_layer.with_filter(otel_filter).boxed());
-
-                // Store providers in guard for shutdown
-                tracer_provider = Some(tp);
             }
         }
 
@@ -1033,6 +1095,14 @@ impl TracingInit {
         if self.service_name.is_none() {
             self.service_name = config.service_name.clone();
         }
+        if self.on_destination_error.is_none() {
+            if let Some(ref s) = config.on_destination_error {
+                match s.parse::<types::OnDestinationError>() {
+                    Ok(v) => self.on_destination_error = Some(v),
+                    Err(e) => eprintln!("tracing-init: {e} — using \"fail\""),
+                }
+            }
+        }
 
         // Apply GELF address from config
         #[cfg(feature = "gelf")]
@@ -1228,10 +1298,25 @@ impl TracingInit {
 }
 
 impl TracingInit {
+    /// Whether `dest` failed to initialize (and was skipped).
+    fn dest_failed(&self, dest: &str) -> bool {
+        self.failed_destinations.iter().any(|(d, _)| d == dest)
+    }
+
+    /// Record a destination that failed to initialize under
+    /// `on_destination_error = "skip"`: stderr note now, summary entry later.
+    fn note_destination_failure(&mut self, dest: &str, e: &Box<dyn std::error::Error>) {
+        eprintln!(
+            "tracing-init: {dest} destination failed to initialize: {e} — continuing without it (on_destination_error = \"skip\")"
+        );
+        self.failed_destinations
+            .push((dest.to_string(), e.to_string()));
+    }
+
     fn build_summary(&self) -> String {
         let mut parts = Vec::new();
 
-        if self.is_dest_enabled('c') {
+        if self.is_dest_enabled('c') && !self.dest_failed("console") {
             let format = self
                 .dest_settings
                 .resolve_format("console")
@@ -1244,7 +1329,7 @@ impl TracingInit {
             parts.push(format!("console({}, {})", format, level));
         }
         #[cfg(feature = "file")]
-        if self.is_dest_enabled('f') {
+        if self.is_dest_enabled('f') && !self.dest_failed("file") {
             let path = self.file_path.as_deref().unwrap_or(".");
             let path = if path.is_empty() { "." } else { path };
             let format = self
@@ -1263,7 +1348,7 @@ impl TracingInit {
             ));
         }
         #[cfg(feature = "gelf")]
-        if self.is_dest_enabled('g') {
+        if self.is_dest_enabled('g') && !self.dest_failed("gelf") {
             let addr = self.gelf_address.as_deref().unwrap_or("localhost:12201");
             let level = self
                 .dest_settings
@@ -1273,7 +1358,7 @@ impl TracingInit {
             parts.push(format!("gelf({}, {})", addr, level));
         }
         #[cfg(feature = "otel")]
-        if self.is_dest_enabled('o') {
+        if self.is_dest_enabled('o') && !self.dest_failed("otel") {
             let endpoint = self
                 .otel_endpoint
                 .as_deref()
@@ -1297,6 +1382,11 @@ impl TracingInit {
                 .as_deref()
                 .unwrap_or("127.0.0.1:6669");
             parts.push(format!("tokio-console({})", addr));
+        }
+
+        // Destinations skipped under on_destination_error = "skip"
+        for (dest, err) in &self.failed_destinations {
+            parts.push(format!("{}(SKIPPED: {})", dest, err));
         }
 
         // Service name
