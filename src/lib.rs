@@ -175,6 +175,8 @@ pub struct TracingInit {
     // GELF-specific
     #[cfg(feature = "gelf")]
     gelf_address: Option<String>,
+    #[cfg(feature = "gelf")]
+    gelf_extra_fields: Vec<(String, String)>,
 
     // OTel-specific
     #[cfg(feature = "otel")]
@@ -239,6 +241,8 @@ impl TracingInit {
 
             #[cfg(feature = "gelf")]
             gelf_address: None,
+            #[cfg(feature = "gelf")]
+            gelf_extra_fields: Vec::new(),
 
             #[cfg(feature = "otel")]
             otel_endpoint: None,
@@ -878,6 +882,16 @@ impl TracingInit {
         Some(Box::new(builder.spawn()))
     }
 
+    /// Add a custom GELF additional field included in every message — e.g.
+    /// a per-instance identity (`panel`, `worker_id`) when several processes
+    /// share one `app_name`. Repeatable; emitted as `_<key>`.
+    #[cfg(feature = "gelf")]
+    pub fn gelf_field(&mut self, key: &str, value: &str) -> &mut Self {
+        self.gelf_extra_fields
+            .push((key.to_string(), value.to_string()));
+        self
+    }
+
     #[cfg(feature = "gelf")]
     fn get_gelf_layer(&self) -> Result<BoxedLayer, Box<dyn std::error::Error>> {
         if !self.is_dest_enabled('g') {
@@ -886,11 +900,11 @@ impl TracingInit {
         let filter = self.build_env_filter("gelf")?;
         let addr = self.gelf_address.as_deref().unwrap_or("localhost:12201");
         let service = self.service_name.as_deref().unwrap_or(&self.app_name);
-        let layer = gelf::GelfLayer::new(
-            addr,
-            vec![("app", self.app_name.clone())],
-            Some(service.to_string()),
-        )?;
+        let mut fields: Vec<(&str, String)> = vec![("app", self.app_name.clone())];
+        for (k, v) in &self.gelf_extra_fields {
+            fields.push((k.as_str(), v.clone()));
+        }
+        let layer = gelf::GelfLayer::new(addr, fields, Some(service.to_string()))?;
         Ok(Some(layer.with_filter(filter).boxed()))
     }
 
