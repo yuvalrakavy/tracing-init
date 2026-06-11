@@ -1004,10 +1004,17 @@ impl TracingInit {
 
         self.config_summary = Some(source);
 
-        // Apply destination if not already set
-        if self.destination.is_none() && self.enable_console.is_none() {
+        // Apply destination if the code didn't set a destination string.
+        // Boolean builder flags (log_to_console / log_to_file / …) keep
+        // per-letter precedence in should_enable(); the config string covers
+        // the letters the code didn't pin — so a config `destination = "+o"`
+        // can add OTel to an app that configures console/file/gelf via flags.
+        // Modifier strings are normalized against an empty base ("+g+o" →
+        // "go"): storing them raw would make the per-letter contains() check
+        // misread "-o" as enabling 'o'.
+        if self.destination.is_none() {
             if let Some(dest) = &config.destination {
-                self.destination = Some(dest.clone());
+                self.destination = Some(config::apply_destination_modifier(None, dest));
             }
         }
         // Apply top-level level/filter to wildcard dest_settings if not set

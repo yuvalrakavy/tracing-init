@@ -271,3 +271,54 @@ fn test_discover_missing_file_no_fallback() {
     let result = discover_config(Some(missing_path.to_str().unwrap()), "myapp", true);
     assert!(result.is_none());
 }
+
+/// Regression: a config-file `destination` must be adopted even when the
+/// consuming code sets destinations via boolean builder flags
+/// (`log_to_console(...)` etc.) — the flags keep per-letter precedence in
+/// `is_dest_enabled`, and the config string covers the letters the code
+/// didn't pin. Previously the adoption was skipped whenever
+/// `enable_console` was set, which made the documented
+/// `destination = "-f+g"` config feature dead for flag-configured apps.
+#[test]
+fn config_destination_augments_boolean_flag_setup() {
+    let toml_value: toml::Value = r#"
+[logging]
+destination = "+g+o"
+"#
+    .parse()
+    .unwrap();
+
+    let mut builder = crate::TracingInit::builder("test_app");
+    builder
+        .log_to_console(true)
+        .log_to_file(false)
+        .config_toml(&toml_value);
+    builder.apply_toml_config();
+
+    // Modifier string normalized against an empty base: "+g+o" → "go".
+    assert_eq!(builder.destination.as_deref(), Some("go"));
+    // Boolean flags keep per-letter precedence...
+    assert!(builder.is_dest_enabled('c'));
+    assert!(!builder.is_dest_enabled('f'));
+    // ...and the adopted config string covers unpinned letters.
+    assert!(builder.is_dest_enabled('g'));
+    assert!(builder.is_dest_enabled('o'));
+}
+
+/// A builder-set destination string still wins over the config file.
+#[test]
+fn builder_destination_string_wins_over_config() {
+    let toml_value: toml::Value = r#"
+[logging]
+destination = "go"
+"#
+    .parse()
+    .unwrap();
+
+    let mut builder = crate::TracingInit::builder("test_app");
+    builder.destination("c").config_toml(&toml_value);
+    builder.apply_toml_config();
+
+    assert_eq!(builder.destination.as_deref(), Some("c"));
+    assert!(!builder.is_dest_enabled('o'));
+}
