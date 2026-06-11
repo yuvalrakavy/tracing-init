@@ -100,6 +100,8 @@ mod gelf;
 mod guard;
 #[cfg(feature = "otel")]
 mod otel;
+#[cfg(feature = "otel")]
+pub mod traceparent;
 
 #[cfg(test)]
 mod tests;
