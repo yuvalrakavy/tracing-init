@@ -161,12 +161,14 @@ impl<'a> Visit for SpanFieldVisitor<'a> {
 /// are prefixed with `_` per the GELF spec for additional fields.
 struct FieldVisitor<'a> {
     fields: &'a mut Map<String, Value>,
+    /// True when the event came through `tracing-log`'s bridge: its
+    /// `log.target`/`log.module_path`/`log.file`/`log.line` carrier fields
+    /// surface via [`NormalizeEvent`] as proper metadata, so emitting them
+    /// as GELF fields would only duplicate it. Native tracing events keep
+    /// any (unusual) user field that happens to start with `log.`.
+    skip_log_carriers: bool,
 }
 
-/// `log.target`, `log.module_path`, `log.file`, `log.line` are internal
-/// carrier fields attached by `tracing-log`'s bridge; their content surfaces
-/// through [`NormalizeEvent`] as proper metadata, so emitting them as GELF
-/// fields would only duplicate it.
 fn is_log_carrier_field(name: &str) -> bool {
     name.starts_with("log.")
 }
@@ -174,7 +176,7 @@ fn is_log_carrier_field(name: &str) -> bool {
 impl<'a> Visit for FieldVisitor<'a> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         let key = field.name();
-        if is_log_carrier_field(key) {
+        if self.skip_log_carriers && is_log_carrier_field(key) {
             return;
         }
         let val = format!("{value:?}");
@@ -187,7 +189,7 @@ impl<'a> Visit for FieldVisitor<'a> {
 
     fn record_str(&mut self, field: &Field, value: &str) {
         let key = field.name();
-        if is_log_carrier_field(key) {
+        if self.skip_log_carriers && is_log_carrier_field(key) {
             return;
         }
         if key == "message" {
@@ -198,7 +200,7 @@ impl<'a> Visit for FieldVisitor<'a> {
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        if is_log_carrier_field(field.name()) {
+        if self.skip_log_carriers && is_log_carrier_field(field.name()) {
             return;
         }
         self.fields
@@ -206,7 +208,7 @@ impl<'a> Visit for FieldVisitor<'a> {
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if is_log_carrier_field(field.name()) {
+        if self.skip_log_carriers && is_log_carrier_field(field.name()) {
             return;
         }
         self.fields
@@ -214,7 +216,7 @@ impl<'a> Visit for FieldVisitor<'a> {
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        if is_log_carrier_field(field.name()) {
+        if self.skip_log_carriers && is_log_carrier_field(field.name()) {
             return;
         }
         self.fields
@@ -222,7 +224,7 @@ impl<'a> Visit for FieldVisitor<'a> {
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        if is_log_carrier_field(field.name()) {
+        if self.skip_log_carriers && is_log_carrier_field(field.name()) {
             return;
         }
         self.fields
@@ -257,22 +259,31 @@ where
         ctx: Context<'_, S>,
     ) {
         // Capture fields recorded after span creation (`field::Empty` +
-        // `span.record(...)`). A re-recorded name is pushed again; the map
-        // insert in `on_event` iterates in order, so the latest value wins.
+        // `span.record(...)`). Re-recorded names replace in place so a
+        // long-lived span that records a field periodically doesn't grow
+        // its extension (and the per-event iteration) without bound.
         if let Some(span) = ctx.span(id) {
+            let mut new_fields = Vec::new();
+            let mut visitor = SpanFieldVisitor {
+                fields: &mut new_fields,
+            };
+            values.record(&mut visitor);
+
             let mut extensions = span.extensions_mut();
             if let Some(span_fields) = extensions.get_mut::<SpanFields>() {
-                let mut visitor = SpanFieldVisitor {
-                    fields: &mut span_fields.fields,
-                };
-                values.record(&mut visitor);
+                for (key, value) in new_fields {
+                    if let Some(slot) = span_fields
+                        .fields
+                        .iter_mut()
+                        .find(|(existing, _)| *existing == key)
+                    {
+                        slot.1 = value;
+                    } else {
+                        span_fields.fields.push((key, value));
+                    }
+                }
             } else {
-                let mut fields = Vec::new();
-                let mut visitor = SpanFieldVisitor {
-                    fields: &mut fields,
-                };
-                values.record(&mut visitor);
-                extensions.insert(SpanFields { fields });
+                extensions.insert(SpanFields { fields: new_fields });
             }
         }
     }
@@ -364,6 +375,7 @@ where
         // Collect event fields
         let mut visitor = FieldVisitor {
             fields: &mut fields,
+            skip_log_carriers: normalized.is_some(),
         };
         event.record(&mut visitor);
 
