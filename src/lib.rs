@@ -386,6 +386,21 @@ impl TracingInit {
         self
     }
 
+    // ── GELF-specific methods ──
+
+    /// Set the GELF server address (`host:port`) the GELF layer ships to.
+    ///
+    /// Takes precedence over the config file's `[logging.gelf] address` (config
+    /// only fills this when the builder left it unset), so a caller can point a
+    /// process at a specific GELF ingest port programmatically — e.g. per-worktree
+    /// dev-track isolation routing each stack to its own logmon domain port.
+    /// Defaults to `localhost:12201` when neither builder nor config sets it.
+    #[cfg(feature = "gelf")]
+    pub fn gelf_address(&mut self, address: &str) -> &mut Self {
+        self.gelf_address = Some(address.to_string());
+        self
+    }
+
     // ── OTel-specific methods ──
 
     /// Set the OTLP endpoint URL.
