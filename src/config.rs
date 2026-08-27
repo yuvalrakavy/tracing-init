@@ -118,6 +118,15 @@ pub struct OtelConfig {
     pub beacon_group: Option<String>,
     /// UDP port for beacon listener (default 4399).
     pub beacon_port: Option<u16>,
+    /// Span-queue depth for the batch processor (SDK default 2048).
+    ///
+    /// APPLIED ONLY WHEN `OTEL_BSP_MAX_QUEUE_SIZE` IS ABSENT. That inversion is
+    /// deliberate and has to be explicit code, because the SDK's own precedence runs the
+    /// other way -- `BatchConfigBuilder`'s docs say "Programmatic configuration overrides
+    /// any value set via the environment variable". Left to the SDK, setting this in TOML
+    /// would silently beat the spec-defined variable that every OTel tool understands, and
+    /// an operator who set it would get no value and no explanation.
+    pub span_queue_size: Option<usize>,
 }
 
 /// Parsed and layered logging configuration from nested TOML.
@@ -275,6 +284,21 @@ impl LoggingConfig {
             .map(|v| v as u64)
     }
 
+    /// A positive count, or `None`.
+    ///
+    /// Unlike the siblings above this REJECTS a non-positive value instead of casting it.
+    /// `as u64` on a negative wraps to an enormous number, and for a queue depth that is
+    /// the difference between "the operator typo'd" and "allocate 18 exabytes". Zero is
+    /// rejected for the same reason Store's own reader rejects it: a zero-length queue
+    /// drops every span, which is never what someone meant to configure.
+    fn get_usize(table: &toml::value::Table, key: &str) -> Option<usize> {
+        table
+            .get(key)
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+            .map(|v| v as usize)
+    }
+
     fn get_u32(table: &toml::value::Table, key: &str) -> Option<u32> {
         table
             .get(key)
@@ -351,6 +375,7 @@ impl LoggingConfig {
             failure_threshold: Self::get_u32(table, "failure_threshold"),
             beacon_group: Self::get_str(table, "beacon_group"),
             beacon_port: Self::get_u16(table, "beacon_port"),
+            span_queue_size: Self::get_usize(table, "span_queue_size"),
         })
     }
 
@@ -455,6 +480,7 @@ impl LoggingConfig {
                     failure_threshold: a.failure_threshold.or(b.failure_threshold),
                     beacon_group: a.beacon_group.or(b.beacon_group),
                     beacon_port: a.beacon_port.or(b.beacon_port),
+                    span_queue_size: a.span_queue_size.or(b.span_queue_size),
                 })
             }
         }

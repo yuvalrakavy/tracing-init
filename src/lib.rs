@@ -152,6 +152,15 @@ enum ConfigSource {
 ///     .init()
 ///     .unwrap();
 /// ```
+/// The OpenTelemetry SDK's own default span-queue depth.
+///
+/// Mirrored here rather than read from the SDK because it is what a caller must be TOLD is
+/// in force when neither the env var nor the TOML option supplies a value -- and because
+/// the SDK reaches this same number by ignoring an unparseable env var, which is a case the
+/// startup summary has to be able to name.
+#[cfg(feature = "otel")]
+const OTEL_SPAN_QUEUE_DEFAULT: usize = 2_048;
+
 #[derive(Debug, Clone)]
 pub struct TracingInit {
     app_name: String,
@@ -204,6 +213,8 @@ pub struct TracingInit {
     otel_beacon_group: Option<String>,
     #[cfg(feature = "otel")]
     otel_beacon_port: Option<u16>,
+    #[cfg(feature = "otel")]
+    otel_span_queue_size: Option<usize>,
 
     // Config
     #[cfg(feature = "config")]
@@ -271,6 +282,8 @@ impl TracingInit {
             otel_beacon_group: None,
             #[cfg(feature = "otel")]
             otel_beacon_port: None,
+            #[cfg(feature = "otel")]
+            otel_span_queue_size: None,
 
             #[cfg(feature = "config")]
             config_source: None,
@@ -423,6 +436,70 @@ impl TracingInit {
         self.otel_resource_attrs
             .push((key.to_string(), value.to_string()));
         self
+    }
+
+    /// Where an OTel batch-processor knob's effective value came from.
+    ///
+    /// ONE RULE, not one per field: the sibling knobs (`OTEL_BSP_SCHEDULE_DELAY`,
+    /// `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT`) resolve through
+    /// `batch_knob` too when they are added, so the precedence cannot drift per field.
+    ///
+    /// ENV WINS, which INVERTS the SDK's own precedence and therefore has to be explicit
+    /// code. `BatchConfigBuilder`'s docs state that "Programmatic configuration overrides
+    /// any value set via the environment variable", so the obvious implementation -- read
+    /// the TOML value, hand it to the builder -- would silently beat
+    /// `OTEL_BSP_MAX_QUEUE_SIZE`. An operator sets the spec-defined variable every OTel
+    /// tool understands, nothing happens, and nothing says why.
+    ///
+    /// PRESENCE decides, not parseability. A variable set to something unparseable still
+    /// means the operator reached for the env spelling, and the SDK will silently ignore
+    /// it and stand on its default -- so the honest report is the default that will
+    /// actually be in force, credited to `Env`, rather than quietly applying a TOML value
+    /// the operator had superseded.
+    ///
+    /// Returns the value to REPORT and, separately, whether to configure it
+    /// programmatically. `None` in the second slot means "leave the SDK alone" -- which is
+    /// the whole mechanism by which env keeps winning.
+    #[cfg(feature = "otel")]
+    fn batch_knob(
+        env_var: &str,
+        toml_value: Option<usize>,
+        sdk_default: usize,
+    ) -> (usize, &'static str, Option<usize>) {
+        match std::env::var(env_var) {
+            Ok(raw) => {
+                let effective = raw
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .unwrap_or(sdk_default);
+                (effective, "env", None)
+            }
+            Err(_) => match toml_value {
+                Some(v) => (v, "toml", Some(v)),
+                None => (sdk_default, "default", None),
+            },
+        }
+    }
+
+    /// The span-queue depth: (effective value, source, value to apply programmatically).
+    #[cfg(feature = "otel")]
+    fn otel_span_queue(&self) -> (usize, &'static str, Option<usize>) {
+        Self::batch_knob(
+            "OTEL_BSP_MAX_QUEUE_SIZE",
+            self.otel_span_queue_size,
+            OTEL_SPAN_QUEUE_DEFAULT,
+        )
+    }
+
+    #[cfg(all(test, feature = "otel"))]
+    fn batch_knob_for_test(
+        env_var: &str,
+        toml_value: Option<usize>,
+        sdk_default: usize,
+    ) -> (usize, &'static str, Option<usize>) {
+        Self::batch_knob(env_var, toml_value, sdk_default)
     }
 
     /// Resolve circuit breaker config: (reprobe_interval_secs, failure_threshold, beacon_group, beacon_port)
@@ -635,11 +712,17 @@ impl TracingInit {
                         Box<dyn Layer<Registry> + Send + Sync + 'static>,
                     > = Vec::new();
 
+                    // Only the third slot reaches the SDK. It is `None` unless the value
+                    // came from TOML, which is how `OTEL_BSP_MAX_QUEUE_SIZE` keeps winning
+                    // despite the SDK's opposite precedence.
+                    let (_, _, span_queue_override) = self.otel_span_queue();
+
                     let (tp, trace_layer) = otel::traces::create_trace_layer(
                         endpoint,
                         &transport,
                         resource.clone(),
                         circuit_state.clone(),
+                        span_queue_override,
                     )?;
                     // Only create OTel log bridge if GELF is NOT enabled.
                     // When GELF is active, logs are already delivered with trace context
@@ -1240,6 +1323,9 @@ impl TracingInit {
             if self.otel_beacon_port.is_none() {
                 self.otel_beacon_port = otel.beacon_port;
             }
+            if self.otel_span_queue_size.is_none() {
+                self.otel_span_queue_size = otel.span_queue_size;
+            }
         }
     }
 
@@ -1388,7 +1474,15 @@ impl TracingInit {
             } else {
                 "traces+logs"
             };
-            parts.push(format!("otel({}, {}, {})", endpoint, level, mode));
+            // The queue depth is reported WITH ITS SOURCE. A depth that silently differs
+            // from what the config file says is worse than having no option at all, and
+            // the source is the only way a reader can tell "my TOML took effect" from
+            // "an env var I forgot about is overriding it".
+            let (queue, queue_source, _) = self.otel_span_queue();
+            parts.push(format!(
+                "otel({}, {}, {}, queue:{}/{})",
+                endpoint, level, mode, queue, queue_source
+            ));
         }
         #[cfg(feature = "tokio-console")]
         if self.is_dest_enabled('t') {
@@ -1424,5 +1518,73 @@ impl TracingInit {
 impl Display for TracingInit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.build_summary())
+    }
+}
+
+#[cfg(all(test, feature = "otel"))]
+mod batch_knob_tests {
+    use super::TracingInit;
+
+    /// A name no other test touches. `set_var` is process-global and cargo runs tests on
+    /// threads, so a shared name would make this flaky in a way that looks like a logic bug.
+    const VAR: &str = "TRACING_INIT_TEST_BATCH_KNOB";
+    const SDK_DEFAULT: usize = 2_048;
+
+    /// The precedence rule, with the two cases that are the entire point of the feature.
+    ///
+    /// One test rather than six: they share a process-global env var, so splitting them
+    /// would let cargo interleave them and the failure would read as nondeterminism.
+    #[test]
+    fn env_beats_toml_and_the_reported_value_is_the_one_in_force() {
+        std::env::remove_var(VAR);
+
+        assert_eq!(
+            TracingInit::batch_knob_for_test(VAR, None, SDK_DEFAULT),
+            (SDK_DEFAULT, "default", None),
+            "nothing configured: report the SDK default and configure nothing"
+        );
+
+        assert_eq!(
+            TracingInit::batch_knob_for_test(VAR, Some(16_384), SDK_DEFAULT),
+            (16_384, "toml", Some(16_384)),
+            "TOML alone applies, and is the only case that touches the SDK builder"
+        );
+
+        // THE POINT OF THE FEATURE. Without the explicit inversion the SDK would let the
+        // programmatic TOML value beat the env var, so an operator who set the
+        // spec-defined spelling would get 999 and no explanation.
+        std::env::set_var(VAR, "16384");
+        assert_eq!(
+            TracingInit::batch_knob_for_test(VAR, Some(999), SDK_DEFAULT),
+            (16_384, "env", None),
+            "env wins over TOML, and applies nothing programmatically so the SDK reads it"
+        );
+
+        std::env::set_var(VAR, "  16384  ");
+        assert_eq!(
+            TracingInit::batch_knob_for_test(VAR, None, SDK_DEFAULT).0,
+            16_384,
+            "surrounding space is tolerated, as in Store's own reader"
+        );
+
+        // PRESENCE decides, not parseability. The SDK ignores a value it cannot parse and
+        // stands on its default, so reporting the TOML value here would name a depth that
+        // is not in force -- the "announced but not armed" shape this fleet has paid for.
+        std::env::set_var(VAR, "plenty");
+        assert_eq!(
+            TracingInit::batch_knob_for_test(VAR, Some(999), SDK_DEFAULT),
+            (SDK_DEFAULT, "env", None),
+            "an unparseable env var still means the operator chose env; report the default \
+             that will actually be in force, not the superseded TOML value"
+        );
+
+        std::env::set_var(VAR, "0");
+        assert_eq!(
+            TracingInit::batch_knob_for_test(VAR, None, SDK_DEFAULT),
+            (SDK_DEFAULT, "env", None),
+            "zero would be a queue that drops every span; treat it as unusable"
+        );
+
+        std::env::remove_var(VAR);
     }
 }
