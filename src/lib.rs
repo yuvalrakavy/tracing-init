@@ -102,6 +102,7 @@ mod config;
 #[cfg(feature = "gelf")]
 mod gelf;
 mod guard;
+pub mod loss;
 #[cfg(feature = "otel")]
 mod otel;
 #[cfg(feature = "otel")]
@@ -111,6 +112,7 @@ pub mod traceparent;
 mod tests;
 
 pub use guard::TracingGuard;
+pub use loss::{telemetry_loss, TelemetryLoss};
 
 pub mod dest_config;
 pub mod types;
@@ -631,6 +633,15 @@ impl TracingInit {
 
         let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync + 'static>> = Vec::new();
 
+        // The telemetry-loss latch, carrying its own `Targets` filter. Attached here rather
+        // than inside the OTel block on purpose: it must not be conditioned on any
+        // destination being enabled or on a destination's filter admitting
+        // `opentelemetry_sdk` WARN, since either would leave it permanently clear and
+        // reporting "nothing lost". It is installed unconditionally because it costs one
+        // filtered callsite check and answers a question about the process, not a
+        // destination.
+        layers.push(loss::loss_latch_layer().boxed());
+
         #[cfg(feature = "otel")]
         let mut tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider> = None;
         #[cfg(feature = "otel")]
@@ -707,6 +718,11 @@ impl TracingInit {
                             reprobe_interval,
                             &self.app_name,
                         ));
+
+                    // Register before the Arc is cloned into the exporters and MOVED into
+                    // the beacon listener below, so `telemetry_loss()` has a handle to read
+                    // the availability counters from.
+                    otel::circuit_breaker::register(circuit_state.clone());
 
                     let mut otel_layers: Vec<
                         Box<dyn Layer<Registry> + Send + Sync + 'static>,

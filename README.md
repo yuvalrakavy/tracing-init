@@ -290,6 +290,51 @@ The beacon wire format is documented in [`docs/beacon.md`](docs/beacon.md) so ex
 
 This makes `tracing-init` a pragmatic choice for environments where the collector and the apps come up in any order (development laptops, k8s rollouts, edge devices).
 
+## Did anything get lost?
+
+Availability and loss are different questions. The circuit breaker above handles a collector
+that is *unreachable* — by design, nothing is wrong. A full queue is different: the SDK
+discards spans or log records, and that telemetry no longer exists. A measurement taken over
+a run that silently lost records is not a measurement, so the process keeps the answer:
+
+```rust
+let loss = tracing_init::telemetry_loss();
+if loss.any_dropped() {
+    eprintln!("telemetry incomplete: spans since {:?}, logs since {:?}",
+              loss.spans_dropped_since, loss.logs_dropped_since);
+}
+```
+
+`telemetry_loss()` is safe to call whether or not OpenTelemetry was initialized, and reports
+both axes:
+
+| Field | Meaning |
+|---|---|
+| `spans_dropped_since` / `logs_dropped_since` | when the SDK first dropped; `None` if it never did |
+| `export_failures_total` / `batches_discarded_total` | monotonic availability counters, never reset |
+| `first_failure_at` | when the first export failure was recorded |
+| `circuit_open` | current breaker state; `None` when OTel is not initialized |
+
+Three properties are deliberate:
+
+- **It latches and is never cleared.** The SDK reports only the *first* drop until shutdown,
+  so a latch is exactly as much as can be known while the process runs. Deriving how *many*
+  were lost is unsound under sampling, pending work and shutdown timeouts; the SDK's own
+  shutdown events still carry exact totals for forensics.
+- **The layer carries its own filter** (`opentelemetry_sdk` at WARN) and is attached
+  independently of every destination. Behind a destination's filter, a filter that excludes
+  those records would leave it permanently clear — reporting "nothing lost" forever, which is
+  worse than reporting nothing. Attached plain, it would report no max-level hint and drag
+  the whole subscriber to TRACE, undoing static level skipping in every process.
+- **Availability is never folded into loss.** An unreachable collector does not set the loss
+  latch. The counters exist because `failure_count` is the *consecutive* count the breaker
+  acts on and is reset whenever the circuit closes, so an outage that recovered before the
+  run ended used to leave no trace at all.
+
+This depends on the `opentelemetry` crate's `internal-logs` feature, which is on by default.
+If your dependency graph takes `opentelemetry` with `default-features = false`, re-add
+`internal-logs` or the latch will never fire.
+
 ## `tokio-console` (developer-time runtime inspection)
 
 When the `tokio-console` feature is enabled and `t` is in the destination string, `tracing-init` adds a [`console-subscriber`](https://docs.rs/console-subscriber) layer that exposes per-task scheduling, polling, and resource-contention data to the standalone [`tokio-console`](https://github.com/tokio-rs/console) CLI.

@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Telemetry-loss latch**, read with `telemetry_loss()`: answers whether this process
+  silently dropped spans or log records. The OpenTelemetry SDK keeps its drop counts
+  private and reports loss only through two internal `tracing` events, so a small layer
+  watches for them and latches the first-drop time — the process can now be asked the
+  question instead of it being answered by whoever remembers the right log query. Never
+  cleared: the SDK reports only the FIRST drop until shutdown, so a latch is exactly as
+  much as can be known while the process runs, and deriving a lost COUNT is unsound under
+  sampling, pending work and shutdown timeouts. The layer carries its own `Targets` filter
+  (`opentelemetry_sdk` at WARN) and is attached independently of every destination: behind
+  a destination's filter it could be left permanently clear, and attached plain it would
+  report no max-level hint, dragging the whole subscriber to TRACE and undoing static level
+  skipping. Requires the `opentelemetry` crate's `internal-logs` feature, which is on by
+  default — a dependency graph that disables default features there without re-adding it
+  makes the latch permanently silent.
+- **Monotonic exporter-availability counters** on the circuit breaker, reported through the
+  same `telemetry_loss()` call: `export_failures_total`, `batches_discarded_total` and
+  `first_failure_at`. The existing `failure_count` is the CONSECUTIVE count the breaker
+  acts on and is zeroed at four sites, so a transient outage that recovered before the
+  process ended previously left no trace at all. Availability sits beside loss and is never
+  folded into it: an unreachable collector is a condition the breaker handles by design,
+  while a full queue is telemetry that no longer exists.
 - New optional `tokio-console` feature: a `console-subscriber` layer wired
   in alongside the existing destinations behind the destination character
   `t`. Adds `.log_to_tokio_console(bool)` and `.tokio_console_bind(&str)`

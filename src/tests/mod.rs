@@ -6,4 +6,5 @@ mod gelf_enrichment_tests;
 mod guard_tests;
 #[cfg(feature = "config")]
 mod integration_tests;
+mod loss_tests;
 mod types_tests;

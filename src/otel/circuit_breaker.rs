@@ -26,6 +26,25 @@ use opentelemetry_sdk::logs::{LogBatch, LogExporter};
 use opentelemetry_sdk::trace::{SpanData, SpanExporter};
 use opentelemetry_sdk::Resource;
 
+/// The process's circuit state, registered by `init()` so [`crate::telemetry_loss`] can
+/// report availability beside the loss latch.
+///
+/// A global rather than a field on `TracingGuard`: the `Arc` is cloned into both exporter
+/// wrappers and then MOVED into the beacon listener, and the guard never held it, so there
+/// was no handle to read. `OnceLock` keeps the first registration — a second `init()` in one
+/// process is already refused by `tracing` itself.
+static REGISTERED: std::sync::OnceLock<Arc<CircuitState>> = std::sync::OnceLock::new();
+
+/// Record the circuit built by `init()`. Ignores a second call.
+pub(crate) fn register(state: Arc<CircuitState>) {
+    let _ = REGISTERED.set(state);
+}
+
+/// The registered circuit, or `None` when OTel was never initialized.
+pub fn registered() -> Option<&'static Arc<CircuitState>> {
+    REGISTERED.get()
+}
+
 // Circuit states
 const CLOSED: u8 = 0;
 const OPEN: u8 = 1;
@@ -47,6 +66,17 @@ pub struct CircuitState {
     has_logged_offline: AtomicBool,
     /// Application name for log messages.
     app_name: String,
+    /// Exports attempted and failed, monotonic for the life of the process.
+    ///
+    /// `failure_count` above is the CONSECUTIVE count the breaker acts on, and it is zeroed
+    /// at four sites (`record_success`, `open_circuit`, `force_close`, `force_open`), so
+    /// after an outage that recovers it reads 0 and nothing records that anything failed.
+    export_failures_total: AtomicU64,
+    /// Batches dropped without an export attempt because the circuit was open (or a
+    /// half-open probe was already in flight). Monotonic.
+    batches_discarded_total: AtomicU64,
+    /// Unix-epoch milliseconds of the first recorded failure; `0` means none yet. Set once.
+    first_failure_at_ms: AtomicU64,
 }
 
 impl fmt::Debug for CircuitState {
@@ -60,6 +90,18 @@ impl fmt::Debug for CircuitState {
         f.debug_struct("CircuitState")
             .field("state", &state_name)
             .field("failure_count", &self.failure_count.load(Ordering::Relaxed))
+            .field(
+                "export_failures_total",
+                &self.export_failures_total.load(Ordering::Relaxed),
+            )
+            .field(
+                "batches_discarded_total",
+                &self.batches_discarded_total.load(Ordering::Relaxed),
+            )
+            .field(
+                "first_failure_at_ms",
+                &self.first_failure_at_ms.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -79,6 +121,9 @@ impl CircuitState {
             reprobe_interval_ms: reprobe_interval_secs * 1000,
             has_logged_offline: AtomicBool::new(false),
             app_name: app_name.to_string(),
+            export_failures_total: AtomicU64::new(0),
+            batches_discarded_total: AtomicU64::new(0),
+            first_failure_at_ms: AtomicU64::new(0),
         }
     }
 
@@ -87,7 +132,21 @@ impl CircuitState {
     }
 
     /// Returns `true` if the export should proceed, `false` if it should be dropped.
+    ///
+    /// The discard is counted HERE, in a wrapper over the decision, rather than at each
+    /// `false` inside it. The gate has three `false` returns today and a fourth added later
+    /// would silently stop being counted; this shape cannot miss one. Both exporter wrappers
+    /// call this one function, so spans and logs are covered by a single site.
     fn should_export(&self) -> bool {
+        let allowed = self.evaluate_export_gate();
+        if !allowed {
+            self.batches_discarded_total.fetch_add(1, Ordering::Relaxed);
+        }
+        allowed
+    }
+
+    /// The circuit's own decision, with no accounting — see [`Self::should_export`].
+    fn evaluate_export_gate(&self) -> bool {
         let state = self.state.load(Ordering::Acquire);
         match state {
             CLOSED => true,
@@ -132,6 +191,16 @@ impl CircuitState {
 
     /// Record a failed export.
     fn record_failure(&self) {
+        // Monotonic, before the state machine below: this counts every failed export
+        // attempt, including one that leaves the circuit's own consecutive count reset.
+        self.export_failures_total.fetch_add(1, Ordering::Relaxed);
+        let _ = self.first_failure_at_ms.compare_exchange(
+            0,
+            crate::loss::unix_millis_now(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+
         let state = self.state.load(Ordering::Acquire);
         match state {
             CLOSED => {
@@ -160,6 +229,26 @@ impl CircuitState {
                 now_timestamp(), self.app_name
             );
         }
+    }
+
+    /// Exports attempted and failed, for the life of the process. Never reset.
+    pub fn export_failures_total(&self) -> u64 {
+        self.export_failures_total.load(Ordering::Relaxed)
+    }
+
+    /// Batches discarded without an export attempt, for the life of the process.
+    pub fn batches_discarded_total(&self) -> u64 {
+        self.batches_discarded_total.load(Ordering::Relaxed)
+    }
+
+    /// When the first export failure was recorded, or `None` if none ever was.
+    pub fn first_failure_at(&self) -> Option<std::time::SystemTime> {
+        crate::loss::system_time_from_millis(self.first_failure_at_ms.load(Ordering::Relaxed))
+    }
+
+    /// `true` while the circuit is not closed — exports are being discarded.
+    pub fn is_open(&self) -> bool {
+        self.state.load(Ordering::Acquire) != CLOSED
     }
 
     /// Force the circuit closed (e.g. from beacon ONLINE message).
@@ -316,5 +405,100 @@ impl<E: LogExporter> LogExporter for CircuitBreakerLogExporter<E> {
 
     fn set_resource(&mut self, resource: &Resource) {
         self.inner.set_resource(resource);
+    }
+}
+
+/// A child module, so the private gate and recorders can be driven directly. Widening them
+/// to `pub(crate)` for tests would move production surface for test convenience.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// V22 / A16 — the counters survive the circuit closing again, and `first_failure_at`
+    /// is set once.
+    ///
+    /// The last assertion is the point of the whole addition: after an outage that
+    /// RECOVERED, `failure_count` reads 0 — it is the consecutive count the breaker acts on
+    /// and is zeroed whenever the circuit closes — so before these fields, a run that lost
+    /// its collector for a while and got it back ended with no evidence at all.
+    #[test]
+    fn availability_counters_survive_a_recovery() {
+        let circuit = CircuitState::new(2, 30, "test");
+
+        circuit.record_failure();
+        let first = circuit
+            .first_failure_at()
+            .expect("a failure records its instant");
+        circuit.record_failure(); // reaches the threshold and opens the circuit
+        assert!(
+            circuit.is_open(),
+            "two failures at threshold 2 must open the circuit"
+        );
+
+        circuit.record_success(); // the collector came back
+        assert!(!circuit.is_open(), "a success must close the circuit again");
+
+        assert_eq!(
+            circuit.export_failures_total(),
+            2,
+            "both failures must survive the recovery"
+        );
+        assert_eq!(
+            circuit.first_failure_at(),
+            Some(first),
+            "first_failure_at is set once and must not move to the later failure"
+        );
+        assert_eq!(
+            circuit.failure_count.load(Ordering::Relaxed),
+            0,
+            "the pre-existing consecutive count is back to zero — this is the blindness \
+             the monotonic counters exist to fix, and if it ever stops being zero here, \
+             the assertions above stop being interesting"
+        );
+    }
+
+    /// Every discard is counted, and only a discard is.
+    #[test]
+    fn discards_are_counted_while_the_circuit_is_open() {
+        let circuit = CircuitState::new(3, 30, "test");
+        assert_eq!(circuit.batches_discarded_total(), 0);
+
+        assert!(circuit.should_export(), "a closed circuit exports");
+        assert_eq!(
+            circuit.batches_discarded_total(),
+            0,
+            "an allowed export must not be counted as a discard"
+        );
+
+        circuit.force_open();
+        assert!(!circuit.should_export());
+        assert!(!circuit.should_export());
+        assert_eq!(
+            circuit.batches_discarded_total(),
+            2,
+            "each refused batch counts exactly once"
+        );
+    }
+
+    /// A14 — availability loss is not telemetry loss. An unreachable collector is a
+    /// condition the breaker handles by design; it must never set the drop latch, which
+    /// means "records that no longer exist".
+    ///
+    /// Sound in parallel because nothing in this test binary installs the latch layer
+    /// against the process-wide latch: `tests/loss_tests.rs` uses local instances precisely
+    /// so this assertion keeps its meaning.
+    #[test]
+    fn availability_is_not_loss() {
+        let circuit = CircuitState::new(1, 30, "test");
+        circuit.record_failure();
+        circuit.force_open();
+        assert!(!circuit.should_export());
+        assert!(circuit.export_failures_total() > 0 && circuit.batches_discarded_total() > 0);
+
+        let loss = crate::loss::telemetry_loss();
+        assert!(
+            !loss.any_dropped(),
+            "a failing, open exporter must not report dropped telemetry"
+        );
     }
 }
