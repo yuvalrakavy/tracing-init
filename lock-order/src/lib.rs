@@ -36,9 +36,9 @@
 //! registers itself, and a plain thread — independent of the runtime, so blocked workers cannot
 //! silence it — reports each one past its class's threshold ([`set_report_after`], default
 //! [`watchdog::DEFAULT_REPORT_AFTER`]): a WARN (`kind = "lock_wait_long"`) naming the class, the
-//! waiter and where the lock is held. It never aborts: a generic bound would end healthy work
-//! that holds a lock for minutes. It also logs the cycles, so nothing is logged from inside an
-//! acquisition.
+//! waiter and — in a debug build, where the held sets are kept — where the lock is held. It never
+//! aborts: a generic bound would end healthy work that holds a lock for minutes. It also logs the
+//! cycles, so nothing is logged from inside an acquisition.
 //!
 //! # What it does not check
 //!

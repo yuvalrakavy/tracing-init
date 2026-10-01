@@ -55,7 +55,12 @@ pub fn set_report_after(class: &'static str, after: Duration) {
     thresholds().write().unwrap_or_else(|p| p.into_inner()).insert(class, after);
 }
 
-/// Every wait reported so far — for a test harness.
+/// How many reported waits [`long_waits`] keeps: the latest ones. The WARN is the record; this is
+/// for a test harness, and must not grow for the life of a server that reports a slow holder
+/// every few minutes.
+pub const LONG_WAITS_KEPT: usize = 256;
+
+/// The latest waits reported (at most [`LONG_WAITS_KEPT`]) — for a test harness.
 pub fn long_waits() -> Vec<LongWait> {
     long().lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
@@ -203,6 +208,29 @@ pub fn watchdog_running() -> bool {
     STARTER.running()
 }
 
+/// Push `item`, dropping the oldest past `cap`.
+fn keep_latest<T>(kept: &mut Vec<T>, item: T, cap: usize) {
+    if kept.len() >= cap {
+        kept.remove(0);
+    }
+    kept.push(item);
+}
+
+#[cfg(test)]
+mod kept_tests {
+    /// Review finding (Claude, 2026-10-02): the record of reported waits grew for a server's life.
+    #[test]
+    fn the_record_keeps_only_the_latest() {
+        let mut kept = Vec::new();
+        for i in 0..1000 {
+            super::keep_latest(&mut kept, i, 256);
+        }
+        assert_eq!(kept.len(), 256);
+        assert_eq!(kept.first(), Some(&744));
+        assert_eq!(kept.last(), Some(&999));
+    }
+}
+
 #[cfg(test)]
 mod starter_tests {
     use super::*;
@@ -264,6 +292,6 @@ fn tick() {
             holders = %holders.join(", "),
             "lock wait past its class's threshold — its holder, or what the holder waits on, may be stuck"
         );
-        long().lock().unwrap_or_else(|p| p.into_inner()).push(LongWait { class, site, waited, holders });
+        keep_latest(&mut long().lock().unwrap_or_else(|p| p.into_inner()), LongWait { class, site, waited, holders }, LONG_WAITS_KEPT);
     }
 }

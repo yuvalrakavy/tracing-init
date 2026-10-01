@@ -142,7 +142,9 @@ fn shard(ctx: &Context) -> &'static Mutex<HashMap<Context, Vec<Held>>> {
 /// What `ctx` holds, and what the branches it descends from hold.
 fn held_by(ctx: &Context) -> Vec<Held> {
     let mut chain = vec![*ctx];
-    {
+    // Outside any branch — every task's own context — there is no branch tree to walk, and no
+    // global lock to take on every acquisition.
+    if ctx.branch != 0 {
         let parents = parents().lock().unwrap_or_else(|p| p.into_inner());
         let mut at = ctx.branch;
         while at != 0 {
@@ -308,7 +310,8 @@ pub fn acquired(class: &'static str, instance: usize, site: Site) -> Token {
     let ctx = current();
     let token = next_id();
     let owner: Owner = std::sync::Arc::new(Mutex::new(ctx));
-    let _ordered = migration().read().unwrap_or_else(|p| p.into_inner());
+    // No migration lock: a branch's records move only once its future is dropped, after its last
+    // acquisition, and a task's only by `adopt`.
     shard(&ctx).lock().unwrap_or_else(|p| p.into_inner()).entry(ctx).or_default().push(Held {
         token,
         class,
@@ -334,7 +337,11 @@ fn remove_record(t: &Token) {
 
 /// A guard went: its lock is no longer held, by whichever context holds its record now.
 pub fn released(t: &Token) {
-    let _ordered = migration().read().unwrap_or_else(|p| p.into_inner());
+    // A record in a branch can be moved by the branch's end while this runs: order the two. One
+    // outside any branch moves only by `adopt`, which holds the token exclusively — no global
+    // lock on the common path.
+    let in_branch = t.owner.lock().unwrap_or_else(|p| p.into_inner()).branch != 0;
+    let _ordered = in_branch.then(|| migration().read().unwrap_or_else(|p| p.into_inner()));
     remove_record(t);
 }
 
