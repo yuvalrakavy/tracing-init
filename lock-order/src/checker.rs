@@ -196,6 +196,17 @@ fn pending() -> &'static Mutex<Vec<String>> {
     PENDING.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Whether a cycle is on record, or `None` if the record's lock is held — for the exit handler,
+/// which must neither wait nor allocate before it knows the run fails.
+#[cfg_attr(test, allow(dead_code))]
+pub fn has_cycles() -> Option<bool> {
+    match recorded().try_lock() {
+        Ok(c) => Some(!c.is_empty()),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(!p.into_inner().is_empty()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// The cycles not yet logged — for the watchdog thread.
 pub fn take_pending() -> Vec<String> {
     std::mem::take(&mut *pending().lock().unwrap_or_else(|p| p.into_inner()))

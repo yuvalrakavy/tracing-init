@@ -28,17 +28,38 @@ pub(crate) fn arm() {
     }
 }
 
+/// How long a failing exit may spend printing its report before the process ends anyway: stderr
+/// can be a full pipe nobody drains, and a write to it blocks forever.
+#[cfg(all(unix, not(test)))]
+const REPORT_BOUND_SECS: u32 = 2;
+
 #[cfg(all(unix, not(test)))]
 extern "C" fn at_exit() {
     // Other threads still run while exit handlers do, and one may hold the record's lock: never
-    // wait on it here. Nor on stderr's lock — write(2) to the descriptor directly.
+    // wait on it here. A clean record leaves the exit untouched — nothing is armed for it.
+    if crate::checker::has_cycles() == Some(false) {
+        return;
+    }
+    // The run fails. Everything after this is bounded: SIGALRM's default action ends the process
+    // — still a failing exit — if the report has not reached `_exit` in time (a full stderr pipe,
+    // an allocator another thread holds). Its disposition and mask are reset first, so a handler
+    // or a blocked mask the program installed cannot defeat the bound.
+    // SAFETY: plain libc calls on a zeroed, locally owned signal set.
+    unsafe {
+        libc::signal(libc::SIGALRM, libc::SIG_DFL);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGALRM);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::alarm(REPORT_BOUND_SECS);
+    }
     let text = match crate::checker::try_cycles() {
-        Some(cycles) if cycles.is_empty() => return,
         Some(cycles) => cycles.join("\n"),
         None => "(the record was busy at exit; see the `lock_order_cycle` ERRORs)".to_owned(),
     };
     let message = format!("\nlock-order: this run left lock-order cycles on record, so it fails:\n{text}\n");
-    // SAFETY: a write of an owned buffer to fd 2, then `_exit`, which runs no further handlers.
+    // SAFETY: a write of an owned buffer to fd 2 (not stderr's lock), then `_exit`, which runs no
+    // further handlers.
     unsafe {
         libc::write(2, message.as_ptr().cast(), message.len());
         libc::_exit(EXIT_STATUS);
