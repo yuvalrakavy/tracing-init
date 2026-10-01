@@ -91,7 +91,7 @@ pub const WAITING_MACROS: &[&str] = &["select", "select_biased", "join", "try_jo
 const TRANSPARENT_METHODS: &[&str] = &["instrument", "in_current_span", "boxed", "fuse", "catch_unwind"];
 /// Methods whose last argument is the future really awaited: a task-local's `KEY.scope(v, fut)`.
 const TRANSPARENT_LAST_ARG_METHODS: &[&str] = &["scope", "sync_scope"];
-const TRANSPARENT_FNS: &[&str] = &["pin", "branch"];
+const TRANSPARENT_FNS: &[&str] = &["pin", "branch", "AssertUnwindSafe"];
 /// lock_order's consumer wrappers: their last argument is the future really awaited.
 const TRANSPARENT_LAST_ARG_FNS: &[&str] = &["holding", "holding_in"];
 
