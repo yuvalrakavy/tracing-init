@@ -1,2 +1,3 @@
 /target
 App.*.log
+/wait-lint/target
