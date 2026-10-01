@@ -88,7 +88,9 @@ const BOUNDING_FNS: &[&str] = &["timeout", "timeout_at"];
 pub const WAITING_MACROS: &[&str] = &["select", "select_biased", "join", "try_join"];
 
 /// Wrappers an `.await` sees through: `f().instrument(span).await` awaits `f()`.
-const TRANSPARENT_METHODS: &[&str] = &["instrument", "in_current_span", "boxed", "fuse"];
+const TRANSPARENT_METHODS: &[&str] = &["instrument", "in_current_span", "boxed", "fuse", "catch_unwind"];
+/// Methods whose last argument is the future really awaited: a task-local's `KEY.scope(v, fut)`.
+const TRANSPARENT_LAST_ARG_METHODS: &[&str] = &["scope", "sync_scope"];
 const TRANSPARENT_FNS: &[&str] = &["pin", "branch"];
 /// lock_order's consumer wrappers: their last argument is the future really awaited.
 const TRANSPARENT_LAST_ARG_FNS: &[&str] = &["holding", "holding_in"];
@@ -99,6 +101,7 @@ const COMMON_NAMES: &[&str] = &[
     "new", "get", "set", "insert", "remove", "push", "pop", "clear", "len", "is_empty", "send", "recv", "read",
     "write", "lock", "run", "start", "stop", "close", "flush", "next", "call", "execute", "handle", "update",
     "load", "save", "init", "connect", "open", "wait", "apply", "build", "from", "into", "clone", "drop",
+    "drain", "take", "poll", "tick", "flush",
 ];
 
 /// What this code defines, from its production (non-test) items only: a test helper named like
@@ -404,6 +407,11 @@ fn block_value(b: &syn::Block) -> Option<&syn::Expr> {
 fn see_through(e: &syn::Expr) -> &syn::Expr {
     match peel(e) {
         syn::Expr::MethodCall(mc) if TRANSPARENT_METHODS.contains(&mc.method.to_string().as_str()) => see_through(&mc.receiver),
+        syn::Expr::MethodCall(mc)
+            if !mc.args.is_empty() && TRANSPARENT_LAST_ARG_METHODS.contains(&mc.method.to_string().as_str()) =>
+        {
+            see_through(&mc.args[mc.args.len() - 1])
+        }
         syn::Expr::Call(c) if c.args.len() == 1 && last_ident(&c.func).is_some_and(|n| TRANSPARENT_FNS.contains(&n.as_str())) => {
             see_through(&c.args[0])
         }
@@ -787,6 +795,16 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
 
     fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
         self.item(&c.attrs, c.span(), None, |v| syn::visit::visit_item_const(v, c));
+    }
+
+    /// `#[cfg(test)] Some(x) => ..,` — a test-only match arm.
+    fn visit_arm(&mut self, a: &'ast syn::Arm) {
+        if is_test_item(&a.attrs) {
+            let span = a.span();
+            self.out.test_ranges.push((span.start().line, span.end().line));
+            return;
+        }
+        syn::visit::visit_arm(self, a);
     }
 
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {

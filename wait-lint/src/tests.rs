@@ -709,3 +709,24 @@ fn a_crate_is_the_path_before_its_src_component() {
     assert_eq!(crate_of("tools/mysrc/x/src/b.rs"), "tools/mysrc/x");
     assert_eq!(crate_of("src/a.rs"), "");
 }
+
+#[test]
+fn catch_unwind_task_local_scope_and_a_test_arm_add_no_waits() {
+    let src = "\
+async fn work() {}
+async fn f(x: Option<u8>) {
+    work().catch_unwind().await;
+    TASK.scope(1, work()).await;
+    match x {
+        #[cfg(test)]
+        Some(_) => hold().await,
+        _ => {}
+    }
+    let mut m = std::collections::HashMap::<u8, u8>::new();
+    let d: Vec<_> = m.drain().collect();
+}
+async fn drain() {}
+";
+    let r = run(src);
+    assert!(r.sites.is_empty(), "{:?}", r.sites);
+}
