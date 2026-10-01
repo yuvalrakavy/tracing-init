@@ -1,0 +1,16 @@
+[package]
+name = "lock-order"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Lock wrappers that record, per lock class, the order a running program takes them in, and report the first cycle — lockdep for std and tokio locks"
+license = "MIT"
+repository = "https://github.com/yuvalrakavy/tracing-init"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "rt", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }

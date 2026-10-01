@@ -1,3 +1,4 @@
 /target
 App.*.log
 /wait-lint/target
+/lock-order/target
