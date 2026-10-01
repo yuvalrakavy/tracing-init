@@ -293,6 +293,13 @@ mod tests {
     async fn t(m: M) { m.lock().await; }
 }
 
+async fn p(m: M) {
+    #[cfg(test)]
+    hold(m).await;
+    #[cfg(test)]
+    m.lock().await;
+}
+
 #[test]
 fn u() { m.lock().unwrap(); }
 

@@ -341,6 +341,27 @@ fn is_test_item(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
+/// The outer attributes of the expression kinds a statement starts with.
+fn expr_attrs(e: &syn::Expr) -> &[syn::Attribute] {
+    match e {
+        syn::Expr::Await(x) => &x.attrs,
+        syn::Expr::Call(x) => &x.attrs,
+        syn::Expr::MethodCall(x) => &x.attrs,
+        syn::Expr::Macro(x) => &x.attrs,
+        syn::Expr::Block(x) => &x.attrs,
+        syn::Expr::If(x) => &x.attrs,
+        syn::Expr::Match(x) => &x.attrs,
+        syn::Expr::Assign(x) => &x.attrs,
+        syn::Expr::Path(x) => &x.attrs,
+        syn::Expr::Try(x) => &x.attrs,
+        syn::Expr::Unsafe(x) => &x.attrs,
+        syn::Expr::ForLoop(x) => &x.attrs,
+        syn::Expr::While(x) => &x.attrs,
+        syn::Expr::Loop(x) => &x.attrs,
+        _ => &[],
+    }
+}
+
 fn type_name(t: &syn::Type) -> Option<String> {
     match t {
         syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
@@ -792,7 +813,10 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         let attrs: &[syn::Attribute] = match s {
             syn::Stmt::Local(l) => &l.attrs,
             syn::Stmt::Macro(m) => &m.attrs,
-            _ => &[],
+            // `#[cfg(test)] hold().await;` — syn keeps an expression statement's attributes on
+            // the expression.
+            syn::Stmt::Expr(e, _) => expr_attrs(e),
+            syn::Stmt::Item(_) => &[],
         };
         let span = s.span();
         let test = is_test_item(attrs);
