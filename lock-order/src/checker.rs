@@ -186,6 +186,17 @@ pub fn cycles() -> Vec<String> {
     recorded().lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
+/// Every cycle reported so far, or `None` if the record's lock is held — for the exit handler,
+/// which must not wait. (Unused in this crate's own unit tests, where the handler is off.)
+#[cfg_attr(test, allow(dead_code))]
+pub fn try_cycles() -> Option<Vec<String>> {
+    match recorded().try_lock() {
+        Ok(c) => Some(c.clone()),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner().clone()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// Every cycle reported so far, cleared.
 pub fn take_cycles() -> Vec<String> {
     std::mem::take(&mut *recorded().lock().unwrap_or_else(|p| p.into_inner()))
@@ -301,5 +312,6 @@ fn report(reports: Vec<String>) {
     }
     recorded().lock().unwrap_or_else(|p| p.into_inner()).extend(reports.iter().cloned());
     pending().lock().unwrap_or_else(|p| p.into_inner()).extend(reports);
+    crate::at_exit::arm();
     crate::watchdog::ensure_thread();
 }

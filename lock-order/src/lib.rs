@@ -56,6 +56,8 @@
 //! acquisition, and one map entry for a contended one.
 
 #[cfg(debug_assertions)]
+pub mod at_exit;
+#[cfg(debug_assertions)]
 mod checker;
 pub mod sync;
 pub mod tokio_sync;
