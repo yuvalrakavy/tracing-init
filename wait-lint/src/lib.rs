@@ -24,9 +24,10 @@
 //! * A timeout tagged with an `acyclic` row: a timeout is a bound, and its row must say what
 //!   the expiry does.
 //! * **The waiters.** The registry ends with a generated block listing, for each row, every
-//!   function holding one of its waits. A new waiter is a diff to that block, in the reviewed
-//!   change, so a tag cannot be copied onto a new call path without the row being in front of
-//!   its reviewer. `--write` regenerates it.
+//!   function holding one of its waits. A new waiting *function* is a diff to that block, in the
+//!   reviewed change, so a tag cannot be copied into a new function without the row being in front
+//!   of its reviewer. `--write` regenerates it. It is per function, not per call path: a new
+//!   caller of a function that already waits adds no line (see below).
 //! * **Declared helpers.** A helper that waits for its callers (`wait-fns`: `run_async`) makes
 //!   every call to it a wait to tag, so a new caller is a reviewed diff too.
 //! * **Raw locks** (`raw-locks = forbid`): naming `std::sync`/`tokio::sync`/`parking_lot`
@@ -80,14 +81,25 @@
 //! covering several waits lists one key per wait, in order: `// WAIT: store-lock, p-reply`. One
 //! key over many waits would let the next wait added there pass unread.
 //!
-//! **Names are per crate**, from production items, without trait-impl methods: one crate's
+//! **Names are per crate**, from production items, trait-impl methods included: one crate's
 //! `async fn execute` does not excuse another's `client.execute(..).await`. A crate is the path
-//! up to its `src/` (`store_server/src/…` → `store_server`).
+//! up to its `src/` (`store_server/src/…` → `store_server`). The match is by name.
 //!
 //! # What it cannot see
 //!
-//! The order of locks (the `lock-order` crate's runtime check owns it), and a wait reached
-//! through a call nobody declared as waiting.
+//! * The order of locks (the `lock-order` crate's runtime check owns it).
+//! * **A wait reached through a call.** A call to this crate's own `async fn` is excused — the
+//!   waits inside it carry their own tags — so a new caller of a function that waits adds no
+//!   line to the waiters block, and the conditions a row puts on its callers (hold no store guard
+//!   across it, say) are not checked at the new call site. A synchronous helper that blocks for
+//!   its caller is a wait only if declared in `wait-fns`.
+//! * **Blocking forms by name only:** a call written as a path (`Mutex::lock(&m)`,
+//!   `JoinHandle::join(h)`), a point-free one (`map(JoinHandle::join)`), an aliased `block_on`,
+//!   an implicit join (`std::thread::scope`), iterating a std channel, and an initializer of a
+//!   `Once`/`OnceLock`/`LazyLock` are not seen. A method is blocking only if listed, or declared
+//!   in `blocking-methods`.
+//! * **Paths under `tests/`, `benches/`, `examples/` and files named `*_tests.rs`** are test code
+//!   whatever their `cfg`.
 
 mod registry;
 mod scan;
