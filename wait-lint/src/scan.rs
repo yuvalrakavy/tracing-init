@@ -1,5 +1,5 @@
-//! Finding the waits in one parsed file: what each is, the statement and function it sits in,
-//! and which lock guards are held across it.
+//! Finding the waits in one parsed file: what each is, and the statement and function it sits
+//! in; and the raw lock types it names.
 
 use std::collections::BTreeSet;
 
@@ -57,20 +57,6 @@ pub const BLOCKING_ANY_ARG: &[&str] = &[
 /// Blocking methods bounded by their argument: a bounded wait, still a wait.
 pub const BOUNDED_BLOCKING: &[&str] = &["recv_timeout", "wait_timeout", "wait_timeout_while"];
 
-/// Acquisitions whose result is a guard.
-const GUARD_METHODS: &[&str] = &[
-    "lock",
-    "read",
-    "write",
-    "lock_owned",
-    "read_owned",
-    "write_owned",
-    "blocking_lock",
-    "blocking_read",
-    "blocking_write",
-    "blocking_lock_owned",
-];
-
 /// Methods that make a future unambiguously: one made and not awaited where it is made is a
 /// wait that escapes.
 const ESCAPING_METHODS: &[&str] = &[
@@ -99,7 +85,7 @@ const SPAWNING_FNS: &[&str] = &["spawn", "spawn_blocking", "spawn_local"];
 const BOUNDING_FNS: &[&str] = &["timeout", "timeout_at"];
 
 /// Macros that are each one wait on the futures they are given.
-pub const WAITING_MACROS: &[&str] = &["select", "join", "try_join"];
+pub const WAITING_MACROS: &[&str] = &["select", "select_biased", "join", "try_join"];
 
 /// Wrappers an `.await` sees through: `f().instrument(span).await` awaits `f()`.
 const TRANSPARENT_METHODS: &[&str] = &["instrument", "in_current_span", "boxed", "fuse"];
@@ -153,7 +139,11 @@ impl Names {
                     if let Some(t) = type_name(&i.self_ty) {
                         self.0.local_paths.insert(t);
                     }
-                    syn::visit::visit_item_impl(self, i);
+                    // A trait impl's methods answer someone else's calls (a tonic server's
+                    // `execute` is what another crate's client awaits); they excuse nothing.
+                    if i.trait_.is_none() {
+                        syn::visit::visit_item_impl(self, i);
+                    }
                 }
             }
             fn visit_item_struct(&mut self, s: &'ast syn::ItemStruct) {
@@ -221,30 +211,19 @@ pub struct Found {
     pub what: String,
     /// A timeout: its tag must name a `bounded` row.
     pub bounded: bool,
-    /// A lock acquisition, whose result may be held as a guard.
-    pub guard: bool,
     /// The enclosing function, with its inline modules and owner: `m::Type::method`.
     pub func: String,
-    deferred: usize,
-}
-
-/// What a guard held across a wait is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GuardOf {
-    /// The wait at this index of [`FileScan::found`].
-    Site(usize),
-    /// A call to a function the registry declares returns a guard of this row (`guard-fns`).
-    Key(String),
 }
 
 /// `((line, column), (line, column))`, start and end, of a string literal.
 pub type Span2 = ((usize, usize), (usize, usize));
 
-/// One file's waits, and the guards held across them: `(guard, guard's line, wait index)`.
+/// One file's waits.
 #[derive(Debug, Default)]
 pub struct FileScan {
     pub found: Vec<Found>,
-    pub edges: Vec<(GuardOf, usize, usize)>,
+    /// Raw lock types named in production code: `(line, path)` (the `raw-locks` rule).
+    pub raw_locks: Vec<(usize, String)>,
     /// Line ranges of test items, whose tags are not production tags.
     pub test_ranges: Vec<(usize, usize)>,
     /// String literals: a `// WAIT:` inside one is text, not a tag.
@@ -258,28 +237,16 @@ pub fn scan(file: &syn::File, reg: &Registry, names: &Names) -> FileScan {
         test_depth: 0,
         bounded_depth: 0,
         bounding_future: 0,
-        deferred_depth: 0,
-        block_depth: 0,
         token_depth: 0,
         stmts: Vec::new(),
         consumed: BTreeSet::new(),
         funcs: Vec::new(),
         owners: Vec::new(),
         mods: Vec::new(),
-        guards: Vec::new(),
         out: FileScan::default(),
     };
     v.visit_file(file);
     v.out
-}
-
-struct Guard {
-    of: GuardOf,
-    line: usize,
-    /// `None` once shadowed: it is still held, and can no longer be dropped by name.
-    name: Option<String>,
-    block_depth: usize,
-    deferred: usize,
 }
 
 struct Visitor<'r> {
@@ -290,9 +257,6 @@ struct Visitor<'r> {
     bounded_depth: usize,
     /// Visiting a timeout's future argument: an `async` block here runs under the timeout.
     bounding_future: usize,
-    /// Inside a closure or an `async` block: run later, so not under the guards held here.
-    deferred_depth: usize,
-    block_depth: usize,
     /// Inside a macro's tokens.
     token_depth: usize,
     stmts: Vec<(usize, usize)>,
@@ -304,7 +268,6 @@ struct Visitor<'r> {
     owners: Vec<String>,
     /// Inline modules being visited.
     mods: Vec<String>,
-    guards: Vec<Guard>,
     out: FileScan,
 }
 
@@ -331,7 +294,7 @@ enum Scan {
 impl Scan {
     fn for_macro(name: &str) -> Scan {
         match name {
-            "select" => Scan::Select,
+            "select" | "select_biased" => Scan::Select,
             "join" | "try_join" => Scan::Futures,
             _ => Scan::Code,
         }
@@ -444,57 +407,6 @@ fn call_key(e: &syn::Expr) -> Option<(usize, usize)> {
     }
 }
 
-/// `let g = m.lock().unwrap();` holds a guard; `let n = m.lock().unwrap().len();` does not.
-fn init_is_guard(e: &syn::Expr) -> bool {
-    match peel(e) {
-        syn::Expr::Await(a) => init_is_guard(&a.base),
-        syn::Expr::Block(b) => block_value(&b.block).is_some_and(init_is_guard),
-        syn::Expr::MethodCall(mc) => {
-            let name = mc.method.to_string();
-            if GUARD_METHODS.contains(&name.as_str()) {
-                return true;
-            }
-            matches!(name.as_str(), "unwrap" | "expect" | "unwrap_or_else" | "map_err" | "ok" | "change_context")
-                && init_is_guard(&mc.receiver)
-        }
-        syn::Expr::Call(c) => match peel(&c.func) {
-            // `(|| m.lock().unwrap())()`
-            syn::Expr::Closure(cl) => init_is_guard(&cl.body),
-            // `timeout(d, m.lock()).await` acquires a guard too.
-            func => {
-                last_ident(func).is_some_and(|n| BOUNDING_FNS.contains(&n.as_str()))
-                    && c.args.iter().any(|a| matches!(peel(a), syn::Expr::MethodCall(mc) if GUARD_METHODS.contains(&mc.method.to_string().as_str())))
-            }
-        },
-        _ => false,
-    }
-}
-
-fn pat_name(p: &syn::Pat) -> Option<String> {
-    match p {
-        syn::Pat::Ident(pi) => Some(pi.ident.to_string()),
-        syn::Pat::Type(pt) => pat_name(&pt.pat),
-        syn::Pat::TupleStruct(ts) if ts.elems.len() == 1 => pat_name(&ts.elems[0]),
-        _ => None,
-    }
-}
-
-fn plain_ident(e: &syn::Expr) -> Option<String> {
-    match peel(e) {
-        syn::Expr::Path(p) => p.path.get_ident().map(|i| i.to_string()),
-        _ => None,
-    }
-}
-
-/// `drop(g);` → `g`.
-fn dropped(stmt: &syn::Stmt) -> Option<String> {
-    let syn::Stmt::Expr(syn::Expr::Call(c), _) = stmt else { return None };
-    if last_ident(&c.func).as_deref() != Some("drop") || c.args.len() != 1 {
-        return None;
-    }
-    plain_ident(&c.args[0])
-}
-
 fn is_string_literal(text: &str) -> bool {
     text.starts_with('"') || text.starts_with("r\"") || text.starts_with("r#") || text.starts_with("b\"") || text.starts_with("br") || text.starts_with("c\"")
 }
@@ -510,11 +422,10 @@ impl Visitor<'_> {
         })
     }
 
-    fn record(&mut self, line: usize, column: usize, what: String, kind: Wait, bounded: bool, guard: bool) {
+    fn record(&mut self, line: usize, column: usize, what: String, kind: Wait, bounded: bool) {
         if self.test_depth > 0 || (kind == Wait::Async && self.bounded_depth > 0) {
             return;
         }
-        let idx = self.out.found.len();
         self.out.found.push(Found {
             line,
             column,
@@ -523,15 +434,8 @@ impl Visitor<'_> {
             stmt: if self.token_depth > 0 { None } else { self.stmts.last().copied() },
             what,
             bounded,
-            guard,
             func: self.func(),
-            deferred: self.deferred_depth,
         });
-        for g in &self.guards {
-            if g.deferred == self.deferred_depth {
-                self.out.edges.push((g.of.clone(), g.line, idx));
-            }
-        }
     }
 
     fn literal(&mut self, span: proc_macro2::Span) {
@@ -550,7 +454,7 @@ impl Visitor<'_> {
     }
 
     /// Record an `.await` on a call: a method `name` when `path` is `None`, else a function.
-    fn await_on_call(&mut self, name: &str, path: Option<&[String]>, line: usize, column: usize, guard: bool) {
+    fn await_on_call(&mut self, name: &str, path: Option<&[String]>, line: usize, column: usize) {
         let method = path.is_none();
         let (what, bounded) = if method && self.waits_when_awaited(name) {
             (format!("`.{name}(..).await`"), false)
@@ -570,7 +474,7 @@ impl Visitor<'_> {
             let shown = if method { format!(".{name}(..)") } else { format!("{}(..)", path.map(|p| p.join("::")).unwrap_or_default()) };
             (format!("`{shown}.await`, an async call this code does not define"), false)
         };
-        self.record(line, column, what, Wait::Async, bounded, guard || (method && GUARD_METHODS.contains(&name)));
+        self.record(line, column, what, Wait::Async, bounded);
     }
 
     fn item(&mut self, attrs: &[syn::Attribute], span: proc_macro2::Span, func: Option<String>, f: impl FnOnce(&mut Self)) {
@@ -584,14 +488,10 @@ impl Visitor<'_> {
             let prefix: Vec<&str> = self.mods.iter().map(String::as_str).chain(self.owners.last().map(String::as_str)).collect();
             self.funcs.push(if prefix.is_empty() { name } else { format!("{}::{name}", prefix.join("::")) });
         }
-        // A function's guards and contexts are its own.
-        let guards = std::mem::take(&mut self.guards);
-        let deferred = std::mem::replace(&mut self.deferred_depth, 0);
+        // A function's contexts are its own.
         let bounded = std::mem::replace(&mut self.bounded_depth, 0);
         let bounding = std::mem::replace(&mut self.bounding_future, 0);
         f(self);
-        self.guards = guards;
-        self.deferred_depth = deferred;
         self.bounded_depth = bounded;
         self.bounding_future = bounding;
         if pushed {
@@ -599,6 +499,24 @@ impl Visitor<'_> {
         }
         if test {
             self.test_depth -= 1;
+        }
+    }
+
+    /// A wait-shaped future handed to a call (`run_async(tx.send(..))`, `traced(child.kill())`) is
+    /// awaited by that call, wherever it is: a wait where it is made.
+    fn escaping_arguments<'a>(&mut self, args: impl Iterator<Item = &'a syn::Expr>) {
+        for arg in args {
+            let syn::Expr::MethodCall(mc) = see_through(arg) else { continue };
+            let name = mc.method.to_string();
+            let at = mc.method.span().start();
+            let zero_arg_blocking = mc.args.is_empty() && BLOCKING_ZERO_ARG.contains(&name.as_str());
+            if self.consumed.contains(&(at.line, at.column)) || zero_arg_blocking || ESCAPING_METHODS.contains(&name.as_str()) {
+                continue; // a blocking call or an escaping-method future is recorded where it is visited
+            }
+            if self.waits_when_awaited(&name) {
+                self.consumed.insert((at.line, at.column));
+                self.record(at.line, at.column, format!("a `.{name}(..)` future, handed to a call that awaits it"), Wait::Async, false);
+            }
         }
     }
 
@@ -665,7 +583,7 @@ impl Visitor<'_> {
                     if matches!(next, Some(TokenTree::Punct(p)) if p.as_char() == '!') {
                         if let Some(TokenTree::Group(g)) = tts.get(i + 2) {
                             if WAITING_MACROS.contains(&name.as_str()) {
-                                self.record(at.line, at.column, format!("`{name}!`"), Wait::Async, false, false);
+                                self.record(at.line, at.column, format!("`{name}!`"), Wait::Async, false);
                             }
                             self.scan_tokens(g.stream(), Scan::for_macro(&name));
                             i += 3;
@@ -679,13 +597,12 @@ impl Visitor<'_> {
                             let awaited = awaited_after(&tts, i + 2);
                             if after_dot && !awaited && !in_future && !TRANSPARENT_METHODS.contains(&name.as_str()) {
                                 if BOUNDED_BLOCKING.contains(&name.as_str()) {
-                                    self.record(at.line, at.column, format!("blocking `.{name}(..)`"), Wait::Blocking, true, false);
+                                    self.record(at.line, at.column, format!("blocking `.{name}(..)`"), Wait::Blocking, true);
                                 } else if self.blocks(&name, args.stream().is_empty()) {
-                                    let guard = GUARD_METHODS.contains(&name.as_str());
-                                    self.record(at.line, at.column, format!("blocking `.{name}(..)`"), Wait::Blocking, false, guard);
+                                    self.record(at.line, at.column, format!("blocking `.{name}(..)`"), Wait::Blocking, false);
                                 }
                             } else if !after_dot && name == "block_on" {
-                                self.record(at.line, at.column, "`block_on(..)`".to_string(), Wait::Blocking, false, false);
+                                self.record(at.line, at.column, "`block_on(..)`".to_string(), Wait::Blocking, false);
                             }
                         }
                     }
@@ -732,19 +649,19 @@ impl Visitor<'_> {
                     let name = name.to_string();
                     let method = end >= 3 && matches!(&tts[end - 3], TokenTree::Punct(p) if p.as_char() == '.');
                     if method {
-                        self.await_on_call(&name, None, line, column, false);
+                        self.await_on_call(&name, None, line, column);
                     } else {
                         let path = token_path(tts, end - 2);
-                        self.await_on_call(&name, Some(&path), line, column, false);
+                        self.await_on_call(&name, Some(&path), line, column);
                     }
                 }
-                _ => self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false, false),
+                _ => self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false),
             },
             TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {}
             TokenTree::Ident(name) if !is_keyword(&name.to_string()) => {
-                self.record(line, column, format!("`.await` on a stored future (`{name}`)"), Wait::Async, false, false);
+                self.record(line, column, format!("`.await` on a stored future (`{name}`)"), Wait::Async, false);
             }
-            _ => self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false, false),
+            _ => self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false),
         }
     }
 }
@@ -842,6 +759,23 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         self.item(&s.attrs, s.span(), None, |v| syn::visit::visit_item_static(v, s));
     }
 
+    fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+        if self.test_depth == 0 && !is_test_item(&u.attrs) {
+            let mut prefix = Vec::new();
+            raw_locks_in_use(&u.tree, &mut prefix, &mut self.out.raw_locks);
+        }
+    }
+
+    fn visit_path(&mut self, p: &'ast syn::Path) {
+        if self.test_depth == 0 {
+            let segs: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
+            if let Some(raw) = raw_lock(&segs) {
+                self.out.raw_locks.push((p.span().start().line, raw));
+            }
+        }
+        syn::visit::visit_path(self, p);
+    }
+
     fn visit_lit_str(&mut self, l: &'ast syn::LitStr) {
         self.literal(l.span());
     }
@@ -852,50 +786,6 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
 
     fn visit_lit_cstr(&mut self, l: &'ast syn::LitCStr) {
         self.literal(l.span());
-    }
-
-    fn visit_block(&mut self, b: &'ast syn::Block) {
-        self.block_depth += 1;
-        for stmt in &b.stmts {
-            let before = self.out.found.len();
-            self.visit_stmt(stmt);
-            if let syn::Stmt::Local(local) = stmt {
-                let new_name = pat_name(&local.pat);
-                // `let h = g;` moves a guard rather than taking one.
-                let moved = local.init.as_ref().and_then(|init| plain_ident(&init.expr)).and_then(|src| {
-                    self.guards.iter().rposition(|g| g.name.as_deref() == Some(src.as_str()))
-                });
-                // A new binding of a guard's name shadows it: still held, no longer droppable.
-                if let Some(n) = &new_name {
-                    for g in self.guards.iter_mut().filter(|g| g.name.as_deref() == Some(n.as_str())) {
-                        g.name = None;
-                    }
-                }
-                if let Some(at) = moved {
-                    self.guards[at].name = new_name.clone();
-                } else if let Some(init) = &local.init {
-                    let deferred = self.deferred_depth;
-                    let new_guard_site = (before..self.out.found.len()).find(|&i| self.out.found[i].guard && self.out.found[i].deferred == deferred);
-                    let guard = if init_is_guard(&init.expr) || matches!(peel(&init.expr), syn::Expr::Macro(_)) {
-                        new_guard_site.map(|i| (GuardOf::Site(i), self.out.found[i].line))
-                    } else {
-                        None
-                    }
-                    .or_else(|| guard_fn_call(&init.expr, self.reg).map(|key| (GuardOf::Key(key), init.expr.span().start().line)));
-                    if let Some((of, line)) = guard {
-                        self.guards.push(Guard { of, line, name: new_name, block_depth: self.block_depth, deferred });
-                    }
-                }
-            }
-            if let Some(name) = dropped(stmt) {
-                if let Some(at) = self.guards.iter().rposition(|g| g.name.as_deref() == Some(name.as_str())) {
-                    self.guards.remove(at);
-                }
-            }
-        }
-        let depth = self.block_depth;
-        self.guards.retain(|g| g.block_depth < depth);
-        self.block_depth -= 1;
     }
 
     fn visit_stmt(&mut self, s: &'ast syn::Stmt) {
@@ -918,12 +808,6 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         }
     }
 
-    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
-        self.deferred_depth += 1;
-        syn::visit::visit_expr_closure(self, c);
-        self.deferred_depth -= 1;
-    }
-
     fn visit_expr_async(&mut self, a: &'ast syn::ExprAsync) {
         // A timeout's future argument: this block runs under the timeout.
         let bounded = self.bounding_future > 0;
@@ -931,9 +815,7 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         if bounded {
             self.bounded_depth += 1;
         }
-        self.deferred_depth += 1;
         syn::visit::visit_expr_async(self, a);
-        self.deferred_depth -= 1;
         if bounded {
             self.bounded_depth -= 1;
         }
@@ -950,31 +832,25 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         match base {
             syn::Expr::MethodCall(mc) => {
                 let at = mc.method.span().start();
-                self.await_on_call(&mc.method.to_string(), None, at.line, at.column, false);
+                self.await_on_call(&mc.method.to_string(), None, at.line, at.column);
             }
             syn::Expr::Call(c) => match path_of(&c.func) {
                 Some(path) => {
                     let at = c.func.span().start();
                     let name = path.last().cloned().unwrap_or_default();
-                    let guard = init_is_guard(base);
-                    self.await_on_call(&name, Some(&path), at.line, at.column, guard);
+                    self.await_on_call(&name, Some(&path), at.line, at.column);
                 }
-                None => self.record(line, column, "an `.await` on the result of a computed call".into(), Wait::Async, false, false),
+                None => self.record(line, column, "an `.await` on the result of a computed call".into(), Wait::Async, false),
             },
             syn::Expr::Path(p) => {
                 let name = p.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
-                self.record(line, column, format!("`.await` on a stored future (`{name}`)"), Wait::Async, false, false);
+                self.record(line, column, format!("`.await` on a stored future (`{name}`)"), Wait::Async, false);
             }
             syn::Expr::Async(_) => {}
             syn::Expr::Field(_) | syn::Expr::Index(_) | syn::Expr::Reference(_) | syn::Expr::Unary(_) => {
-                self.record(line, column, "`.await` on a stored future".into(), Wait::Async, false, false);
+                self.record(line, column, "`.await` on a stored future".into(), Wait::Async, false);
             }
-            _ => self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false, false),
-        }
-        // An awaited `async {}` block runs here, under the guards held here.
-        if let syn::Expr::Async(a) = base {
-            syn::visit::visit_block(self, &a.block);
-            return;
+            _ => self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false),
         }
         syn::visit::visit_expr_await(self, e);
     }
@@ -984,13 +860,23 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         let at = mc.method.span().start();
         if !self.consumed.contains(&(at.line, at.column)) {
             if BOUNDED_BLOCKING.contains(&name.as_str()) {
-                self.record(at.line, at.column, format!("blocking `.{name}(..)`"), Wait::Blocking, true, false);
+                self.record(at.line, at.column, format!("blocking `.{name}(..)`"), Wait::Blocking, true);
             } else if self.blocks(&name, mc.args.is_empty()) {
-                let guard = GUARD_METHODS.contains(&name.as_str());
-                self.record(at.line, at.column, format!("blocking `.{name}(..)`"), Wait::Blocking, false, guard);
+                self.record(at.line, at.column, format!("blocking `.{name}(..)`"), Wait::Blocking, false);
+            } else if self.reg.wait_fns.contains(&name) {
+                self.record(at.line, at.column, format!("`.{name}(..)`, a declared helper that waits"), Wait::Blocking, false);
             } else if ESCAPING_METHODS.contains(&name.as_str()) || self.names.escapes_method(&name) {
-                self.record(at.line, at.column, format!("a `.{name}(..)` future, made here and awaited elsewhere"), Wait::Async, false, false);
+                self.record(at.line, at.column, format!("a `.{name}(..)` future, made here and awaited elsewhere"), Wait::Async, false);
             }
+        }
+        if self.reg.wait_fns.contains(&name) || name == "block_on" {
+            for arg in &mc.args {
+                if let Some(key) = call_key(see_through(arg)) {
+                    self.consumed.insert(key);
+                }
+            }
+        } else if !SPAWNING_FNS.contains(&name.as_str()) {
+            self.escaping_arguments(mc.args.iter());
         }
         if SPAWNING_FNS.contains(&name.as_str()) {
             // `join_set.spawn(fut)`: the future is the task's.
@@ -1011,32 +897,28 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
     }
 
     fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
-        // `(|| { .. })()` runs here and now, under the guards held here.
-        if let syn::Expr::Closure(cl) = peel(&c.func) {
-            self.visit_expr(&cl.body);
-            for arg in &c.args {
-                self.visit_expr(arg);
-            }
-            return;
-        }
         let path = path_of(&c.func).unwrap_or_default();
         let name = path.last().cloned().unwrap_or_default();
         let at = c.func.span().start();
         if name == "block_on" {
-            self.record(at.line, at.column, "`block_on(..)`".into(), Wait::Blocking, false, false);
+            self.record(at.line, at.column, "`block_on(..)`".into(), Wait::Blocking, false);
+        } else if self.reg.wait_fns.contains(&name) {
+            self.record(at.line, at.column, format!("`{name}(..)`, a declared helper that waits"), Wait::Blocking, false);
         } else if !self.consumed.contains(&(at.line, at.column)) && self.names.escapes_fn(&path) {
-            self.record(at.line, at.column, format!("a future of `{name}(..)`, made here and awaited elsewhere"), Wait::Async, false, false);
+            self.record(at.line, at.column, format!("a future of `{name}(..)`, made here and awaited elsewhere"), Wait::Async, false);
         }
         let bounding = BOUNDING_FNS.contains(&name.as_str());
         let spawning = SPAWNING_FNS.contains(&name.as_str());
-        // The future argument of a timeout, a spawn or a `block_on` is that call's own; one
-        // passed to `drop` is never polled.
-        if bounding || spawning || name == "block_on" || name == "drop" {
+        // The future argument of a timeout, a spawn, a `block_on` or a declared helper is that
+        // call's own; one passed to `drop` is never polled.
+        if bounding || spawning || name == "block_on" || name == "drop" || self.reg.wait_fns.contains(&name) {
             for arg in &c.args {
                 if let Some(key) = call_key(see_through(arg)) {
                     self.consumed.insert(key);
                 }
             }
+        } else {
+            self.escaping_arguments(c.args.iter());
         }
         self.visit_expr(&c.func);
         let last = c.args.len().saturating_sub(1);
@@ -1062,7 +944,7 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         let name = m.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
         if WAITING_MACROS.contains(&name.as_str()) {
             let at = m.path.segments.last().map(|s| s.ident.span().start()).unwrap_or_else(|| m.span().start());
-            self.record(at.line, at.column, format!("`{name}!`"), Wait::Async, false, false);
+            self.record(at.line, at.column, format!("`{name}!`"), Wait::Async, false);
         }
         self.token_depth += 1;
         self.scan_tokens(m.tokens.clone(), Scan::for_macro(&name));
@@ -1070,18 +952,53 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
     }
 }
 
-/// `let g = write_with_bound(..).await;` where the registry declares `write_with_bound` returns
-/// a guard of some row (`guard-fns = write_with_bound: store-lock`).
-fn guard_fn_call(e: &syn::Expr, reg: &Registry) -> Option<String> {
-    match peel(e) {
-        syn::Expr::Await(a) => guard_fn_call(&a.base, reg),
-        syn::Expr::MethodCall(mc) => {
-            let name = mc.method.to_string();
-            reg.guard_fns.get(&name).cloned().or_else(|| {
-                matches!(name.as_str(), "unwrap" | "expect" | "map_err" | "ok").then(|| guard_fn_call(&mc.receiver, reg)).flatten()
-            })
+/// Lock types that must be built through `lock-order`'s wrappers (`raw-locks`).
+const RAW_LOCKS: &[(&str, &str)] = &[
+    ("std::sync", "Mutex"),
+    ("std::sync", "RwLock"),
+    ("tokio::sync", "Mutex"),
+    ("tokio::sync", "RwLock"),
+    ("parking_lot", "Mutex"),
+    ("parking_lot", "RwLock"),
+];
+
+/// `std::sync::Mutex`, `tokio::sync::RwLock`, … — or any path ending `sync::Mutex`.
+fn raw_lock(segs: &[String]) -> Option<String> {
+    let n = segs.len();
+    if n < 2 {
+        return None;
+    }
+    let (module, item) = (segs[..n - 1].join("::"), segs[n - 1].as_str());
+    let hit = RAW_LOCKS.iter().any(|(m, i)| *i == item && (module == *m || module.ends_with(&format!("::{}", m.rsplit("::").next().unwrap_or(m))) || module == m.rsplit("::").next().unwrap_or(m)));
+    hit.then(|| segs.join("::"))
+}
+
+fn raw_locks_in_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<(usize, String)>) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            prefix.push(p.ident.to_string());
+            raw_locks_in_use(&p.tree, prefix, out);
+            prefix.pop();
         }
-        syn::Expr::Call(c) => last_ident(&c.func).and_then(|n| reg.guard_fns.get(&n).cloned()),
-        _ => None,
+        syn::UseTree::Name(n) => {
+            let mut segs = prefix.clone();
+            segs.push(n.ident.to_string());
+            if let Some(raw) = raw_lock(&segs) {
+                out.push((n.ident.span().start().line, raw));
+            }
+        }
+        syn::UseTree::Rename(r) => {
+            let mut segs = prefix.clone();
+            segs.push(r.ident.to_string());
+            if let Some(raw) = raw_lock(&segs) {
+                out.push((r.ident.span().start().line, raw));
+            }
+        }
+        syn::UseTree::Group(g) => {
+            for t in &g.items {
+                raw_locks_in_use(t, prefix, out);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
     }
 }

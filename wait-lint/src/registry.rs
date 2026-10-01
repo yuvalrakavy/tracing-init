@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const SETTINGS_BLOCK: &str = "wait-lint";
 /// The info string of the generated waiters block.
 pub const WAITERS_BLOCK: &str = "wait-lint-waiters";
+/// Any other fenced block.
+const OTHER_BLOCK: &str = "";
 
 /// A row's kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,15 +25,12 @@ pub struct Row {
     pub key: String,
     /// `None` when the kind is neither `acyclic` nor `bounded` (a finding).
     pub kind: Option<Kind>,
-    /// The waits allowed while a guard of this row is held: the lock-order edges it declares.
-    pub held_across: BTreeSet<String>,
     /// 1-based line in the registry.
     pub line: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Columns {
-    held: Option<usize>,
     waits_on: Option<usize>,
     argument: Option<usize>,
 }
@@ -49,9 +48,10 @@ pub struct Registry {
     pub blocking_methods: BTreeSet<String>,
     /// Functions and methods whose `.await` waits on nothing in this process (`sleep`, …).
     pub not_waits: BTreeSet<String>,
-    /// Functions that return a guard of a row (`write_with_bound: store-lock`): a caller binding
-    /// their result holds that row's guard.
-    pub guard_fns: BTreeMap<String, String>,
+    /// Helpers that wait on behalf of their callers (`run_async`): every call is a wait.
+    pub wait_fns: BTreeSet<String>,
+    /// `forbid`: naming a raw lock type outside the lock-order crate is a finding.
+    pub raw_locks_forbidden: bool,
     /// The generated waiters block, if present: each waiter and its line.
     pub waiters: Option<BTreeMap<Waiter, usize>>,
     /// Format problems: `(line, message)`.
@@ -61,14 +61,6 @@ pub struct Registry {
 pub fn is_key(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-/// Split a comma-separated list of keys, tolerating backticks.
-pub fn key_list(cell: &str) -> Vec<String> {
-    cell.split(',')
-        .map(|k| k.trim().trim_matches('`').trim().to_string())
-        .filter(|k| !k.is_empty() && k != "-" && k != "—")
-        .collect()
 }
 
 impl Registry {
@@ -84,6 +76,9 @@ impl Registry {
             if let Some(kind) = block {
                 if t.starts_with("```") {
                     block = None;
+                    continue;
+                }
+                if kind == OTHER_BLOCK {
                     continue;
                 }
                 if t.is_empty() || t.starts_with('#') {
@@ -106,14 +101,13 @@ impl Registry {
                             "wait-methods" => reg.wait_methods.extend(values),
                             "blocking-methods" => reg.blocking_methods.extend(values),
                             "not-waits" => reg.not_waits.extend(values),
-                            "guard-fns" => {
-                                for pair in values {
-                                    match pair.split_once(':') {
-                                        Some((f, k)) if is_key(k.trim()) => {
-                                            reg.guard_fns.insert(f.trim().to_string(), k.trim().to_string());
-                                        }
-                                        _ => reg.problems.push((line_no, format!("not a `function: key` pair: `{pair}`"))),
-                                    }
+                            "wait-fns" => reg.wait_fns.extend(values),
+                            "raw-locks" => {
+                                let v: Vec<String> = values.collect();
+                                match v.as_slice() {
+                                    [x] if x == "forbid" => reg.raw_locks_forbidden = true,
+                                    [x] if x == "allow" => reg.raw_locks_forbidden = false,
+                                    _ => reg.problems.push((line_no, "`raw-locks` is `forbid` or `allow`".into())),
                                 }
                             }
                             other => reg.problems.push((line_no, format!("unknown setting `{other}`"))),
@@ -130,8 +124,10 @@ impl Registry {
                         block = Some(WAITERS_BLOCK);
                         reg.waiters.get_or_insert_with(BTreeMap::new);
                     }
-                    _ => {}
+                    // Any other fence is an example: nothing inside it is read.
+                    _ => block = Some(OTHER_BLOCK),
                 }
+                table = None;
                 continue;
             }
             if !t.starts_with('|') {
@@ -143,7 +139,7 @@ impl Registry {
                 let lower: Vec<String> = cells.iter().map(|c| c.to_ascii_lowercase()).collect();
                 if lower.first().map(String::as_str) == Some("key") && lower.get(1).map(String::as_str) == Some("kind") {
                     let at = |name: &str| lower.iter().position(|c| c == name);
-                    table = Some(Columns { held: at("held across"), waits_on: at("waits on"), argument: at("argument") });
+                    table = Some(Columns { waits_on: at("waits on"), argument: at("argument") });
                     if at("waits on").is_none() || at("argument").is_none() {
                         reg.problems.push((line_no, "the table needs `Waits on` and `Argument` columns".into()));
                     }
@@ -168,7 +164,6 @@ impl Registry {
                 reg.problems.push((line_no, format!("`{key}` is a second row with the same key")));
                 continue;
             }
-            let held_across = cols.held.and_then(|at| cells.get(at)).map(|c| key_list(c)).unwrap_or_default();
             let cell = |at: Option<usize>| at.and_then(|a| cells.get(a)).map(|c| c.trim()).unwrap_or("");
             if cell(cols.waits_on).is_empty() {
                 reg.problems.push((line_no, format!("row `{key}` does not say what it waits on")));
@@ -179,7 +174,7 @@ impl Registry {
             } else if kind == Some(Kind::Bounded) && !argument.to_ascii_lowercase().contains("on expiry") {
                 reg.problems.push((line_no, format!("row `{key}` is `bounded`: its argument must say what happens `on expiry`")));
             }
-            reg.rows.push(Row { key, kind, held_across: held_across.into_iter().collect(), line: line_no });
+            reg.rows.push(Row { key, kind, line: line_no });
         }
         if block.is_some() {
             reg.problems.push((text.lines().count(), "a fenced block is never closed".into()));

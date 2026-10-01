@@ -393,121 +393,6 @@ fn a_current_waiters_block_is_clean_and_rewrites_in_place() {
     assert_eq!(registry::with_waiters(&stale, &r.waiters_block), registry);
 }
 
-// Lock order.
-
-fn order_registry(k_held: &str, b_held: &str) -> String {
-    format!(
-        "\
-| Key | Kind | Waits on | Held across | Argument |
-|---|---|---|---|---|
-| `k` | acyclic | a lock | {k_held} | x |
-| `b` | acyclic | another lock | {b_held} | y |
-"
-    )
-}
-
-const K_THEN_B: &str = "\
-fn f(m: M, n: M) {
-    let g = m.lock().unwrap(); // WAIT: k
-    let h = n.lock().unwrap(); // WAIT: b
-}
-";
-
-#[test]
-fn a_guard_held_across_an_undeclared_wait_is_a_finding() {
-    let r = run_files(&[("src/a.rs", K_THEN_B)], &order_registry("—", "—"));
-    let f = source_findings(&r);
-    assert!(f.iter().any(|(l, m)| *l == 3 && m.contains("a `k` guard (line 2) is held across this `b` wait")), "{f:?}");
-}
-
-#[test]
-fn a_declared_edge_is_clean_and_an_unused_one_is_a_finding() {
-    let r = run_files(&[("src/a.rs", K_THEN_B)], &order_registry("`b`", "—"));
-    assert!(source_findings(&r).is_empty(), "{:?}", r.findings);
-    let r = run_files(&[("src/a.rs", K_THEN_B)], &order_registry("`b`", "`k`"));
-    assert!(registry_findings(&r).iter().any(|(_, m)| m.contains("row `b` declares `k` held across, and no `b` guard")), "{:?}", r.findings);
-}
-
-#[test]
-fn a_cycle_in_the_declared_order_is_a_finding() {
-    let both = "\
-fn f(m: M, n: M) {
-    let g = m.lock().unwrap(); // WAIT: k
-    let h = n.lock().unwrap(); // WAIT: b
-}
-fn g(m: M, n: M) {
-    let h = n.lock().unwrap(); // WAIT: b
-    let g = m.lock().unwrap(); // WAIT: k
-}
-";
-    let r = run_files(&[("src/a.rs", both)], &order_registry("`b`", "`k`"));
-    let cycles: Vec<_> = registry_findings(&r).into_iter().filter(|(_, m)| m.contains("cycle")).collect();
-    assert_eq!(cycles.len(), 1, "{cycles:?}");
-    assert!(cycles[0].1.contains("b → k → b"), "{cycles:?}");
-}
-
-#[test]
-fn taking_a_lock_again_while_holding_it_is_a_cycle() {
-    let src = "\
-fn f(m: M) {
-    let g = m.read().unwrap(); // WAIT: k
-    let h = m.read().unwrap(); // WAIT: k
-}
-";
-    let r = run_files(&[("src/a.rs", src)], &order_registry("`k`", "—"));
-    assert!(registry_findings(&r).iter().any(|(_, m)| m.contains("cycle: k → k")), "{:?}", r.findings);
-}
-
-#[test]
-fn a_temporary_a_dropped_guard_and_a_closure_hold_nothing_across() {
-    let src = "\
-fn f(m: M, n: M) {
-    let len = m.lock().unwrap().len(); // WAIT: k
-    let h = n.lock().unwrap(); // WAIT: b
-}
-fn g(m: M, n: M) {
-    let g = m.lock().unwrap(); // WAIT: k
-    drop(g);
-    let h = n.lock().unwrap(); // WAIT: b
-}
-fn h(m: M, n: M) {
-    let g = m.lock().unwrap(); // WAIT: k
-    let later = move || n.lock().unwrap(); // WAIT: b
-}
-fn i(m: M, n: M) {
-    {
-        let g = m.lock().unwrap(); // WAIT: k
-    }
-    let h = n.lock().unwrap(); // WAIT: b
-}
-";
-    let r = run_files(&[("src/a.rs", src)], &order_registry("—", "—"));
-    assert!(source_findings(&r).is_empty(), "{:?}", r.findings);
-}
-
-#[test]
-fn an_awaited_guard_and_a_declared_guard_function_hold_their_rows() {
-    let src = "\
-async fn f(m: M, n: M) {
-    let g = m.write().await; // WAIT: k
-    let h = n.lock().await; // WAIT: b
-}
-async fn g(m: M, n: M) {
-    let g = write_with_bound(m).await;
-    let h = n.lock().await; // WAIT: b
-}
-async fn write_with_bound(m: M) -> G {
-    m.write().await // WAIT: k
-}
-";
-    let registry = format!("{}\n```wait-lint\nguard-fns = write_with_bound: k\n```\n", order_registry("`b`", "—"));
-    let r = run_files(&[("src/a.rs", src)], &registry);
-    assert!(source_findings(&r).is_empty(), "{:?}", r.findings);
-    let r = run_files(&[("src/a.rs", src)], &format!("{}\n```wait-lint\nguard-fns = write_with_bound: k\n```\n", order_registry("—", "—")));
-    let held: Vec<_> = source_findings(&r).into_iter().filter(|(_, m)| m.contains("held across")).map(|(l, _)| l).collect();
-    assert_eq!(held, vec![3, 7], "{:?}", r.findings);
-}
-
 // The re-gate's probes (Codex, on 2de2c4a): each was silent, and is not.
 
 #[test]
@@ -581,58 +466,6 @@ async fn f(m: M) {
 }
 
 #[test]
-fn a_shadowed_guard_is_still_held_and_dropping_its_replacement_frees_nothing() {
-    let src = "\
-fn f(m: M) {
-    let g = m.lock().unwrap(); // WAIT: k
-    let g = ();
-    drop(g);
-    let h = m.lock().unwrap(); // WAIT: k
-}
-";
-    let r = run_files(&[("src/a.rs", src)], &order_registry("—", "—"));
-    assert!(source_findings(&r).iter().any(|(l, m)| *l == 5 && m.contains("`k` guard (line 2)")), "{:?}", r.findings);
-}
-
-#[test]
-fn a_guard_from_a_block_a_called_closure_or_a_macro_is_held() {
-    let src = "\
-fn f(m: M) {
-    let g = { m.lock().unwrap() }; // WAIT: k
-    let h = m.lock().unwrap(); // WAIT: k
-}
-fn g(m: M) {
-    (|| {
-        let g = m.lock().unwrap(); // WAIT: k
-        let h = m.lock().unwrap(); // WAIT: k
-    })();
-}
-fn h(m: M) {
-    let g = id!(m.lock().unwrap()); // WAIT: k
-    let h = m.lock().unwrap(); // WAIT: k
-}
-";
-    let r = run_files(&[("src/a.rs", src)], &order_registry("—", "—"));
-    let held: Vec<usize> =
-        source_findings(&r).into_iter().filter(|(_, m)| m.contains("held across")).map(|(l, _)| l).collect();
-    assert_eq!(held, vec![3, 8, 13], "{:?}", r.findings);
-}
-
-#[test]
-fn a_moved_guard_is_tracked_and_dropping_it_ends_it() {
-    let src = "\
-fn f(m: M) {
-    let g = m.lock().unwrap(); // WAIT: k
-    let h = g;
-    drop(h);
-    let i = m.lock().unwrap(); // WAIT: k
-}
-";
-    let r = run_files(&[("src/a.rs", src)], &order_registry("—", "—"));
-    assert!(source_findings(&r).is_empty(), "{:?}", r.findings);
-}
-
-#[test]
 fn a_tag_inside_a_string_is_text_and_one_in_a_doc_comment_is_refused() {
     let src = "\
 async fn f(rx: R) {
@@ -702,4 +535,102 @@ async fn f(rx: R) {
     let r = run(src);
     let whats: Vec<(usize, &str)> = r.sites.iter().map(|s| (s.line, s.what.as_str())).collect();
     assert_eq!(whats, vec![(3, "`select!`"), (6, "`.recv(..).await`")], "{:?}", r.sites);
+}
+
+// Version 5: declared helpers, per-crate names, futures handed to calls, raw locks.
+
+#[test]
+fn a_call_to_a_declared_helper_is_a_wait_and_its_future_argument_is_its_own() {
+    let src = "\
+fn f(tx: T) {
+    run_async(async { 1 });
+    RhaiStore::run_async(tx.send(2));
+    self.run_async(x);
+}
+";
+    let registry = format!("{ROWS}\n```wait-lint\nwait-fns = run_async\n```\n");
+    let r = run_files(&[("src/a.rs", src)], &registry);
+    assert_eq!(untagged_lines(&r), vec![2, 3, 4], "{:?}", r.sites);
+    assert!(r.sites.iter().all(|s| s.what.contains("declared helper")), "the send is the helper's, not a second wait: {:?}", r.sites);
+}
+
+#[test]
+fn a_wait_shaped_future_handed_to_a_call_is_a_wait_where_it_is_made() {
+    let src = "\
+async fn traced<F>(f: F) { f.await; } // WAIT: k
+async fn g(tx: T, child: C) {
+    traced(tx.send(2)).await;
+    traced(child.kill()).await;
+    log(tx.len());
+}
+";
+    let registry = format!("{ROWS}\n```wait-lint\nwait-methods = kill\n```\n");
+    let r = run_files(&[("src/a.rs", src)], &registry);
+    assert_eq!(untagged_lines(&r), vec![3, 4], "{:?}", r.sites);
+}
+
+#[test]
+fn names_are_per_crate_and_a_trait_impl_excuses_nothing() {
+    let server = "\
+impl StoreService for Server {
+    async fn execute(&self) {}
+}
+impl Server {
+    async fn settle_pending(&self) {}
+}
+";
+    let client = "\
+async fn f(client: C, s: Server) {
+    client.execute(req).await;
+    s.settle_pending().await;
+}
+";
+    let own = "\
+async fn g(s: Server) {
+    s.settle_pending().await;
+}
+";
+    let files = [("store_server/src/services.rs", server), ("ht_server/src/client.rs", client), ("store_server/src/own.rs", own)];
+    let r = run_files(&files, ROWS);
+    let at: Vec<(String, usize)> = r.sites.iter().map(|s| (s.file.clone(), s.line)).collect();
+    assert_eq!(
+        at,
+        vec![("ht_server/src/client.rs".to_string(), 2), ("ht_server/src/client.rs".to_string(), 3)],
+        "another crate's methods excuse nothing; the own crate's inherent one does: {:?}",
+        r.sites
+    );
+}
+
+#[test]
+fn select_biased_is_one_wait() {
+    let r = run("async fn f(rx: R) {\n    futures::select_biased! { v = rx.recv() => {} }\n}\n");
+    assert_eq!(r.sites.len(), 1, "{:?}", r.sites);
+    assert_eq!(r.sites[0].what, "`select_biased!`");
+}
+
+#[test]
+fn an_example_fence_in_the_registry_is_not_read() {
+    let registry = format!(
+        "{ROWS}\nAn example, not a row:\n\n```text\n| Key | Kind | Waits on | Argument |\n|---|---|---|---|\n| `ex` | acyclic | x | y |\n```\n"
+    );
+    let r = run_files(&[("src/a.rs", "fn f() {}\n")], &registry);
+    assert!(!registry_findings(&r).iter().any(|(_, m)| m.contains("`ex`")), "{:?}", r.findings);
+}
+
+#[test]
+fn a_raw_lock_is_a_finding_when_forbidden() {
+    let src = "\
+use std::sync::{Arc, Mutex};
+use tokio::sync::RwLock as R;
+static S: std::sync::RwLock<u8> = std::sync::RwLock::new(0);
+fn f() -> tokio::sync::Mutex<u8> { todo() }
+#[cfg(test)]
+mod tests { use std::sync::Mutex; }
+";
+    let forbid = format!("{ROWS}\n```wait-lint\nraw-locks = forbid\n```\n");
+    let r = run_files(&[("src/a.rs", src)], &forbid);
+    let raw: Vec<usize> = source_findings(&r).into_iter().filter(|(_, m)| m.contains("raw lock")).map(|(l, _)| l).collect();
+    assert_eq!(raw, vec![1, 2, 3, 4], "{:?}", r.findings);
+    let r = run_files(&[("src/a.rs", src)], ROWS);
+    assert!(!source_findings(&r).iter().any(|(_, m)| m.contains("raw lock")), "allowed unless forbidden");
 }

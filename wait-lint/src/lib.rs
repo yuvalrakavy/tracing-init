@@ -10,9 +10,9 @@
 //! ```
 //!
 //! ```text
-//! | Key | Kind | Waits on | Held across | Argument |
-//! |---|---|---|---|---|
-//! | `manager-lock` | acyclic | the store manager's lock | — | only slot changes write it, and they wait on nothing |
+//! | Key | Kind | Waits on | Argument |
+//! |---|---|---|---|
+//! | `manager-lock` | acyclic | the store manager's lock | only slot changes write it, and they wait on nothing |
 //! ```
 //!
 //! A row is `acyclic` (nothing it waits on can wait back on any of its waiters) or `bounded`
@@ -27,11 +27,12 @@
 //!   function holding one of its waits. A new waiter is a diff to that block, in the reviewed
 //!   change, so a tag cannot be copied onto a new call path without the row being in front of
 //!   its reviewer. `--write` regenerates it.
-//! * **Lock order.** A guard (`let g = m.lock()…`) held across another wait is an edge from
-//!   the guard's row to the wait's. Each row declares, in its `Held across` column, the waits
-//!   its guards may be held across; an undeclared edge is a finding, a declared one no code
-//!   takes is a finding, and **a cycle among the declared edges is a finding** — two locks taken
-//!   in both orders, or one taken again while held.
+//! * **Declared helpers.** A helper that waits for its callers (`wait-fns`: `run_async`) makes
+//!   every call to it a wait to tag, so a new caller is a reviewed diff too.
+//! * **Raw locks** (`raw-locks = forbid`): naming `std::sync`/`tokio::sync`/`parking_lot`
+//!   `Mutex` or `RwLock` is a finding — every lock is built through the `lock-order` crate's
+//!   wrappers, whose runtime check owns lock order. Syntax cannot see a guard's lifetime, so lock
+//!   order is not this lint's.
 //!
 //! # What a wait is
 //!
@@ -79,11 +80,14 @@
 //! covering several waits lists one key per wait, in order: `// WAIT: store-lock, p-reply`. One
 //! key over many waits would let the next wait added there pass unread.
 //!
+//! **Names are per crate**, from production items, without trait-impl methods: one crate's
+//! `async fn execute` does not excuse another's `client.execute(..).await`. A crate is the path
+//! up to its `src/` (`store_server/src/…` → `store_server`).
+//!
 //! # What it cannot see
 //!
-//! What a caller holds across a call into another function: a guard held while calling a helper
-//! that waits is not an edge here. A consumer refusing a call that would wait on itself (the
-//! runtime guards), the bounded lock waits, and review cover that.
+//! The order of locks (the `lock-order` crate's runtime check owns it), and a wait reached
+//! through a call nobody declared as waiting.
 
 mod registry;
 mod scan;
@@ -154,16 +158,6 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
         if row.kind.is_none() {
             finding(registry_file, Some(row.line), format!("row `{}`: its kind must be `acyclic` or `bounded`", row.key));
         }
-        for held in &row.held_across {
-            if reg.row(held).is_none() {
-                finding(registry_file, Some(row.line), format!("row `{}` declares `{held}` held across, and no row has that key", row.key));
-            }
-        }
-    }
-    for key in reg.guard_fns.values() {
-        if reg.row(key).is_none() {
-            finding(registry_file, None, format!("`guard-fns` names `{key}`, and no row has that key"));
-        }
     }
 
     let test_files = declared_test_files(files);
@@ -177,19 +171,27 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
             Err(e) => finding(rel, Some(e.span().start().line), format!("`syn` cannot parse this file ({e}), so its waits cannot be read")),
         }
     }
-    let mut names = scan::Names::default();
+    let mut names: BTreeMap<String, scan::Names> = BTreeMap::new();
     for (rel, _, file) in &parsed {
-        names.collect(file);
+        let crate_names = names.entry(crate_of(rel)).or_default();
+        crate_names.collect(file);
         if let Some(module) = file_module(rel) {
-            names.local_paths.insert(module);
+            crate_names.local_paths.insert(module);
         }
     }
 
-    // (guard key, wait key, file, line of the wait, line of the guard): every place an order is taken.
-    let mut edges: Vec<(String, String, String, usize, usize)> = Vec::new();
     let mut sites = Vec::new();
     for (rel, text, file) in &parsed {
-        let scanned = scan::scan(file, &reg, &names);
+        let scanned = scan::scan(file, &reg, &names[&crate_of(rel)]);
+        if reg.raw_locks_forbidden {
+            for (line, path) in &scanned.raw_locks {
+                finding(
+                    rel,
+                    Some(*line),
+                    format!("`{path}` is a raw lock: build it through the lock-order crate's wrapper, naming its registry key as its class"),
+                );
+            }
+        }
         let tags = Tags::read(text, &scanned.test_ranges, &scanned.literals);
         let mut tag_problems = Vec::new();
         let keys = tags.assign(&scanned.found, &mut tag_problems);
@@ -214,15 +216,6 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
                         found.what
                     ),
                 );
-            }
-        }
-        for (of, guard_line, wait) in &scanned.edges {
-            let guard_key = match of {
-                scan::GuardOf::Site(i) => keys[*i].clone().flatten(),
-                scan::GuardOf::Key(k) => Some(k.clone()),
-            };
-            if let (Some(g), Some(Some(Some(w)))) = (guard_key, keys.get(*wait)) {
-                edges.push((g, w.clone(), (*rel).clone(), scanned.found[*wait].line, *guard_line));
             }
         }
     }
@@ -273,67 +266,9 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
     }
     out.waiters_block = registry::render_waiters(&waiters);
 
-    // Lock order.
-    let mut taken: BTreeSet<(String, String)> = BTreeSet::new();
-    for (g, w, file, wait_line, guard_line) in &edges {
-        let Some(row) = reg.row(g) else { continue };
-        if reg.row(w).is_none() {
-            continue;
-        }
-        taken.insert((g.clone(), w.clone()));
-        if !row.held_across.contains(w) {
-            finding(
-                file,
-                Some(*wait_line),
-                format!(
-                    "a `{g}` guard (line {guard_line}) is held across this `{w}` wait: declare `{w}` in row `{g}`'s Held across, with why that order cannot close a cycle, or release the guard first"
-                ),
-            );
-        }
-    }
-    for row in &reg.rows {
-        for held in &row.held_across {
-            if reg.row(held).is_some() && !taken.contains(&(row.key.clone(), held.clone())) {
-                finding(registry_file, Some(row.line), format!("row `{}` declares `{held}` held across, and no `{}` guard is held across one", row.key, row.key));
-            }
-        }
-    }
-    for cycle in cycles(&reg) {
-        let first = reg.row(&cycle[0]).map(|r| r.line);
-        finding(registry_file, first, format!("the declared lock order has a cycle: {}", cycle.join(" → ")));
-    }
-
     out.sites = sites;
     out.findings.sort_by(|a, b| (&a.file, a.line, &a.message).cmp(&(&b.file, b.line, &b.message)));
     out
-}
-
-/// Each elementary cycle of the declared `Held across` edges, once, starting at its least key.
-fn cycles(reg: &Registry) -> Vec<Vec<String>> {
-    let graph: BTreeMap<&str, Vec<&str>> = reg
-        .rows
-        .iter()
-        .map(|r| (r.key.as_str(), r.held_across.iter().map(String::as_str).filter(|k| reg.row(k).is_some()).collect()))
-        .collect();
-    let mut found = Vec::new();
-    for &start in graph.keys() {
-        // Paths from `start` through keys greater than it, back to `start`.
-        let mut stack = vec![(start, vec![start])];
-        while let Some((at, path)) = stack.pop() {
-            for &next in graph.get(at).map(Vec::as_slice).unwrap_or(&[]) {
-                if next == start {
-                    let mut cycle: Vec<String> = path.iter().map(|s| s.to_string()).collect();
-                    cycle.push(start.to_string());
-                    found.push(cycle);
-                } else if next > start && !path.contains(&next) {
-                    let mut p = path.clone();
-                    p.push(next);
-                    stack.push((next, p));
-                }
-            }
-        }
-    }
-    found
 }
 
 /// Read every `.rs` under `root/<dir>` for each of `src_dirs`, and the registry at
@@ -442,6 +377,15 @@ fn external_mod_name(line: &str) -> Option<&str> {
     let (vis, name) = (&rest[..idx], rest[idx + 4..].trim());
     let vis_ok = vis.trim().is_empty() || vis.trim().starts_with("pub");
     (vis_ok && !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
+}
+
+/// The crate a file belongs to: the path before its `src/` (`store_server/src/a.rs` →
+/// `store_server`; `src/a.rs` → ``).
+fn crate_of(rel: &str) -> String {
+    match rel.find("src/") {
+        Some(0) | None => String::new(),
+        Some(at) => rel[..at].trim_end_matches('/').to_string(),
+    }
 }
 
 /// The module a file is: `a/b.rs` → `b`, `a/b/mod.rs` → `b`; a crate root is none.
