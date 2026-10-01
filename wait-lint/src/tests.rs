@@ -4,7 +4,7 @@ const ROWS: &str = "\
 | Key | Kind | Waits on | Held across | Argument |
 |---|---|---|---|---|
 | `k` | acyclic | a lock | — | nothing waits back |
-| `b` | bounded | a reply | — | 5 s, then the caller fails loudly |
+| `b` | bounded | a reply | — | 5 s; on expiry the caller fails loudly |
 ";
 
 fn run_files(files: &[(&str, &str)], registry: &str) -> Report {
@@ -506,4 +506,200 @@ async fn write_with_bound(m: M) -> G {
     let r = run_files(&[("src/a.rs", src)], &format!("{}\n```wait-lint\nguard-fns = write_with_bound: k\n```\n", order_registry("—", "—")));
     let held: Vec<_> = source_findings(&r).into_iter().filter(|(_, m)| m.contains("held across")).map(|(l, _)| l).collect();
     assert_eq!(held, vec![3, 7], "{:?}", r.findings);
+}
+
+// The re-gate's probes (Codex, on 2de2c4a): each was silent, and is not.
+
+#[test]
+fn a_test_helper_named_like_a_dependency_does_not_excuse_it() {
+    let src = "\
+#[cfg(test)]
+async fn pending() {}
+
+async fn f() {
+    std::future::pending::<()>().await;
+    pending().await;
+}
+";
+    let r = run(src);
+    assert_eq!(untagged_lines(&r), vec![5, 6], "{:?}", r.sites);
+}
+
+#[test]
+fn a_local_path_is_delegated_and_a_dependency_path_is_not() {
+    let src = "\
+mod helpers {
+    pub async fn settle() {}
+}
+async fn f() {
+    helpers::settle().await;
+    crate::helpers::settle().await;
+    tokio::settle().await;
+}
+";
+    let r = run(src);
+    assert_eq!(untagged_lines(&r), vec![7], "{:?}", r.sites);
+}
+
+#[test]
+fn a_block_s_value_is_what_is_awaited() {
+    let src = "\
+async fn f() {
+    { std::future::pending::<()>() }.await;
+    id!({ std::future::pending::<()>() }.await);
+}
+";
+    let r = run(src);
+    assert_eq!(untagged_lines(&r), vec![2], "the AST block: {:?}", r.sites);
+}
+
+#[test]
+fn only_a_cfg_that_implies_test_is_test_code() {
+    let src = "\
+#[cfg(any(test, unix))]
+async fn f() { std::future::pending::<()>().await; }
+#[cfg(all(test, unix))]
+async fn g() { std::future::pending::<()>().await; }
+#[cfg(any(test, all(test, unix)))]
+async fn h() { std::future::pending::<()>().await; }
+";
+    let r = run(src);
+    assert_eq!(untagged_lines(&r), vec![2], "{:?}", r.sites);
+}
+
+#[test]
+fn a_timeout_bounds_its_future_and_not_its_eager_arguments_or_a_spawned_task() {
+    let src = "\
+async fn f(m: M) {
+    let a = timeout(std::future::pending().await, async {}).await; // WAIT: b
+    let b = timeout(D, async { tokio::spawn(async { m.lock().await; }); }).await; // WAIT: b
+}
+";
+    let r = run(src);
+    let lines: Vec<usize> = r.sites.iter().map(|s| s.line).collect();
+    assert_eq!(lines, vec![2, 2, 3, 3], "the eager pending and the spawned lock are waits: {:?}", r.sites);
+}
+
+#[test]
+fn a_shadowed_guard_is_still_held_and_dropping_its_replacement_frees_nothing() {
+    let src = "\
+fn f(m: M) {
+    let g = m.lock().unwrap(); // WAIT: k
+    let g = ();
+    drop(g);
+    let h = m.lock().unwrap(); // WAIT: k
+}
+";
+    let r = run_files(&[("src/a.rs", src)], &order_registry("—", "—"));
+    assert!(source_findings(&r).iter().any(|(l, m)| *l == 5 && m.contains("`k` guard (line 2)")), "{:?}", r.findings);
+}
+
+#[test]
+fn a_guard_from_a_block_a_called_closure_or_a_macro_is_held() {
+    let src = "\
+fn f(m: M) {
+    let g = { m.lock().unwrap() }; // WAIT: k
+    let h = m.lock().unwrap(); // WAIT: k
+}
+fn g(m: M) {
+    (|| {
+        let g = m.lock().unwrap(); // WAIT: k
+        let h = m.lock().unwrap(); // WAIT: k
+    })();
+}
+fn h(m: M) {
+    let g = id!(m.lock().unwrap()); // WAIT: k
+    let h = m.lock().unwrap(); // WAIT: k
+}
+";
+    let r = run_files(&[("src/a.rs", src)], &order_registry("—", "—"));
+    let held: Vec<usize> =
+        source_findings(&r).into_iter().filter(|(_, m)| m.contains("held across")).map(|(l, _)| l).collect();
+    assert_eq!(held, vec![3, 8, 13], "{:?}", r.findings);
+}
+
+#[test]
+fn a_moved_guard_is_tracked_and_dropping_it_ends_it() {
+    let src = "\
+fn f(m: M) {
+    let g = m.lock().unwrap(); // WAIT: k
+    let h = g;
+    drop(h);
+    let i = m.lock().unwrap(); // WAIT: k
+}
+";
+    let r = run_files(&[("src/a.rs", src)], &order_registry("—", "—"));
+    assert!(source_findings(&r).is_empty(), "{:?}", r.findings);
+}
+
+#[test]
+fn a_tag_inside_a_string_is_text_and_one_in_a_doc_comment_is_refused() {
+    let src = "\
+async fn f(rx: R) {
+    let s = r#\"// WAIT: k;\"#; rx.recv().await;
+    let t = \"// WAIT: k\"; rx.recv().await;
+}
+/// WAIT: k
+async fn g(rx: R) {
+    rx.recv().await;
+}
+";
+    let r = run(src);
+    assert_eq!(untagged_lines(&r), vec![2, 3, 7], "{:?}", r.findings);
+    assert!(source_findings(&r).iter().any(|(l, m)| *l == 5 && m.contains("doc comment")), "{:?}", r.findings);
+}
+
+#[test]
+fn a_waiter_names_its_inline_module_and_its_trait() {
+    let src = "\
+mod a {
+    async fn f(m: M) { m.lock().await; } // WAIT: k
+}
+mod b {
+    async fn f(m: M) { m.lock().await; } // WAIT: k
+}
+impl Run for S {
+    async fn f(m: M) { m.lock().await; } // WAIT: k
+}
+";
+    let r = run_files(&[("src/a.rs", src)], K_ONLY);
+    assert_eq!(
+        r.waiters_block,
+        "```wait-lint-waiters\nk src/a.rs <S as Run>::f\nk src/a.rs a::f\nk src/a.rs b::f\n```\n"
+    );
+}
+
+#[test]
+fn a_row_must_say_what_it_waits_on_and_why_and_a_bounded_row_what_expiry_does() {
+    let registry = "\
+| Key | Kind | Waits on | Held across | Argument |
+|---|---|---|---|---|
+| `a` | acyclic |  | — | why |
+| `b` | acyclic | x | — |  |
+| `c` | bounded | x | — | 5 s, and then something |
+| `d` | bounded | x | — | 5 s; on expiry the caller fails loudly |
+";
+    let r = run_files(&[("src/a.rs", "fn f() {}\n")], registry);
+    let msgs = registry_findings(&r);
+    assert!(msgs.iter().any(|(l, m)| *l == Some(3) && m.contains("what it waits on")), "{msgs:?}");
+    assert!(msgs.iter().any(|(l, m)| *l == Some(4) && m.contains("no argument")), "{msgs:?}");
+    assert!(msgs.iter().any(|(l, m)| *l == Some(5) && m.contains("on expiry")), "{msgs:?}");
+    assert!(!msgs.iter().any(|(l, m)| *l == Some(6) && !m.contains("named by no wait")), "{msgs:?}");
+}
+
+#[test]
+fn futures_in_future_position_are_not_invented_waits() {
+    let src = "\
+async fn idle() {}
+async fn f(rx: R) {
+    tokio::select! { // WAIT: k
+        v = (rx.recv()) => {}
+    }
+    id!(rx.recv().boxed().await);
+    drop(idle());
+}
+";
+    let r = run(src);
+    let whats: Vec<(usize, &str)> = r.sites.iter().map(|s| (s.line, s.what.as_str())).collect();
+    assert_eq!(whats, vec![(3, "`select!`"), (6, "`.recv(..).await`")], "{:?}", r.sites);
 }

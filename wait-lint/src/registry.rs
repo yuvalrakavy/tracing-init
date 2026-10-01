@@ -29,6 +29,13 @@ pub struct Row {
     pub line: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Columns {
+    held: Option<usize>,
+    waits_on: Option<usize>,
+    argument: Option<usize>,
+}
+
 /// `(key, file, function)`: a function that holds a wait of that row.
 pub type Waiter = (String, String, String);
 
@@ -67,8 +74,8 @@ pub fn key_list(cell: &str) -> Vec<String> {
 impl Registry {
     pub fn parse(text: &str) -> Registry {
         let mut reg = Registry::default();
-        // Column indices of the table being read: (key, kind, held across).
-        let mut table: Option<(usize, usize, Option<usize>)> = None;
+        // Column indices of the table being read.
+        let mut table: Option<Columns> = None;
         let mut block: Option<&str> = None;
         let mut seen = BTreeSet::new();
         for (i, raw) in text.lines().enumerate() {
@@ -132,13 +139,18 @@ impl Registry {
                 continue;
             }
             let cells: Vec<&str> = t.trim_matches('|').split('|').map(str::trim).collect();
-            let Some((key_at, kind_at, held_at)) = table else {
+            let Some(cols) = table else {
                 let lower: Vec<String> = cells.iter().map(|c| c.to_ascii_lowercase()).collect();
                 if lower.first().map(String::as_str) == Some("key") && lower.get(1).map(String::as_str) == Some("kind") {
-                    table = Some((0, 1, lower.iter().position(|c| c == "held across")));
+                    let at = |name: &str| lower.iter().position(|c| c == name);
+                    table = Some(Columns { held: at("held across"), waits_on: at("waits on"), argument: at("argument") });
+                    if at("waits on").is_none() || at("argument").is_none() {
+                        reg.problems.push((line_no, "the table needs `Waits on` and `Argument` columns".into()));
+                    }
                 }
                 continue;
             };
+            let (key_at, kind_at) = (0, 1);
             if cells.iter().all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':')) {
                 continue;
             }
@@ -156,7 +168,17 @@ impl Registry {
                 reg.problems.push((line_no, format!("`{key}` is a second row with the same key")));
                 continue;
             }
-            let held_across = held_at.and_then(|at| cells.get(at)).map(|c| key_list(c)).unwrap_or_default();
+            let held_across = cols.held.and_then(|at| cells.get(at)).map(|c| key_list(c)).unwrap_or_default();
+            let cell = |at: Option<usize>| at.and_then(|a| cells.get(a)).map(|c| c.trim()).unwrap_or("");
+            if cell(cols.waits_on).is_empty() {
+                reg.problems.push((line_no, format!("row `{key}` does not say what it waits on")));
+            }
+            let argument = cell(cols.argument);
+            if argument.is_empty() {
+                reg.problems.push((line_no, format!("row `{key}` has no argument")));
+            } else if kind == Some(Kind::Bounded) && !argument.to_ascii_lowercase().contains("on expiry") {
+                reg.problems.push((line_no, format!("row `{key}` is `bounded`: its argument must say what happens `on expiry`")));
+            }
             reg.rows.push(Row { key, kind, held_across: held_across.into_iter().collect(), line: line_no });
         }
         if block.is_some() {

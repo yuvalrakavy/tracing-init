@@ -178,8 +178,11 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
         }
     }
     let mut names = scan::Names::default();
-    for (_, _, file) in &parsed {
+    for (rel, _, file) in &parsed {
         names.collect(file);
+        if let Some(module) = file_module(rel) {
+            names.local_paths.insert(module);
+        }
     }
 
     // (guard key, wait key, file, line of the wait, line of the guard): every place an order is taken.
@@ -187,7 +190,7 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
     let mut sites = Vec::new();
     for (rel, text, file) in &parsed {
         let scanned = scan::scan(file, &reg, &names);
-        let tags = Tags::read(text, &scanned.test_ranges);
+        let tags = Tags::read(text, &scanned.test_ranges, &scanned.literals);
         let mut tag_problems = Vec::new();
         let keys = tags.assign(&scanned.found, &mut tag_problems);
         for (line, message) in tag_problems {
@@ -441,6 +444,16 @@ fn external_mod_name(line: &str) -> Option<&str> {
     (vis_ok && !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
 }
 
+/// The module a file is: `a/b.rs` → `b`, `a/b/mod.rs` → `b`; a crate root is none.
+fn file_module(rel: &str) -> Option<String> {
+    let (dir, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    match name {
+        "lib.rs" | "main.rs" => None,
+        "mod.rs" => dir.rsplit('/').next().filter(|d| !d.is_empty()).map(str::to_string),
+        other => Some(other.trim_end_matches(".rs").to_string()),
+    }
+}
+
 fn module_dir(rel: &str) -> String {
     let (dir, name) = rel.rsplit_once('/').unwrap_or(("", rel));
     let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
@@ -455,19 +468,33 @@ struct Tags<'a> {
     lines: Vec<&'a str>,
     by_line: BTreeMap<usize, Vec<String>>,
     malformed: Vec<usize>,
+    in_doc: Vec<usize>,
 }
 
 impl<'a> Tags<'a> {
-    fn read(text: &'a str, test_ranges: &[(usize, usize)]) -> Tags<'a> {
+    fn read(text: &'a str, test_ranges: &[(usize, usize)], literals: &[scan::Span2]) -> Tags<'a> {
         let lines: Vec<&str> = text.lines().collect();
         let mut by_line = BTreeMap::new();
         let mut malformed = Vec::new();
+        let mut in_doc = Vec::new();
+        let in_literal = |line: usize, col: usize| {
+            literals.iter().any(|&(start, end)| (line, col) >= start && (line, col) < end)
+        };
         for (i, line) in lines.iter().enumerate() {
             let n = i + 1;
             if test_ranges.iter().any(|(a, b)| (*a..=*b).contains(&n)) {
                 continue;
             }
-            match tag_on(line) {
+            let t = line.trim_start();
+            if (t.starts_with("///") || t.starts_with("//!")) && t.contains("WAIT:") {
+                in_doc.push(n);
+                continue;
+            }
+            // The first `//` that is not inside a string literal starts the line's comment.
+            let Some((at, _)) = line.match_indices("//").find(|(at, _)| !in_literal(n, line[..*at].chars().count())) else {
+                continue;
+            };
+            match tag_on(&line[at..]) {
                 Some(Ok(keys)) => {
                     by_line.insert(n, keys);
                 }
@@ -475,7 +502,7 @@ impl<'a> Tags<'a> {
                 None => {}
             }
         }
-        Tags { lines, by_line, malformed }
+        Tags { lines, by_line, malformed, in_doc }
     }
 
     /// The nearest tag line for a wait on `line` in the statement starting at `stmt_first`.
@@ -549,14 +576,17 @@ impl<'a> Tags<'a> {
         for line in &self.malformed {
             problems.push((*line, "a malformed `// WAIT:` tag: keys are lowercase letters, digits and `-`, separated by commas".into()));
         }
+        for line in &self.in_doc {
+            problems.push((*line, "a `WAIT:` tag in a doc comment is not read: use a plain `//` comment".into()));
+        }
         keys
     }
 }
 
-/// `// WAIT: k1, k2` anywhere on a line → the keys; `Err` when the tag is there but malformed.
-fn tag_on(line: &str) -> Option<Result<Vec<String>, ()>> {
-    let idx = line.find("//")?;
-    let rest = line[idx + 2..].trim_start_matches('/').trim_start();
+/// A comment's text, starting at its `//` → the keys of a `WAIT:` tag; `Err` when the tag is
+/// there but malformed.
+fn tag_on(comment: &str) -> Option<Result<Vec<String>, ()>> {
+    let rest = comment.strip_prefix("//")?.trim_start_matches('/').trim_start();
     let rest = rest.strip_prefix("WAIT:")?;
     // The keys run to the end of the line, or to prose after them (`// WAIT: k — why`).
     let list = rest.split(|c: char| c == '—' || c == '(' || c == ';').next().unwrap_or("");

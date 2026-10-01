@@ -91,10 +91,11 @@ const ESCAPING_METHODS: &[&str] = &[
     "write_owned",
 ];
 
-/// Functions whose `.await` waits on a task they start, and whose future argument is that task.
+/// Functions (and methods) whose `.await` waits on a task they start, and whose future argument
+/// runs as that task — beyond the reach of any timeout around the call.
 const SPAWNING_FNS: &[&str] = &["spawn", "spawn_blocking", "spawn_local"];
 
-/// Functions that bound the async waits inside their arguments.
+/// Functions whose last argument is a future they bound.
 const BOUNDING_FNS: &[&str] = &["timeout", "timeout_at"];
 
 /// Macros that are each one wait on the futures they are given.
@@ -104,24 +105,69 @@ pub const WAITING_MACROS: &[&str] = &["select", "join", "try_join"];
 const TRANSPARENT_METHODS: &[&str] = &["instrument", "in_current_span", "boxed", "fuse"];
 const TRANSPARENT_FNS: &[&str] = &["pin"];
 
-/// Names too common to read a local `async fn` into: a sync `map.get(k)` is not a future.
+/// Names too common to read a method call into one of this code's `async fn`s: `x.get(k)` is
+/// not a future of a local `async fn get`.
 const COMMON_NAMES: &[&str] = &[
     "new", "get", "set", "insert", "remove", "push", "pop", "clear", "len", "is_empty", "send", "recv", "read",
     "write", "lock", "run", "start", "stop", "close", "flush", "next", "call", "execute", "handle", "update",
     "load", "save", "init", "connect", "open", "wait", "apply", "build", "from", "into", "clone", "drop",
 ];
 
-/// Every `async fn` (and every non-async fn) this code defines, by name.
+/// What this code defines, from its production (non-test) items only: a test helper named like
+/// a dependency's function must not excuse that function.
 #[derive(Debug, Default)]
 pub struct Names {
     pub local_async: BTreeSet<String>,
     pub local_sync: BTreeSet<String>,
+    /// Module and type names: a path starting with one is a path into this code.
+    pub local_paths: BTreeSet<String>,
 }
 
 impl Names {
     pub fn collect(&mut self, file: &syn::File) {
         struct C<'a>(&'a mut Names);
         impl<'ast> Visit<'ast> for C<'_> {
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                if !is_test_item(&f.attrs) {
+                    syn::visit::visit_item_fn(self, f);
+                }
+            }
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                if !is_test_item(&f.attrs) {
+                    syn::visit::visit_impl_item_fn(self, f);
+                }
+            }
+            fn visit_trait_item_fn(&mut self, f: &'ast syn::TraitItemFn) {
+                if !is_test_item(&f.attrs) {
+                    syn::visit::visit_trait_item_fn(self, f);
+                }
+            }
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                if !is_test_item(&m.attrs) {
+                    self.0.local_paths.insert(m.ident.to_string());
+                    syn::visit::visit_item_mod(self, m);
+                }
+            }
+            fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+                if !is_test_item(&i.attrs) {
+                    if let Some(t) = type_name(&i.self_ty) {
+                        self.0.local_paths.insert(t);
+                    }
+                    syn::visit::visit_item_impl(self, i);
+                }
+            }
+            fn visit_item_struct(&mut self, s: &'ast syn::ItemStruct) {
+                self.0.local_paths.insert(s.ident.to_string());
+            }
+            fn visit_item_enum(&mut self, e: &'ast syn::ItemEnum) {
+                self.0.local_paths.insert(e.ident.to_string());
+            }
+            fn visit_item_trait(&mut self, t: &'ast syn::ItemTrait) {
+                if !is_test_item(&t.attrs) {
+                    self.0.local_paths.insert(t.ident.to_string());
+                    syn::visit::visit_item_trait(self, t);
+                }
+            }
             fn visit_signature(&mut self, sig: &'ast syn::Signature) {
                 let name = sig.ident.to_string();
                 if sig.asyncness.is_some() {
@@ -135,9 +181,33 @@ impl Names {
         C(self).visit_file(file);
     }
 
-    /// A call to `name` that is not awaited where it is made builds a future that escapes.
-    fn makes_escaping_future(&self, name: &str) -> bool {
-        self.local_async.contains(name) && !self.local_sync.contains(name) && !COMMON_NAMES.contains(&name)
+    /// A call through `path` reaches one of this code's `async fn`s: a bare name, or a path that
+    /// starts in this code (`crate::`, `self::`, `Self::`, a local module or type).
+    fn is_local_fn(&self, path: &[String]) -> bool {
+        let Some(last) = path.last() else { return false };
+        if !self.local_async.contains(last) {
+            return false;
+        }
+        match path.first().map(String::as_str) {
+            _ if path.len() == 1 => true,
+            Some("crate" | "self" | "super" | "Self") => true,
+            Some(first) => self.local_paths.contains(first),
+            None => false,
+        }
+    }
+
+    /// A method call reaches one of this code's `async fn`s. Name-based, so common names never
+    /// count: the method could be anyone's.
+    fn is_local_method(&self, name: &str) -> bool {
+        self.local_async.contains(name) && !COMMON_NAMES.contains(&name)
+    }
+
+    fn escapes_fn(&self, path: &[String]) -> bool {
+        self.is_local_fn(path) && path.last().is_some_and(|n| !self.local_sync.contains(n) && !COMMON_NAMES.contains(&n.as_str()))
+    }
+
+    fn escapes_method(&self, name: &str) -> bool {
+        self.is_local_method(name) && !self.local_sync.contains(name)
     }
 }
 
@@ -153,7 +223,7 @@ pub struct Found {
     pub bounded: bool,
     /// A lock acquisition, whose result may be held as a guard.
     pub guard: bool,
-    /// The enclosing function, `Type::method` or `function`.
+    /// The enclosing function, with its inline modules and owner: `m::Type::method`.
     pub func: String,
     deferred: usize,
 }
@@ -167,6 +237,9 @@ pub enum GuardOf {
     Key(String),
 }
 
+/// `((line, column), (line, column))`, start and end, of a string literal.
+pub type Span2 = ((usize, usize), (usize, usize));
+
 /// One file's waits, and the guards held across them: `(guard, guard's line, wait index)`.
 #[derive(Debug, Default)]
 pub struct FileScan {
@@ -174,6 +247,8 @@ pub struct FileScan {
     pub edges: Vec<(GuardOf, usize, usize)>,
     /// Line ranges of test items, whose tags are not production tags.
     pub test_ranges: Vec<(usize, usize)>,
+    /// String literals: a `// WAIT:` inside one is text, not a tag.
+    pub literals: Vec<Span2>,
 }
 
 pub fn scan(file: &syn::File, reg: &Registry, names: &Names) -> FileScan {
@@ -182,6 +257,7 @@ pub fn scan(file: &syn::File, reg: &Registry, names: &Names) -> FileScan {
         names,
         test_depth: 0,
         bounded_depth: 0,
+        bounding_future: 0,
         deferred_depth: 0,
         block_depth: 0,
         token_depth: 0,
@@ -189,6 +265,7 @@ pub fn scan(file: &syn::File, reg: &Registry, names: &Names) -> FileScan {
         consumed: BTreeSet::new(),
         funcs: Vec::new(),
         owners: Vec::new(),
+        mods: Vec::new(),
         guards: Vec::new(),
         out: FileScan::default(),
     };
@@ -199,6 +276,7 @@ pub fn scan(file: &syn::File, reg: &Registry, names: &Names) -> FileScan {
 struct Guard {
     of: GuardOf,
     line: usize,
+    /// `None` once shadowed: it is still held, and can no longer be dropped by name.
     name: Option<String>,
     block_depth: usize,
     deferred: usize,
@@ -208,18 +286,24 @@ struct Visitor<'r> {
     reg: &'r Registry,
     names: &'r Names,
     test_depth: usize,
+    /// Inside a future a timeout bounds: its async waits are the timeout's.
     bounded_depth: usize,
+    /// Visiting a timeout's future argument: an `async` block here runs under the timeout.
+    bounding_future: usize,
     /// Inside a closure or an `async` block: run later, so not under the guards held here.
     deferred_depth: usize,
     block_depth: usize,
     /// Inside a macro's tokens.
     token_depth: usize,
     stmts: Vec<(usize, usize)>,
-    /// `(line, column)` of calls whose future is awaited, bounded or spawned where it is made.
+    /// `(line, column)` of calls whose future is awaited, bounded, spawned or dropped where it
+    /// is made.
     consumed: BTreeSet<(usize, usize)>,
     funcs: Vec<String>,
-    /// The `impl` or `trait` being visited, for `Type::method`.
+    /// The `impl` or `trait` being visited, for `Type::method` / `<Type as Trait>::method`.
     owners: Vec<String>,
+    /// Inline modules being visited.
+    mods: Vec<String>,
     guards: Vec<Guard>,
     out: FileScan,
 }
@@ -238,8 +322,10 @@ enum Scan {
     Code,
     /// A `select!` body: branch futures between `=` and `=>`, handlers after.
     Select,
-    /// Arguments that are futures (a `join!`'s, a `timeout`'s).
+    /// Arguments that are futures (a `join!`'s).
     Futures,
+    /// A timeout's arguments: futures, and its `async` blocks run under it.
+    TimeoutArgs,
 }
 
 impl Scan {
@@ -252,34 +338,62 @@ impl Scan {
     }
 }
 
-fn attr_is_cfg_test(attr: &syn::Attribute) -> bool {
-    fn idents(ts: TokenStream, out: &mut Vec<String>) {
-        for tt in ts {
-            match tt {
-                TokenTree::Ident(i) => out.push(i.to_string()),
-                TokenTree::Group(g) => idents(g.stream(), out),
-                _ => {}
-            }
+/// Split a cfg list on its top-level commas.
+fn cfg_items(ts: TokenStream) -> Vec<Vec<TokenTree>> {
+    let mut items = vec![Vec::new()];
+    for tt in ts {
+        match &tt {
+            TokenTree::Punct(p) if p.as_char() == ',' => items.push(Vec::new()),
+            _ => items.last_mut().expect("never empty").push(tt),
         }
     }
-    if !attr.path().is_ident("cfg") {
-        return false;
+    items.retain(|i| !i.is_empty());
+    items
+}
+
+/// Does this cfg predicate hold only in test builds? `test`, `all(.., test, ..)`, and an
+/// `any(..)` all of whose arms do. `any(test, unix)` does not: it is production code on unix.
+fn implies_test(pred: &[TokenTree]) -> bool {
+    match pred {
+        [TokenTree::Ident(i)] => i == "test",
+        [TokenTree::Ident(i), TokenTree::Group(g)] if i == "all" => cfg_items(g.stream()).iter().any(|p| implies_test(p)),
+        [TokenTree::Ident(i), TokenTree::Group(g)] if i == "any" => {
+            let arms = cfg_items(g.stream());
+            !arms.is_empty() && arms.iter().all(|p| implies_test(p))
+        }
+        _ => false,
     }
-    let syn::Meta::List(list) = &attr.meta else { return false };
-    let mut words = Vec::new();
-    idents(list.tokens.clone(), &mut words);
-    words.iter().any(|w| w == "test") && !words.iter().any(|w| w == "not")
 }
 
 fn is_test_item(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| attr_is_cfg_test(a) || a.path().segments.last().is_some_and(|s| s.ident == "test"))
+    attrs.iter().any(|a| {
+        if a.path().is_ident("cfg") {
+            if let syn::Meta::List(list) = &a.meta {
+                let items = cfg_items(list.tokens.clone());
+                return items.len() == 1 && implies_test(&items[0]);
+            }
+            return false;
+        }
+        a.path().segments.last().is_some_and(|s| s.ident == "test")
+    })
+}
+
+fn type_name(t: &syn::Type) -> Option<String> {
+    match t {
+        syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn path_of(func: &syn::Expr) -> Option<Vec<String>> {
+    match func {
+        syn::Expr::Path(p) => Some(p.path.segments.iter().map(|s| s.ident.to_string()).collect()),
+        _ => None,
+    }
 }
 
 fn last_ident(func: &syn::Expr) -> Option<String> {
-    match func {
-        syn::Expr::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
-        _ => None,
-    }
+    path_of(func).and_then(|p| p.last().cloned())
 }
 
 fn peel(e: &syn::Expr) -> &syn::Expr {
@@ -291,13 +405,26 @@ fn peel(e: &syn::Expr) -> &syn::Expr {
     }
 }
 
-/// Through `Box::pin(..)`, `.instrument(..)` and the like, to the future really awaited.
+/// A block's value: its last statement, when that is an expression without a semicolon.
+fn block_value(b: &syn::Block) -> Option<&syn::Expr> {
+    match b.stmts.last() {
+        Some(syn::Stmt::Expr(e, None)) => Some(e),
+        _ => None,
+    }
+}
+
+/// Through `Box::pin(..)`, `.instrument(..)`, `{ .. }` and the like, to the future really
+/// awaited.
 fn see_through(e: &syn::Expr) -> &syn::Expr {
     match peel(e) {
         syn::Expr::MethodCall(mc) if TRANSPARENT_METHODS.contains(&mc.method.to_string().as_str()) => see_through(&mc.receiver),
         syn::Expr::Call(c) if c.args.len() == 1 && last_ident(&c.func).is_some_and(|n| TRANSPARENT_FNS.contains(&n.as_str())) => {
             see_through(&c.args[0])
         }
+        syn::Expr::Block(b) => match block_value(&b.block) {
+            Some(v) => see_through(v),
+            None => peel(e),
+        },
         other => other,
     }
 }
@@ -321,6 +448,7 @@ fn call_key(e: &syn::Expr) -> Option<(usize, usize)> {
 fn init_is_guard(e: &syn::Expr) -> bool {
     match peel(e) {
         syn::Expr::Await(a) => init_is_guard(&a.base),
+        syn::Expr::Block(b) => block_value(&b.block).is_some_and(init_is_guard),
         syn::Expr::MethodCall(mc) => {
             let name = mc.method.to_string();
             if GUARD_METHODS.contains(&name.as_str()) {
@@ -329,11 +457,15 @@ fn init_is_guard(e: &syn::Expr) -> bool {
             matches!(name.as_str(), "unwrap" | "expect" | "unwrap_or_else" | "map_err" | "ok" | "change_context")
                 && init_is_guard(&mc.receiver)
         }
-        syn::Expr::Call(c) => {
+        syn::Expr::Call(c) => match peel(&c.func) {
+            // `(|| m.lock().unwrap())()`
+            syn::Expr::Closure(cl) => init_is_guard(&cl.body),
             // `timeout(d, m.lock()).await` acquires a guard too.
-            last_ident(&c.func).is_some_and(|n| BOUNDING_FNS.contains(&n.as_str()))
-                && c.args.iter().any(|a| matches!(peel(a), syn::Expr::MethodCall(mc) if GUARD_METHODS.contains(&mc.method.to_string().as_str())))
-        }
+            func => {
+                last_ident(func).is_some_and(|n| BOUNDING_FNS.contains(&n.as_str()))
+                    && c.args.iter().any(|a| matches!(peel(a), syn::Expr::MethodCall(mc) if GUARD_METHODS.contains(&mc.method.to_string().as_str())))
+            }
+        },
         _ => false,
     }
 }
@@ -347,21 +479,35 @@ fn pat_name(p: &syn::Pat) -> Option<String> {
     }
 }
 
+fn plain_ident(e: &syn::Expr) -> Option<String> {
+    match peel(e) {
+        syn::Expr::Path(p) => p.path.get_ident().map(|i| i.to_string()),
+        _ => None,
+    }
+}
+
 /// `drop(g);` → `g`.
 fn dropped(stmt: &syn::Stmt) -> Option<String> {
     let syn::Stmt::Expr(syn::Expr::Call(c), _) = stmt else { return None };
     if last_ident(&c.func).as_deref() != Some("drop") || c.args.len() != 1 {
         return None;
     }
-    match &c.args[0] {
-        syn::Expr::Path(p) => p.path.get_ident().map(|i| i.to_string()),
-        _ => None,
-    }
+    plain_ident(&c.args[0])
+}
+
+fn is_string_literal(text: &str) -> bool {
+    text.starts_with('"') || text.starts_with("r\"") || text.starts_with("r#") || text.starts_with("b\"") || text.starts_with("br") || text.starts_with("c\"")
 }
 
 impl Visitor<'_> {
     fn func(&self) -> String {
-        self.funcs.last().cloned().unwrap_or_else(|| "<module>".to_string())
+        self.funcs.last().cloned().unwrap_or_else(|| {
+            if self.mods.is_empty() {
+                "<module>".to_string()
+            } else {
+                format!("{}::<module>", self.mods.join("::"))
+            }
+        })
     }
 
     fn record(&mut self, line: usize, column: usize, what: String, kind: Wait, bounded: bool, guard: bool) {
@@ -388,6 +534,11 @@ impl Visitor<'_> {
         }
     }
 
+    fn literal(&mut self, span: proc_macro2::Span) {
+        let (a, b) = (span.start(), span.end());
+        self.out.literals.push(((a.line, a.column), (b.line, b.column)));
+    }
+
     fn waits_when_awaited(&self, name: &str) -> bool {
         AWAIT_METHODS.contains(&name) || self.reg.wait_methods.contains(name)
     }
@@ -398,18 +549,25 @@ impl Visitor<'_> {
             || self.reg.blocking_methods.contains(name)
     }
 
-    /// Record an `.await` on a call to `name` (a method call when `method`).
-    fn await_on_call(&mut self, name: &str, method: bool, line: usize, column: usize, guard: bool) {
+    /// Record an `.await` on a call: a method `name` when `path` is `None`, else a function.
+    fn await_on_call(&mut self, name: &str, path: Option<&[String]>, line: usize, column: usize, guard: bool) {
+        let method = path.is_none();
         let (what, bounded) = if method && self.waits_when_awaited(name) {
             (format!("`.{name}(..).await`"), false)
         } else if !method && BOUNDING_FNS.contains(&name) {
             (format!("`{name}(..).await`"), true)
-        } else if !method && (SPAWNING_FNS.contains(&name) || self.reg.wait_methods.contains(name)) {
-            (format!("`{name}(..).await`"), false)
-        } else if self.names.local_async.contains(name) || self.reg.not_waits.contains(name) {
+        } else if SPAWNING_FNS.contains(&name) || (!method && self.reg.wait_methods.contains(name)) {
+            let shown = if method { format!(".{name}(..)") } else { format!("{name}(..)") };
+            (format!("`{shown}.await`"), false)
+        } else if self.reg.not_waits.contains(name) {
+            return;
+        } else if match path {
+            None => self.names.is_local_method(name),
+            Some(p) => self.names.is_local_fn(p),
+        } {
             return;
         } else {
-            let shown = if method { format!(".{name}(..)") } else { format!("{name}(..)") };
+            let shown = if method { format!(".{name}(..)") } else { format!("{}(..)", path.map(|p| p.join("::")).unwrap_or_default()) };
             (format!("`{shown}.await`, an async call this code does not define"), false)
         };
         self.record(line, column, what, Wait::Async, bounded, guard || (method && GUARD_METHODS.contains(&name)));
@@ -423,14 +581,19 @@ impl Visitor<'_> {
         }
         let pushed = func.is_some();
         if let Some(name) = func {
-            self.funcs.push(name);
+            let prefix: Vec<&str> = self.mods.iter().map(String::as_str).chain(self.owners.last().map(String::as_str)).collect();
+            self.funcs.push(if prefix.is_empty() { name } else { format!("{}::{name}", prefix.join("::")) });
         }
-        // A function's guards are its own.
+        // A function's guards and contexts are its own.
         let guards = std::mem::take(&mut self.guards);
         let deferred = std::mem::replace(&mut self.deferred_depth, 0);
+        let bounded = std::mem::replace(&mut self.bounded_depth, 0);
+        let bounding = std::mem::replace(&mut self.bounding_future, 0);
         f(self);
         self.guards = guards;
         self.deferred_depth = deferred;
+        self.bounded_depth = bounded;
+        self.bounding_future = bounding;
         if pushed {
             self.funcs.pop();
         }
@@ -439,34 +602,59 @@ impl Visitor<'_> {
         }
     }
 
-    fn method_name(&self, name: &syn::Ident) -> String {
-        match self.owners.last() {
-            Some(owner) => format!("{owner}::{name}"),
-            None => name.to_string(),
-        }
+    /// Run `f` as a spawned task: no timeout around the spawn bounds what it runs.
+    fn unbounded(&mut self, f: impl FnOnce(&mut Self)) {
+        let bounded = std::mem::replace(&mut self.bounded_depth, 0);
+        let bounding = std::mem::replace(&mut self.bounding_future, 0);
+        f(self);
+        self.bounded_depth = bounded;
+        self.bounding_future = bounding;
     }
 
     /// Walk a macro's tokens, which `syn` leaves opaque, for the waits inside them. The futures
     /// a `select!` branch names (between its `=` and its `=>`), a `join!`'s arguments and a
-    /// `timeout`'s arguments are that wait's own, so a call there that builds a future is not a
+    /// timeout's arguments are that wait's own, so a call there that builds a future is not a
     /// second, blocking one.
     fn scan_tokens(&mut self, ts: TokenStream, mode: Scan) {
         let tts: Vec<TokenTree> = ts.into_iter().collect();
-        let mut in_future = mode == Scan::Futures;
+        let mut in_future = matches!(mode, Scan::Futures | Scan::TimeoutArgs);
         let select = mode == Scan::Select;
         let mut i = 0;
         while i < tts.len() {
             match &tts[i] {
-                TokenTree::Group(g) => {
-                    let bounded = g.delimiter() == Delimiter::Parenthesis
-                        && i > 0
-                        && matches!(&tts[i - 1], TokenTree::Ident(id) if BOUNDING_FNS.contains(&id.to_string().as_str()));
-                    if bounded {
-                        self.bounded_depth += 1;
+                TokenTree::Literal(l) => {
+                    if is_string_literal(&l.to_string()) {
+                        self.literal(l.span());
                     }
-                    self.scan_tokens(g.stream(), if bounded { Scan::Futures } else { Scan::Code });
-                    if bounded {
-                        self.bounded_depth -= 1;
+                }
+                TokenTree::Group(g) => {
+                    let prev_ident = |k: usize| match k.checked_sub(1).and_then(|j| tts.get(j)) {
+                        Some(TokenTree::Ident(id)) => Some(id.to_string()),
+                        _ => None,
+                    };
+                    let is_async_block = g.delimiter() == Delimiter::Brace
+                        && (prev_ident(i).as_deref() == Some("async")
+                            || (prev_ident(i).as_deref() == Some("move") && prev_ident(i - 1).as_deref() == Some("async")));
+                    match g.delimiter() {
+                        Delimiter::Parenthesis => {
+                            let callee = prev_ident(i);
+                            if callee.as_deref().is_some_and(|c| BOUNDING_FNS.contains(&c)) {
+                                self.scan_tokens(g.stream(), Scan::TimeoutArgs);
+                            } else if callee.as_deref().is_some_and(|c| SPAWNING_FNS.contains(&c)) {
+                                let stream = g.stream();
+                                self.unbounded(|v| v.scan_tokens(stream, Scan::Code));
+                            } else if mode == Scan::TimeoutArgs {
+                                self.scan_tokens(g.stream(), Scan::TimeoutArgs);
+                            } else {
+                                self.scan_tokens(g.stream(), if in_future { Scan::Futures } else { Scan::Code });
+                            }
+                        }
+                        Delimiter::Brace if is_async_block && mode == Scan::TimeoutArgs => {
+                            self.bounded_depth += 1;
+                            self.scan_tokens(g.stream(), Scan::Code);
+                            self.bounded_depth -= 1;
+                        }
+                        _ => self.scan_tokens(g.stream(), Scan::Code),
                     }
                 }
                 TokenTree::Ident(id) => {
@@ -488,9 +676,8 @@ impl Visitor<'_> {
                         self.token_await(&tts, i - 1, at.line, at.column);
                     } else if let Some(TokenTree::Group(args)) = next {
                         if args.delimiter() == Delimiter::Parenthesis {
-                            let awaited = matches!(tts.get(i + 2), Some(TokenTree::Punct(p)) if p.as_char() == '.')
-                                && matches!(tts.get(i + 3), Some(TokenTree::Ident(a)) if a == "await");
-                            if after_dot && !awaited && !in_future {
+                            let awaited = awaited_after(&tts, i + 2);
+                            if after_dot && !awaited && !in_future && !TRANSPARENT_METHODS.contains(&name.as_str()) {
                                 if BOUNDED_BLOCKING.contains(&name.as_str()) {
                                     self.record(at.line, at.column, format!("blocking `.{name}(..)`"), Wait::Blocking, true, false);
                                 } else if self.blocks(&name, args.stream().is_empty()) {
@@ -524,15 +711,32 @@ impl Visitor<'_> {
 
     /// An `.await` inside macro tokens; `dot` is the index of the `.` before it.
     fn token_await(&mut self, tts: &[TokenTree], dot: usize, line: usize, column: usize) {
-        if dot == 0 {
+        // Step back over `.instrument(..)`-like wrappers to the future really awaited.
+        let mut end = dot;
+        while end >= 3 {
+            match (&tts[end - 1], &tts[end - 2], &tts[end - 3]) {
+                (TokenTree::Group(g), TokenTree::Ident(name), TokenTree::Punct(p))
+                    if g.delimiter() == Delimiter::Parenthesis && p.as_char() == '.' && TRANSPARENT_METHODS.contains(&name.to_string().as_str()) =>
+                {
+                    end -= 3;
+                }
+                _ => break,
+            }
+        }
+        if end == 0 {
             return;
         }
-        match &tts[dot - 1] {
-            TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis && dot >= 2 => match &tts[dot - 2] {
+        match &tts[end - 1] {
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis && end >= 2 => match &tts[end - 2] {
                 TokenTree::Ident(name) => {
                     let name = name.to_string();
-                    let method = dot >= 3 && matches!(&tts[dot - 3], TokenTree::Punct(p) if p.as_char() == '.');
-                    self.await_on_call(&name, method, line, column, false);
+                    let method = end >= 3 && matches!(&tts[end - 3], TokenTree::Punct(p) if p.as_char() == '.');
+                    if method {
+                        self.await_on_call(&name, None, line, column, false);
+                    } else {
+                        let path = token_path(tts, end - 2);
+                        self.await_on_call(&name, Some(&path), line, column, false);
+                    }
                 }
                 _ => self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false, false),
             },
@@ -543,6 +747,42 @@ impl Visitor<'_> {
             _ => self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false, false),
         }
     }
+}
+
+/// Is the call whose argument group ends just before `at` awaited — directly, or through
+/// `.instrument(..)`-like wrappers?
+fn awaited_after(tts: &[TokenTree], mut at: usize) -> bool {
+    loop {
+        let dot = matches!(tts.get(at), Some(TokenTree::Punct(p)) if p.as_char() == '.');
+        match (dot, tts.get(at + 1), tts.get(at + 2)) {
+            (true, Some(TokenTree::Ident(a)), _) if a == "await" => return true,
+            (true, Some(TokenTree::Ident(m)), Some(TokenTree::Group(g)))
+                if g.delimiter() == Delimiter::Parenthesis && TRANSPARENT_METHODS.contains(&m.to_string().as_str()) =>
+            {
+                at += 3;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The path segments of a function call in tokens, ending at the ident at `last`.
+fn token_path(tts: &[TokenTree], last: usize) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut k = last;
+    loop {
+        let TokenTree::Ident(id) = &tts[k] else { break };
+        path.push(id.to_string());
+        let colons = k >= 3
+            && matches!(&tts[k - 1], TokenTree::Punct(p) if p.as_char() == ':')
+            && matches!(&tts[k - 2], TokenTree::Punct(p) if p.as_char() == ':');
+        if !colons {
+            break;
+        }
+        k -= 3;
+    }
+    path.reverse();
+    path
 }
 
 fn is_keyword(s: &str) -> bool {
@@ -559,25 +799,30 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
     }
 
     fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
-        let name = self.method_name(&f.sig.ident);
+        let name = f.sig.ident.to_string();
         self.item(&f.attrs, f.span(), Some(name), |v| syn::visit::visit_impl_item_fn(v, f));
     }
 
     fn visit_trait_item_fn(&mut self, f: &'ast syn::TraitItemFn) {
-        let name = self.method_name(&f.sig.ident);
+        let name = f.sig.ident.to_string();
         self.item(&f.attrs, f.span(), Some(name), |v| syn::visit::visit_trait_item_fn(v, f));
     }
 
     fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        self.mods.push(m.ident.to_string());
         self.item(&m.attrs, m.span(), None, |v| syn::visit::visit_item_mod(v, m));
+        self.mods.pop();
     }
 
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        let owner = match &*i.self_ty {
-            syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
-            _ => None,
-        }
-        .unwrap_or_else(|| "<impl>".to_string());
+        let ty = type_name(&i.self_ty).unwrap_or_else(|| "<impl>".to_string());
+        let owner = match &i.trait_ {
+            Some((_, path, _)) => {
+                let tr = path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+                format!("<{ty} as {tr}>")
+            }
+            None => ty,
+        };
         self.owners.push(owner);
         self.item(&i.attrs, i.span(), None, |v| syn::visit::visit_item_impl(v, i));
         self.owners.pop();
@@ -597,29 +842,48 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         self.item(&s.attrs, s.span(), None, |v| syn::visit::visit_item_static(v, s));
     }
 
+    fn visit_lit_str(&mut self, l: &'ast syn::LitStr) {
+        self.literal(l.span());
+    }
+
+    fn visit_lit_byte_str(&mut self, l: &'ast syn::LitByteStr) {
+        self.literal(l.span());
+    }
+
+    fn visit_lit_cstr(&mut self, l: &'ast syn::LitCStr) {
+        self.literal(l.span());
+    }
+
     fn visit_block(&mut self, b: &'ast syn::Block) {
         self.block_depth += 1;
         for stmt in &b.stmts {
             let before = self.out.found.len();
             self.visit_stmt(stmt);
             if let syn::Stmt::Local(local) = stmt {
-                if let Some(init) = &local.init {
-                    let guard = if init_is_guard(&init.expr) {
-                        (before..self.out.found.len())
-                            .find(|&i| self.out.found[i].guard && self.out.found[i].deferred == self.deferred_depth)
-                            .map(|i| (GuardOf::Site(i), self.out.found[i].line))
+                let new_name = pat_name(&local.pat);
+                // `let h = g;` moves a guard rather than taking one.
+                let moved = local.init.as_ref().and_then(|init| plain_ident(&init.expr)).and_then(|src| {
+                    self.guards.iter().rposition(|g| g.name.as_deref() == Some(src.as_str()))
+                });
+                // A new binding of a guard's name shadows it: still held, no longer droppable.
+                if let Some(n) = &new_name {
+                    for g in self.guards.iter_mut().filter(|g| g.name.as_deref() == Some(n.as_str())) {
+                        g.name = None;
+                    }
+                }
+                if let Some(at) = moved {
+                    self.guards[at].name = new_name.clone();
+                } else if let Some(init) = &local.init {
+                    let deferred = self.deferred_depth;
+                    let new_guard_site = (before..self.out.found.len()).find(|&i| self.out.found[i].guard && self.out.found[i].deferred == deferred);
+                    let guard = if init_is_guard(&init.expr) || matches!(peel(&init.expr), syn::Expr::Macro(_)) {
+                        new_guard_site.map(|i| (GuardOf::Site(i), self.out.found[i].line))
                     } else {
-                        // A call the registry declares returns a guard (`guard-fns`).
-                        guard_fn_call(&init.expr, self.reg).map(|key| (GuardOf::Key(key), init.expr.span().start().line))
-                    };
+                        None
+                    }
+                    .or_else(|| guard_fn_call(&init.expr, self.reg).map(|key| (GuardOf::Key(key), init.expr.span().start().line)));
                     if let Some((of, line)) = guard {
-                        self.guards.push(Guard {
-                            of,
-                            line,
-                            name: pat_name(&local.pat),
-                            block_depth: self.block_depth,
-                            deferred: self.deferred_depth,
-                        });
+                        self.guards.push(Guard { of, line, name: new_name, block_depth: self.block_depth, deferred });
                     }
                 }
             }
@@ -661,9 +925,19 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
     }
 
     fn visit_expr_async(&mut self, a: &'ast syn::ExprAsync) {
+        // A timeout's future argument: this block runs under the timeout.
+        let bounded = self.bounding_future > 0;
+        let bounding = std::mem::replace(&mut self.bounding_future, 0);
+        if bounded {
+            self.bounded_depth += 1;
+        }
         self.deferred_depth += 1;
         syn::visit::visit_expr_async(self, a);
         self.deferred_depth -= 1;
+        if bounded {
+            self.bounded_depth -= 1;
+        }
+        self.bounding_future = bounding;
     }
 
     fn visit_expr_await(&mut self, e: &'ast syn::ExprAwait) {
@@ -676,13 +950,14 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         match base {
             syn::Expr::MethodCall(mc) => {
                 let at = mc.method.span().start();
-                self.await_on_call(&mc.method.to_string(), true, at.line, at.column, false);
+                self.await_on_call(&mc.method.to_string(), None, at.line, at.column, false);
             }
-            syn::Expr::Call(c) => match last_ident(&c.func) {
-                Some(name) => {
+            syn::Expr::Call(c) => match path_of(&c.func) {
+                Some(path) => {
                     let at = c.func.span().start();
+                    let name = path.last().cloned().unwrap_or_default();
                     let guard = init_is_guard(base);
-                    self.await_on_call(&name, false, at.line, at.column, guard);
+                    self.await_on_call(&name, Some(&path), at.line, at.column, guard);
                 }
                 None => self.record(line, column, "an `.await` on the result of a computed call".into(), Wait::Async, false, false),
             },
@@ -690,7 +965,7 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
                 let name = p.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
                 self.record(line, column, format!("`.await` on a stored future (`{name}`)"), Wait::Async, false, false);
             }
-            syn::Expr::Async(_) | syn::Expr::Block(_) => {}
+            syn::Expr::Async(_) => {}
             syn::Expr::Field(_) | syn::Expr::Index(_) | syn::Expr::Reference(_) | syn::Expr::Unary(_) => {
                 self.record(line, column, "`.await` on a stored future".into(), Wait::Async, false, false);
             }
@@ -698,9 +973,6 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         }
         // An awaited `async {}` block runs here, under the guards held here.
         if let syn::Expr::Async(a) = base {
-            for attr in &e.attrs {
-                self.visit_attribute(attr);
-            }
             syn::visit::visit_block(self, &a.block);
             return;
         }
@@ -716,36 +988,70 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
             } else if self.blocks(&name, mc.args.is_empty()) {
                 let guard = GUARD_METHODS.contains(&name.as_str());
                 self.record(at.line, at.column, format!("blocking `.{name}(..)`"), Wait::Blocking, false, guard);
-            } else if ESCAPING_METHODS.contains(&name.as_str()) || self.names.makes_escaping_future(&name) {
+            } else if ESCAPING_METHODS.contains(&name.as_str()) || self.names.escapes_method(&name) {
                 self.record(at.line, at.column, format!("a `.{name}(..)` future, made here and awaited elsewhere"), Wait::Async, false, false);
             }
+        }
+        if SPAWNING_FNS.contains(&name.as_str()) {
+            // `join_set.spawn(fut)`: the future is the task's.
+            for arg in &mc.args {
+                if let Some(key) = call_key(see_through(arg)) {
+                    self.consumed.insert(key);
+                }
+            }
+            self.visit_expr(&mc.receiver);
+            self.unbounded(|v| {
+                for arg in &mc.args {
+                    v.visit_expr(arg);
+                }
+            });
+            return;
         }
         syn::visit::visit_expr_method_call(self, mc);
     }
 
     fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
-        let name = last_ident(&c.func).unwrap_or_default();
+        // `(|| { .. })()` runs here and now, under the guards held here.
+        if let syn::Expr::Closure(cl) = peel(&c.func) {
+            self.visit_expr(&cl.body);
+            for arg in &c.args {
+                self.visit_expr(arg);
+            }
+            return;
+        }
+        let path = path_of(&c.func).unwrap_or_default();
+        let name = path.last().cloned().unwrap_or_default();
         let at = c.func.span().start();
         if name == "block_on" {
             self.record(at.line, at.column, "`block_on(..)`".into(), Wait::Blocking, false, false);
-        } else if !self.consumed.contains(&(at.line, at.column)) && self.names.makes_escaping_future(&name) {
+        } else if !self.consumed.contains(&(at.line, at.column)) && self.names.escapes_fn(&path) {
             self.record(at.line, at.column, format!("a future of `{name}(..)`, made here and awaited elsewhere"), Wait::Async, false, false);
         }
         let bounding = BOUNDING_FNS.contains(&name.as_str());
-        // The future argument of a timeout, a spawn or a `block_on` is that call's own.
-        if bounding || SPAWNING_FNS.contains(&name.as_str()) || name == "block_on" {
+        let spawning = SPAWNING_FNS.contains(&name.as_str());
+        // The future argument of a timeout, a spawn or a `block_on` is that call's own; one
+        // passed to `drop` is never polled.
+        if bounding || spawning || name == "block_on" || name == "drop" {
             for arg in &c.args {
                 if let Some(key) = call_key(see_through(arg)) {
                     self.consumed.insert(key);
                 }
             }
         }
-        if bounding {
-            self.bounded_depth += 1;
-        }
-        syn::visit::visit_expr_call(self, c);
-        if bounding {
-            self.bounded_depth -= 1;
+        self.visit_expr(&c.func);
+        let last = c.args.len().saturating_sub(1);
+        for (i, arg) in c.args.iter().enumerate() {
+            if spawning {
+                self.unbounded(|v| v.visit_expr(arg));
+            } else if bounding && i == last {
+                // Only the future is polled under the timeout; the other arguments are
+                // evaluated before it exists.
+                self.bounding_future += 1;
+                self.visit_expr(arg);
+                self.bounding_future -= 1;
+            } else {
+                self.visit_expr(arg);
+            }
         }
     }
 
