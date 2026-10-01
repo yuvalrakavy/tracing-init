@@ -553,11 +553,12 @@ fn f(tx: T) {
     run_async(async { 1 });
     RhaiStore::run_async(tx.send(2));
     self.run_async(x);
+    wrap! { run_async(x); }
 }
 ";
     let registry = format!("{ROWS}\n```wait-lint\nwait-fns = run_async\n```\n");
     let r = run_files(&[("src/a.rs", src)], &registry);
-    assert_eq!(untagged_lines(&r), vec![2, 3, 4], "{:?}", r.sites);
+    assert_eq!(untagged_lines(&r), vec![2, 3, 4, 5], "a helper inside a macro too: {:?}", r.sites);
     assert!(r.sites.iter().all(|s| s.what.contains("declared helper")), "the send is the helper's, not a second wait: {:?}", r.sites);
 }
 
@@ -633,6 +634,8 @@ static S: std::sync::RwLock<u8> = std::sync::RwLock::new(0);
 fn f() -> tokio::sync::Mutex<u8> { todo() }
 #[cfg(test)]
 mod tests { use std::sync::Mutex; }
+use lock_order::sync::{Mutex as Wrapped, RwLock};
+static W: lock_order::sync::Mutex<u8> = lock_order::sync::Mutex::new(\"w\", 0);
 ";
     let forbid = format!("{ROWS}\n```wait-lint\nraw-locks = forbid\n```\n");
     let r = run_files(&[("src/a.rs", src)], &forbid);

@@ -624,6 +624,9 @@ impl Visitor<'_> {
                                 }
                             } else if !after_dot && name == "block_on" {
                                 self.record(at.line, at.column, "`block_on(..)`".to_string(), Wait::Blocking, false);
+                            } else if self.reg.wait_fns.contains(&name) {
+                                let shown = if after_dot { format!(".{name}(..)") } else { format!("{name}(..)") };
+                                self.record(at.line, at.column, format!("`{shown}`, a declared helper that waits"), Wait::Blocking, false);
                             }
                         }
                     }
@@ -989,7 +992,8 @@ const RAW_LOCKS: &[(&str, &str)] = &[
 /// `std::sync::Mutex`, `tokio::sync::RwLock`, … — or any path ending `sync::Mutex`.
 fn raw_lock(segs: &[String]) -> Option<String> {
     let n = segs.len();
-    if n < 2 {
+    // The wrappers themselves (`lock_order::sync::Mutex`) are what raw locks are replaced by.
+    if n < 2 || segs[0] == "lock_order" {
         return None;
     }
     let (module, item) = (segs[..n - 1].join("::"), segs[n - 1].as_str());

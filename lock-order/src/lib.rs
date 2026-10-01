@@ -30,16 +30,20 @@
 //! context that took it, wherever it is dropped; an owned guard handed to another task or thread
 //! is `adopt`ed there.
 //!
-//! # The watchdog
+//! # The watchdog thread
 //!
-//! An order no run took can still deadlock in production. Every tokio lock acquisition waits
-//! under a watchdog (in every build): an ERROR (`kind = "lock_wait_wedged"`) at a third of its
-//! class's bound ([`set_bound`], default [`watchdog::DEFAULT_BOUND`]), and past the bound the
-//! [`set_wedge_handler`] handler, or an abort.
+//! An order no run took can still deadlock in production. A wait that does not succeed at once
+//! registers itself, and a plain thread — independent of the runtime, so blocked workers cannot
+//! silence it — reports each one past its class's threshold ([`set_report_after`], default
+//! [`watchdog::DEFAULT_REPORT_AFTER`]): a WARN (`kind = "lock_wait_long"`) naming the class, the
+//! waiter and where the lock is held. It never aborts: a generic bound would end healthy work
+//! that holds a lock for minutes. It also logs the cycles, so nothing is logged from inside an
+//! acquisition.
 //!
 //! # What it does not check
 //!
-//! * Orders no run takes — the watchdog is the answer to those in production.
+//! * Orders no run takes. In production the watchdog reports the wait such an order causes; it
+//!   does not end it.
 //! * Two instances of one class held together (two stores' locks): no order between instances is
 //!   checked. The same instance waited on again while held *is* reported.
 //! * `try_lock` and its kin never wait, so they record no edge; a guard they return is held like
@@ -48,7 +52,8 @@
 //! # Cost
 //!
 //! The order check is debug-only: in a release build every hook compiles away and the wrappers
-//! are the inner locks plus a class name. The watchdog costs a timer per contended async wait.
+//! are the inner locks plus a class name. The watchdog costs nothing for an uncontended
+//! acquisition, and one map entry for a contended one.
 
 #[cfg(debug_assertions)]
 mod checker;
@@ -56,7 +61,7 @@ pub mod sync;
 pub mod tokio_sync;
 pub mod watchdog;
 
-pub use watchdog::{set_bound, set_wedge_handler, Wedge};
+pub use watchdog::{long_waits, set_report_after, LongWait};
 
 use std::future::Future;
 use std::panic::Location;
@@ -135,7 +140,7 @@ pub fn take_cycles() -> Vec<String> {
 /// branch polled after it.
 pub fn branch<F: Future>(fut: F) -> Branch<F> {
     #[cfg(debug_assertions)]
-    let id = checker::next_id();
+    let id = checker::new_branch();
     #[cfg(not(debug_assertions))]
     let id = 0;
     Branch { id, fut: Box::pin(fut) }
@@ -145,6 +150,13 @@ pub struct Branch<F> {
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     id: u64,
     fut: Pin<Box<F>>,
+}
+
+impl<F> Drop for Branch<F> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        checker::end_branch(self.id);
+    }
 }
 
 impl<F: Future> Future for Branch<F> {
@@ -161,9 +173,13 @@ impl<F: Future> Future for Branch<F> {
     }
 }
 
-/// The address a class's pseudo-lock is identified by: one instance per class.
+/// A pseudo-lock's identity: its class's name — so two spellings of one name are one consumer.
+/// Odd, so it never equals a real lock's (aligned) address.
 fn pseudo(class: &'static str) -> usize {
-    class.as_ptr() as usize
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    class.hash(&mut h);
+    (h.finish() as usize) | 1
 }
 
 /// `fut`, run as the consumer `class`: while it runs, the consumer is held, so the locks it takes
@@ -185,14 +201,32 @@ pub fn waits_on(class: &'static str) {
     hooks::attempt(class, pseudo(class), Location::caller());
 }
 
-/// `f`, run while holding a pseudo-lock of `class`: for a blocking primitive the wrappers do not
-/// cover (a database's write transaction, a `OnceLock` initializer), so its order with the locks
-/// around it is checked too.
+/// A pseudo-lock of `class`, held until the returned guard drops: for a blocking primitive the
+/// wrappers do not cover — keep it beside the transaction or permit it stands for, so it lives as
+/// long as the resource does.
 #[track_caller]
-pub fn scope<R>(class: &'static str, f: impl FnOnce() -> R) -> R {
+pub fn hold(class: &'static str) -> PseudoGuard {
     let site = Location::caller();
     hooks::attempt(class, pseudo(class), site);
-    let _held = Held(hooks::acquired(class, pseudo(class), site));
+    PseudoGuard { _held: Held(hooks::acquired(class, pseudo(class), site)) }
+}
+
+/// Held while it lives; see [`hold`].
+pub struct PseudoGuard {
+    _held: Held,
+}
+
+impl std::fmt::Debug for PseudoGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PseudoGuard")
+    }
+}
+
+/// `f`, run while holding a pseudo-lock of `class` (see [`hold`]): for a blocking call whose
+/// result does not outlive it — a `OnceLock` initializer.
+#[track_caller]
+pub fn scope<R>(class: &'static str, f: impl FnOnce() -> R) -> R {
+    let _held = hold(class);
     f()
 }
 

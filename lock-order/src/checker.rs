@@ -2,9 +2,9 @@
 //!
 //! **Internal discipline.** The checker's own state sits behind plain `std` locks, never the
 //! wrappers. Two of them, never held together: a held-set shard, then (after releasing it) the
-//! graph. Nothing calls out while holding either — a report is built, every internal lock is
-//! released, and only then is it logged and recorded, so a tracing layer that takes a wrapped lock
-//! re-enters a checker that holds nothing.
+//! graph. Nothing calls out while holding either. A report is recorded and queued, and the
+//! watchdog thread logs it: nothing is logged from inside an acquisition, so a tracing layer that
+//! takes a wrapped lock is never entered with the caller's locks held.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -29,6 +29,24 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn parents() -> &'static Mutex<HashMap<u64, u64>> {
+    static PARENTS: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+    PARENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A new branch, whose parent is the branch running now: it inherits what its parent holds, not
+/// what its siblings do.
+pub fn new_branch() -> u64 {
+    let id = next_id();
+    let parent = BRANCH.with(|b| b.get());
+    parents().lock().unwrap_or_else(|p| p.into_inner()).insert(id, parent);
+    id
+}
+
+pub fn end_branch(id: u64) {
+    parents().lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
 }
 
 /// Run `f` with the current branch set to `id`, restoring the previous one after.
@@ -89,9 +107,24 @@ fn shard(ctx: &Context) -> &'static Mutex<HashMap<Context, Vec<Held>>> {
     &shards()[(h.finish() as usize) % SHARDS]
 }
 
+/// What `ctx` holds, and what the branches it descends from hold.
 fn held_by(ctx: &Context) -> Vec<Held> {
-    let map = shard(ctx).lock().unwrap_or_else(|p| p.into_inner());
-    map.get(ctx).cloned().unwrap_or_default()
+    let mut chain = vec![*ctx];
+    {
+        let parents = parents().lock().unwrap_or_else(|p| p.into_inner());
+        let mut at = ctx.branch;
+        while at != 0 {
+            let Some(&up) = parents.get(&at) else { break };
+            chain.push(Context { branch: up, ..*ctx });
+            at = up;
+        }
+    }
+    let mut out = Vec::new();
+    for c in chain {
+        let map = shard(&c).lock().unwrap_or_else(|p| p.into_inner());
+        out.extend(map.get(&c).cloned().unwrap_or_default());
+    }
+    out
 }
 
 /// Where `instance` is held now, across every context — for a wedge report. Takes each shard
@@ -122,6 +155,16 @@ fn graph() -> &'static RwLock<Graph> {
 fn recorded() -> &'static Mutex<Vec<String>> {
     static CYCLES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     CYCLES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn pending() -> &'static Mutex<Vec<String>> {
+    static PENDING: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The cycles not yet logged — for the watchdog thread.
+pub fn take_pending() -> Vec<String> {
+    std::mem::take(&mut *pending().lock().unwrap_or_else(|p| p.into_inner()))
 }
 
 /// Every cycle reported so far.
@@ -233,10 +276,13 @@ pub fn adopt(t: &mut Token) {
     t.ctx = ctx;
 }
 
-/// Every internal lock is released by the time this runs.
+/// Every internal lock is released by the time this runs. The cycle is recorded now, for a test
+/// harness; the watchdog thread logs it.
 fn report(reports: Vec<String>) {
-    for r in reports {
-        tracing::error!(kind = "lock_order_cycle", cycle = %r, "lock order cycle: two locks waited on in both orders, or one waited on again while held");
-        recorded().lock().unwrap_or_else(|p| p.into_inner()).push(r);
+    if reports.is_empty() {
+        return;
     }
+    recorded().lock().unwrap_or_else(|p| p.into_inner()).extend(reports.iter().cloned());
+    pending().lock().unwrap_or_else(|p| p.into_inner()).extend(reports);
+    crate::watchdog::ensure_thread();
 }

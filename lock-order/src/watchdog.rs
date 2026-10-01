@@ -1,59 +1,121 @@
-//! The production escape (no-hang spec §13.9, ruling 7): every wrapped tokio lock acquisition
-//! waits under a watchdog — an ERROR at a third of its class's bound, the installed wedge handler
-//! past it. Runs in every build: an order no test took can still deadlock in production, and a
-//! loud abort and restart is the ruled answer, never a silent hang.
+//! The watchdog thread (no-hang spec §13.9, ruling 7 as revised): it reports every lock wait
+//! that has gone on past its class's threshold, and never aborts. A plain thread, independent of
+//! the runtime, so blocked workers cannot silence it. It also logs the order checker's cycles, so
+//! nothing is logged from inside an acquisition. Runs in every build.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::panic::Location;
-use std::sync::{OnceLock, RwLock};
-use std::time::Duration;
+use std::sync::{Mutex, Once, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
-/// How long an acquisition of a class with no bound of its own may wait.
-pub const DEFAULT_BOUND: Duration = Duration::from_secs(120);
+/// How long a wait goes on before it is reported, for a class with no threshold of its own.
+pub const DEFAULT_REPORT_AFTER: Duration = Duration::from_secs(60);
 
-/// A lock wait past its class's bound.
+const TICK: Duration = Duration::from_millis(100);
+
+/// A wait reported as long.
 #[derive(Debug, Clone)]
-pub struct Wedge {
+pub struct LongWait {
     pub class: &'static str,
     /// Where the waiting acquisition was made.
     pub site: &'static Location<'static>,
     pub waited: Duration,
-    pub bound: Duration,
-    /// Where the lock is held now (debug builds; empty in release).
+    /// Where the lock is held (debug builds; empty in release).
     pub holders: Vec<String>,
 }
 
-type Handler = std::sync::Arc<dyn Fn(&Wedge) + Send + Sync>;
-
-fn bounds() -> &'static RwLock<HashMap<&'static str, Option<Duration>>> {
-    static BOUNDS: OnceLock<RwLock<HashMap<&'static str, Option<Duration>>>> = OnceLock::new();
-    BOUNDS.get_or_init(|| RwLock::new(HashMap::new()))
+struct Wait {
+    class: &'static str,
+    site: &'static Location<'static>,
+    instance: usize,
+    since: Instant,
+    reported: bool,
 }
 
-fn handler() -> &'static RwLock<Option<Handler>> {
-    static HANDLER: OnceLock<RwLock<Option<Handler>>> = OnceLock::new();
-    HANDLER.get_or_init(|| RwLock::new(None))
+fn waits() -> &'static Mutex<HashMap<u64, Wait>> {
+    static WAITS: OnceLock<Mutex<HashMap<u64, Wait>>> = OnceLock::new();
+    WAITS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Set `class`'s bound. `None`: its waits are bounded elsewhere (the store lock's own limits), and
-/// the watchdog stays out.
-pub fn set_bound(class: &'static str, bound: Option<Duration>) {
-    bounds().write().unwrap_or_else(|p| p.into_inner()).insert(class, bound);
+fn thresholds() -> &'static RwLock<HashMap<&'static str, Duration>> {
+    static T: OnceLock<RwLock<HashMap<&'static str, Duration>>> = OnceLock::new();
+    T.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Install what runs when a wait passes its bound. Store's flushes its stores and aborts (ruling 3,
-/// kernel-internal). Without one, the process aborts after the ERROR. A handler that returns lets
-/// the wait go on — for tests.
-pub fn set_wedge_handler(h: impl Fn(&Wedge) + Send + Sync + 'static) {
-    *handler().write().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(h));
+fn long() -> &'static Mutex<Vec<LongWait>> {
+    static LONG: OnceLock<Mutex<Vec<LongWait>>> = OnceLock::new();
+    LONG.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn bound_of(class: &'static str) -> Option<Duration> {
-    match bounds().read().unwrap_or_else(|p| p.into_inner()).get(class) {
-        Some(b) => *b,
-        None => Some(DEFAULT_BOUND),
+/// How long `class`'s waits may go on before they are reported. A class that legitimately holds
+/// for minutes (a template rebake, a config reload) gets a longer threshold, with the reason in
+/// its registry row.
+pub fn set_report_after(class: &'static str, after: Duration) {
+    thresholds().write().unwrap_or_else(|p| p.into_inner()).insert(class, after);
+}
+
+/// Every wait reported so far — for a test harness.
+pub fn long_waits() -> Vec<LongWait> {
+    long().lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+fn threshold(class: &'static str) -> Duration {
+    thresholds().read().unwrap_or_else(|p| p.into_inner()).get(class).copied().unwrap_or(DEFAULT_REPORT_AFTER)
+}
+
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A registered wait; ends when dropped — on success, or when the acquisition is cancelled.
+pub(crate) struct WaitGuard(Option<u64>);
+
+impl WaitGuard {
+    pub(crate) fn none() -> Self {
+        WaitGuard(None)
     }
+
+    pub(crate) fn begin(class: &'static str, site: &'static Location<'static>, instance: usize) -> Self {
+        let mut g = WaitGuard(None);
+        g.start(class, site, instance);
+        g
+    }
+
+    pub(crate) fn start(&mut self, class: &'static str, site: &'static Location<'static>, instance: usize) {
+        if self.0.is_some() {
+            return;
+        }
+        ensure_thread();
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        waits().lock().unwrap_or_else(|p| p.into_inner()).insert(id, Wait { class, site, instance, since: Instant::now(), reported: false });
+        self.0 = Some(id);
+    }
+}
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            waits().lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+        }
+    }
+}
+
+/// `fut`, an inner acquisition, registered as a wait only if it does not complete at once — so an
+/// uncontended acquisition costs nothing here.
+pub(crate) async fn watched<F: std::future::Future>(
+    class: &'static str,
+    site: &'static Location<'static>,
+    instance: usize,
+    fut: F,
+) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let mut wait = WaitGuard::none();
+    std::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
+        std::task::Poll::Ready(v) => std::task::Poll::Ready(v),
+        std::task::Poll::Pending => {
+            wait.start(class, site, instance);
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 #[allow(unused_variables)]
@@ -64,41 +126,46 @@ fn holders(instance: usize) -> Vec<String> {
     Vec::new()
 }
 
-/// Wait for `fut`, the inner lock's acquisition, under `class`'s bound.
-pub async fn bounded<F: Future>(class: &'static str, site: &'static Location<'static>, instance: usize, fut: F) -> F::Output {
-    let Some(bound) = bound_of(class) else { return fut.await };
-    let started = tokio::time::Instant::now();
-    let mut fut = std::pin::pin!(fut);
-    // Pinned once and polled by reference: an expiry drops only the timeout, never the queued
-    // acquisition, so its place in the lock's queue survives every warning.
-    if let Ok(v) = tokio::time::timeout_at(started + bound / 3, fut.as_mut()).await {
-        return v;
+pub(crate) fn ensure_thread() {
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("lock-order-watchdog".into()).spawn(|| loop {
+            std::thread::sleep(TICK);
+            tick();
+        });
+    });
+}
+
+fn tick() {
+    #[cfg(debug_assertions)]
+    for cycle in crate::checker::take_pending() {
+        tracing::error!(
+            kind = "lock_order_cycle",
+            cycle = %cycle,
+            "lock order cycle: two locks waited on in both orders, or one waited on again while held"
+        );
     }
-    let waiting = holders(instance);
-    tracing::error!(
-        kind = "lock_wait_wedged",
-        class,
-        site = %site,
-        waited_ms = (bound / 3).as_millis() as u64,
-        bound_ms = bound.as_millis() as u64,
-        holders = %waiting.join(", "),
-        "lock wait past a third of its bound — its holder, or what the holder waits on, is stuck"
-    );
-    let mut deadline = started + bound;
-    loop {
-        if let Ok(v) = tokio::time::timeout_at(deadline, fut.as_mut()).await {
-            return v;
-        }
-        let wedge = Wedge { class, site, waited: started.elapsed(), bound, holders: holders(instance) };
-        // Cloned out, so the handler runs with no lock of this module held.
-        let installed = handler().read().unwrap_or_else(|p| p.into_inner()).clone();
-        match installed {
-            Some(h) => h(&wedge),
-            None => {
-                tracing::error!(kind = "lock_wait_wedged", class, site = %site, "lock wait past its bound: aborting");
-                std::process::abort();
-            }
-        }
-        deadline += bound;
+    let now = Instant::now();
+    let due: Vec<(&'static str, &'static Location<'static>, usize, Duration)> = {
+        let mut map = waits().lock().unwrap_or_else(|p| p.into_inner());
+        map.values_mut()
+            .filter(|w| !w.reported && now.duration_since(w.since) >= threshold(w.class))
+            .map(|w| {
+                w.reported = true;
+                (w.class, w.site, w.instance, now.duration_since(w.since))
+            })
+            .collect()
+    };
+    for (class, site, instance, waited) in due {
+        let holders = holders(instance);
+        tracing::warn!(
+            kind = "lock_wait_long",
+            class,
+            site = %site,
+            waited_ms = waited.as_millis() as u64,
+            holders = %holders.join(", "),
+            "lock wait past its class's threshold — its holder, or what the holder waits on, may be stuck"
+        );
+        long().lock().unwrap_or_else(|p| p.into_inner()).push(LongWait { class, site, waited, holders });
     }
 }

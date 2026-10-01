@@ -1,5 +1,5 @@
 //! `tokio::sync::{Mutex, RwLock}`, with a class. Same methods; the guards deref to the inner ones.
-//! Every async acquisition waits under the watchdog ([`crate::watchdog`]). The inner lock is kept
+//! A contended acquisition registers its wait with the watchdog thread ([`crate::watchdog`]). The inner lock is kept
 //! in an `Arc`, so the owned acquisitions (`lock_owned`, `read_owned`, …) take `&self`.
 
 use std::fmt;
@@ -47,7 +47,7 @@ impl<T: ?Sized> Mutex<T> {
         async move {
             let instance = self.instance();
             hooks::attempt(self.class, instance, site);
-            let inner = watchdog::bounded(self.class, site, instance, self.inner.lock()).await;
+            let inner = watchdog::watched(self.class, site, instance, self.inner.lock()).await;
             MutexGuard { inner, _held: Held(hooks::acquired(self.class, instance, site)) }
         }
     }
@@ -71,7 +71,7 @@ impl<T: ?Sized + Send + 'static> Mutex<T> {
         let (class, instance, inner) = (self.class, self.instance(), self.inner.clone());
         async move {
             hooks::attempt(class, instance, site);
-            let inner = watchdog::bounded(class, site, instance, inner.lock_owned()).await;
+            let inner = watchdog::watched(class, site, instance, inner.lock_owned()).await;
             OwnedMutexGuard { inner, held: Held(hooks::acquired(class, instance, site)) }
         }
     }
@@ -171,7 +171,7 @@ impl<T: ?Sized> RwLock<T> {
         async move {
             let instance = self.instance();
             hooks::attempt(self.class, instance, site);
-            let inner = watchdog::bounded(self.class, site, instance, self.inner.read()).await;
+            let inner = watchdog::watched(self.class, site, instance, self.inner.read()).await;
             RwLockReadGuard { inner, _held: Held(hooks::acquired(self.class, instance, site)) }
         }
     }
@@ -182,7 +182,7 @@ impl<T: ?Sized> RwLock<T> {
         async move {
             let instance = self.instance();
             hooks::attempt(self.class, instance, site);
-            let inner = watchdog::bounded(self.class, site, instance, self.inner.write()).await;
+            let inner = watchdog::watched(self.class, site, instance, self.inner.write()).await;
             RwLockWriteGuard { inner, held: Held(hooks::acquired(self.class, instance, site)) }
         }
     }
@@ -213,7 +213,7 @@ impl<T: ?Sized + Send + Sync + 'static> RwLock<T> {
         let (class, instance, inner) = (self.class, self.instance(), self.inner.clone());
         async move {
             hooks::attempt(class, instance, site);
-            let inner = watchdog::bounded(class, site, instance, inner.read_owned()).await;
+            let inner = watchdog::watched(class, site, instance, inner.read_owned()).await;
             OwnedRwLockReadGuard { inner, held: Held(hooks::acquired(class, instance, site)) }
         }
     }
@@ -224,7 +224,7 @@ impl<T: ?Sized + Send + Sync + 'static> RwLock<T> {
         let (class, instance, inner) = (self.class, self.instance(), self.inner.clone());
         async move {
             hooks::attempt(class, instance, site);
-            let inner = watchdog::bounded(class, site, instance, inner.write_owned()).await;
+            let inner = watchdog::watched(class, site, instance, inner.write_owned()).await;
             OwnedRwLockWriteGuard { inner, held: Held(hooks::acquired(class, instance, site)) }
         }
     }
@@ -336,3 +336,25 @@ impl<T: ?Sized> DerefMut for OwnedRwLockWriteGuard<T> {
         &mut self.inner
     }
 }
+
+macro_rules! debug_guard {
+    ($($g:ident),*) => {$(
+        impl<T: ?Sized + fmt::Debug> fmt::Debug for $g<'_, T> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Debug::fmt(&*self.inner, f)
+            }
+        }
+    )*};
+}
+debug_guard!(MutexGuard, RwLockReadGuard, RwLockWriteGuard);
+
+macro_rules! debug_owned_guard {
+    ($($g:ident),*) => {$(
+        impl<T: ?Sized + fmt::Debug> fmt::Debug for $g<T> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Debug::fmt(&*self.inner, f)
+            }
+        }
+    )*};
+}
+debug_owned_guard!(OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard);

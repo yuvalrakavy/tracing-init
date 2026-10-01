@@ -7,7 +7,19 @@ use std::ops::{Deref, DerefMut};
 use std::panic::Location;
 use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
 
-use crate::{hooks, Held};
+use crate::{hooks, watchdog::WaitGuard, Held};
+
+/// Take the lock at once, or register the wait with the watchdog thread and block.
+fn take<G>(try_take: TryLockResult<G>, take: impl FnOnce() -> LockResult<G>, class: &'static str, site: &'static Location<'static>, instance: usize) -> LockResult<G> {
+    match try_take {
+        Ok(g) => Ok(g),
+        Err(TryLockError::Poisoned(p)) => Err(p),
+        Err(TryLockError::WouldBlock) => {
+            let _wait = WaitGuard::begin(class, site, instance);
+            take()
+        }
+    }
+}
 
 fn map_lock<G, H>(r: LockResult<G>, wrap: impl FnOnce(G) -> H) -> LockResult<H> {
     match r {
@@ -53,7 +65,7 @@ impl<T: ?Sized> Mutex<T> {
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
         let site = Location::caller();
         hooks::attempt(self.class, self.instance(), site);
-        let r = self.inner.lock();
+        let r = take(self.inner.try_lock(), || self.inner.lock(), self.class, site, self.instance());
         map_lock(r, |g| MutexGuard { inner: g, _held: Held(hooks::acquired(self.class, self.instance(), site)) })
     }
 
@@ -132,7 +144,7 @@ impl<T: ?Sized> RwLock<T> {
     pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
         let site = Location::caller();
         hooks::attempt(self.class, self.instance(), site);
-        let r = self.inner.read();
+        let r = take(self.inner.try_read(), || self.inner.read(), self.class, site, self.instance());
         map_lock(r, |g| RwLockReadGuard { inner: g, _held: Held(hooks::acquired(self.class, self.instance(), site)) })
     }
 
@@ -140,7 +152,7 @@ impl<T: ?Sized> RwLock<T> {
     pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
         let site = Location::caller();
         hooks::attempt(self.class, self.instance(), site);
-        let r = self.inner.write();
+        let r = take(self.inner.try_write(), || self.inner.write(), self.class, site, self.instance());
         map_lock(r, |g| RwLockWriteGuard { inner: g, _held: Held(hooks::acquired(self.class, self.instance(), site)) })
     }
 
@@ -200,5 +212,17 @@ impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
 impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.inner
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockReadGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.inner, f)
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockWriteGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.inner, f)
     }
 }

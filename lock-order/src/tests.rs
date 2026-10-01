@@ -1,10 +1,10 @@
 //! Each test uses its own class names: the order graph and the recorded cycles are global, and
 //! tests run in parallel.
 
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{branch, cycles, holding, scope, set_bound, set_wedge_handler, sync, tokio_sync, waits_on, Wedge};
+use crate::{branch, cycles, holding, long_waits, scope, set_report_after, sync, tokio_sync, waits_on};
 
 fn cycle_with(a: &str, b: &str) -> Option<String> {
     cycles().into_iter().find(|c| c.contains(&format!("`{a}`")) && c.contains(&format!("`{b}`")))
@@ -221,28 +221,71 @@ fn a_consistent_order_a_thousand_times_is_no_cycle() {
     assert!(any_cycle_with("steady-a").is_none(), "{:?}", cycles());
 }
 
-fn wedges() -> &'static StdMutex<Vec<Wedge>> {
-    static W: OnceLock<StdMutex<Vec<Wedge>>> = OnceLock::new();
-    W.get_or_init(|| {
-        set_wedge_handler(|w| wedges().lock().unwrap().push(w.clone()));
-        StdMutex::new(Vec::new())
-    })
+/// The runtime's only worker blocks on a std lock; the watchdog thread reports the wait anyway,
+/// naming where the lock is held.
+#[test]
+fn a_long_wait_is_reported_by_the_watchdog_thread_while_the_waiter_blocks() {
+    set_report_after("long-std", Duration::from_millis(200));
+    let l = Arc::new(sync::Mutex::new("long-std", ()));
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let l1 = l.clone();
+    let holder = std::thread::spawn(move || {
+        let _g = l1.lock().unwrap();
+        held_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+    });
+    held_rx.recv().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let _g = l.lock().unwrap(); // blocks the runtime's only worker for ~700 ms
+    });
+    holder.join().unwrap();
+    let seen: Vec<_> = long_waits().into_iter().filter(|w| w.class == "long-std").collect();
+    assert_eq!(seen.len(), 1, "one report per wait: {seen:?}");
+    assert!(seen[0].holders.iter().any(|h| h.contains("tests.rs")), "names the holder: {:?}", seen[0]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_wait_past_its_bound_runs_the_wedge_handler_naming_the_holder() {
-    wedges();
-    set_bound("wedged", Some(Duration::from_millis(300)));
-    let l = Arc::new(tokio_sync::Mutex::new("wedged", ()));
+async fn a_contended_tokio_wait_is_reported_and_an_uncontended_one_is_not_registered() {
+    set_report_after("long-tok", Duration::from_millis(200));
+    let l = Arc::new(tokio_sync::Mutex::new("long-tok", ()));
+    {
+        let _quick = l.lock().await;
+    }
     let held = l.lock().await;
     let l2 = l.clone();
     let waiter = tokio::spawn(async move {
         let _g = l2.lock().await;
     });
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    let seen: Vec<Wedge> = wedges().lock().unwrap().iter().filter(|w| w.class == "wedged").cloned().collect();
-    assert!(!seen.is_empty(), "no wedge reported past the bound");
-    assert!(seen[0].holders.iter().any(|h| h.contains("tests.rs")), "the holder's site: {:?}", seen[0]);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(long_waits().iter().filter(|w| w.class == "long-tok").count(), 1, "{:?}", long_waits());
     drop(held);
-    tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("the waiter gets the lock once released").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("the waiter gets the lock").unwrap();
+}
+
+#[tokio::test]
+async fn a_branch_inherits_what_is_held_around_it() {
+    let a = tokio_sync::Mutex::new("inherit-a", ());
+    let b = tokio_sync::Mutex::new("inherit-b", ());
+    {
+        let _ga = a.lock().await;
+        branch(async {
+            let _gb = b.lock().await; // a is held around this branch: a → b
+        })
+        .await;
+    }
+    let _gb = b.lock().await;
+    let _ga = a.lock().await;
+    assert!(cycle_with("inherit-a", "inherit-b").is_some(), "the branch lost the lock held around it: {:?}", cycles());
+}
+
+#[tokio::test]
+async fn a_consumer_waiting_on_itself_is_reported_whatever_its_name_s_spelling() {
+    let one: &'static str = Box::leak(String::from("self-consumer").into_boxed_str());
+    let two: &'static str = Box::leak(String::from("self-consumer").into_boxed_str());
+    holding(one, async move {
+        waits_on(two);
+    })
+    .await;
+    assert!(any_cycle_with("self-consumer").is_some_and(|c| c.contains("waits on itself")), "{:?}", cycles());
 }
