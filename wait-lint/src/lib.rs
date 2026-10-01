@@ -189,7 +189,9 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
             }
         }
         if reg.raw_locks_forbidden {
-            for (line, path) in &scanned.raw_locks {
+            // A static's type and its initializer name the same lock on one line: one finding.
+            let mut seen = std::collections::BTreeSet::new();
+            for (line, path) in scanned.raw_locks.iter().filter(|r| seen.insert((*r).clone())) {
                 finding(
                     rel,
                     Some(*line),

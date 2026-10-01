@@ -443,7 +443,36 @@ async fn f() {
 }
 ";
     let r = run(src);
-    assert_eq!(untagged_lines(&r), vec![2], "the AST block: {:?}", r.sites);
+    // Review finding (Codex, 2026-10-02): the macro form used to be skipped, so an infinite wait
+    // inside a macro needed no tag. Both forms are unclassified waits now.
+    assert_eq!(untagged_lines(&r), vec![2, 3], "the AST block and the macro's: {:?}", r.sites);
+}
+
+#[test]
+fn an_async_block_awaited_inside_a_macro_is_not_a_wait_of_its_own() {
+    let r = run("async fn f() {\n    id!(async { 1 }.await);\n    id!(async move { 2 }.await);\n}\n");
+    assert!(r.sites.is_empty(), "{:?}", r.sites);
+}
+
+/// Review finding (Codex, 2026-10-02): macro tokens skipped the raw-lock and class checks, and an
+/// expression path (`std::sync::Mutex::new(0)`, no type named) escaped the raw-lock check anywhere.
+#[test]
+fn raw_locks_and_classes_inside_macros_and_expressions_are_checked() {
+    let src = "\
+fn f() {
+    let v = vec![std::sync::Mutex::new(0)];
+    let w = vec![lock_order::sync::Mutex::new(\"misspelled-class\", 0)];
+    let x = std::sync::Mutex::new(0);
+    let y = vec![lock_order::sync::Mutex::new(\"k\", 0)];
+    let z = vec![lock_order::holding(\"nope\", g())];
+}
+";
+    let forbid = format!("{ROWS}\n```wait-lint\nraw-locks = forbid\n```\n");
+    let r = run_files(&[("src/a.rs", src)], &forbid);
+    let raw: Vec<usize> = source_findings(&r).into_iter().filter(|(_, m)| m.contains("raw lock")).map(|(l, _)| l).collect();
+    assert_eq!(raw, vec![2, 4], "{:?}", r.findings);
+    let bad: Vec<usize> = source_findings(&r).into_iter().filter(|(_, m)| m.contains("is no row")).map(|(l, _)| l).collect();
+    assert_eq!(bad, vec![3, 6], "{:?}", r.findings);
 }
 
 #[test]

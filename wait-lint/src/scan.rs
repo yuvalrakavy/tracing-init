@@ -617,6 +617,9 @@ impl Visitor<'_> {
                 TokenTree::Ident(id) => {
                     let name = id.to_string();
                     let at = id.span().start();
+                    if is_path_start(&tts, i) {
+                        self.token_path_checks(&tts, i, at.line);
+                    }
                     let after_dot = i > 0 && matches!(&tts[i - 1], TokenTree::Punct(p) if p.as_char() == '.');
                     let next = tts.get(i + 1);
                     if matches!(next, Some(TokenTree::Punct(p)) if p.as_char() == '!') {
@@ -668,6 +671,32 @@ impl Visitor<'_> {
         }
     }
 
+    /// The `raw-locks` and lock-class checks the AST pass makes on a path, made on one inside macro
+    /// tokens: the path that starts at `tts[i]`, and the string literal its call is given.
+    fn token_path_checks(&mut self, tts: &[TokenTree], i: usize, line: usize) {
+        let (segs, after) = token_path_from(tts, i);
+        if let Some(raw) = raw_lock(&segs) {
+            self.out.raw_locks.push((line, raw));
+        }
+        let Some(TokenTree::Group(args)) = tts.get(after) else { return };
+        if args.delimiter() != Delimiter::Parenthesis {
+            return;
+        }
+        let arg_tokens: Vec<TokenTree> = args.stream().into_iter().collect();
+        let commas = arg_tokens.iter().filter(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ',')).count();
+        let trailing = matches!(arg_tokens.last(), Some(TokenTree::Punct(p)) if p.as_char() == ',');
+        let arg_count = if arg_tokens.is_empty() { 0 } else { commas + 1 - usize::from(trailing) };
+        if !is_class_call(&segs, arg_count) {
+            return;
+        }
+        if let Some(TokenTree::Literal(l)) = arg_tokens.first() {
+            let text = l.to_string();
+            if is_string_literal(&text) && text.starts_with('"') && text.ends_with('"') && text.len() >= 2 {
+                self.out.classes.push((l.span().start().line, text[1..text.len() - 1].to_string()));
+            }
+        }
+    }
+
     /// An `.await` inside macro tokens; `dot` is the index of the `.` before it.
     fn token_await(&mut self, tts: &[TokenTree], dot: usize, line: usize, column: usize) {
         // Step back over `.instrument(..)`-like wrappers to the future really awaited.
@@ -699,7 +728,19 @@ impl Visitor<'_> {
                 }
                 _ => self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false),
             },
-            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {}
+            // An async block's waits are scanned where they are; awaiting the block is not one
+            // more. A plain block's value is a future the lint cannot see, as in the AST pass.
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {
+                let before = |k: usize| match end.checked_sub(k).and_then(|j| tts.get(j)) {
+                    Some(TokenTree::Ident(id)) => Some(id.to_string()),
+                    _ => None,
+                };
+                let async_block = before(2).as_deref() == Some("async")
+                    || (before(2).as_deref() == Some("move") && before(3).as_deref() == Some("async"));
+                if !async_block {
+                    self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false);
+                }
+            }
             TokenTree::Ident(name) if !is_keyword(&name.to_string()) => {
                 self.record(line, column, format!("`.await` on a stored future (`{name}`)"), Wait::Async, false);
             }
@@ -1016,16 +1057,44 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
 /// is a string literal.
 fn class_literal(c: &syn::ExprCall) -> Option<(usize, String)> {
     let path = path_of(&c.func)?;
-    let last = path.last()?.as_str();
-    let named = matches!(last, "holding" | "holding_in" | "waits_on" | "waits_on_in" | "hold" | "scope" | "acquire")
-        || (matches!(last, "new" | "with_default") && path.len() >= 2 && matches!(path[path.len() - 2].as_str(), "Mutex" | "RwLock") && c.args.len() == 2);
-    if !named {
+    if !is_class_call(&path, c.args.len()) {
         return None;
     }
     match c.args.first()? {
         syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => Some((s.span().start().line, s.value())),
         _ => None,
     }
+}
+
+/// Does a call to `path` with `args` arguments name a lock-order class as its first argument?
+fn is_class_call(path: &[String], args: usize) -> bool {
+    let Some(last) = path.last().map(String::as_str) else { return false };
+    matches!(last, "holding" | "holding_in" | "waits_on" | "waits_on_in" | "hold" | "scope" | "acquire")
+        || (matches!(last, "new" | "with_default") && path.len() >= 2 && matches!(path[path.len() - 2].as_str(), "Mutex" | "RwLock") && args == 2)
+}
+
+/// Is `tts[i]` the first segment of a path — not one after `::`?
+fn is_path_start(tts: &[TokenTree], i: usize) -> bool {
+    !(i >= 2
+        && matches!(&tts[i - 1], TokenTree::Punct(p) if p.as_char() == ':')
+        && matches!(&tts[i - 2], TokenTree::Punct(p) if p.as_char() == ':'))
+}
+
+/// The path starting at the identifier `tts[i]`: its segments, and the index just past it. A
+/// turbofish (`::<`) ends it.
+fn token_path_from(tts: &[TokenTree], i: usize) -> (Vec<String>, usize) {
+    let mut segs = Vec::new();
+    let mut k = i;
+    while let Some(TokenTree::Ident(id)) = tts.get(k) {
+        segs.push(id.to_string());
+        let colons = matches!(tts.get(k + 1), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+            && matches!(tts.get(k + 2), Some(TokenTree::Punct(p)) if p.as_char() == ':');
+        if !colons || !matches!(tts.get(k + 3), Some(TokenTree::Ident(_))) {
+            return (segs, k + 1);
+        }
+        k += 3;
+    }
+    (segs, k)
 }
 
 /// Lock types that must be built through `lock-order`'s wrappers (`raw-locks`).
@@ -1040,6 +1109,12 @@ const RAW_LOCKS: &[(&str, &str)] = &[
 
 /// `std::sync::Mutex`, `tokio::sync::RwLock`, … — or any path ending `sync::Mutex`.
 fn raw_lock(segs: &[String]) -> Option<String> {
+    // A path that goes on past the type — `std::sync::Mutex::new`, an associated item — names it
+    // as surely as the type path does.
+    (2..segs.len()).find_map(|n| raw_lock_exact(&segs[..n])).or_else(|| raw_lock_exact(segs))
+}
+
+fn raw_lock_exact(segs: &[String]) -> Option<String> {
     let n = segs.len();
     // The wrappers themselves (`lock_order::sync::Mutex`) are what raw locks are replaced by.
     if n < 2 || segs[0] == "lock_order" {
