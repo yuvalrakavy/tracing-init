@@ -85,8 +85,9 @@ impl Registry {
                     continue;
                 }
                 if kind == WAITERS_BLOCK {
-                    let parts: Vec<&str> = t.split_whitespace().collect();
-                    if parts.len() == 3 {
+                    // The function is the rest of the line: `<Type as Trait>::f` has spaces.
+                    let parts: Vec<&str> = t.splitn(3, ' ').map(str::trim).collect();
+                    if parts.len() == 3 && parts.iter().all(|p| !p.is_empty()) {
                         let waiter = (parts[0].to_string(), parts[1].to_string(), parts[2].to_string());
                         reg.waiters.get_or_insert_with(BTreeMap::new).insert(waiter, line_no);
                     } else {
