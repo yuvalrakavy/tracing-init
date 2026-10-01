@@ -508,6 +508,10 @@ impl Run for S {
         r.waiters_block,
         "```wait-lint-waiters\nk src/a.rs <S as Run>::f\nk src/a.rs a::f\nk src/a.rs b::f\n```\n"
     );
+    // And the block reads back: a waiter's function may contain spaces.
+    let registry = format!("{K_ONLY}\n{}", r.waiters_block);
+    let again = run_files(&[("src/a.rs", src)], &registry);
+    assert!(again.findings.is_empty(), "{:?}", again.findings);
 }
 
 #[test]
