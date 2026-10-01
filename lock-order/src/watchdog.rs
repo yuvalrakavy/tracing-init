@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 use std::panic::Location;
-use std::sync::{Mutex, Once, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 /// How long a wait goes on before it is reported, for a class with no threshold of its own.
@@ -126,14 +127,111 @@ fn holders(instance: usize) -> Vec<String> {
     Vec::new()
 }
 
-pub(crate) fn ensure_thread() {
-    static STARTED: Once = Once::new();
-    STARTED.call_once(|| {
-        let _ = std::thread::Builder::new().name("lock-order-watchdog".into()).spawn(|| loop {
+/// How long after a failed start an acquisition path tries to start the thread again.
+const RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// Whether the watchdog thread runs, and when starting it last failed. Marked started only once a
+/// spawn has succeeded: a failed spawn (thread creation under resource pressure) is retried, not
+/// remembered as done.
+struct Starter {
+    running: AtomicBool,
+    last_failure: Mutex<Option<Instant>>,
+}
+
+impl Starter {
+    const fn new() -> Self {
+        Starter { running: AtomicBool::new(false), last_failure: Mutex::new(None) }
+    }
+
+    fn start(&self, retry_after: Duration, spawn: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+        if self.running.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut last = self.last_failure.lock().unwrap_or_else(|p| p.into_inner());
+        if self.running.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if last.is_some_and(|at| at.elapsed() < retry_after) {
+            return Err(std::io::Error::other("the lock-order watchdog thread failed to start moments ago"));
+        }
+        match spawn() {
+            Ok(()) => {
+                self.running.store(true, Ordering::Release);
+                *last = None;
+                Ok(())
+            }
+            Err(e) => {
+                *last = Some(Instant::now());
+                Err(e)
+            }
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+}
+
+static STARTER: Starter = Starter::new();
+
+fn spawn_thread() -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("lock-order-watchdog".into())
+        .spawn(|| loop {
             std::thread::sleep(TICK);
             tick();
-        });
-    });
+        })
+        .map(drop)
+}
+
+/// From an acquisition path: start the thread if it is not running. Says nothing on failure —
+/// nothing is logged from inside an acquisition — and retries at most once per `RETRY_AFTER`.
+pub(crate) fn ensure_thread() {
+    let _ = STARTER.start(RETRY_AFTER, spawn_thread);
+}
+
+/// Start the watchdog thread now. A program calls this at startup — before resource pressure can
+/// make thread creation fail — and reports the error if it does: without the thread, long lock
+/// waits and recorded cycles go unreported. Retried here at once, and from acquisition paths at
+/// most once a second, until it starts.
+pub fn start_watchdog() -> std::io::Result<()> {
+    STARTER.start(Duration::ZERO, spawn_thread)
+}
+
+/// Whether the watchdog thread is running.
+pub fn watchdog_running() -> bool {
+    STARTER.running()
+}
+
+#[cfg(test)]
+mod starter_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Review finding (Codex, 2026-10-02): a failed spawn was discarded and the `Once` completed,
+    /// so the thread never existed and was never retried — silently. Now a failure is returned,
+    /// the starter stays unstarted, and a later attempt spawns again.
+    #[test]
+    fn a_failed_start_is_reported_and_retried() {
+        let s = Starter::new();
+        let spawns = Cell::new(0);
+        let failing = || {
+            spawns.set(spawns.get() + 1);
+            Err(std::io::Error::other("no threads left"))
+        };
+        assert!(s.start(Duration::from_secs(60), failing).is_err(), "the failure is returned");
+        assert!(!s.running(), "a failed start is not a start");
+        assert!(s.start(Duration::from_secs(60), || unreachable!("retried inside the window")).is_err());
+        assert_eq!(spawns.get(), 1);
+        let ok = || {
+            spawns.set(spawns.get() + 1);
+            Ok(())
+        };
+        assert!(s.start(Duration::ZERO, ok).is_ok(), "a retry past the window spawns again");
+        assert!(s.running());
+        assert!(s.start(Duration::ZERO, || unreachable!("started once")).is_ok());
+        assert_eq!(spawns.get(), 2);
+    }
 }
 
 fn tick() {

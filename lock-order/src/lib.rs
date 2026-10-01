@@ -63,7 +63,7 @@ pub mod sync;
 pub mod tokio_sync;
 pub mod watchdog;
 
-pub use watchdog::{long_waits, set_report_after, LongWait};
+pub use watchdog::{long_waits, set_report_after, start_watchdog, watchdog_running, LongWait};
 
 use std::future::Future;
 use std::panic::Location;
