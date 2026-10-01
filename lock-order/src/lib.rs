@@ -154,6 +154,9 @@ pub struct Branch<F> {
     fut: Pin<Box<F>>,
 }
 
+/// What the branch still holds moves to its parent here. A guard its future still holds (a
+/// cancelled branch) drops after this, and finds its record through the owner cell the move
+/// updated.
 impl<F> Drop for Branch<F> {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]

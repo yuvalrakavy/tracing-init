@@ -318,6 +318,58 @@ async fn a_guard_returned_out_of_a_branch_is_held_by_its_parent() {
     assert!(cycle_with("ret-a", "ret-b").is_some(), "the returned guard was lost with its branch: {:?}", cycles());
 }
 
+/// A guard returned out of a branch moves to its parent when the branch ends — and its drop must
+/// release it there. Leaked, the parent "holds" the lock forever, and taking it again reads as a
+/// false self-wait (review finding, 2026-10-02).
+#[tokio::test]
+async fn a_guard_returned_out_of_a_branch_releases_when_dropped() {
+    let a = Arc::new(tokio_sync::Mutex::new("relret-a", ()));
+    let a1 = a.clone();
+    let g = branch(async move { a1.lock_owned().await }).await;
+    drop(g);
+    let _again = a.lock().await;
+    assert!(any_cycle_with("relret-a").is_none(), "the dropped guard's record leaked into the parent: {:?}", cycles());
+}
+
+/// A branch cancelled while it holds a guard: the guard drops with the branch's future, and
+/// must not be left behind in the parent.
+#[tokio::test]
+async fn a_cancelled_branch_releases_what_it_held() {
+    let a = Arc::new(tokio_sync::Mutex::new("cancel-a", ()));
+    let a1 = a.clone();
+    let (taken_tx, taken_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut held = Box::pin(branch(async move {
+        let _g = a1.lock_owned().await;
+        let _ = taken_tx.send(());
+        std::future::pending::<()>().await;
+    }));
+    tokio::select! {
+        _ = &mut held => unreachable!("the branch never completes"),
+        _ = taken_rx => {}
+    }
+    drop(held);
+    let _again = a.lock().await;
+    assert!(any_cycle_with("cancel-a").is_none(), "the cancelled branch's guard was left held: {:?}", cycles());
+}
+
+/// An owned guard returned out of a branch, then adopted by another task: the adoption must find
+/// it where the branch's end moved it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guard_from_an_ended_branch_can_be_adopted() {
+    let a = Arc::new(tokio_sync::Mutex::new("adopt-ret-a", ()));
+    let a1 = a.clone();
+    let g = branch(async move { a1.lock_owned().await }).await;
+    tokio::spawn(async move {
+        let mut g = g;
+        g.adopt();
+        drop(g);
+    })
+    .await
+    .unwrap();
+    let _again = a.lock().await;
+    assert!(any_cycle_with("adopt-ret-a").is_none(), "the adopted guard's record stayed in the parent: {:?}", cycles());
+}
+
 #[test]
 fn a_self_wait_is_reported_once_per_site() {
     let l = sync::RwLock::new("self-once", ());

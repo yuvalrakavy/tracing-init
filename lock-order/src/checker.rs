@@ -1,8 +1,10 @@
 //! The order graph and the held sets — compiled in debug builds only.
 //!
 //! **Internal discipline.** The checker's own state sits behind plain `std` locks, never the
-//! wrappers. Two of them, never held together: a held-set shard, then (after releasing it) the
-//! graph. Nothing calls out while holding either. A report is recorded and queued, and the
+//! wrappers. The graph is never held with any other. A held record's move between contexts (a
+//! branch ending, an adoption) and its release are ordered by the migration lock, taken first;
+//! under it, one held-set shard at a time, and under a shard, a record's owner cell. Nothing calls
+//! out while holding any of them. A report is recorded and queued, and the
 //! watchdog thread logs it: nothing is logged from inside an acquisition, so a tracing layer that
 //! takes a wrapped lock is never entered with the caller's locks held.
 
@@ -45,9 +47,18 @@ pub fn new_branch() -> u64 {
     id
 }
 
-/// A branch ended: a guard it returned is still held, now by its parent.
+/// Orders a held record's move between contexts against its release, so a guard dropped while
+/// its record moves always finds it: moves take it to write, releases to read.
+fn migration() -> &'static RwLock<()> {
+    static MIGRATION: RwLock<()> = RwLock::new(());
+    &MIGRATION
+}
+
+/// A branch ended: a guard it returned is still held, now by its parent — and its owner cell says
+/// so, so the guard's drop or adoption finds it there.
 pub fn end_branch(id: u64) {
     let Some(parent) = parents().lock().unwrap_or_else(|p| p.into_inner()).remove(&id) else { return };
+    let _moving = migration().write().unwrap_or_else(|p| p.into_inner());
     for s in shards() {
         let moved: Vec<(Context, Vec<Held>)> = {
             let mut map = s.lock().unwrap_or_else(|p| p.into_inner());
@@ -56,7 +67,11 @@ pub fn end_branch(id: u64) {
         };
         for (c, held) in moved {
             let to = Context { branch: parent, ..c };
-            shard(&to).lock().unwrap_or_else(|p| p.into_inner()).entry(to).or_default().extend(held);
+            let mut map = shard(&to).lock().unwrap_or_else(|p| p.into_inner());
+            for h in &held {
+                *h.owner.lock().unwrap_or_else(|p| p.into_inner()) = to;
+            }
+            map.entry(to).or_default().extend(held);
         }
     }
 }
@@ -87,18 +102,23 @@ pub fn current() -> Context {
 
 pub type Site = &'static Location<'static>;
 
-#[derive(Clone, Copy, Debug)]
+/// The context a held record sits under now — shared by the record and its guard's token, so a
+/// move (a branch ending, an adoption) is seen by the guard's drop.
+type Owner = std::sync::Arc<Mutex<Context>>;
+
+#[derive(Clone, Debug)]
 struct Held {
     token: u64,
     class: &'static str,
     instance: usize,
     site: Site,
+    owner: Owner,
 }
 
-/// What a guard carries so it releases in the context that took it, wherever it is dropped.
+/// What a guard carries so it releases where its record is, wherever it is dropped.
 #[derive(Debug)]
 pub struct Token {
-    ctx: Context,
+    owner: Owner,
     token: u64,
     class: &'static str,
     instance: usize,
@@ -276,32 +296,50 @@ pub fn attempt(class: &'static str, instance: usize, site: Site) {
 pub fn acquired(class: &'static str, instance: usize, site: Site) -> Token {
     let ctx = current();
     let token = next_id();
-    shard(&ctx).lock().unwrap_or_else(|p| p.into_inner()).entry(ctx).or_default().push(Held { token, class, instance, site });
-    Token { ctx, token, class, instance, site }
+    let owner: Owner = std::sync::Arc::new(Mutex::new(ctx));
+    let _ordered = migration().read().unwrap_or_else(|p| p.into_inner());
+    shard(&ctx).lock().unwrap_or_else(|p| p.into_inner()).entry(ctx).or_default().push(Held {
+        token,
+        class,
+        instance,
+        site,
+        owner: owner.clone(),
+    });
+    Token { owner, token, class, instance, site }
 }
 
-/// A guard went: its lock is no longer held by the context that took it.
-pub fn released(t: &Token) {
-    let mut map = shard(&t.ctx).lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(list) = map.get_mut(&t.ctx) {
+/// Remove `t`'s record from wherever its owner cell says it is. The migration lock is held by the
+/// caller, so the record cannot move meanwhile.
+fn remove_record(t: &Token) {
+    let ctx = *t.owner.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map = shard(&ctx).lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(list) = map.get_mut(&ctx) {
         list.retain(|h| h.token != t.token);
         if list.is_empty() {
-            map.remove(&t.ctx);
+            map.remove(&ctx);
         }
     }
 }
 
+/// A guard went: its lock is no longer held, by whichever context holds its record now.
+pub fn released(t: &Token) {
+    let _ordered = migration().read().unwrap_or_else(|p| p.into_inner());
+    remove_record(t);
+}
+
 /// Move a held entry to the current context: an owned guard handed to another task or thread.
 pub fn adopt(t: &mut Token) {
-    released(t);
+    let _ordered = migration().write().unwrap_or_else(|p| p.into_inner());
+    remove_record(t);
     let ctx = current();
+    *t.owner.lock().unwrap_or_else(|p| p.into_inner()) = ctx;
     shard(&ctx).lock().unwrap_or_else(|p| p.into_inner()).entry(ctx).or_default().push(Held {
         token: t.token,
         class: t.class,
         instance: t.instance,
         site: t.site,
+        owner: t.owner.clone(),
     });
-    t.ctx = ctx;
 }
 
 /// Every internal lock is released by the time this runs. The cycle is recorded now, for a test
