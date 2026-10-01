@@ -173,32 +173,66 @@ impl<F: Future> Future for Branch<F> {
     }
 }
 
-/// A pseudo-lock's identity: its class's name — so two spellings of one name are one consumer.
-/// Odd, so it never equals a real lock's (aligned) address.
-fn pseudo(class: &'static str) -> usize {
+/// A pseudo-lock's identity: its class's name and an instance — so two spellings of one name are
+/// one consumer, and one store's processor is not another's. Odd, so it never equals a real lock's
+/// (aligned) address.
+fn pseudo(class: &'static str, instance: u64) -> usize {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     class.hash(&mut h);
+    instance.hash(&mut h);
     (h.finish() as usize) | 1
 }
 
 /// `fut`, run as the consumer `class`: while it runs, the consumer is held, so the locks it takes
 /// order after it, and a wait on it from a holder of those locks is a cycle. For a task others
-/// wait on, around each message it handles.
+/// wait on, around each message it handles. One instance per class; see [`holding_in`].
 #[track_caller]
 pub fn holding<F: Future>(class: &'static str, fut: F) -> impl Future<Output = F::Output> {
+    holding_in(class, 0, fut)
+}
+
+/// [`holding`], for one of several consumers of a class — one per store, say: `instance` tells
+/// them apart, so one store's consumer waiting on another's is an order between two instances,
+/// not a wait on itself.
+#[track_caller]
+pub fn holding_in<F: Future>(class: &'static str, instance: u64, fut: F) -> impl Future<Output = F::Output> {
     let site = Location::caller();
     async move {
-        let _held = Held(hooks::acquired(class, pseudo(class), site));
+        let _held = Held(hooks::acquired(class, pseudo(class, instance), site));
         fut.await
     }
 }
 
 /// About to wait on the consumer `class` (send it a message and await the reply, join it): its
-/// order with the locks this context holds is checked, as for an acquisition. Nothing is held.
+/// order with the locks this context holds is checked, as for an acquisition. Keep the returned
+/// guard while waiting: the watchdog thread reports the wait if it goes on past the class's
+/// threshold. Nothing is held.
 #[track_caller]
-pub fn waits_on(class: &'static str) {
-    hooks::attempt(class, pseudo(class), Location::caller());
+#[must_use = "keep the guard while waiting, so the watchdog can report a wait that goes on too long"]
+pub fn waits_on(class: &'static str) -> Waiting {
+    waits_on_in(class, 0)
+}
+
+/// [`waits_on`] for one instance of a consumer class; see [`holding_in`].
+#[track_caller]
+#[must_use = "keep the guard while waiting, so the watchdog can report a wait that goes on too long"]
+pub fn waits_on_in(class: &'static str, instance: u64) -> Waiting {
+    let site = Location::caller();
+    let id = pseudo(class, instance);
+    hooks::attempt(class, id, site);
+    Waiting { _guard: watchdog::WaitGuard::begin(class, site, id) }
+}
+
+/// A wait on a consumer, watched while it lives; see [`waits_on`].
+pub struct Waiting {
+    _guard: watchdog::WaitGuard,
+}
+
+impl std::fmt::Debug for Waiting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Waiting")
+    }
 }
 
 /// A pseudo-lock of `class`, held until the returned guard drops: for a blocking primitive the
@@ -207,13 +241,36 @@ pub fn waits_on(class: &'static str) {
 #[track_caller]
 pub fn hold(class: &'static str) -> PseudoGuard {
     let site = Location::caller();
-    hooks::attempt(class, pseudo(class), site);
-    PseudoGuard { _held: Held(hooks::acquired(class, pseudo(class), site)) }
+    let id = pseudo(class, 0);
+    hooks::attempt(class, id, site);
+    PseudoGuard { held: Held(hooks::acquired(class, id, site)) }
+}
+
+/// `fut` — an acquisition the wrappers do not cover, such as a semaphore's permit — awaited as a
+/// pseudo-lock of `class`: its order is checked before it waits, the watchdog watches the wait,
+/// and the returned guard holds the pseudo-lock while it lives (keep it beside the permit).
+#[track_caller]
+pub fn acquire<F: Future>(class: &'static str, fut: F) -> impl Future<Output = (F::Output, PseudoGuard)> {
+    let site = Location::caller();
+    async move {
+        let id = pseudo(class, 0);
+        hooks::attempt(class, id, site);
+        let out = watchdog::watched(class, site, id, fut).await;
+        (out, PseudoGuard { held: Held(hooks::acquired(class, id, site)) })
+    }
 }
 
 /// Held while it lives; see [`hold`].
 pub struct PseudoGuard {
-    _held: Held,
+    held: Held,
+}
+
+impl PseudoGuard {
+    /// Now held by the context running this — after the guard was handed to another task or
+    /// thread.
+    pub fn adopt(&mut self) {
+        hooks::adopt(&mut self.held.0);
+    }
 }
 
 impl std::fmt::Debug for PseudoGuard {

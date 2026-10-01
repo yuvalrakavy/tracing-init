@@ -53,7 +53,9 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
-    fn instance(&self) -> usize {
+    /// The lock's identity: what the checker and the watchdog name it by. Stable for the lock's
+    /// life (a tokio lock's is its inner allocation, so it survives a move of the wrapper).
+    pub fn instance(&self) -> usize {
         &self.inner as *const std::sync::Mutex<T> as *const () as usize
     }
 
@@ -132,7 +134,9 @@ impl<T> RwLock<T> {
 }
 
 impl<T: ?Sized> RwLock<T> {
-    fn instance(&self) -> usize {
+    /// The lock's identity: what the checker and the watchdog name it by. Stable for the lock's
+    /// life (a tokio lock's is its inner allocation, so it survives a move of the wrapper).
+    pub fn instance(&self) -> usize {
         &self.inner as *const std::sync::RwLock<T> as *const () as usize
     }
 

@@ -1,4 +1,5 @@
 use super::*;
+use super::crate_of;
 
 const ROWS: &str = "\
 | Key | Kind | Waits on | Held across | Argument |
@@ -582,6 +583,7 @@ fn names_are_per_crate_and_a_trait_impl_excuses_nothing() {
     let server = "\
 impl StoreService for Server {
     async fn execute(&self) {}
+    async fn select_store(&self) {}
 }
 impl Server {
     async fn settle_pending(&self) {}
@@ -598,13 +600,23 @@ async fn g(s: Server) {
     s.settle_pending().await;
 }
 ";
-    let files = [("store_server/src/services.rs", server), ("ht_server/src/client.rs", client), ("store_server/src/own.rs", own)];
+    let in_process = "\
+async fn h(svc: Server) {
+    svc.select_store(req).await;
+}
+";
+    let files = [
+        ("store_server/src/services.rs", server),
+        ("ht_server/src/client.rs", client),
+        ("store_server/src/own.rs", own),
+        ("store_server/src/websocket.rs", in_process),
+    ];
     let r = run_files(&files, ROWS);
     let at: Vec<(String, usize)> = r.sites.iter().map(|s| (s.file.clone(), s.line)).collect();
     assert_eq!(
         at,
         vec![("ht_server/src/client.rs".to_string(), 2), ("ht_server/src/client.rs".to_string(), 3)],
-        "another crate's methods excuse nothing; the own crate's inherent one does: {:?}",
+        "another crate's methods excuse nothing; the own crate's — inherent or trait impl — do: {:?}",
         r.sites
     );
 }
@@ -643,4 +655,57 @@ static W: lock_order::sync::Mutex<u8> = lock_order::sync::Mutex::new(\"w\", 0);
     assert_eq!(raw, vec![1, 2, 3, 4], "{:?}", r.findings);
     let r = run_files(&[("src/a.rs", src)], ROWS);
     assert!(!source_findings(&r).iter().any(|(_, m)| m.contains("raw lock")), "allowed unless forbidden");
+}
+
+#[test]
+fn a_declared_helper_awaited_inside_a_timeout_is_the_timeout_s() {
+    let src = "\
+async fn f() {
+    let r = timeout(D, send_transaction(t)).await; // WAIT: b
+    send_transaction(t).await;
+    run_async(x);
+}
+";
+    let registry = format!("{ROWS}\n```wait-lint\nwait-fns = send_transaction, run_async\n```\n");
+    let r = run_files(&[("src/a.rs", src)], &registry);
+    let whats: Vec<(usize, &str)> = r.sites.iter().map(|s| (s.line, s.what.as_str())).collect();
+    assert_eq!(whats.len(), 3, "{whats:?}");
+    assert!(whats[1].1.contains(".await") && whats[2].1.contains("run_async(..)`, a declared"), "{whats:?}");
+}
+
+#[test]
+fn holding_and_branch_are_seen_through() {
+    let src = "\
+async fn process(n: u8) {}
+async fn f() {
+    lock_order::holding(\"processor\", process(1)).await;
+    lock_order::branch(process(2)).await;
+}
+";
+    let registry = "\
+| Key | Kind | Waits on | Argument |
+|---|---|---|---|
+| `processor` | acyclic | P | x |
+";
+    let r = run_files(&[("src/a.rs", src)], registry);
+    assert!(r.sites.is_empty(), "{:?}", r.sites);
+}
+
+#[test]
+fn a_lock_class_must_be_a_registry_key() {
+    let src = "\
+static A: lock_order::sync::Mutex<u8> = lock_order::sync::Mutex::new(\"k\", 0);
+static B: lock_order::sync::Mutex<u8> = lock_order::sync::Mutex::new(\"typo\", 0);
+fn f() { let _w = lock_order::waits_on(\"nope\"); }
+";
+    let r = run(src);
+    let bad: Vec<usize> = source_findings(&r).into_iter().filter(|(_, m)| m.contains("is no row")).map(|(l, _)| l).collect();
+    assert_eq!(bad, vec![2, 3], "{:?}", r.findings);
+}
+
+#[test]
+fn a_crate_is_the_path_before_its_src_component() {
+    assert_eq!(crate_of("store_server/src/a.rs"), "store_server");
+    assert_eq!(crate_of("tools/mysrc/x/src/b.rs"), "tools/mysrc/x");
+    assert_eq!(crate_of("src/a.rs"), "");
 }

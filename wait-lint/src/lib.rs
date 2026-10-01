@@ -183,6 +183,11 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
     let mut sites = Vec::new();
     for (rel, text, file) in &parsed {
         let scanned = scan::scan(file, &reg, &names[&crate_of(rel)]);
+        for (line, class) in &scanned.classes {
+            if reg.row(class).is_none() {
+                finding(rel, Some(*line), format!("lock class `{class}` is no row of {registry_file}: a class names its registry row, or its cycles hide behind a typo"));
+            }
+        }
         if reg.raw_locks_forbidden {
             for (line, path) in &scanned.raw_locks {
                 finding(
@@ -382,9 +387,10 @@ fn external_mod_name(line: &str) -> Option<&str> {
 /// The crate a file belongs to: the path before its `src/` (`store_server/src/a.rs` →
 /// `store_server`; `src/a.rs` → ``).
 fn crate_of(rel: &str) -> String {
-    match rel.find("src/") {
-        Some(0) | None => String::new(),
-        Some(at) => rel[..at].trim_end_matches('/').to_string(),
+    let parts: Vec<&str> = rel.split('/').collect();
+    match parts.iter().position(|p| *p == "src") {
+        Some(at) => parts[..at].join("/"),
+        None => String::new(),
     }
 }
 

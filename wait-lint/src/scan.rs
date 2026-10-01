@@ -89,7 +89,9 @@ pub const WAITING_MACROS: &[&str] = &["select", "select_biased", "join", "try_jo
 
 /// Wrappers an `.await` sees through: `f().instrument(span).await` awaits `f()`.
 const TRANSPARENT_METHODS: &[&str] = &["instrument", "in_current_span", "boxed", "fuse"];
-const TRANSPARENT_FNS: &[&str] = &["pin"];
+const TRANSPARENT_FNS: &[&str] = &["pin", "branch"];
+/// lock_order's consumer wrappers: their last argument is the future really awaited.
+const TRANSPARENT_LAST_ARG_FNS: &[&str] = &["holding", "holding_in"];
 
 /// Names too common to read a method call into one of this code's `async fn`s: `x.get(k)` is
 /// not a future of a local `async fn get`.
@@ -139,11 +141,9 @@ impl Names {
                     if let Some(t) = type_name(&i.self_ty) {
                         self.0.local_paths.insert(t);
                     }
-                    // A trait impl's methods answer someone else's calls (a tonic server's
-                    // `execute` is what another crate's client awaits); they excuse nothing.
-                    if i.trait_.is_none() {
-                        syn::visit::visit_item_impl(self, i);
-                    }
+                    // Its trait impls are this crate's own async fns too; another crate's calls
+                    // to the same names are not excused, since names are per crate.
+                    syn::visit::visit_item_impl(self, i);
                 }
             }
             fn visit_item_struct(&mut self, s: &'ast syn::ItemStruct) {
@@ -224,6 +224,8 @@ pub struct FileScan {
     pub found: Vec<Found>,
     /// Raw lock types named in production code: `(line, path)` (the `raw-locks` rule).
     pub raw_locks: Vec<(usize, String)>,
+    /// lock_order classes named by a string literal: `(line, class)` — each must be a registry key.
+    pub classes: Vec<(usize, String)>,
     /// Line ranges of test items, whose tags are not production tags.
     pub test_ranges: Vec<(usize, usize)>,
     /// String literals: a `// WAIT:` inside one is text, not a tag.
@@ -405,6 +407,11 @@ fn see_through(e: &syn::Expr) -> &syn::Expr {
         syn::Expr::Call(c) if c.args.len() == 1 && last_ident(&c.func).is_some_and(|n| TRANSPARENT_FNS.contains(&n.as_str())) => {
             see_through(&c.args[0])
         }
+        syn::Expr::Call(c)
+            if !c.args.is_empty() && last_ident(&c.func).is_some_and(|n| TRANSPARENT_LAST_ARG_FNS.contains(&n.as_str())) =>
+        {
+            see_through(&c.args[c.args.len() - 1])
+        }
         syn::Expr::Block(b) => match block_value(&b.block) {
             Some(v) => see_through(v),
             None => peel(e),
@@ -477,7 +484,10 @@ impl Visitor<'_> {
     /// Record an `.await` on a call: a method `name` when `path` is `None`, else a function.
     fn await_on_call(&mut self, name: &str, path: Option<&[String]>, line: usize, column: usize) {
         let method = path.is_none();
-        let (what, bounded) = if method && self.waits_when_awaited(name) {
+        let (what, bounded) = if self.reg.wait_fns.contains(name) {
+            let shown = if method { format!(".{name}(..)") } else { format!("{name}(..)") };
+            (format!("`{shown}.await`, a declared helper that waits"), false)
+        } else if method && self.waits_when_awaited(name) {
             (format!("`.{name}(..).await`"), false)
         } else if !method && BOUNDING_FNS.contains(&name) {
             (format!("`{name}(..).await`"), true)
@@ -624,7 +634,7 @@ impl Visitor<'_> {
                                 }
                             } else if !after_dot && name == "block_on" {
                                 self.record(at.line, at.column, "`block_on(..)`".to_string(), Wait::Blocking, false);
-                            } else if self.reg.wait_fns.contains(&name) {
+                            } else if !awaited && self.reg.wait_fns.contains(&name) {
                                 let shown = if after_dot { format!(".{name}(..)") } else { format!("{name}(..)") };
                                 self.record(at.line, at.column, format!("`{shown}`, a declared helper that waits"), Wait::Blocking, false);
                             }
@@ -924,12 +934,17 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
     }
 
     fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+        if self.test_depth == 0 {
+            if let Some(class) = class_literal(c) {
+                self.out.classes.push(class);
+            }
+        }
         let path = path_of(&c.func).unwrap_or_default();
         let name = path.last().cloned().unwrap_or_default();
         let at = c.func.span().start();
         if name == "block_on" {
             self.record(at.line, at.column, "`block_on(..)`".into(), Wait::Blocking, false);
-        } else if self.reg.wait_fns.contains(&name) {
+        } else if !self.consumed.contains(&(at.line, at.column)) && self.reg.wait_fns.contains(&name) {
             self.record(at.line, at.column, format!("`{name}(..)`, a declared helper that waits"), Wait::Blocking, false);
         } else if !self.consumed.contains(&(at.line, at.column)) && self.names.escapes_fn(&path) {
             self.record(at.line, at.column, format!("a future of `{name}(..)`, made here and awaited elsewhere"), Wait::Async, false);
@@ -979,6 +994,22 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
     }
 }
 
+/// `lock_order::holding("processor", ..)`, `Mutex::new("store-lock", ..)`, … → the class, if it
+/// is a string literal.
+fn class_literal(c: &syn::ExprCall) -> Option<(usize, String)> {
+    let path = path_of(&c.func)?;
+    let last = path.last()?.as_str();
+    let named = matches!(last, "holding" | "holding_in" | "waits_on" | "waits_on_in" | "hold" | "scope" | "acquire")
+        || (matches!(last, "new" | "with_default") && path.len() >= 2 && matches!(path[path.len() - 2].as_str(), "Mutex" | "RwLock") && c.args.len() == 2);
+    if !named {
+        return None;
+    }
+    match c.args.first()? {
+        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => Some((s.span().start().line, s.value())),
+        _ => None,
+    }
+}
+
 /// Lock types that must be built through `lock-order`'s wrappers (`raw-locks`).
 const RAW_LOCKS: &[(&str, &str)] = &[
     ("std::sync", "Mutex"),
@@ -997,7 +1028,10 @@ fn raw_lock(segs: &[String]) -> Option<String> {
         return None;
     }
     let (module, item) = (segs[..n - 1].join("::"), segs[n - 1].as_str());
-    let hit = RAW_LOCKS.iter().any(|(m, i)| *i == item && (module == *m || module.ends_with(&format!("::{}", m.rsplit("::").next().unwrap_or(m))) || module == m.rsplit("::").next().unwrap_or(m)));
+    // Exactly `std::sync`, `tokio::sync`, `parking_lot` (or `::std::sync`), or a bare `sync::` —
+    // `use std::sync; sync::Mutex`. A module alias (`use tokio::sync as ts`) is not followed.
+    let module = module.trim_start_matches("::");
+    let hit = RAW_LOCKS.iter().any(|(m, i)| *i == item && (module == *m || module == "sync"));
     hit.then(|| segs.join("::"))
 }
 

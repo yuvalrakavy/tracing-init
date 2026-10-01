@@ -45,8 +45,20 @@ pub fn new_branch() -> u64 {
     id
 }
 
+/// A branch ended: a guard it returned is still held, now by its parent.
 pub fn end_branch(id: u64) {
-    parents().lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+    let Some(parent) = parents().lock().unwrap_or_else(|p| p.into_inner()).remove(&id) else { return };
+    for s in shards() {
+        let moved: Vec<(Context, Vec<Held>)> = {
+            let mut map = s.lock().unwrap_or_else(|p| p.into_inner());
+            let keys: Vec<Context> = map.keys().filter(|c| c.branch == id).copied().collect();
+            keys.into_iter().filter_map(|c| map.remove(&c).map(|v| (c, v))).collect()
+        };
+        for (c, held) in moved {
+            let to = Context { branch: parent, ..c };
+            shard(&to).lock().unwrap_or_else(|p| p.into_inner()).entry(to).or_default().extend(held);
+        }
+    }
 }
 
 /// Run `f` with the current branch set to `id`, restoring the previous one after.
@@ -145,6 +157,8 @@ struct Graph {
     /// from → to → (where `from` was held, where `to` was taken), first time seen.
     edges: HashMap<&'static str, HashMap<&'static str, (Site, Site)>>,
     reported: HashSet<(&'static str, &'static str)>,
+    /// Self-waits reported, by class and where the second wait was made.
+    reported_self: HashSet<(&'static str, Site)>,
 }
 
 fn graph() -> &'static RwLock<Graph> {
@@ -209,10 +223,13 @@ pub fn attempt(class: &'static str, instance: usize, site: Site) {
     let mut reports = Vec::new();
     for h in &held {
         if h.instance == instance {
-            reports.push(format!(
-                "`{class}` waited on again while this context holds it (held since {}, again at {site}): it waits on itself",
-                h.site
-            ));
+            let first = graph().write().unwrap_or_else(|p| p.into_inner()).reported_self.insert((class, site));
+            if first {
+                reports.push(format!(
+                    "`{class}` waited on again while this context holds it (held since {}, again at {site}): it waits on itself",
+                    h.site
+                ));
+            }
             continue;
         }
         if h.class == class {

@@ -83,7 +83,7 @@ async fn waiting_on_a_consumer_while_holding_a_lock_it_takes_is_a_cycle() {
     .unwrap();
     // A caller holding the store lock waits on the consumer: 07-07's shape.
     let _r = store.read().await;
-    waits_on("cons-processor");
+    let _waiting = waits_on("cons-processor");
     assert!(cycle_with("cons-store", "cons-processor").is_some(), "{:?}", cycles());
 }
 
@@ -284,8 +284,70 @@ async fn a_consumer_waiting_on_itself_is_reported_whatever_its_name_s_spelling()
     let one: &'static str = Box::leak(String::from("self-consumer").into_boxed_str());
     let two: &'static str = Box::leak(String::from("self-consumer").into_boxed_str());
     holding(one, async move {
-        waits_on(two);
+        let _waiting = waits_on(two);
     })
     .await;
     assert!(any_cycle_with("self-consumer").is_some_and(|c| c.contains("waits on itself")), "{:?}", cycles());
+}
+
+#[tokio::test]
+async fn one_store_s_consumer_waiting_on_another_s_is_not_a_self_wait() {
+    crate::holding_in("inst-consumer", 1, async {
+        let _waiting = crate::waits_on_in("inst-consumer", 2);
+    })
+    .await;
+    assert!(any_cycle_with("inst-consumer").is_none(), "{:?}", cycles());
+    crate::holding_in("inst-consumer", 3, async {
+        let _waiting = crate::waits_on_in("inst-consumer", 3);
+    })
+    .await;
+    assert!(any_cycle_with("inst-consumer").is_some_and(|c| c.contains("waits on itself")), "{:?}", cycles());
+}
+
+#[tokio::test]
+async fn a_guard_returned_out_of_a_branch_is_held_by_its_parent() {
+    let a = Arc::new(tokio_sync::Mutex::new("ret-a", ()));
+    let b = tokio_sync::Mutex::new("ret-b", ());
+    let a1 = a.clone();
+    let ga = branch(async move { a1.lock_owned().await }).await;
+    let _gb = b.lock().await; // a is held here, returned by the branch: a → b
+    drop(_gb);
+    drop(ga);
+    let _gb = b.lock().await;
+    let _ga = a.lock().await;
+    assert!(cycle_with("ret-a", "ret-b").is_some(), "the returned guard was lost with its branch: {:?}", cycles());
+}
+
+#[test]
+fn a_self_wait_is_reported_once_per_site() {
+    let l = sync::RwLock::new("self-once", ());
+    let _first = l.read().unwrap();
+    for _ in 0..1000 {
+        let _again = l.try_read().unwrap(); // try: no wait, no report
+    }
+    let before = cycles().iter().filter(|c| c.contains("`self-once`")).count();
+    assert_eq!(before, 0);
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let t = tokio_sync::RwLock::new("self-once-tok", ());
+    rt.block_on(async {
+        let _first = t.read().await;
+        for _ in 0..1000 {
+            let _again = t.read().await;
+        }
+    });
+    assert_eq!(cycles().iter().filter(|c| c.contains("`self-once-tok`")).count(), 1, "{:?}", cycles());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_semaphore_permit_is_a_pseudo_lock_while_it_lives() {
+    let sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let a = tokio_sync::Mutex::new("sem-a", ());
+    {
+        let (permit, _held) = crate::acquire("sem-window", sem.clone().acquire_owned()).await;
+        let _ga = a.lock().await; // sem-window → sem-a
+        drop(permit);
+    }
+    let _ga = a.lock().await;
+    let (_permit, _held) = crate::acquire("sem-window", sem.clone().acquire_owned()).await;
+    assert!(cycle_with("sem-window", "sem-a").is_some(), "{:?}", cycles());
 }
