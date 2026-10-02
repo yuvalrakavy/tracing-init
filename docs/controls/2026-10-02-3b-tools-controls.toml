@@ -110,8 +110,8 @@ guard       = "raw_glob"
 [[control]]
 name        = "the_fake_broker_never_holds_an_ack"
 file        = "mqtt-test-broker/src/lib.rs"
-anchor      = '''                    if shared.hold_acks.load(Ordering::SeqCst) {'''
-replacement = '''                    if false {'''
+anchor      = '''    if shared.hold_acks.load(Ordering::SeqCst) {'''
+replacement = '''    if false {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "held_acks_saturate"]
 expect_text = "the channel never filled: the acks are not being held"
