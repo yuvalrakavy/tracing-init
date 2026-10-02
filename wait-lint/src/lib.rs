@@ -31,9 +31,21 @@
 //! * **Declared helpers.** A helper that waits for its callers (`wait-fns`: `run_async`) makes
 //!   every call to it a wait to tag, so a new caller is a reviewed diff too.
 //! * **Raw locks** (`raw-locks = forbid`): naming `std::sync`/`tokio::sync`/`parking_lot`
-//!   `Mutex` or `RwLock` is a finding — every lock is built through the `lock-order` crate's
-//!   wrappers, whose runtime check owns lock order. Syntax cannot see a guard's lifetime, so lock
-//!   order is not this lint's.
+//!   `Mutex` or `RwLock`, or a `std`/`parking_lot` `Condvar`, is a finding — every lock is built
+//!   through the `lock-order` crate's wrappers, whose runtime check owns lock order. So is a glob
+//!   import of one of those modules or an alias for one (`use std::sync::*`, `use std::sync as
+//!   s`), which would name a raw lock past this check. Syntax cannot see a guard's lifetime, so
+//!   lock order is not this lint's.
+//! * **A name collision.** This code's own async methods are recognised by name, not by the
+//!   receiver's type, so `client.publish(..).await` on a dependency's client would pass as this
+//!   code's `publish` if the crate defines one (Store no-hang §14.1: it hid rumqttc's calls in two
+//!   bridges). An `.await` on such a name with a receiver other than bare `self` is a finding until
+//!   the registry declares the name: `wait-methods` if any awaited one is a dependency's (every
+//!   call becomes a wait to tag — over-tagging this code's own calls is safe), `local-methods` if
+//!   every one is this code's. A `local-methods` name this code does not define is a finding.
+//! * **An empty scan.** [`Report::files_scanned`] counts the production files read;
+//!   [`assert_registered`] and the CLI refuse a scan that read none or found no wait, since a wrong
+//!   source directory is otherwise green.
 //!
 //! # What a wait is
 //!
@@ -41,7 +53,8 @@
 //! is a finding rather than a silence. An `.await` on:
 //!
 //! * a method named in [`AWAIT_METHODS`] (`lock`, `send`, `recv`, `notified`, `cancelled`, …) or
-//!   declared by the registry (`wait-methods`) — **a wait**;
+//!   declared by the registry (`wait-methods`) — **a wait**, even where this code defines an
+//!   `async fn` of the same name;
 //! * something that is not a call — a stored future: a oneshot reply, a `JoinHandle` — or on
 //!   `spawn(..)` / `spawn_blocking(..)` — **a wait**;
 //! * `timeout(..)` / `timeout_at(..)` — **a bounded wait**. The async waits inside its arguments
@@ -151,6 +164,9 @@ pub struct Report {
     pub findings: Vec<Finding>,
     /// The waiters block the registry should hold, rendered.
     pub waiters_block: String,
+    /// Production files read. A check over no file is green and says nothing, so the directory
+    /// entry points ([`assert_registered`], the CLI) refuse a scan that read none or found no wait.
+    pub files_scanned: usize,
 }
 
 /// Every wait in `files` (path → contents), with the key its tag gives it, and every finding.
@@ -191,10 +207,37 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
             crate_names.local_paths.insert(module);
         }
     }
+    out.files_scanned = parsed.len();
+    // A `local-methods` name must be one of this code's async methods: a stale one would excuse a
+    // dependency's wait of that name if it were ever awaited.
+    for name in &reg.local_methods {
+        if !names.values().any(|n| n.local_async.contains(name)) {
+            out.findings.push(Finding {
+                file: registry_file.to_string(),
+                line: None,
+                message: format!("`local-methods` names `{name}`, which this code does not define as an async method"),
+            });
+        }
+    }
+    let mut finding = |file: &str, line: Option<usize>, message: String| {
+        out.findings.push(Finding { file: file.to_string(), line, message });
+    };
 
     let mut sites = Vec::new();
     for (rel, text, file) in &parsed {
         let scanned = scan::scan(file, &reg, &names[&crate_of(rel)]);
+        for (line, name) in &scanned.ambiguous {
+            finding(
+                rel,
+                Some(*line),
+                format!(
+                    "`.{name}(..).await` on a receiver other than `self`: `{name}` is one of this code's async methods, and \
+                     the lint matches names, not types, so a dependency's `{name}` would hide here. Declare it in {registry_file}: \
+                     `wait-methods` if any awaited `{name}` is a dependency's (each becomes a wait to tag), `local-methods` if \
+                     every one is this code's"
+                ),
+            );
+        }
         for (line, class) in &scanned.classes {
             if reg.row(class).is_none() {
                 finding(rel, Some(*line), format!("lock class `{class}` is no row of {registry_file}: a class names its registry row, or its cycles hide behind a typo"));
@@ -325,6 +368,14 @@ pub fn write_waiters(root: &Path, src_dirs: &[&str], registry: &str) -> std::io:
 /// ```
 pub fn assert_registered(root: impl AsRef<Path>, src_dirs: &[&str], registry: &str) {
     let report = check_dirs(root.as_ref(), src_dirs, registry).expect("read the sources and the registry");
+    // A wrong directory reads nothing, and nothing has no findings (Store no-hang §14.1).
+    assert!(
+        report.files_scanned > 0 && !report.sites.is_empty(),
+        "the wait-registry check read {} production file(s) under {src_dirs:?} and found {} wait(s): a server with no wait \
+         is not this crate, so the source directories are wrong",
+        report.files_scanned,
+        report.sites.len()
+    );
     assert!(
         report.findings.is_empty(),
         "{} wait-registry finding(s):\n{}",

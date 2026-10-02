@@ -93,6 +93,12 @@ fn main() -> ExitCode {
     if mode == "check" {
         println!("{} finding(s)", report.findings.len());
     }
+    // No file read, or no wait found: the directories are wrong, and a green verdict would say so
+    // about nothing.
+    if mode == "check" && (report.files_scanned == 0 || report.sites.is_empty()) {
+        println!("read {} production file(s) and found {} wait(s) — check the --src directories", report.files_scanned, report.sites.len());
+        return ExitCode::from(1);
+    }
     if report.findings.is_empty() {
         ExitCode::SUCCESS
     } else {

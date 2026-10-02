@@ -403,3 +403,115 @@ async fn a_semaphore_permit_is_a_pseudo_lock_while_it_lives() {
     let (_permit, _held) = crate::acquire("sem-window", sem.clone().acquire_owned()).await;
     assert!(cycle_with("sem-window", "sem-a").is_some(), "{:?}", cycles());
 }
+
+// `sync::Condvar` (Store no-hang §14.2). A notifier on another thread proves nothing about the
+// waiter's own record — holdings are per thread — so these look at the record itself.
+
+/// Lock `m` from this thread until `state` reads `want`, the waiter's signal that it is inside
+/// its wait (it set the state under the lock, and released the lock only by waiting).
+fn until_state(m: &sync::Mutex<u8>, want: u8) -> sync::MutexGuard<'_, u8> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(g) = m.try_lock() {
+            if *g == want {
+                return g;
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "the waiter never reached its wait");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn a_condvar_wait_gives_up_its_class_and_takes_it_back() {
+    let pair = Arc::new((sync::Mutex::new("cv-own", 0u8), sync::Condvar::new()));
+    let instance = pair.0.instance();
+    let (woke_tx, woke_rx) = std::sync::mpsc::channel();
+    let (looked_tx, looked_rx) = std::sync::mpsc::channel::<()>();
+    let p = pair.clone();
+    let waiter = std::thread::spawn(move || {
+        let (m, cv) = &*p;
+        let mut g = m.lock().unwrap();
+        *g = 1;
+        while *g != 2 {
+            g = cv.wait(g).unwrap();
+        }
+        woke_tx.send(()).unwrap();
+        looked_rx.recv().unwrap(); // hold the re-taken guard while the test looks
+    });
+    let mut g = until_state(&pair.0, 1);
+    // This thread holds the mutex now; the waiter, inside its wait, must not be recorded too.
+    assert_eq!(crate::checker::holders_of(instance).len(), 1, "the waiter kept its record through the wait");
+    *g = 2;
+    pair.1.notify_all();
+    drop(g);
+    woke_rx.recv().unwrap();
+    assert_eq!(crate::checker::holders_of(instance).len(), 1, "the waiter did not take its record back on wake");
+    looked_tx.send(()).unwrap();
+    waiter.join().unwrap();
+}
+
+#[test]
+fn a_condvar_wait_holding_a_later_lock_reports_the_reacquisitions_cycle() {
+    let a = sync::Mutex::new("cv-ord-a", ());
+    let b = sync::Mutex::new("cv-ord-b", ());
+    let cv = sync::Condvar::new();
+    {
+        let _ga = a.lock().unwrap();
+        let _gb = b.lock().unwrap(); // a → b
+    }
+    assert!(cycle_with("cv-ord-a", "cv-ord-b").is_none(), "one order alone is no cycle");
+    let ga = a.lock().unwrap();
+    let gb = b.lock().unwrap();
+    // Waiting on `a` while holding `b`: the wake re-takes `a` under `b`. std re-takes it before
+    // returning, so the check must have happened before the wait.
+    let (ga, _) = cv.wait_timeout(ga, Duration::from_millis(5)).unwrap();
+    drop(gb);
+    drop(ga);
+    assert!(
+        cycle_with("cv-ord-a", "cv-ord-b").is_some(),
+        "the re-acquisition's order was not checked before the wait: {:?}",
+        cycles()
+    );
+}
+
+#[test]
+fn a_poisoned_wake_takes_the_class_back_too() {
+    let pair = Arc::new((sync::Mutex::new("cv-poison", 0u8), sync::Condvar::new()));
+    let instance = pair.0.instance();
+    let p = pair.clone();
+    let waiter = std::thread::spawn(move || {
+        let (m, cv) = &*p;
+        let mut g = m.lock().unwrap();
+        *g = 1;
+        let g = match cv.wait_while(g, |s| *s != 2) {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let held = crate::checker::holders_of(instance).len();
+        drop(g);
+        held
+    });
+    drop(until_state(&pair.0, 1));
+    let p = pair.clone();
+    let poisoner = std::thread::spawn(move || {
+        let mut g = p.0.lock().unwrap();
+        *g = 2;
+        p.1.notify_all();
+        panic!("poison the mutex under the waiter");
+    });
+    assert!(poisoner.join().is_err());
+    assert_eq!(waiter.join().unwrap(), 1, "a poisoned wake left the waiter without its record");
+}
+
+#[test]
+fn a_condvar_wait_timeout_returns_at_its_bound() {
+    let m = sync::Mutex::new("cv-timeout", ());
+    let cv = sync::Condvar::new();
+    let started = std::time::Instant::now();
+    let (g, timed_out) = cv.wait_timeout(m.lock().unwrap(), Duration::from_millis(20)).unwrap();
+    assert!(timed_out.timed_out());
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    drop(g);
+    assert!(any_cycle_with("cv-timeout").is_none(), "{:?}", cycles());
+}

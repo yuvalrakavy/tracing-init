@@ -1,0 +1,108 @@
+# Negative controls for the phase-3b tool changes (Store no-hang §14.2): wait-lint's name
+# collision, empty scan and raw-lock escapes; lock-order's Condvar. Run from Store with
+#     scripts/negative-control.py --root ../tracing-init ../tracing-init/docs/controls/2026-10-02-3b-tools-controls.toml
+
+[[control]]
+name        = "the_condvar_checks_nothing_before_the_wait"
+file        = "lock-order/src/sync.rs"
+anchor      = '''    drop(_held);
+    hooks::attempt(class, instance, site);
+'''
+replacement = '''    drop(_held);
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--", "reports_the_reacquisitions_cycle"]
+expect_text = "the re-acquisition's order was not checked before the wait"
+guard       = "condvar_prewait_check"
+
+[[control]]
+name        = "the_condvar_keeps_its_record_through_the_wait"
+file        = "lock-order/src/sync.rs"
+anchor      = '''    drop(_held);
+    hooks::attempt(class, instance, site);
+'''
+replacement = '''    std::mem::forget(_held);
+    hooks::attempt(class, instance, site);
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--", "gives_up_its_class_and_takes_it_back"]
+expect_text = "the waiter kept its record through the wait"
+guard       = "condvar_release"
+
+[[control]]
+name        = "an_ambiguous_call_is_not_recorded"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''                self.out.ambiguous.push((line, name.to_string()));
+'''
+replacement = ""
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "is_ambiguous_until_declared"]
+expect_text = "a_local_name_awaited_on_another_receiver_is_ambiguous_until_declared"
+guard       = "collision"
+
+[[control]]
+name        = "every_receiver_counts_as_another"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''                let on_self = matches!(see_through(&mc.receiver), syn::Expr::Path(p) if p.path.is_ident("self"));
+'''
+replacement = '''                let on_self = false;
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "is_ambiguous_until_declared"]
+expect_text = "left: [5, 9]"
+guard       = "collision_self"
+
+[[control]]
+name        = "a_declared_wait_method_loses_to_this_codes_name"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        } else if method && self.waits_when_awaited(name) {
+            (format!("`.{name}(..).await`"), false)'''
+replacement = '''        } else if method && self.waits_when_awaited(name) && !self.names.is_local_method(name) {
+            (format!("`.{name}(..).await`"), false)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "wins_over_this_codes_name"]
+expect_text = "a_declared_wait_method_wins_over_this_codes_name"
+guard       = "precedence"
+
+[[control]]
+name        = "a_stale_local_method_passes"
+file        = "wait-lint/src/lib.rs"
+anchor      = '''        if !names.values().any(|n| n.local_async.contains(name)) {'''
+replacement = '''        if false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "a_stale_one_is_a_finding"]
+expect_text = "a_declared_local_method_is_this_codes_and_a_stale_one_is_a_finding"
+guard       = "stale_local"
+
+[[control]]
+name        = "an_empty_scan_is_green"
+file        = "wait-lint/src/lib.rs"
+anchor      = '''        report.files_scanned > 0 && !report.sites.is_empty(),'''
+replacement = '''        true,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "refuses_a_scan_that_read_nothing"]
+expect_text = "assert_registered_refuses_a_scan_that_read_nothing"
+guard       = "empty_scan"
+
+[[control]]
+name        = "a_raw_condvar_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''    ("std::sync", "Condvar"),
+'''
+replacement = ""
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "raw_condvars_aliases_and_globs"]
+expect_text = "raw_condvars_aliases_and_globs_are_raw_locks"
+guard       = "raw_condvar"
+
+[[control]]
+name        = "a_glob_import_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''            if lock_module(prefix) {
+                out.push((g.star_token.span.start().line, format!("{}::* (a glob import)", prefix.join("::"))));
+            }'''
+replacement = '''            let _ = g;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "raw_condvars_aliases_and_globs"]
+expect_text = "raw_condvars_aliases_and_globs_are_raw_locks"
+guard       = "raw_glob"

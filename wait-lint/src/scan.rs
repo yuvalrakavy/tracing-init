@@ -227,6 +227,11 @@ pub struct FileScan {
     pub found: Vec<Found>,
     /// Raw lock types named in production code: `(line, path)` (the `raw-locks` rule).
     pub raw_locks: Vec<(usize, String)>,
+    /// `.name(..).await` on a receiver other than `self`, where `name` is one of this code's async
+    /// methods and the registry says neither `wait-methods` nor `local-methods`: `(line, name)`.
+    /// The lint matches names, not types, so such a call may be a dependency's wait hiding behind
+    /// this code's name (Store no-hang §14.1: mqtt_hdl's own `publish` hid rumqttc's).
+    pub ambiguous: Vec<(usize, String)>,
     /// lock_order classes named by a string literal: `(line, class)` — each must be a registry key.
     pub classes: Vec<(usize, String)>,
     /// Line ranges of test items, whose tags are not production tags.
@@ -490,7 +495,8 @@ impl Visitor<'_> {
     }
 
     /// Record an `.await` on a call: a method `name` when `path` is `None`, else a function.
-    fn await_on_call(&mut self, name: &str, path: Option<&[String]>, line: usize, column: usize) {
+    /// `on_self`: a method called on bare `self`, which is certainly this code's own.
+    fn await_on_call(&mut self, name: &str, path: Option<&[String]>, on_self: bool, line: usize, column: usize) {
         let method = path.is_none();
         let (what, bounded) = if self.reg.wait_fns.contains(name) {
             let shown = if method { format!(".{name}(..)") } else { format!("{name}(..)") };
@@ -508,6 +514,11 @@ impl Visitor<'_> {
             None => self.names.is_local_method(name),
             Some(p) => self.names.is_local_fn(p),
         } {
+            // A method matched by name alone: on `self` it is this code's; on anything else it may
+            // be a dependency's of the same name, and only the registry can say which.
+            if method && !on_self && self.test_depth == 0 && !self.reg.local_methods.contains(name) {
+                self.out.ambiguous.push((line, name.to_string()));
+            }
             return;
         } else {
             let shown = if method { format!(".{name}(..)") } else { format!("{}(..)", path.map(|p| p.join("::")).unwrap_or_default()) };
@@ -720,10 +731,14 @@ impl Visitor<'_> {
                     let name = name.to_string();
                     let method = end >= 3 && matches!(&tts[end - 3], TokenTree::Punct(p) if p.as_char() == '.');
                     if method {
-                        self.await_on_call(&name, None, line, column);
+                        // `self.name(..)`: the receiver is the bare `self` token, not `x.self`-shaped.
+                        let on_self = end >= 4
+                            && matches!(&tts[end - 4], TokenTree::Ident(id) if id == "self")
+                            && !(end >= 5 && matches!(&tts[end - 5], TokenTree::Punct(p) if p.as_char() == '.'));
+                        self.await_on_call(&name, None, on_self, line, column);
                     } else {
                         let path = token_path(tts, end - 2);
-                        self.await_on_call(&name, Some(&path), line, column);
+                        self.await_on_call(&name, Some(&path), false, line, column);
                     }
                 }
                 _ => self.record(line, column, "an `.await` the lint cannot classify".into(), Wait::Async, false),
@@ -928,13 +943,14 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         match base {
             syn::Expr::MethodCall(mc) => {
                 let at = mc.method.span().start();
-                self.await_on_call(&mc.method.to_string(), None, at.line, at.column);
+                let on_self = matches!(see_through(&mc.receiver), syn::Expr::Path(p) if p.path.is_ident("self"));
+                self.await_on_call(&mc.method.to_string(), None, on_self, at.line, at.column);
             }
             syn::Expr::Call(c) => match path_of(&c.func) {
                 Some(path) => {
                     let at = c.func.span().start();
                     let name = path.last().cloned().unwrap_or_default();
-                    self.await_on_call(&name, Some(&path), at.line, at.column);
+                    self.await_on_call(&name, Some(&path), false, at.line, at.column);
                 }
                 None => self.record(line, column, "an `.await` on the result of a computed call".into(), Wait::Async, false),
             },
@@ -1105,7 +1121,18 @@ const RAW_LOCKS: &[(&str, &str)] = &[
     ("tokio::sync", "RwLock"),
     ("parking_lot", "Mutex"),
     ("parking_lot", "RwLock"),
+    // A raw condvar waits on a raw mutex's guard, so it is the same escape (Store no-hang §14.2).
+    ("std::sync", "Condvar"),
+    ("parking_lot", "Condvar"),
 ];
+
+/// The modules raw locks live in: a glob import of one, or an alias for one, would name them past
+/// this check (`use std::sync::*; Mutex::new(..)`, `use std::sync as s; s::Mutex`).
+fn lock_module(segs: &[String]) -> bool {
+    let joined = segs.join("::");
+    let joined = joined.trim_start_matches("::");
+    RAW_LOCKS.iter().any(|(m, _)| *m == joined)
+}
 
 /// `std::sync::Mutex`, `tokio::sync::RwLock`, … — or any path ending `sync::Mutex`.
 fn raw_lock(segs: &[String]) -> Option<String> {
@@ -1147,6 +1174,8 @@ fn raw_locks_in_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec
             segs.push(r.ident.to_string());
             if let Some(raw) = raw_lock(&segs) {
                 out.push((r.ident.span().start().line, raw));
+            } else if lock_module(&segs) {
+                out.push((r.ident.span().start().line, format!("{} as {} (a module alias)", segs.join("::"), r.rename)));
             }
         }
         syn::UseTree::Group(g) => {
@@ -1154,6 +1183,10 @@ fn raw_locks_in_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec
                 raw_locks_in_use(t, prefix, out);
             }
         }
-        syn::UseTree::Glob(_) => {}
+        syn::UseTree::Glob(g) => {
+            if lock_module(prefix) {
+                out.push((g.star_token.span.start().line, format!("{}::* (a glob import)", prefix.join("::"))));
+            }
+        }
     }
 }

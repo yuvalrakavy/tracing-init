@@ -50,6 +50,9 @@ pub struct Registry {
     pub not_waits: BTreeSet<String>,
     /// Helpers that wait on behalf of their callers (`run_async`): every call is a wait.
     pub wait_fns: BTreeSet<String>,
+    /// This code's own async methods, confirmed as such where they are awaited on a receiver other
+    /// than `self` (a name that is also a dependency's goes in `wait_methods` instead).
+    pub local_methods: BTreeSet<String>,
     /// `forbid`: naming a raw lock type outside the lock-order crate is a finding.
     pub raw_locks_forbidden: bool,
     /// The generated waiters block, if present: each waiter and its line.
@@ -103,6 +106,7 @@ impl Registry {
                             "blocking-methods" => reg.blocking_methods.extend(values),
                             "not-waits" => reg.not_waits.extend(values),
                             "wait-fns" => reg.wait_fns.extend(values),
+                            "local-methods" => reg.local_methods.extend(values),
                             "raw-locks" => {
                                 let v: Vec<String> = values.collect();
                                 match v.as_slice() {

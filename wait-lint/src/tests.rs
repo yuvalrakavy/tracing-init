@@ -763,3 +763,109 @@ async fn drain() {}
     let r = run(src);
     assert!(r.sites.is_empty(), "{:?}", r.sites);
 }
+
+// Store no-hang §14 (phase 3b): the name collision, the empty scan, and the raw-lock escapes.
+
+/// This code's own `async fn publish`, and a dependency client's `publish` awaited beside it.
+const COLLIDES: &str = "\
+struct Publisher;
+impl Publisher {
+    async fn publish(&self, t: &str) {}
+    async fn send_status(&self) {
+        self.publish(\"x\").await;
+    }
+}
+async fn poll(client: Client) {
+    client.publish(t, q, r, p).await;
+}
+";
+
+#[test]
+fn a_local_name_awaited_on_another_receiver_is_ambiguous_until_declared() {
+    let r = run(COLLIDES);
+    let ambiguous: Vec<usize> =
+        source_findings(&r).into_iter().filter(|(_, m)| m.contains("receiver other than `self`")).map(|(l, _)| l).collect();
+    // `self.publish` is this code's; `client.publish` may be anyone's.
+    assert_eq!(ambiguous, vec![9], "{:?}", r.findings);
+    assert!(r.sites.is_empty(), "an undeclared collision is no wait yet: {:?}", r.sites);
+}
+
+#[test]
+fn a_declared_wait_method_wins_over_this_codes_name() {
+    // The precedence the bridges rely on: rumqttc's `publish`, declared, is a wait even where
+    // this code defines an `async fn publish` — its own calls included (over-tagging is safe).
+    let registry = format!("{ROWS}\n```wait-lint\nwait-methods = publish\n```\n");
+    let r = run_files(&[("src/a.rs", COLLIDES)], &registry);
+    assert_eq!(untagged_lines(&r), vec![5, 9], "{:?}", r.findings);
+    assert!(!r.findings.iter().any(|f| f.message.contains("receiver other than `self`")), "{:?}", r.findings);
+}
+
+#[test]
+fn a_declared_local_method_is_this_codes_and_a_stale_one_is_a_finding() {
+    let registry = format!("{ROWS}\n```wait-lint\nlocal-methods = publish\n```\n");
+    let r = run_files(&[("src/a.rs", COLLIDES)], &registry);
+    assert!(r.findings.iter().all(|f| !f.message.contains("receiver other than `self`")), "{:?}", r.findings);
+    assert!(r.sites.is_empty(), "{:?}", r.sites);
+
+    let stale = format!("{ROWS}\n```wait-lint\nlocal-methods = subscribe\n```\n");
+    let r = run_files(&[("src/a.rs", COLLIDES)], &stale);
+    assert!(
+        registry_findings(&r).iter().any(|(_, m)| m.contains("`local-methods` names `subscribe`")),
+        "{:?}",
+        r.findings
+    );
+}
+
+#[test]
+fn a_collision_inside_macro_tokens_is_ambiguous_too() {
+    // An `.await` inside a macro's tokens is read token by token; the receiver test is the same.
+    let src = "\
+impl Publisher {
+    async fn publish(&self) {}
+    async fn report(&self, client: Client) {
+        log!(client.publish().await);
+        log!(self.publish().await);
+    }
+}
+";
+    let r = run(src);
+    let ambiguous: Vec<usize> =
+        source_findings(&r).into_iter().filter(|(_, m)| m.contains("receiver other than `self`")).map(|(l, _)| l).collect();
+    assert_eq!(ambiguous, vec![4], "{:?}", r.findings);
+}
+
+#[test]
+fn the_report_counts_the_files_it_read() {
+    let r = run_files(&[("src/a.rs", ONE_WAIT), ("tests/t.rs", ONE_WAIT)], ROWS);
+    assert_eq!(r.files_scanned, 1, "test files are not production files");
+    let r = run_files(&[], ROWS);
+    assert_eq!(r.files_scanned, 0);
+}
+
+#[test]
+#[should_panic(expected = "the source directories are wrong")]
+fn assert_registered_refuses_a_scan_that_read_nothing() {
+    let dir = std::env::temp_dir().join(format!("wait-lint-empty-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("registry.md"), format!("{ROWS}\n```wait-lint-waiters\n```\n")).unwrap();
+    assert_registered(&dir, &["src"], "registry.md");
+}
+
+#[test]
+fn raw_condvars_aliases_and_globs_are_raw_locks() {
+    let src = "\
+use std::sync::Condvar;
+use std::sync as s;
+use parking_lot::*;
+use tokio::sync::*;
+use lock_order::sync::*;
+use std::sync::{Arc, mpsc};
+fn f() {
+    let c = std::sync::Condvar::new();
+}
+";
+    let forbid = format!("{ROWS}\n```wait-lint\nraw-locks = forbid\n```\n");
+    let r = run_files(&[("src/a.rs", src)], &forbid);
+    let raw: Vec<usize> = source_findings(&r).into_iter().filter(|(_, m)| m.contains("raw lock")).map(|(l, _)| l).collect();
+    assert_eq!(raw, vec![1, 2, 3, 4, 8], "{:?}", r.findings);
+}

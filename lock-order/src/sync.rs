@@ -1,11 +1,12 @@
-//! `std::sync::{Mutex, RwLock}`, with a class. Same methods, same `LockResult`s; the guards deref
-//! to the inner ones. Not bounded by the watchdog: no `.await` can sit under a std guard, and a std
-//! guard held across a blocking wait is an order edge like any other.
+//! `std::sync::{Mutex, RwLock, Condvar}`, with a class. Same methods, same `LockResult`s; the
+//! guards deref to the inner ones. Not bounded by the watchdog: no `.await` can sit under a std
+//! guard, and a std guard held across a blocking wait is an order edge like any other.
 
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::panic::Location;
-use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
+use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult, WaitTimeoutResult};
+use std::time::Duration;
 
 use crate::{hooks, watchdog::WaitGuard, Held};
 
@@ -68,14 +69,14 @@ impl<T: ?Sized> Mutex<T> {
         let site = Location::caller();
         hooks::attempt(self.class, self.instance(), site);
         let r = take(self.inner.try_lock(), || self.inner.lock(), self.class, site, self.instance());
-        map_lock(r, |g| MutexGuard { inner: g, _held: Held(hooks::acquired(self.class, self.instance(), site)) })
+        map_lock(r, |g| MutexGuard::new(g, self.class, self.instance(), site))
     }
 
     #[track_caller]
     pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
         let site = Location::caller();
         let r = self.inner.try_lock();
-        map_try(r, |g| MutexGuard { inner: g, _held: Held(hooks::acquired(self.class, self.instance(), site)) })
+        map_try(r, |g| MutexGuard::new(g, self.class, self.instance(), site))
     }
 
     pub fn get_mut(&mut self) -> LockResult<&mut T> {
@@ -96,6 +97,16 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
 pub struct MutexGuard<'a, T: ?Sized> {
     inner: std::sync::MutexGuard<'a, T>,
     _held: Held,
+    // Kept beside the token, which is empty in a release build: a `Condvar` wait gives the token
+    // up and takes it back under the same identity.
+    class: &'static str,
+    instance: usize,
+}
+
+impl<'a, T: ?Sized> MutexGuard<'a, T> {
+    fn new(inner: std::sync::MutexGuard<'a, T>, class: &'static str, instance: usize, site: &'static Location<'static>) -> Self {
+        MutexGuard { inner, _held: Held(hooks::acquired(class, instance, site)), class, instance }
+    }
 }
 
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
@@ -115,6 +126,90 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&*self.inner, f)
     }
+}
+
+/// A `std::sync::Condvar` for this module's [`Mutex`] (Store no-hang §14.2).
+///
+/// lockdep's reading of a condvar wait: the mutex is released and taken again. std re-takes it
+/// BEFORE `wait` returns, so a check made on return would come too late — a deadlock in the
+/// re-acquisition never returns. So a wait, in order:
+///
+/// 1. gives up the guard's checker token (the waiter no longer holds the class);
+/// 2. checks the re-acquisition's order against everything the thread still holds — the edges
+///    are the same at the wake-up, since a thread blocked here takes and releases nothing else;
+/// 3. hands the inner guard to std, which unlocks and waits atomically and re-locks on wake;
+/// 4. takes the token back under the same class and instance, on a normal and a poisoned return.
+///
+/// std offers no hook between the notification and the re-acquisition, so the watchdog cannot see
+/// a stall there, and `wait_timeout`'s bound covers the wait, not the re-acquisition. Step 2 is
+/// what covers it.
+#[derive(Debug, Default)]
+pub struct Condvar {
+    inner: std::sync::Condvar,
+}
+
+impl Condvar {
+    pub const fn new() -> Self {
+        Condvar { inner: std::sync::Condvar::new() }
+    }
+
+    pub fn notify_one(&self) {
+        self.inner.notify_one();
+    }
+
+    pub fn notify_all(&self) {
+        self.inner.notify_all();
+    }
+
+    #[track_caller]
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
+        let site = Location::caller();
+        let (inner, class, instance) = release_for_wait(guard, site);
+        map_lock(self.inner.wait(inner), |g| MutexGuard::new(g, class, instance, site))
+    }
+
+    #[track_caller]
+    pub fn wait_while<'a, T, F>(&self, guard: MutexGuard<'a, T>, condition: F) -> LockResult<MutexGuard<'a, T>>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        let site = Location::caller();
+        let (inner, class, instance) = release_for_wait(guard, site);
+        map_lock(self.inner.wait_while(inner, condition), |g| MutexGuard::new(g, class, instance, site))
+    }
+
+    #[track_caller]
+    pub fn wait_timeout<'a, T>(&self, guard: MutexGuard<'a, T>, dur: Duration) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
+        let site = Location::caller();
+        let (inner, class, instance) = release_for_wait(guard, site);
+        map_lock(self.inner.wait_timeout(inner, dur), |(g, t)| (MutexGuard::new(g, class, instance, site), t))
+    }
+
+    #[track_caller]
+    pub fn wait_timeout_while<'a, T, F>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        dur: Duration,
+        condition: F,
+    ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        let site = Location::caller();
+        let (inner, class, instance) = release_for_wait(guard, site);
+        map_lock(self.inner.wait_timeout_while(inner, dur, condition), |(g, t)| (MutexGuard::new(g, class, instance, site), t))
+    }
+}
+
+/// Steps 1 and 2 of a [`Condvar`] wait: give up the token, then check the re-acquisition.
+fn release_for_wait<'a, T: ?Sized>(
+    guard: MutexGuard<'a, T>,
+    site: &'static Location<'static>,
+) -> (std::sync::MutexGuard<'a, T>, &'static str, usize) {
+    let MutexGuard { inner, _held, class, instance } = guard;
+    drop(_held);
+    hooks::attempt(class, instance, site);
+    (inner, class, instance)
 }
 
 /// A `std::sync::RwLock` with a class.

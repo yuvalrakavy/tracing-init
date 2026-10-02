@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`lock-order`: `sync::Condvar`** for its std `Mutex`. A wait gives up the guard's class,
+  checks the re-acquisition's order against what the thread still holds BEFORE waiting (std
+  re-takes the mutex before `wait` returns, so a later check would come too late), and takes
+  the class back on a normal or poisoned return. `wait`, `wait_while`, `wait_timeout`,
+  `wait_timeout_while`.
+- **`wait-lint`: name collisions.** An `.await` on one of this code's async method names with a
+  receiver other than `self` is a finding until the registry declares the name `wait-methods`
+  (a dependency's: every call becomes a wait) or `local-methods` (this code's). A declared wait
+  method already won over this code's name; a fixture now pins it. A stale `local-methods` name
+  is a finding.
+- **`wait-lint`: no empty scan.** `Report::files_scanned`; `assert_registered` and the CLI
+  refuse a scan that read no file or found no wait.
+- **`wait-lint`: raw-lock escapes.** `raw-locks = forbid` also refuses a raw `std`/`parking_lot`
+  `Condvar`, and a glob import of or alias for `std::sync`, `tokio::sync` or `parking_lot`.
 - **Telemetry-loss latch**, read with `telemetry_loss()`: answers whether this process
   silently dropped spans or log records. The OpenTelemetry SDK keeps its drop counts
   private and reports loss only through two internal `tracing` events, so a small layer
