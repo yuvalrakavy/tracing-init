@@ -119,9 +119,10 @@ pub struct Names {
     /// `src/bin/`), from its `Cargo.toml` when the scan has one: a path starting with one is a path
     /// into this code.
     pub own_crates: BTreeSet<String>,
-    /// Each file module's own `use`s, globs and functions, by its path from the crate root (`a/b.rs`
-    /// → `[a, b]`), so a call path can be followed module by module ([`Self::reach`]). An inline
-    /// module is read as part of its file's.
+    /// Each module's own `use`s, globs and functions, by its path from the crate root (`a/b.rs` →
+    /// `[a, b]`; an inline `mod c { .. }` in it → `[a, b, c]`), so a call path can be followed
+    /// module by module ([`Self::reach`]). An inline module is a scope of its own, as in Rust: its
+    /// items are not its file's (review finding T7).
     pub modules: BTreeMap<Vec<String>, Uses>,
 }
 
@@ -137,7 +138,7 @@ enum Reach {
     Outside,
     /// A glob of a dependency, which may hold the name.
     Glob,
-    /// Not followed: a type's function, an inline module, a name the module neither defines nor
+    /// Not followed: a type's function, a test module, a name the module neither defines nor
     /// imports, a module asked already on another way there, a path too deep.
     Unknown,
 }
@@ -181,7 +182,9 @@ impl Names {
                 }
             }
         }
-        self.modules.entry(module).or_default().merge(&uses);
+        for (inline, scope) in Uses::scopes(file) {
+            self.modules.entry(joined(&module, &inline)).or_default().merge(&scope);
+        }
         struct C<'a>(&'a mut Names);
         impl<'ast> Visit<'ast> for C<'_> {
             fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
@@ -280,7 +283,7 @@ impl Names {
     /// what each module defines, binds by `use` and glob-imports (review finding T3). `use
     /// tokio::time::sleep` in a parent reached by `use super::*`, a module's `pub use` reached as
     /// `net::sleep` or `crate::net::sleep`, and `self::sleep` over a file's own import all lead
-    /// [`Reach::Outside`]. Visibility is not read, and an inline module is read as part of its file.
+    /// [`Reach::Outside`]. Visibility is not read; an inline module is a module of its own.
     fn reach(&self, module: &[String], path: &[String]) -> Vec<Reach> {
         self.reach_path(module, path, 0, &mut BTreeSet::new())
     }
@@ -385,56 +388,95 @@ impl Names {
     }
 }
 
-/// What one file's `use` declarations and `extern crate .. as ..` items bind — a name → every path
-/// it stands for — and what it glob-imports, from production items only. Read for the whole file,
-/// not per module: a name bound two ways in one file has both readings.
+/// What `use` declarations and `extern crate .. as ..` items bind — a name → every path it stands
+/// for — what they glob-import, and the free functions defined, from production items only.
+/// [`Uses::of`] reads a whole file, so a name bound two ways in one file has both readings;
+/// [`Uses::scopes`] reads each scope of a file apart.
 #[derive(Debug, Default)]
 pub struct Uses {
     bound: BTreeMap<String, Vec<Vec<String>>>,
     globs: Vec<Vec<String>>,
-    /// The free functions the file defines: a bare call to one is the file's own.
+    /// The free functions defined: a bare call to one is the scope's own.
     fns: BTreeSet<String>,
+}
+
+/// Reads [`Uses`] from items. With `scoped`, an inline module's items are left for a scope of
+/// their own, and the module is kept in `inline`.
+struct UseReader<'ast> {
+    uses: Uses,
+    scoped: bool,
+    inline: Vec<&'ast syn::ItemMod>,
+}
+
+impl<'ast> Visit<'ast> for UseReader<'ast> {
+    fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+        if !is_test_item(&u.attrs) {
+            self.uses.read_tree(&u.tree, &mut Vec::new());
+        }
+    }
+    fn visit_item_extern_crate(&mut self, e: &'ast syn::ItemExternCrate) {
+        if let (false, Some((_, rename))) = (is_test_item(&e.attrs), &e.rename) {
+            self.uses.bind(rename.to_string(), vec![e.ident.to_string()]);
+        }
+    }
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        if !is_test_item(&f.attrs) {
+            self.uses.fns.insert(f.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, f);
+        }
+    }
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        if !is_test_item(&f.attrs) {
+            syn::visit::visit_impl_item_fn(self, f);
+        }
+    }
+    fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        if is_test_item(&m.attrs) {
+            return;
+        }
+        if self.scoped && m.content.is_some() {
+            self.inline.push(m);
+        } else {
+            syn::visit::visit_item_mod(self, m);
+        }
+    }
+    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+        if !is_test_item(&i.attrs) {
+            syn::visit::visit_item_impl(self, i);
+        }
+    }
 }
 
 impl Uses {
     pub fn of(file: &syn::File) -> Uses {
-        struct C(Uses);
-        impl<'ast> Visit<'ast> for C {
-            fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
-                if !is_test_item(&u.attrs) {
-                    self.0.read_tree(&u.tree, &mut Vec::new());
-                }
-            }
-            fn visit_item_extern_crate(&mut self, e: &'ast syn::ItemExternCrate) {
-                if let (false, Some((_, rename))) = (is_test_item(&e.attrs), &e.rename) {
-                    self.0.bind(rename.to_string(), vec![e.ident.to_string()]);
-                }
-            }
-            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
-                if !is_test_item(&f.attrs) {
-                    self.0.fns.insert(f.sig.ident.to_string());
-                    syn::visit::visit_item_fn(self, f);
-                }
-            }
-            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
-                if !is_test_item(&f.attrs) {
-                    syn::visit::visit_impl_item_fn(self, f);
-                }
-            }
-            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
-                if !is_test_item(&m.attrs) {
-                    syn::visit::visit_item_mod(self, m);
-                }
-            }
-            fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-                if !is_test_item(&i.attrs) {
-                    syn::visit::visit_item_impl(self, i);
-                }
+        let mut reader = UseReader { uses: Uses::default(), scoped: false, inline: Vec::new() };
+        reader.visit_file(file);
+        reader.uses
+    }
+
+    /// Each scope of one file, apart: the file's own items (`[]`) and each production inline
+    /// module's, by its path inside the file (`[a]`, `[a, b]`), each without the inline modules
+    /// inside it. A scope sees its own items, never an inner module's: an inline module's `async
+    /// fn ctrl_c` does not make the file's `ctrl_c` this code's when the file imports tokio's
+    /// (review finding T7).
+    pub fn scopes(file: &syn::File) -> Vec<(Vec<String>, Uses)> {
+        let mut out = Vec::new();
+        Self::read_scope(&file.items, Vec::new(), &mut out);
+        out
+    }
+
+    fn read_scope(items: &[syn::Item], path: Vec<String>, out: &mut Vec<(Vec<String>, Uses)>) {
+        let mut reader = UseReader { uses: Uses::default(), scoped: true, inline: Vec::new() };
+        for item in items {
+            reader.visit_item(item);
+        }
+        let UseReader { uses, inline, .. } = reader;
+        out.push((path.clone(), uses));
+        for m in inline {
+            if let Some((_, items)) = &m.content {
+                Self::read_scope(items, joined(&path, &[m.ident.to_string()]), out);
             }
         }
-        let mut c = C(Uses::default());
-        c.visit_file(file);
-        c.0
     }
 
     fn read_tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
@@ -891,10 +933,12 @@ impl Visitor<'_> {
     /// code defines elsewhere (review finding C-16) — and on through the `use`s and globs of the
     /// modules it passes, so a dependency's function a local module re-exports or a `use super::*`
     /// carries is the dependency's too (review finding T3). A bare name nothing imports by name is
-    /// this code's, unless the file glob-imports from a dependency and does not define the name
-    /// itself.
+    /// this code's, unless the file glob-imports from a dependency and the call's scope does not
+    /// define the name itself. The call is followed from the scope it is written in — its file's,
+    /// or the inline module around it (review finding T7).
     fn callee(&self, path: &[String]) -> Callee {
-        let reach = self.names.reach(&self.module, path);
+        let scope = self.scope();
+        let reach = self.names.reach(&scope, path);
         if reach.contains(&Reach::Outside) {
             return Callee::Foreign;
         }
@@ -904,7 +948,8 @@ impl Visitor<'_> {
         if !self.names.is_local_fn(path) {
             return Callee::Foreign;
         }
-        if path.len() == 1 && !self.uses.fns.contains(&path[0]) && self.uses.globs_outside(self.names) {
+        let defined_here = self.names.modules.get(&scope).is_some_and(|m| m.fns.contains(&path[0]));
+        if path.len() == 1 && !defined_here && self.uses.globs_outside(self.names) {
             return Callee::Ambiguous;
         }
         // `net::sleep`, where `net` neither defines nor imports `sleep` by name but glob-imports
@@ -913,6 +958,17 @@ impl Visitor<'_> {
             return Callee::Ambiguous;
         }
         Callee::Local
+    }
+
+    /// The module the code being visited is in: its file's, and the inline modules around it as
+    /// far as [`Names::modules`] has them — a test module is not read, so code in one is read in
+    /// the scope around it.
+    fn scope(&self) -> Vec<String> {
+        let mut scope = joined(&self.module, &self.mods);
+        while scope.len() > self.module.len() && !self.names.modules.contains_key(&scope) {
+            scope.pop();
+        }
+        scope
     }
 
     /// A call through `path`, not awaited where it is made, makes one of this code's futures.

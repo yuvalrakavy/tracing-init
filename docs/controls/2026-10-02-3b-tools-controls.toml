@@ -1,8 +1,9 @@
 # Negative controls for the phase-3b tool changes (Store no-hang §14.2): wait-lint's name
 # collision, empty scan and raw-lock escapes; lock-order's Condvar; the fake broker. The rows
 # after the first ten are the 3b review's fix pass (findings C-12..C-22, C-M3, X-4, X-7, X-8,
-# X-10); then the re-review's (T1..T4); the last 18 are tracing-init's own destinations (a
-# stuck destination costs lines, never a thread — Store no-hang 3b). Run from Store with
+# X-10); then the re-review's (T1..T4); then 18 for tracing-init's own destinations (a stuck
+# destination costs lines, never a thread — Store no-hang 3b); the last 6 are round 3's (T5..T7).
+# Run from Store with
 #     CARGO_TARGET_DIR=<a scratch dir> scripts/negative-control.py --root ../tracing-init ../tracing-init/docs/controls/2026-10-02-3b-tools-controls.toml
 # The scratch target dir matters: a row that builds wait-lint's binary (`--test cli`) builds it
 # from the mutant, and other sessions run `wait-lint/target/debug/wait-lint --write`.
@@ -1013,3 +1014,23 @@ target      = "test:stalled_file"
 test        = "a_stalled_log_file_drops_lines_instead_of_blocking_the_threads_that_log"
 expect_text = "dropping the guard reported no total for the file"
 guard       = "guard_takes_the_ending"
+
+[[control]]
+name        = "an_inline_module_is_read_as_part_of_its_file"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        if self.scoped && m.content.is_some() {'''
+replacement = '''        if false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "an_inline_module_s_function_does_not_hide_its_file_s_import"]
+expect_text = "hid behind an inline module's"
+guard       = "inline_module_scope"
+
+[[control]]
+name        = "a_call_is_followed_from_its_file_not_its_inline_module"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        let scope = self.scope();'''
+replacement = '''        let scope = self.module.clone();'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "an_inline_module_s_function_does_not_hide_its_file_s_import"]
+expect_text = "a call inside an inline module is followed from that module"
+guard       = "call_scope"

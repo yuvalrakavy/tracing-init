@@ -1257,3 +1257,46 @@ fn globs_that_reach_each_other_are_followed_once() {
     }
     assert_eq!(worker.join().unwrap(), 0, "`go` is this code's");
 }
+
+/// Review finding T7 (round 3): an inline module is a scope of its own. The root imports tokio's
+/// `ctrl_c` and holds an unrelated inline module with its own `async fn ctrl_c`; a file child's
+/// `use super::*` carries the root's import, not the inline module's function — which, read as
+/// part of the root's file, hid the dependency's wait.
+#[test]
+fn an_inline_module_s_function_does_not_hide_its_file_s_import() {
+    let lib = "use tokio::signal::ctrl_c;\nmod quiet {\n    pub async fn ctrl_c() {}\n}\nmod child;\n";
+    let child = "use super::*;\nasync fn stop() {\n    ctrl_c().await;\n}\n";
+    let r = run_files(&[("src/lib.rs", lib), ("src/child.rs", child)], ROWS);
+    assert_eq!(
+        untagged_at(&r),
+        at(&[("src/child.rs", 3)]),
+        "tokio's `ctrl_c`, carried by `use super::*`, hid behind an inline module's: {:?}",
+        r.findings
+    );
+
+    // The fixture's control: with no inline `ctrl_c`, the call is a wait already.
+    let bare = "use tokio::signal::ctrl_c;\nmod child;\n";
+    let r = run_files(&[("src/lib.rs", bare), ("src/child.rs", child)], ROWS);
+    assert_eq!(untagged_at(&r), at(&[("src/child.rs", 3)]), "{:?}", r.findings);
+
+    // The root's own `ctrl_c`, at the root, is this code's.
+    let own = "pub async fn ctrl_c() {}\nmod child;\n";
+    let r = run_files(&[("src/lib.rs", own), ("src/child.rs", child)], ROWS);
+    assert_eq!(untagged_at(&r), at(&[]), "the root's own `ctrl_c` is this code's: {:?}", r.findings);
+
+    // At the root itself: a bare `sleep` the root glob-imports from tokio is not the inline
+    // module's, and may be tokio's.
+    let glob = "use tokio::time::*;\nmod quiet {\n    pub async fn sleep(d: u64) {}\n}\nasync fn f(d: u64) {\n    sleep(d).await;\n}\n";
+    let r = run_files(&[("src/lib.rs", glob)], ROWS);
+    let collisions: Vec<(String, usize)> =
+        r.findings.iter().filter(|f| f.message.contains("glob-imports")).map(|f| (f.file.clone(), f.line.unwrap_or(0))).collect();
+    assert_eq!(collisions, at(&[("src/lib.rs", 6)]), "the root's bare `sleep` may be tokio's, not the inline module's: {:?}", r.findings);
+
+    // A call written inside an inline module is followed from that module: its glob of tokio may
+    // hold `sleep`, whatever `sleep` the root defines.
+    let inner = "pub async fn sleep(d: u64) {}\nmod quiet {\n    use tokio::time::*;\n    async fn f(d: u64) {\n        sleep(d).await;\n    }\n}\n";
+    let r = run_files(&[("src/lib.rs", inner)], ROWS);
+    let collisions: Vec<(String, usize)> =
+        r.findings.iter().filter(|f| f.message.contains("glob-imports")).map(|f| (f.file.clone(), f.line.unwrap_or(0))).collect();
+    assert_eq!(collisions, at(&[("src/lib.rs", 5)]), "a call inside an inline module is followed from that module: {:?}", r.findings);
+}

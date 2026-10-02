@@ -57,8 +57,10 @@
 //!   one of this code's async fns where the module it is found in (the file, or the one its path
 //!   names) neither defines nor imports it by name, but glob-imports from a dependency (`use
 //!   dep::*`), is a collision too, resolved by the same declarations. The modules are read from the
-//!   file layout (`src/a/b.rs` is `a::b`); an inline module is read as part of its file, and
-//!   visibility is not read.
+//!   file layout (`src/a/b.rs` is `a::b`); an inline module (`mod c { .. }` in it) is a module of
+//!   its own (`a::b::c`), and a call is followed from the module it is written in. Visibility is
+//!   not read, and a file's `use`s are still read for the whole file when a path is read through
+//!   them, so an inline module's import of a name also stands for its file's.
 //! * **An empty scan.** [`Report::files_scanned`] counts the production files read;
 //!   [`assert_registered`] and the CLI refuse a scan that read none or found no wait, since a wrong
 //!   source directory is otherwise green.

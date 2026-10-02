@@ -96,6 +96,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`lock-order`: a guard gives up its record before its lock**, in every `sync` and
   `tokio_sync` guard: the next holder never finds the last one still on file (a wedge report
   naming a holder that had let go; a flaky holder count).
+- **`wait-lint`: an inline module is a scope of its own** (3b round 3, T7). Its functions, `use`s
+  and globs were read as its file's, so an unrelated `async fn ctrl_c` in an inline module hid the
+  file's `use tokio::signal::ctrl_c` from a child's `use super::*` — a dependency's wait read as
+  this code's. Each inline module is now a module of its own (`a::b::c`), and a call is followed
+  from the module it is written in. Re-run over the eight `-3b` worktrees and Store-t2's two
+  servers: the same findings before and after.
 - **`wait-lint`: raw-lock escapes.** `use std::sync::{self as s}`, `extern crate parking_lot as
   pl`, a `pub use` of a lock module, `crate::sync::Mutex` through a binding anywhere in the
   crate, a glob through a bound module (`use std::sync; use sync::*`), parking_lot's
