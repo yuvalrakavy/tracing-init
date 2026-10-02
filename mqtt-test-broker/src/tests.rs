@@ -130,3 +130,61 @@ async fn a_v4_client_works_and_saturates_on_held_acks() {
     assert!(broker.wait_until(BOUND, |b| b.received_on("out").len() == saturated + 1).await);
     task.abort();
 }
+
+/// Join `h`, or fail the test if it has not finished within [`BOUND`].
+fn join_within<T>(h: std::thread::JoinHandle<T>, what: &str) -> std::thread::Result<T> {
+    let deadline = std::time::Instant::now() + BOUND;
+    while !h.is_finished() {
+        assert!(std::time::Instant::now() < deadline, "{what} did not finish within {BOUND:?}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    h.join()
+}
+
+/// Review finding X-7 / C-20: an ack is decided and held under the `held` lock, which the hold
+/// flag changes under, so a release cannot slip between the decision and the push and strand the
+/// ack. The probe holds that lock while another thread decides an ack, turns the hold off under it
+/// — as a release does — and only then lets the ack go on: it must see the release, not a hold it
+/// read before.
+#[test]
+fn an_ack_decided_during_a_release_is_not_stranded() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let broker = rt.block_on(FakeBroker::start());
+    let shared = broker.shared.clone();
+    broker.hold_acks();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let held = shared.held.lock().unwrap();
+    let s = shared.clone();
+    let acker = std::thread::spawn(move || ack_or_hold(&s, &tx, 7));
+    // The acker is now blocked on the lock this thread holds.
+    std::thread::sleep(Duration::from_millis(100));
+    shared.hold_acks.store(false, Ordering::SeqCst); // a release, made under the lock
+    drop(held);
+    join_within(acker, "the acker").unwrap();
+    let stranded = shared.held.lock().unwrap().clone();
+    assert!(stranded.is_empty(), "an ack decided during a release was stranded: held {stranded:?}");
+    assert!(rx.try_recv().is_ok(), "the ack was sent at once");
+}
+
+/// Review finding C-19: dropping the broker stops it — its connections too, which used to go on
+/// acknowledging and holding the client's socket open.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_broker_closes_its_connections() {
+    let broker = FakeBroker::start().await;
+    let mut stream = tokio::time::timeout(BOUND, tokio::net::TcpStream::connect(broker.address())).await.expect("connect").unwrap();
+    let connect = v5::Connect { keep_alive: 30, client_id: "raw".into(), clean_start: true, properties: None };
+    tokio::time::timeout(BOUND, stream.write_all(&encode_v5(v5::Packet::Connect(connect, None, None))))
+        .await
+        .expect("send the CONNECT")
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(BOUND, stream.read(&mut buf)).await.expect("a CONNACK").unwrap();
+    assert!(n > 0 && buf[0] >> 4 == 2, "a CONNACK: {:?}", &buf[..n]);
+    assert!(broker.wait_until(BOUND, |b| b.connections() == 1).await);
+    drop(broker);
+    match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("the dropped broker still wrote to its client: {:?}", &buf[..n]),
+        Err(_) => panic!("the broker was dropped but its connection still holds the client's socket open"),
+    }
+}

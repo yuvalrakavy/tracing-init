@@ -10,8 +10,9 @@
 //! whose event loop is still being polled then completes.
 //!
 //! Enough of MQTT for that and no more: one client at a time (a reconnect replaces the
-//! connection), QoS 0 to the client, QoS 1 and 2 from the client acknowledged (or held), retained
-//! flags recorded but not replayed.
+//! connection), QoS 0 to the client, QoS 1 from the client acknowledged or held, QoS 2 from the
+//! client always acknowledged (PUBREC, then PUBCOMP for its PUBREL — never held, so a QoS 2
+//! publish does not saturate a client), retained flags recorded but not replayed.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,7 +42,8 @@ pub enum Protocol {
     V4,
 }
 
-/// The broker. Dropping it stops it.
+/// The broker. Dropping it stops it: the listener and every connection close (their tasks are
+/// aborted, and end at the runtime's next turn).
 pub struct FakeBroker {
     shared: Arc<Shared>,
     port: u16,
@@ -60,6 +62,8 @@ struct Shared {
     received: Mutex<Vec<Received>>,
     subscriptions: Mutex<Vec<String>>,
     connections: AtomicUsize,
+    /// Whether QoS 1 acks are held. Changed and read only under `held`, so an ack's decision and
+    /// its push are one step against a release (review finding X-7).
     hold_acks: AtomicBool,
     /// Packet ids of the PUBACKs held on the current connection.
     held: Mutex<Vec<u16>>,
@@ -125,15 +129,20 @@ impl FakeBroker {
         }
     }
 
-    /// Stop acknowledging the client's QoS 1 publishes (see the module documentation).
+    /// Stop acknowledging the client's QoS 1 publishes (see the module documentation). QoS 2
+    /// publishes are still acknowledged.
     pub fn hold_acks(&self) {
+        let _held = self.shared.held.lock().unwrap();
         self.shared.hold_acks.store(true, Ordering::SeqCst);
     }
 
-    /// Acknowledge everything held, and everything from now on.
+    /// Acknowledge everything held, and everything from now on. The flag turns and the held acks
+    /// go out under the `held` lock, so no ack decided meanwhile is left behind, and the released
+    /// acks precede any later one.
     pub fn release_acks(&self) {
+        let mut held = self.shared.held.lock().unwrap();
         self.shared.hold_acks.store(false, Ordering::SeqCst);
-        let held = std::mem::take(&mut *self.shared.held.lock().unwrap());
+        let held = std::mem::take(&mut *held);
         if let Some(tx) = &*self.shared.to_client.lock().unwrap() {
             for pkid in held {
                 let _ = tx.send(puback(self.shared.protocol, pkid));
@@ -188,9 +197,13 @@ impl FakeBroker {
     }
 }
 
+/// Accept connections. Each runs in this task's `JoinSet`, so aborting this task — dropping the
+/// broker — drops the set, which aborts every connection (review finding C-19).
 async fn serve(listener: TcpListener, shared: Arc<Shared>) {
+    let mut connections = tokio::task::JoinSet::new();
     while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(connection(stream, shared.clone()));
+        while connections.try_join_next().is_some() {}
+        connections.spawn(connection(stream, shared.clone()));
     }
 }
 
@@ -210,6 +223,8 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<BytesMut>();
     *shared.to_client.lock().unwrap() = Some(tx.clone());
     shared.held.lock().unwrap().clear();
+    // Aborted when the client goes. When this task is aborted instead (the broker dropped), the
+    // writer ends when the last sender does: `to_client`'s, freed with the broker's `Shared`.
     let writer = tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {
             if wr.write_all(&packet).await.is_err() {
@@ -245,10 +260,13 @@ fn record(shared: &Shared, topic: String, payload: Bytes, qos: QoS, retain: bool
     shared.received.lock().unwrap().push(Received { topic, payload, qos, retain });
 }
 
-/// Answer a QoS 1 publish now, or hold its ack.
+/// Answer a QoS 1 publish now, or hold its ack — decided and done under the `held` lock, which the
+/// hold flag changes under: read first and pushed after, a release in between would take the held
+/// acks before this one joined them, and strand it (review finding X-7).
 fn ack_or_hold(shared: &Shared, tx: &mpsc::UnboundedSender<BytesMut>, pkid: u16) {
+    let mut held = shared.held.lock().unwrap();
     if shared.hold_acks.load(Ordering::SeqCst) {
-        shared.held.lock().unwrap().push(pkid);
+        held.push(pkid);
     } else {
         let _ = tx.send(puback(shared.protocol, pkid));
     }
