@@ -1,7 +1,7 @@
 //! Finding the waits in one parsed file: what each is, and the statement and function it sits
 //! in; and the raw lock types it names.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 use syn::spanned::Spanned;
@@ -111,10 +111,29 @@ pub struct Names {
     pub local_sync: BTreeSet<String>,
     /// Module and type names: a path starting with one is a path into this code.
     pub local_paths: BTreeSet<String>,
+    /// What every file's `use`s bind, read through that file's own (see [`Uses`]): a path into
+    /// this crate (`crate::sync::Mutex`, `super::sync::Mutex`) can name what any module bound — a
+    /// private `use std::sync` at the root is `crate::sync` to every module.
+    pub bound: BTreeMap<String, Vec<Vec<String>>>,
+    /// The crate's own names as other crates of its package write them (`mqtt_ynca::…` in its
+    /// `src/bin/`), from its `Cargo.toml` when the scan has one: a path starting with one is a path
+    /// into this code.
+    pub own_crates: BTreeSet<String>,
 }
 
 impl Names {
     pub fn collect(&mut self, file: &syn::File) {
+        let uses = Uses::of(file);
+        for (name, paths) in &uses.bound {
+            for path in paths {
+                for reading in uses.readings(path).unwrap_or_else(|| vec![path.clone()]) {
+                    let entry = self.bound.entry(name.clone()).or_default();
+                    if !entry.contains(&reading) {
+                        entry.push(reading);
+                    }
+                }
+            }
+        }
         struct C<'a>(&'a mut Names);
         impl<'ast> Visit<'ast> for C<'_> {
             fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
@@ -183,7 +202,7 @@ impl Names {
         match path.first().map(String::as_str) {
             _ if path.len() == 1 => true,
             Some("crate" | "self" | "super" | "Self") => true,
-            Some(first) => self.local_paths.contains(first),
+            Some(first) => self.local_paths.contains(first) || self.own_crates.contains(first),
             None => false,
         }
     }
@@ -201,6 +220,158 @@ impl Names {
     fn escapes_method(&self, name: &str) -> bool {
         self.is_local_method(name) && !self.local_sync.contains(name)
     }
+
+    /// A path that starts in this code: `crate`/`self`/`super`, or one of its modules or types.
+    fn is_local_path(&self, path: &[String]) -> bool {
+        path.first().is_some_and(|f| {
+            matches!(f.as_str(), "crate" | "self" | "super" | "Self") || self.local_paths.contains(f) || self.own_crates.contains(f)
+        })
+    }
+}
+
+/// What one file's `use` declarations and `extern crate .. as ..` items bind — a name → every path
+/// it stands for — and what it glob-imports, from production items only. Read for the whole file,
+/// not per module: a name bound two ways in one file has both readings.
+#[derive(Debug, Default)]
+pub struct Uses {
+    bound: BTreeMap<String, Vec<Vec<String>>>,
+    globs: Vec<Vec<String>>,
+    /// The free functions the file defines: a bare call to one is the file's own.
+    fns: BTreeSet<String>,
+}
+
+impl Uses {
+    pub fn of(file: &syn::File) -> Uses {
+        struct C(Uses);
+        impl<'ast> Visit<'ast> for C {
+            fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+                if !is_test_item(&u.attrs) {
+                    self.0.read_tree(&u.tree, &mut Vec::new());
+                }
+            }
+            fn visit_item_extern_crate(&mut self, e: &'ast syn::ItemExternCrate) {
+                if let (false, Some((_, rename))) = (is_test_item(&e.attrs), &e.rename) {
+                    self.0.bind(rename.to_string(), vec![e.ident.to_string()]);
+                }
+            }
+            fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+                if !is_test_item(&f.attrs) {
+                    self.0.fns.insert(f.sig.ident.to_string());
+                    syn::visit::visit_item_fn(self, f);
+                }
+            }
+            fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+                if !is_test_item(&f.attrs) {
+                    syn::visit::visit_impl_item_fn(self, f);
+                }
+            }
+            fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+                if !is_test_item(&m.attrs) {
+                    syn::visit::visit_item_mod(self, m);
+                }
+            }
+            fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+                if !is_test_item(&i.attrs) {
+                    syn::visit::visit_item_impl(self, i);
+                }
+            }
+        }
+        let mut c = C(Uses::default());
+        c.visit_file(file);
+        c.0
+    }
+
+    fn read_tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(p) => {
+                prefix.push(p.ident.to_string());
+                self.read_tree(&p.tree, prefix);
+                prefix.pop();
+            }
+            // `use std::sync::{self}` binds `sync`; `use std::sync::{self as s}` binds `s`.
+            syn::UseTree::Name(n) if n.ident == "self" => {
+                if let Some(last) = prefix.last().cloned() {
+                    self.bind(last, prefix.clone());
+                }
+            }
+            syn::UseTree::Name(n) => {
+                let mut path = prefix.clone();
+                path.push(n.ident.to_string());
+                self.bind(n.ident.to_string(), path);
+            }
+            syn::UseTree::Rename(r) if r.rename == "_" => {}
+            syn::UseTree::Rename(r) => {
+                let mut path = prefix.clone();
+                if r.ident != "self" {
+                    path.push(r.ident.to_string());
+                }
+                self.bind(r.rename.to_string(), path);
+            }
+            syn::UseTree::Group(g) => {
+                for t in &g.items {
+                    self.read_tree(t, prefix);
+                }
+            }
+            syn::UseTree::Glob(_) => self.globs.push(prefix.clone()),
+        }
+    }
+
+    fn bind(&mut self, name: String, path: Vec<String>) {
+        if path.len() == 1 && path[0] == name {
+            return; // `use std;`, `extern crate tokio;`: the name is already itself
+        }
+        let entry = self.bound.entry(name).or_default();
+        if !entry.contains(&path) {
+            entry.push(path);
+        }
+    }
+
+    /// Every reading of `segs` through this file's bindings, chained (`use std::sync; use sync as
+    /// s;`) a few deep; `None` when no binding names its first segment.
+    pub fn readings(&self, segs: &[String]) -> Option<Vec<Vec<String>>> {
+        self.bound.get(segs.first()?)?;
+        let mut done = Vec::new();
+        let mut todo = vec![segs.to_vec()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for path in todo {
+                match path.first().and_then(|f| self.bound.get(f)) {
+                    Some(targets) => {
+                        for target in targets {
+                            let mut reading = target.clone();
+                            reading.extend_from_slice(&path[1..]);
+                            next.push(reading);
+                        }
+                    }
+                    None => done.push(path),
+                }
+            }
+            todo = next;
+            if todo.is_empty() {
+                break;
+            }
+        }
+        done.extend(todo); // bound deeper than that: taken as it stands
+        Some(done)
+    }
+
+    /// The file glob-imports from outside this code (`use dep::*`), so a bare name it neither
+    /// defines nor imports by name may be a dependency's.
+    fn globs_outside(&self, names: &Names) -> bool {
+        self.globs.iter().any(|g| self.readings(g).unwrap_or_else(|| vec![g.clone()]).iter().any(|r| !names.is_local_path(r)))
+    }
+}
+
+/// Whose function a call reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Callee {
+    /// One of this code's `async fn`s.
+    Local,
+    /// Not this code's: a dependency's, or a name this code does not define as async.
+    Foreign,
+    /// One of this code's async names, called bare in a file that glob-imports from a dependency
+    /// that may define it too.
+    Ambiguous,
 }
 
 /// A wait found in the syntax.
@@ -231,6 +402,10 @@ pub struct FileScan {
     /// The lint matches names, not types, so such a call may be a dependency's wait hiding behind
     /// this code's name (Store no-hang §14.1: mqtt_hdl's own `publish` hid rumqttc's).
     pub ambiguous: Vec<(usize, String)>,
+    /// `name(..).await`, bare, where `name` is one of this code's async fns that this file neither
+    /// defines nor imports by name, and the file glob-imports from a dependency, which may define
+    /// it too: `(line, name)`. Resolved by the same declarations as [`Self::ambiguous`].
+    pub ambiguous_fns: Vec<(usize, String)>,
     /// lock_order classes named by a string literal: `(line, class)` — each must be a registry key.
     pub classes: Vec<(usize, String)>,
     /// Line ranges of test items, whose tags are not production tags.
@@ -243,6 +418,7 @@ pub fn scan(file: &syn::File, reg: &Registry, names: &Names) -> FileScan {
     let mut v = Visitor {
         reg,
         names,
+        uses: Uses::of(file),
         test_depth: 0,
         bounded_depth: 0,
         bounding_future: 0,
@@ -261,6 +437,8 @@ pub fn scan(file: &syn::File, reg: &Registry, names: &Names) -> FileScan {
 struct Visitor<'r> {
     reg: &'r Registry,
     names: &'r Names,
+    /// What this file's `use`s bind: a path is read through them.
+    uses: Uses,
     test_depth: usize,
     /// Inside a future a timeout bounds: its async waits are the timeout's.
     bounded_depth: usize,
@@ -508,21 +686,138 @@ impl Visitor<'_> {
             (format!("`{shown}.await`"), false)
         } else if self.reg.not_waits.contains(name) {
             return;
-        } else if match path {
-            None => self.names.is_local_method(name),
-            Some(p) => self.names.is_local_fn(p),
-        } {
+        } else if let Some(p) = path {
+            match self.callee(p) {
+                Callee::Local => return,
+                // Only the registry can say whose it is (review finding C-16).
+                Callee::Ambiguous => {
+                    if self.test_depth == 0 && !self.reg.local_methods.contains(name) {
+                        self.out.ambiguous_fns.push((line, name.to_string()));
+                    }
+                    return;
+                }
+                Callee::Foreign => (format!("`{}(..).await`, an async call this code does not define", p.join("::")), false),
+            }
+        } else if self.names.is_local_method(name) {
             // A method matched by name alone: on `self` it is this code's; on anything else it may
             // be a dependency's of the same name, and only the registry can say which.
-            if method && !on_self && self.test_depth == 0 && !self.reg.local_methods.contains(name) {
+            if !on_self && self.test_depth == 0 && !self.reg.local_methods.contains(name) {
                 self.out.ambiguous.push((line, name.to_string()));
             }
             return;
         } else {
-            let shown = if method { format!(".{name}(..)") } else { format!("{}(..)", path.map(|p| p.join("::")).unwrap_or_default()) };
-            (format!("`{shown}.await`, an async call this code does not define"), false)
+            (format!("`.{name}(..).await`, an async call this code does not define"), false)
         };
         self.record(line, column, what, Wait::Async, bounded);
+    }
+
+    /// Whose function a call through `path` reaches. The path is read through this file's `use`s:
+    /// `use dep::publish; publish(..)` calls the dependency's, whatever `async fn publish` this
+    /// code defines elsewhere (review finding C-16). A bare name nothing imports by name is this
+    /// code's, unless the file glob-imports from a dependency and does not define the name itself.
+    fn callee(&self, path: &[String]) -> Callee {
+        if let Some(readings) = self.uses.readings(path) {
+            return if readings.iter().all(|r| self.names.is_local_fn(r)) { Callee::Local } else { Callee::Foreign };
+        }
+        if !self.names.is_local_fn(path) {
+            return Callee::Foreign;
+        }
+        if path.len() == 1 && !self.uses.fns.contains(&path[0]) && self.uses.globs_outside(self.names) {
+            return Callee::Ambiguous;
+        }
+        Callee::Local
+    }
+
+    /// A call through `path`, not awaited where it is made, makes one of this code's futures.
+    fn escapes_fn(&self, path: &[String]) -> bool {
+        let readings = self.uses.readings(path).unwrap_or_else(|| vec![path.to_vec()]);
+        self.callee(path) != Callee::Foreign && readings.iter().all(|r| self.names.escapes_fn(r))
+    }
+
+    /// What `segs` may stand for. A path into this crate (`crate::`, `self::`, `super::`) is read
+    /// through the names any of its files binds — a segment that names one of its own modules or
+    /// types stays that module; any other path through this file's `use`s, or as written when
+    /// they bind nothing it starts with.
+    fn readings(&self, segs: &[String]) -> Vec<Vec<String>> {
+        let lead = segs.iter().take_while(|s| matches!(s.as_str(), "crate" | "self" | "super")).count();
+        if lead == 0 {
+            return self.uses.readings(segs).unwrap_or_else(|| vec![segs.to_vec()]);
+        }
+        let rest = &segs[lead..];
+        let mut out = Vec::new();
+        for (i, seg) in rest.iter().enumerate() {
+            if self.names.local_paths.contains(seg) {
+                continue;
+            }
+            for module in self.names.bound.get(seg).into_iter().flatten() {
+                let mut reading = module.clone();
+                reading.extend_from_slice(&rest[i + 1..]);
+                out.push(reading);
+            }
+        }
+        out
+    }
+
+    /// The raw lock `segs` names, read through what binds it (see [`Self::readings`]); shown as
+    /// written when it is read as something else (review findings C-14, C-15).
+    fn raw_lock_in(&self, segs: &[String]) -> Option<String> {
+        self.readings(segs).iter().find_map(|r| {
+            let raw = raw_lock(r)?;
+            Some(if *r == segs { raw } else { format!("{raw} (named `{}`)", segs.join("::")) })
+        })
+    }
+
+    /// `segs`, read through what binds it, is a module raw locks live in.
+    fn lock_module_in(&self, segs: &[String]) -> bool {
+        self.readings(segs).iter().any(|r| lock_module(r))
+    }
+
+    /// The `raw-locks` check of a `use` tree: a raw lock imported, a lock module aliased, glob-
+    /// imported or — from a `pub` use — re-exported, each read through this file's bindings
+    /// (`use std::sync; use sync::*`).
+    fn raw_locks_in_use(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>, public: bool) {
+        match tree {
+            syn::UseTree::Path(p) => {
+                prefix.push(p.ident.to_string());
+                self.raw_locks_in_use(&p.tree, prefix, public);
+                prefix.pop();
+            }
+            syn::UseTree::Name(n) => {
+                let mut segs = prefix.clone();
+                if n.ident != "self" {
+                    segs.push(n.ident.to_string());
+                }
+                let line = n.ident.span().start().line;
+                if let Some(raw) = self.raw_lock_in(&segs) {
+                    self.out.raw_locks.push((line, raw));
+                } else if public && self.lock_module_in(&segs) {
+                    // Other modules, and other crates, name its locks through the re-export.
+                    self.out.raw_locks.push((line, format!("{} (a re-export of a raw-lock module)", segs.join("::"))));
+                }
+            }
+            syn::UseTree::Rename(r) => {
+                let mut segs = prefix.clone();
+                if r.ident != "self" {
+                    segs.push(r.ident.to_string());
+                }
+                let line = r.ident.span().start().line;
+                if let Some(raw) = self.raw_lock_in(&segs) {
+                    self.out.raw_locks.push((line, raw));
+                } else if self.lock_module_in(&segs) {
+                    self.out.raw_locks.push((line, format!("{} as {} (a module alias)", segs.join("::"), r.rename)));
+                }
+            }
+            syn::UseTree::Group(g) => {
+                for t in &g.items {
+                    self.raw_locks_in_use(t, prefix, public);
+                }
+            }
+            syn::UseTree::Glob(g) => {
+                if self.lock_module_in(prefix) {
+                    self.out.raw_locks.push((g.star_token.span.start().line, format!("{}::* (a glob import)", prefix.join("::"))));
+                }
+            }
+        }
     }
 
     fn item(&mut self, attrs: &[syn::Attribute], span: proc_macro2::Span, func: Option<String>, f: impl FnOnce(&mut Self)) {
@@ -684,7 +979,7 @@ impl Visitor<'_> {
     /// tokens: the path that starts at `tts[i]`, and the string literal its call is given.
     fn token_path_checks(&mut self, tts: &[TokenTree], i: usize, line: usize) {
         let (segs, after) = token_path_from(tts, i);
-        if let Some(raw) = raw_lock(&segs) {
+        if let Some(raw) = self.raw_lock_in(&segs) {
             self.out.raw_locks.push((line, raw));
         }
         let Some(TokenTree::Group(args)) = tts.get(after) else { return };
@@ -882,15 +1177,25 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
 
     fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
         if self.test_depth == 0 && !is_test_item(&u.attrs) {
-            let mut prefix = Vec::new();
-            raw_locks_in_use(&u.tree, &mut prefix, &mut self.out.raw_locks);
+            let public = !matches!(u.vis, syn::Visibility::Inherited);
+            self.raw_locks_in_use(&u.tree, &mut Vec::new(), public);
+        }
+    }
+
+    /// `extern crate parking_lot as pl;` aliases a lock module like `use parking_lot as pl;`.
+    fn visit_item_extern_crate(&mut self, e: &'ast syn::ItemExternCrate) {
+        if let (0, false, Some((_, rename))) = (self.test_depth, is_test_item(&e.attrs), &e.rename) {
+            let segs = vec![e.ident.to_string()];
+            if lock_module(&segs) {
+                self.out.raw_locks.push((rename.span().start().line, format!("{} as {rename} (a module alias)", e.ident)));
+            }
         }
     }
 
     fn visit_path(&mut self, p: &'ast syn::Path) {
         if self.test_depth == 0 {
             let segs: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
-            if let Some(raw) = raw_lock(&segs) {
+            if let Some(raw) = self.raw_lock_in(&segs) {
                 self.out.raw_locks.push((p.span().start().line, raw));
             }
         }
@@ -1034,7 +1339,7 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
             self.record(at.line, at.column, "`block_on(..)`".into(), Wait::Blocking, false);
         } else if !self.consumed.contains(&(at.line, at.column)) && self.reg.wait_fns.contains(&name) {
             self.record(at.line, at.column, format!("`{name}(..)`, a declared helper that waits"), Wait::Blocking, false);
-        } else if !self.consumed.contains(&(at.line, at.column)) && self.names.escapes_fn(&path) {
+        } else if !self.consumed.contains(&(at.line, at.column)) && self.escapes_fn(&path) {
             self.record(at.line, at.column, format!("a future of `{name}(..)`, made here and awaited elsewhere"), Wait::Async, false);
         }
         let bounding = BOUNDING_FNS.contains(&name.as_str());
@@ -1140,6 +1445,17 @@ const RAW_LOCKS: &[(&str, &str)] = &[
     // A raw condvar waits on a raw mutex's guard, so it is the same escape (Store no-hang §14.2).
     ("std::sync", "Condvar"),
     ("parking_lot", "Condvar"),
+    // parking_lot's other locks, and its constructors that name no type (review finding C-14).
+    ("parking_lot", "ReentrantMutex"),
+    ("parking_lot", "FairMutex"),
+    ("parking_lot", "const_mutex"),
+    ("parking_lot", "const_fair_mutex"),
+    ("parking_lot", "const_reentrant_mutex"),
+    ("parking_lot", "const_rwlock"),
+    // The generic locks parking_lot's are instances of.
+    ("lock_api", "Mutex"),
+    ("lock_api", "RwLock"),
+    ("lock_api", "ReentrantMutex"),
 ];
 
 /// The modules raw locks live in: a glob import of one, or an alias for one, would name them past
@@ -1164,45 +1480,11 @@ fn raw_lock_exact(segs: &[String]) -> Option<String> {
         return None;
     }
     let (module, item) = (segs[..n - 1].join("::"), segs[n - 1].as_str());
-    // Exactly `std::sync`, `tokio::sync`, `parking_lot` (or `::std::sync`), or a bare `sync::` —
-    // `use std::sync; sync::Mutex`. A module alias (`use tokio::sync as ts`) is not followed.
+    // Exactly `std::sync`, `tokio::sync`, `parking_lot`, `lock_api` (or `::std::sync`), or a bare
+    // `sync::` that no `use` in the file binds — the caller reads a bound one through its `use`
+    // (`use lock_order::sync; sync::Mutex` is the wrapper), and an alias (`use tokio::sync as ts`)
+    // is refused where it is made.
     let module = module.trim_start_matches("::");
     let hit = RAW_LOCKS.iter().any(|(m, i)| *i == item && (module == *m || module == "sync"));
     hit.then(|| segs.join("::"))
-}
-
-fn raw_locks_in_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<(usize, String)>) {
-    match tree {
-        syn::UseTree::Path(p) => {
-            prefix.push(p.ident.to_string());
-            raw_locks_in_use(&p.tree, prefix, out);
-            prefix.pop();
-        }
-        syn::UseTree::Name(n) => {
-            let mut segs = prefix.clone();
-            segs.push(n.ident.to_string());
-            if let Some(raw) = raw_lock(&segs) {
-                out.push((n.ident.span().start().line, raw));
-            }
-        }
-        syn::UseTree::Rename(r) => {
-            let mut segs = prefix.clone();
-            segs.push(r.ident.to_string());
-            if let Some(raw) = raw_lock(&segs) {
-                out.push((r.ident.span().start().line, raw));
-            } else if lock_module(&segs) {
-                out.push((r.ident.span().start().line, format!("{} as {} (a module alias)", segs.join("::"), r.rename)));
-            }
-        }
-        syn::UseTree::Group(g) => {
-            for t in &g.items {
-                raw_locks_in_use(t, prefix, out);
-            }
-        }
-        syn::UseTree::Glob(g) => {
-            if lock_module(prefix) {
-                out.push((g.star_token.span.start().line, format!("{}::* (a glob import)", prefix.join("::"))));
-            }
-        }
-    }
 }

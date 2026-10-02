@@ -867,3 +867,198 @@ fn f() {
     let raw: Vec<usize> = source_findings(&r).into_iter().filter(|(_, m)| m.contains("raw lock")).map(|(l, _)| l).collect();
     assert_eq!(raw, vec![1, 2, 3, 4, 8], "{:?}", r.findings);
 }
+
+// The 3b review's findings (Claude C-14..C-18, Codex X-10).
+
+/// Raw-lock findings, by file and line.
+fn raw_lock_lines(r: &Report) -> Vec<(String, usize)> {
+    r.findings.iter().filter(|f| f.message.contains("raw lock")).map(|f| (f.file.clone(), f.line.unwrap_or(0))).collect()
+}
+
+fn forbidding() -> String {
+    format!("{ROWS}\n```wait-lint\nraw-locks = forbid\n```\n")
+}
+
+/// Review findings C-14 / X-10: each of these named a raw lock past the check.
+#[test]
+fn raw_lock_escapes_through_self_aliases_extern_crates_and_bound_modules_are_found() {
+    let src = "\
+use std::sync::{self as s};
+use parking_lot::{self as pl};
+extern crate parking_lot as plx;
+use tokio::sync::{self};
+fn f() {
+    let x = sync::Mutex::new(0);
+}
+";
+    let r = run_files(&[("src/a.rs", src)], &forbidding());
+    let lines: Vec<usize> = raw_lock_lines(&r).into_iter().map(|(_, l)| l).collect();
+    assert_eq!(lines, vec![1, 2, 3, 6], "{:?}", r.findings);
+
+    // A glob import through a name a `use` bound to a lock module.
+    let glob = "use std::sync;\nuse sync::*;\n";
+    let r = run_files(&[("src/a.rs", glob)], &forbidding());
+    let lines: Vec<usize> = raw_lock_lines(&r).into_iter().map(|(_, l)| l).collect();
+    assert_eq!(lines, vec![2], "{:?}", r.findings);
+}
+
+/// Review finding C-14: a lock module re-exported (`pub use std::sync`) and named through the
+/// crate (`crate::sync::Mutex`) — and a private `use std::sync` at the root, which the whole crate
+/// can name as `crate::sync` too.
+#[test]
+fn a_raw_lock_module_named_through_the_crate_is_found() {
+    let lib = "pub use std::sync;\nmod a;\n";
+    let a = "\
+fn f() {
+    let m = crate::sync::Mutex::new(0);
+}
+use crate::sync::RwLock;
+use super::sync::Condvar;
+";
+    let r = run_files(&[("src/lib.rs", lib), ("src/a.rs", a)], &forbidding());
+    assert_eq!(
+        raw_lock_lines(&r),
+        vec![("src/a.rs".to_string(), 2), ("src/a.rs".to_string(), 4), ("src/a.rs".to_string(), 5), ("src/lib.rs".to_string(), 1)],
+        "{:?}",
+        r.findings
+    );
+    let private_root = "use std::sync;\nmod a;\n";
+    let r = run_files(&[("src/lib.rs", private_root), ("src/a.rs", a)], &forbidding());
+    assert_eq!(
+        raw_lock_lines(&r),
+        vec![("src/a.rs".to_string(), 2), ("src/a.rs".to_string(), 4), ("src/a.rs".to_string(), 5)],
+        "{:?}",
+        r.findings
+    );
+}
+
+/// Review finding C-14: parking_lot's other locks, its `const_*` constructors (which name no type)
+/// and `lock_api`'s generic locks.
+#[test]
+fn every_parking_lot_and_lock_api_lock_is_a_raw_lock() {
+    let src = "\
+fn f() {
+    let a = parking_lot::ReentrantMutex::new(0);
+    let b = parking_lot::FairMutex::new(0);
+    let c = parking_lot::const_mutex(0);
+    let d = parking_lot::const_rwlock(0);
+    let e = lock_api::Mutex::<R, u8>::new(0);
+    let f = parking_lot::const_fair_mutex(0);
+    let g = parking_lot::const_reentrant_mutex(0);
+}
+";
+    let r = run_files(&[("src/a.rs", src)], &forbidding());
+    let lines: Vec<usize> = raw_lock_lines(&r).into_iter().map(|(_, l)| l).collect();
+    assert_eq!(lines, vec![2, 3, 4, 5, 6, 7, 8], "{:?}", r.findings);
+}
+
+/// Review finding C-15: `sync` bound to lock-order's module is the wrapper, not a raw lock; an
+/// unbound `sync::Mutex` still is.
+#[test]
+fn the_wrappers_named_through_a_bound_module_are_not_raw_locks() {
+    let src = "\
+use lock_order::sync;
+use lock_order::sync::{self as ls};
+use sync::Condvar;
+fn f() {
+    let m = sync::Mutex::new(\"k\", 0);
+    let n = ls::RwLock::new(\"k\", 0);
+}
+";
+    let unbound = "fn g() {\n    let m = sync::Mutex::new(0);\n}\n";
+    let r = run_files(&[("src/a.rs", src), ("src/b.rs", unbound)], &forbidding());
+    assert_eq!(raw_lock_lines(&r), vec![("src/b.rs".to_string(), 2)], "{:?}", r.findings);
+}
+
+/// Review finding C-16: a bare call to a function a `use` imported from a dependency is that
+/// dependency's, whatever async fn of the same name this code defines elsewhere; one that may come
+/// from a dependency's glob import is a collision for the registry to resolve.
+#[test]
+fn an_imported_function_named_like_this_codes_is_the_import_s() {
+    let imported = "\
+use dep::publish;
+async fn poll() {
+    publish(t, q).await;
+}
+";
+    let own = "\
+pub async fn publish(t: &str) {}
+async fn report() {
+    publish(\"x\").await;
+}
+";
+    let from_a_glob = "\
+use dep::*;
+async fn g() {
+    publish(\"y\").await;
+}
+";
+    let from_this_code = "\
+use super::*;
+use crate::b::publish as send_it;
+async fn h() {
+    publish(\"z\").await;
+    send_it(\"w\").await;
+}
+";
+    let files = [("src/a.rs", imported), ("src/b.rs", own), ("src/c.rs", from_a_glob), ("src/b/d.rs", from_this_code)];
+    let r = run_files(&files, ROWS);
+    let untagged: Vec<(String, usize)> =
+        r.findings.iter().filter(|f| f.message.contains("untagged wait")).map(|f| (f.file.clone(), f.line.unwrap_or(0))).collect();
+    assert_eq!(untagged, vec![("src/a.rs".to_string(), 3)], "the imported `publish` is a wait: {:?}", r.findings);
+    let collisions: Vec<(String, usize)> =
+        r.findings.iter().filter(|f| f.message.contains("glob-imports")).map(|f| (f.file.clone(), f.line.unwrap_or(0))).collect();
+    assert_eq!(collisions, vec![("src/c.rs".to_string(), 3)], "a dependency's glob may hold this `publish`: {:?}", r.findings);
+
+    // Declared, the collision resolves either way.
+    let local = format!("{ROWS}\n```wait-lint\nlocal-methods = publish\n```\n");
+    let r = run_files(&files, &local);
+    assert!(!r.findings.iter().any(|f| f.message.contains("glob-imports")), "{:?}", r.findings);
+    let waits = format!("{ROWS}\n```wait-lint\nwait-methods = publish\n```\n");
+    let r = run_files(&files, &waits);
+    assert!(!r.findings.iter().any(|f| f.message.contains("glob-imports")), "{:?}", r.findings);
+    assert!(r.sites.iter().any(|s| s.file == "src/c.rs" && s.line == 3), "declared, it is a wait: {:?}", r.sites);
+}
+
+/// Review finding C-18: a scan that read files but found no wait is refused too.
+#[test]
+#[should_panic(expected = "the source directories are wrong")]
+fn assert_registered_refuses_a_scan_that_found_no_wait() {
+    let dir = std::env::temp_dir().join(format!("wait-lint-no-wait-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn f() -> u8 {\n    1\n}\n").unwrap();
+    std::fs::write(dir.join("registry.md"), "| Key | Kind | Waits on | Argument |\n|---|---|---|---|\n\n```wait-lint-waiters\n```\n")
+        .unwrap();
+    let report = check_dirs(&dir, &["src"], "registry.md").unwrap();
+    assert_eq!((report.files_scanned, report.sites.len(), report.findings.len()), (1, 0, 0), "{:?}", report.findings);
+    assert_registered(&dir, &["src"], "registry.md");
+}
+
+/// A crate's own library, named by a binary of its package (`use mqtt_ynca::emulator::Emulator`
+/// in `src/bin/`), is this code. mqtt_ynca's tree showed it when C-16's `use` reading first landed:
+/// without the crate's name, its own library read as a dependency.
+#[test]
+fn a_path_through_the_crate_s_own_name_is_this_code() {
+    let emulator = "pub struct Emulator;\nimpl Emulator {\n    pub async fn spawn_on(a: &str) {}\n}\n";
+    let bin = "\
+use mqtt_ynca::emulator::Emulator;
+async fn main() {
+    Emulator::spawn_on(\"x\").await;
+    mqtt_ynca::emulator::Emulator::spawn_on(\"y\").await;
+}
+";
+    let files: BTreeMap<String, String> = [("src/lib.rs", "pub mod emulator;\n"), ("src/emulator.rs", emulator), ("src/bin/emu.rs", bin)]
+        .iter()
+        .map(|(p, t)| (p.to_string(), t.to_string()))
+        .collect();
+    let own = BTreeMap::from([(String::new(), BTreeSet::from(["mqtt_ynca".to_string()]))]);
+    let r = check_with_crate_names(&files, ("docs/wait-registry.md", ROWS), &own);
+    assert!(r.sites.is_empty(), "{:?}", r.sites);
+    let r = check(&files, ("docs/wait-registry.md", ROWS));
+    let lines: Vec<usize> = r.sites.iter().map(|s| s.line).collect();
+    assert_eq!(lines, vec![3, 4], "unnamed, the crate's library reads as a dependency: {:?}", r.sites);
+
+    let manifest =
+        "[package]\nname = \"mqtt-ynca\"\nversion = \"1.0.0\"\n\n[lib]\nname = \"ynca\"\n\n[dependencies]\nname = { version = \"1\" }\n";
+    assert_eq!(crate_names_in(manifest), BTreeSet::from(["mqtt_ynca".to_string(), "ynca".to_string()]));
+}

@@ -31,10 +31,15 @@
 //! * **Declared helpers.** A helper that waits for its callers (`wait-fns`: `run_async`) makes
 //!   every call to it a wait to tag, so a new caller is a reviewed diff too.
 //! * **Raw locks** (`raw-locks = forbid`): naming `std::sync`/`tokio::sync`/`parking_lot`
-//!   `Mutex` or `RwLock`, or a `std`/`parking_lot` `Condvar`, is a finding — every lock is built
-//!   through the `lock-order` crate's wrappers, whose runtime check owns lock order. So is a glob
-//!   import of one of those modules or an alias for one (`use std::sync::*`, `use std::sync as
-//!   s`), which would name a raw lock past this check. Syntax cannot see a guard's lifetime, so
+//!   `Mutex` or `RwLock`, a `std`/`parking_lot` `Condvar`, parking_lot's `ReentrantMutex`,
+//!   `FairMutex` or `const_*` constructors, or `lock_api`'s locks, is a finding — every lock is
+//!   built through the `lock-order` crate's wrappers, whose runtime check owns lock order. So is a
+//!   glob import of one of those modules, an alias for one (`use std::sync as s`, `use
+//!   std::sync::{self as s}`, `extern crate parking_lot as pl`) and a `pub` re-export of one
+//!   (`pub use std::sync`), which would name a raw lock past this check. A path is read through
+//!   the file's `use`s (`use std::sync; use sync::*` is a glob of `std::sync`; `use
+//!   lock_order::sync; sync::Mutex` is the wrapper), and a path into the crate (`crate::sync::
+//!   Mutex`) through the names any of its files binds. Syntax cannot see a guard's lifetime, so
 //!   lock order is not this lint's.
 //! * **A name collision.** This code's own async methods are recognised by name, not by the
 //!   receiver's type, so `client.publish(..).await` on a dependency's client would pass as this
@@ -42,7 +47,11 @@
 //!   bridges). An `.await` on such a name with a receiver other than bare `self` is a finding until
 //!   the registry declares the name: `wait-methods` if any awaited one is a dependency's (every
 //!   call becomes a wait to tag — over-tagging this code's own calls is safe), `local-methods` if
-//!   every one is this code's. A `local-methods` name this code does not define is a finding.
+//!   every one is this code's. A `local-methods` name this code does not define is a finding. A
+//!   function call is read through the file's `use`s: `use dep::publish; publish(..).await` is the
+//!   dependency's, a wait. A bare call to one of this code's async fns in a file that neither
+//!   defines nor imports it by name, but glob-imports from a dependency (`use dep::*`), is a
+//!   collision too, resolved by the same declarations.
 //! * **An empty scan.** [`Report::files_scanned`] counts the production files read;
 //!   [`assert_registered`] and the CLI refuse a scan that read none or found no wait, since a wrong
 //!   source directory is otherwise green.
@@ -173,6 +182,13 @@ pub struct Report {
 /// `files` is the set to lint; test code inside it is recognized and skipped. `registry` is the
 /// registry's path (for findings) and its text.
 pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report {
+    check_with_crate_names(files, registry, &BTreeMap::new())
+}
+
+/// [`check`], knowing each crate's own names (crate directory → the names its package's other
+/// crates write it by, `mqtt_ynca` for `use mqtt_ynca::…` in its `src/bin/`), so a path through
+/// one is read as this code's.
+fn check_with_crate_names(files: &BTreeMap<String, String>, registry: (&str, &str), own: &BTreeMap<String, BTreeSet<String>>) -> Report {
     let (registry_file, registry_text) = registry;
     let reg = Registry::parse(registry_text);
     let mut out = Report::default();
@@ -201,7 +217,11 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
     }
     let mut names: BTreeMap<String, scan::Names> = BTreeMap::new();
     for (rel, _, file) in &parsed {
-        let crate_names = names.entry(crate_of(rel)).or_default();
+        let crate_dir = crate_of(rel);
+        let crate_names = names.entry(crate_dir.clone()).or_default();
+        if let Some(own) = own.get(&crate_dir) {
+            crate_names.own_crates.extend(own.iter().cloned());
+        }
         crate_names.collect(file);
         if let Some(module) = file_module(rel) {
             crate_names.local_paths.insert(module);
@@ -235,6 +255,18 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
                      the lint matches names, not types, so a dependency's `{name}` would hide here. Declare it in {registry_file}: \
                      `wait-methods` if any awaited `{name}` is a dependency's (each becomes a wait to tag), `local-methods` if \
                      every one is this code's"
+                ),
+            );
+        }
+        for (line, name) in &scanned.ambiguous_fns {
+            finding(
+                rel,
+                Some(*line),
+                format!(
+                    "`{name}(..).await`: `{name}` is one of this code's async fns, but this file neither defines nor imports it \
+                     by name and glob-imports from outside this code, so a dependency's `{name}` may be the one called. Declare \
+                     it in {registry_file}: `wait-methods` if any awaited `{name}` is a dependency's, `local-methods` if every \
+                     one is this code's"
                 ),
             );
         }
@@ -350,7 +382,35 @@ pub fn check_dirs(root: &Path, src_dirs: &[&str], registry: &str) -> std::io::Re
         collect_rs(root, &root.join(dir), &mut files)?;
     }
     let registry_text = std::fs::read_to_string(root.join(registry))?;
-    Ok(check(&files, (registry, &registry_text)))
+    let mut own = BTreeMap::new();
+    for crate_dir in files.keys().map(|rel| crate_of(rel)).collect::<BTreeSet<_>>() {
+        if let Ok(manifest) = std::fs::read_to_string(root.join(&crate_dir).join("Cargo.toml")) {
+            own.insert(crate_dir, crate_names_in(&manifest));
+        }
+    }
+    Ok(check_with_crate_names(&files, (registry, &registry_text), &own))
+}
+
+/// The names a manifest's crates are written by: its `[package]` name (a `-` read as `_`) and its
+/// `[lib]` name. A line reader, not a TOML parser: enough for `name = "…"`.
+fn crate_names_in(manifest: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut section = "";
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            section = line;
+            continue;
+        }
+        if !matches!(section, "[package]" | "[lib]") {
+            continue;
+        }
+        let Some(value) = line.strip_prefix("name").map(str::trim_start).and_then(|r| r.strip_prefix('=')) else { continue };
+        let value = value.trim().trim_matches('"');
+        if !value.is_empty() && !value.contains(['"', ' ']) {
+            out.insert(value.replace('-', "_"));
+        }
+    }
+    out
 }
 
 /// Rewrite the registry's waiters block from the tree. Returns whether it changed.
