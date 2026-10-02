@@ -2,3 +2,4 @@
 App.*.log
 /wait-lint/target
 /lock-order/target
+/mqtt-test-broker/target
