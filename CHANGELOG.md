@@ -80,7 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The guard's drop is bounded** (about 4 s at most): tracing-appender's `WorkerGuard` drop
   waits at most 1.1 s, except that when its shutdown hand-over times out — a full buffer — it
   `println!`s to stdout, which waits without bound on a stalled stdout. Each worker is flushed on
-  a thread of its own, abandoned at 1.5 s.
+  a thread of its own, abandoned at 1.5 s. A worker whose flush thread cannot start (resource
+  exhaustion) is abandoned too, rather than dropped on the thread dropping the guard (3b round
+  3, T5).
 - **`lock-order`: `Condvar::wait_while` / `wait_timeout_while`** loop over the wrapper's own
   `wait` / `wait_timeout`, so the predicate (which runs under the mutex) runs holding the guard's
   record: a lock taken in it is ordered after the condvar's mutex, and re-taking that mutex there

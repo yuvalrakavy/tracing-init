@@ -25,7 +25,7 @@
 //! be stalled by a stuck destination: every destination it writes to only hands lines over.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -333,20 +333,19 @@ impl Monitor {
 /// hand-over times out, which is what a full buffer makes it do, it `println!`s to stdout, and
 /// that waits without bound on a stalled stdout — or on stdout's lock, held by the console's own
 /// worker while it is blocked writing. So each drop runs on a thread of its own; one still
-/// running at the bound is abandoned, to end with the process.
+/// running at the bound is abandoned, to end with the process. A worker whose thread could not
+/// start is abandoned too, never dropped here ([`Handed`]).
 pub(crate) fn flush_within(workers: Vec<WorkerGuard>, bound: Duration) {
     let (done_tx, done) = mpsc::channel::<()>();
     let mut flushing = 0;
     for worker in workers {
         let done_tx = done_tx.clone();
-        let spawned = thread::Builder::new()
-            .name("tracing-init-flush".into())
-            .spawn(move || {
-                drop(worker);
-                let _ = done_tx.send(());
-            });
-        // A thread that could not start dropped its worker here, within tracing-appender's
-        // own bound except for that `println!`.
+        let handed = Handed(Some(worker));
+        let spawned = spawn_flush(move || {
+            let mut handed = handed;
+            drop(handed.0.take());
+            let _ = done_tx.send(());
+        });
         if spawned.is_ok() {
             flushing += 1;
         }
@@ -359,4 +358,40 @@ pub(crate) fn flush_within(workers: Vec<WorkerGuard>, bound: Duration) {
             break;
         }
     }
+}
+
+/// A worker handed to a flush thread. The thread drops it; if the thread never runs — it could
+/// not start, and its closure is dropped unrun on the thread dropping the guard — the worker is
+/// abandoned instead, since its drop can wait there without bound.
+struct Handed(Option<WorkerGuard>);
+
+impl Drop for Handed {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            std::mem::forget(worker);
+        }
+    }
+}
+
+/// Set by a test to make every flush thread fail to start, as under resource exhaustion.
+static FAIL_FLUSH_SPAWNS: AtomicBool = AtomicBool::new(false);
+
+/// The seam behind [`crate::fail_flush_thread_spawns_for_test`].
+pub(crate) fn fail_flush_spawns() {
+    FAIL_FLUSH_SPAWNS.store(true, Ordering::Relaxed);
+}
+
+/// Start a flush thread. A thread that cannot start leaves its closure dropped unrun, here.
+fn spawn_flush(flush: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    if FAIL_FLUSH_SPAWNS.load(Ordering::Relaxed) {
+        // What `thread::Builder::spawn` does with a closure it could not start.
+        drop(flush);
+        return Err(io::Error::other(
+            "the flush thread could not start (injected)",
+        ));
+    }
+    thread::Builder::new()
+        .name("tracing-init-flush".into())
+        .spawn(flush)
+        .map(|_| ())
 }

@@ -233,6 +233,13 @@ pub struct TracingInit {
 #[cfg(feature = "tokio-console")]
 type BoxedLayer = Option<Box<dyn Layer<Registry> + Send + Sync + 'static>>;
 
+/// Test seam, not an API: from now on, every thread the guard starts to flush a destination
+/// fails to start, as under resource exhaustion.
+#[doc(hidden)]
+pub fn fail_flush_thread_spawns_for_test() {
+    sink::fail_flush_spawns();
+}
+
 /// A stream destination's layer, with its writing side: what watches it for lost lines, and
 /// the worker the guard flushes.
 type DestinationLayer = (Box<dyn Layer<Registry> + Send + Sync + 'static>, sink::Sink);

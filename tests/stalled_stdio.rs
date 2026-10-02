@@ -25,6 +25,7 @@ const CHILD: &str = "TRACING_INIT_STALLED_STDIO_CHILD";
 const CHILD_GELF: &str = "TRACING_INIT_STALLED_STDIO_GELF";
 
 const STDOUT_TEST: &str = "a_stalled_stdout_drops_lines_instead_of_blocking_the_threads_that_log";
+const FLUSH_SPAWN_TEST: &str = "a_flush_thread_that_cannot_start_does_not_hold_the_guards_drop";
 const STDERR_TEST: &str = "a_stalled_stderr_does_not_block_init";
 
 /// Start this binary again, running `test` as the child.
@@ -70,7 +71,9 @@ fn reap(child: &mut Child, within: Duration) -> Option<std::process::ExitStatus>
 const THREADS: usize = 4;
 const LINES_PER_THREAD: usize = 50_000;
 
-fn stdout_child() -> ! {
+/// Log far more than stdout can take, then drop the guard; with `flush_threads_fail`, every
+/// thread the guard starts to flush a destination fails to start.
+fn stdout_child(flush_threads_fail: bool) -> ! {
     let guard = TracingInit::builder("app")
         .destination("cg")
         .gelf_address(&child_gelf())
@@ -104,6 +107,9 @@ fn stdout_child() -> ! {
     );
     // Long enough for the loss to be seen and reported before the guard reports the total.
     thread::sleep(Duration::from_millis(2_500));
+    if flush_threads_fail {
+        tracing_init::fail_flush_thread_spawns_for_test();
+    }
     drop(guard);
     tracing::warn!(probe = "guard_dropped", "the child dropped its guard");
     // Not a return: the test harness would print its verdict to the stuck stdout.
@@ -113,10 +119,26 @@ fn stdout_child() -> ! {
 #[test]
 fn a_stalled_stdout_drops_lines_instead_of_blocking_the_threads_that_log() {
     if is_child(STDOUT_TEST) {
-        stdout_child();
+        stdout_child(false);
     }
+    stalled_stdout(STDOUT_TEST);
+}
+
+/// The guard's flush threads cannot start (resource exhaustion) while the console's buffer is
+/// full and stdout is stalled: a worker whose flush thread did not start must be abandoned, not
+/// dropped on the thread dropping the guard, where tracing-appender's drop `println!`s.
+#[test]
+fn a_flush_thread_that_cannot_start_does_not_hold_the_guards_drop() {
+    if is_child(FLUSH_SPAWN_TEST) {
+        stdout_child(true);
+    }
+    stalled_stdout(FLUSH_SPAWN_TEST);
+}
+
+/// The parent of [`stdout_child`]: its stdout is a pipe nobody reads.
+fn stalled_stdout(test: &str) {
     let mut gelf = Gelf::bind();
-    let mut child = spawn_child(STDOUT_TEST, &gelf.address(), Stdio::piped(), Stdio::null());
+    let mut child = spawn_child(test, &gelf.address(), Stdio::piped(), Stdio::null());
     // Held, never read: closing it would turn the stall into a broken pipe.
     let _stdout = child.stdout.take();
 
