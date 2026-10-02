@@ -76,6 +76,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `held` lock (a release could strand an ack); dropping the broker now closes its connections
   (they kept acknowledging and held the client's socket open); the docs say QoS 2 is
   acknowledged, never held.
+- **`wait-lint`: more raw-lock escapes** (the 3b re-review, T2). A lock module bound at the root
+  and rebound in a child through the crate (`use crate::sync;` or `use super::sync;`, then
+  `sync::Mutex`) is followed to `std::sync`; `parking_lot::lock_api`'s locks are raw locks; and a
+  glob of a module that holds a lock module (`use std::*`, `pub use tokio::*`) is refused, since it
+  binds `sync` without naming it.
+- **`wait-lint`: a dependency's function behind a local module** (the 3b re-review, T3). A call is
+  followed module by module through what each module defines, binds by `use` and glob-imports, so
+  where this code defines its own `async fn sleep`, tokio's `sleep` is still a wait when it arrives
+  through `use super::*` over a parent's import, through a local module's `pub use`
+  (`net::sleep`, `crate::net::sleep`, or a `use` of either), or as `self::sleep` over the file's
+  own import. A module path into a module whose dependency glob may hold the name is a collision.
+- **`mqtt-test-broker`:** a connection's writer is aborted with its connection, also while it is
+  blocked writing to a client that stopped reading; detached, it held the client's socket open
+  past the broker's drop and delivered everything still queued once the client read again (the
+  3b re-review, T4). The ack-race test waits until the acker has reached the `held` lock (an
+  arrival count kept under test) instead of sleeping 100 ms, so its control sees a slow acker too
+  (T1).
 
 ## [0.2.0]
 

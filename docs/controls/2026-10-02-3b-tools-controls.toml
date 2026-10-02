@@ -1,7 +1,7 @@
 # Negative controls for the phase-3b tool changes (Store no-hang §14.2): wait-lint's name
 # collision, empty scan and raw-lock escapes; lock-order's Condvar; the fake broker. The rows
 # after the first ten are the 3b review's fix pass (findings C-12..C-22, C-M3, X-4, X-7, X-8,
-# X-10). Run from Store with
+# X-10); the rows at the end are the re-review's (T1..T4). Run from Store with
 #     CARGO_TARGET_DIR=<a scratch dir> scripts/negative-control.py --root ../tracing-init ../tracing-init/docs/controls/2026-10-02-3b-tools-controls.toml
 # The scratch target dir matters: a row that builds wait-lint's binary (`--test cli`) builds it
 # from the mutant, and other sessions run `wait-lint/target/debug/wait-lint --write`.
@@ -103,9 +103,11 @@ guard       = "raw_condvar"
 name        = "a_glob_import_passes"
 file        = "wait-lint/src/scan.rs"
 anchor      = '''                if self.lock_module_in(prefix) {
-                    self.out.raw_locks.push((g.star_token.span.start().line, format!("{}::* (a glob import)", prefix.join("::"))));
-                }'''
-replacement = '''                let _ = g;'''
+                    self.out.raw_locks.push((line, format!("{}::* (a glob import)", prefix.join("::"))));
+                } else if'''
+replacement = '''                if false {
+                    self.out.raw_locks.push((line, format!("{}::* (a glob import)", prefix.join("::"))));
+                } else if'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "raw_condvars_aliases_and_globs"]
 expect_text = "raw_condvars_aliases_and_globs_are_raw_locks"
@@ -407,8 +409,8 @@ guard       = "raw_lock_kinds"
 [[control]]
 name        = "a_bound_module_is_read_as_written"
 file        = "wait-lint/src/scan.rs"
-anchor      = '''            return self.uses.readings(segs).unwrap_or_else(|| vec![segs.to_vec()]);'''
-replacement = '''            return vec![segs.to_vec()];'''
+anchor      = '''        let mut todo = if into_crate(segs) { vec![segs.to_vec()] } else { self.uses.readings(segs).unwrap_or_else(|| vec![segs.to_vec()]) };'''
+replacement = '''        let mut todo = vec![segs.to_vec()];'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "the_wrappers_named_through_a_bound_module"]
 expect_text = "the_wrappers_named_through_a_bound_module_are_not_raw_locks"
@@ -431,7 +433,12 @@ guard       = "raw_module_alias"
 [[control]]
 name        = "an_imported_function_is_read_as_this_codes"
 file        = "wait-lint/src/scan.rs"
-anchor      = '''        if let Some(readings) = self.uses.readings(path) {
+# Since T3, a call is also followed through the modules' `use`s (`reach`), which reads the file's
+# own import too: the mutation drops both readings, as the original defect had neither.
+anchor      = '''        if reach.contains(&Reach::Outside) {
+            return Callee::Foreign;
+        }
+        if let Some(readings) = self.uses.readings(path) {
             return if readings.iter().all(|r| self.names.is_local_fn(r)) { Callee::Local } else { Callee::Foreign };'''
 replacement = '''        if let Some(readings) = None::<Vec<Vec<String>>> {
             return if readings.iter().all(|r| self.names.is_local_fn(r)) { Callee::Local } else { Callee::Foreign };'''
@@ -443,8 +450,10 @@ guard       = "collision_imported_fn"
 [[control]]
 name        = "a_name_a_dependency_s_glob_may_hold_is_this_codes"
 file        = "wait-lint/src/scan.rs"
-anchor      = '''            return Callee::Ambiguous;'''
-replacement = '''            return Callee::Local;'''
+anchor      = '''        if path.len() == 1 && !self.uses.fns.contains(&path[0]) && self.uses.globs_outside(self.names) {
+            return Callee::Ambiguous;'''
+replacement = '''        if path.len() == 1 && !self.uses.fns.contains(&path[0]) && self.uses.globs_outside(self.names) {
+            return Callee::Local;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "an_imported_function_named_like"]
 expect_text = "a dependency's glob may hold this `publish`"
@@ -485,11 +494,11 @@ guard       = "cli_empty_scan"
 [[control]]
 name        = "an_ack_is_decided_before_the_held_lock"
 file        = "mqtt-test-broker/src/lib.rs"
-anchor      = '''    let mut held = shared.held.lock().unwrap();
+anchor      = '''    let mut held = lock_held(shared);
     if shared.hold_acks.load(Ordering::SeqCst) {
         held.push(pkid);'''
 replacement = '''    let holding = shared.hold_acks.load(Ordering::SeqCst);
-    let mut held = shared.held.lock().unwrap();
+    let mut held = lock_held(shared);
     if holding {
         held.push(pkid);'''
 target      = "command"
@@ -507,3 +516,245 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "dropping_the_broker_closes"]
 expect_text = "the broker was dropped but its connection still holds the client's socket open"
 guard       = "fake_broker_drop_connections"
+
+# --- The re-review's fixes (T1..T4) ---------------------------------------------------------
+
+# T1: the ack-race test waits until the acker has reached the `held` lock, not 100 ms. The row
+# above (`an_ack_is_decided_before_the_held_lock`) is the prompt acker; this one is a slow one,
+# which the 100 ms sleep let read the flag after the release (GREEN on the old test).
+
+[[control]]
+name        = "a_slow_ack_is_decided_before_the_held_lock"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''    let mut held = lock_held(shared);
+    if shared.hold_acks.load(Ordering::SeqCst) {
+        held.push(pkid);'''
+replacement = '''    std::thread::sleep(std::time::Duration::from_millis(300));
+    let holding = shared.hold_acks.load(Ordering::SeqCst);
+    let mut held = lock_held(shared);
+    if holding {
+        held.push(pkid);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "an_ack_decided_during_a_release"]
+expect_text = "an ack decided during a release was stranded"
+guard       = "fake_broker_ack_race_sync"
+
+# T2: raw-lock escapes — a lock module rebound through the crate, lock_api through parking_lot,
+# a glob of a module that holds a lock module.
+
+[[control]]
+name        = "a_lock_module_rebound_through_the_crate_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        let mut todo = if into_crate(segs) { vec![segs.to_vec()] } else { self.uses.readings(segs).unwrap_or_else(|| vec![segs.to_vec()]) };'''
+replacement = '''        if !into_crate(segs) {
+            return self.uses.readings(segs).unwrap_or_else(|| vec![segs.to_vec()]);
+        }
+        let mut todo = vec![segs.to_vec()];'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_lock_module_rebound_through_the_crate"]
+expect_text = "a lock module rebound through the crate named its raw locks past the check"
+guard       = "raw_crate_rebind"
+
+[[control]]
+name        = "lock_api_through_parking_lot_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''    ("parking_lot::lock_api", "Mutex"),
+    ("parking_lot::lock_api", "RwLock"),
+    ("parking_lot::lock_api", "ReentrantMutex"),
+'''
+replacement = ""
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "lock_api_s_locks_named_through_parking_lot"]
+expect_text = "lock_api's locks through parking_lot passed"
+guard       = "raw_parking_lot_lock_api"
+
+[[control]]
+name        = "a_glob_of_a_module_holding_a_lock_module_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''                } else if let Some(held) = self.lock_module_held_in(prefix) {'''
+replacement = '''                } else if let Some(held) = None::<&str> {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_glob_of_a_module_holding_a_lock_module"]
+expect_text = "a glob of a module holding a lock module passed"
+guard       = "raw_glob_of_holder"
+
+# T3: a call followed through the modules' `use`s and globs.
+
+[[control]]
+name        = "a_use_leading_out_of_this_code_is_ignored"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        let reach = self.names.reach(&self.module, path);
+        if reach.contains(&Reach::Outside) {
+            return Callee::Foreign;
+        }
+'''
+replacement = '''        let reach = self.names.reach(&self.module, path);
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_dependency_fn_"]
+expect_text = "tokio's `sleep`, re-exported by a local module, hid behind this code's"
+guard       = "reach_outside"
+
+[[control]]
+name        = "a_glob_of_this_code_is_not_followed"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''                    Place::Module(target) => out.extend(self.reach_item(&target, name, depth + 1, seen)),'''
+replacement = '''                    Place::Module(_) => out.push(Reach::Unknown),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_dependency_fn_carried_by_a_glob"]
+expect_text = "tokio's `sleep`, carried by `use super::*`, hid behind this code's"
+guard       = "reach_local_glob"
+
+[[control]]
+name        = "a_module_s_use_is_not_followed"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        if let Some(targets) = m.bound.get(name) {
+            return targets.iter().flat_map(|t| self.reach_path(module, t, depth + 1, seen)).collect();'''
+replacement = '''        if let Some(targets) = None::<&Vec<Vec<String>>> {
+            return targets.iter().flat_map(|t| self.reach_path(module, t, depth + 1, seen)).collect();'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_dependency_fn_re_exported_by_a_local_module"]
+expect_text = "tokio's `sleep`, re-exported by a local module, hid behind this code's"
+guard       = "reach_module_use"
+
+[[control]]
+name        = "a_crate_path_is_not_followed"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''            "crate" => return self.places_in(&crate_root(module), rest, depth + 1),'''
+replacement = '''            "crate" => return vec![Place::Unknown],'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_dependency_fn_re_exported_by_a_local_module"]
+expect_text = "tokio's `sleep`, re-exported by a local module, hid behind this code's"
+guard       = "reach_crate_path"
+
+[[control]]
+name        = "a_child_module_path_is_not_followed"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        let child = joined(module, std::slice::from_ref(first));
+        if self.modules.contains_key(&child) {
+            return self.places_in(&child, rest, depth + 1);
+        }
+        if let Some(targets) = self.modules.get(module).and_then(|m| m.bound.get(first)) {
+            return targets.iter().flat_map(|t| self.places(module, &joined(t, rest), depth + 1)).collect();
+        }
+        if self.own_crates.contains(first) {'''
+replacement = '''        if let Some(targets) = self.modules.get(module).and_then(|m| m.bound.get(first)) {
+            return targets.iter().flat_map(|t| self.places(module, &joined(t, rest), depth + 1)).collect();
+        }
+        if self.own_crates.contains(first) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_dependency_fn_re_exported_by_a_local_module"]
+expect_text = "tokio's `sleep`, re-exported by a local module, hid behind this code's"
+guard       = "reach_child_module"
+
+# Unfollowed, `use crate::net as n` leaves `n::` reading as a dependency's path: the tokio form is
+# still a wait (for the wrong reason), and the local re-export's `n::sleep` becomes a false one.
+[[control]]
+name        = "a_module_path_s_use_is_not_followed"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        if let Some(targets) = self.modules.get(module).and_then(|m| m.bound.get(first)) {
+            return targets.iter().flat_map(|t| self.places(module, &joined(t, rest), depth + 1)).collect();
+        }'''
+replacement = ""
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_dependency_fn_re_exported_by_a_local_module"]
+expect_text = "only `self::sleep`, tokio's, is a wait"
+guard       = "reach_module_path_use"
+
+[[control]]
+name        = "a_path_inside_a_module_through_its_use_is_not_followed"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        if let Some(targets) = self.modules.get(module).and_then(|m| m.bound.get(first)) {
+            return targets.iter().flat_map(|t| self.places(module, &joined(t, more), depth + 1)).collect();
+        }'''
+replacement = ""
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_dependency_fn_re_exported_by_a_local_module"]
+expect_text = "tokio's `sleep`, re-exported by a local module, hid behind this code's"
+guard       = "reach_inner_use"
+
+[[control]]
+name        = "a_dependency_glob_behind_a_module_path_is_this_codes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        if reach.contains(&Reach::Glob) {
+            return Callee::Ambiguous;
+        }'''
+replacement = ""
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_module_s_dependency_glob_may_hold"]
+expect_text = "`net::sleep` may be tokio's, `own::sleep` is the module's"
+guard       = "reach_glob_collision"
+
+[[control]]
+name        = "a_definition_does_not_shadow_a_glob"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        if m.fns.contains(name) {
+            return vec![Reach::Here];
+        }'''
+replacement = ""
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_module_s_dependency_glob_may_hold"]
+expect_text = "`net::sleep` may be tokio's, `own::sleep` is the module's"
+guard       = "reach_definition_first"
+
+[[control]]
+name        = "the_crate_s_own_name_reads_as_a_dependency_when_followed"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        if self.own_crates.contains(first) {
+            return self.places_in(&[], rest, depth + 1);
+        }'''
+replacement = ""
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_path_through_the_crate_s_own_name"]
+expect_text = "a_path_through_the_crate_s_own_name_is_this_code"
+guard       = "reach_own_crate"
+
+# The resolver's false-positive side: a path through one of this code's own types or inline
+# modules is not a dependency's.
+[[control]]
+name        = "a_local_type_or_inline_module_reads_as_a_dependency"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        if first == "Self" || self.local_paths.contains(first) {
+            return vec![Place::Unknown];
+        }'''
+replacement = ""
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_local_path_is_delegated_and_a_dependency_path_is_not"]
+expect_text = "a_local_path_is_delegated_and_a_dependency_path_is_not"
+guard       = "reach_local_path"
+
+[[control]]
+name        = "globs_that_reach_each_other_are_asked_every_time"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        if !seen.insert((module.to_vec(), name.to_string())) {
+            return vec![Reach::Unknown]; // asked already, on another way here: its answer is in
+        }'''
+replacement = '''        seen.insert((module.to_vec(), name.to_string()));'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "globs_that_reach_each_other"]
+expect_text = "did not finish within 20 s"
+guard       = "reach_seen"
+
+# T4: a connection's writer goes with its connection.
+
+[[control]]
+name        = "a_dropped_broker_detaches_a_blocked_writer"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''    let _writer = AbortOnDrop(tokio::spawn(async move {
+        while let Some(packet) = rx.recv().await {
+            if wr.write_all(&packet).await.is_err() {
+                break;
+            }
+        }
+    }));'''
+replacement = '''    let _writer = tokio::spawn(async move {
+        while let Some(packet) = rx.recv().await {
+            if wr.write_all(&packet).await.is_err() {
+                break;
+            }
+        }
+    });'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "dropping_the_broker_stops_a_writer"]
+expect_text = "the dropped broker's writer went on writing"
+guard       = "fake_broker_writer_abort"
