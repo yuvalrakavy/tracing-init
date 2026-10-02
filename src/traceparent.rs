@@ -114,14 +114,18 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             let root = tracing::info_span!("cause_site");
-            let tp = root.in_scope(current).expect("valid context inside root span");
+            let tp = root
+                .in_scope(current)
+                .expect("valid context inside root span");
             assert!(tp.starts_with("00-"));
             let trace_id = &tp[3..35];
 
             // Detached work: new span, re-parented before first enter.
             let detached = tracing::info_span!("handling_site");
             assert!(set_remote_parent(&detached, &tp));
-            let detached_tp = detached.in_scope(current).expect("valid context in re-parented span");
+            let detached_tp = detached
+                .in_scope(current)
+                .expect("valid context in re-parented span");
             assert_eq!(
                 &detached_tp[3..35],
                 trace_id,

@@ -40,11 +40,7 @@ pub fn apply_destination_modifier(base: Option<&str>, modifier: &str) -> String 
                 chars.next();
                 match op {
                     '-' => result.retain(|c| *c != target),
-                    '+' => {
-                        if !result.contains(&target) {
-                            result.push(target);
-                        }
-                    }
+                    '+' if !result.contains(&target) => result.push(target),
                     _ => {}
                 }
             }

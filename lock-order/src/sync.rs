@@ -11,7 +11,13 @@ use std::time::Duration;
 use crate::{hooks, watchdog::WaitGuard, Held};
 
 /// Take the lock at once, or register the wait with the watchdog thread and block.
-fn take<G>(try_take: TryLockResult<G>, take: impl FnOnce() -> LockResult<G>, class: &'static str, site: &'static Location<'static>, instance: usize) -> LockResult<G> {
+fn take<G>(
+    try_take: TryLockResult<G>,
+    take: impl FnOnce() -> LockResult<G>,
+    class: &'static str,
+    site: &'static Location<'static>,
+    instance: usize,
+) -> LockResult<G> {
     match try_take {
         Ok(g) => Ok(g),
         Err(TryLockError::Poisoned(p)) => Err(p),

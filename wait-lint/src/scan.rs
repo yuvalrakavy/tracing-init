@@ -98,10 +98,9 @@ const TRANSPARENT_LAST_ARG_FNS: &[&str] = &["holding", "holding_in"];
 /// Names too common to read a method call into one of this code's `async fn`s: `x.get(k)` is
 /// not a future of a local `async fn get`.
 const COMMON_NAMES: &[&str] = &[
-    "new", "get", "set", "insert", "remove", "push", "pop", "clear", "len", "is_empty", "send", "recv", "read",
-    "write", "lock", "run", "start", "stop", "close", "flush", "next", "call", "execute", "handle", "update",
-    "load", "save", "init", "connect", "open", "wait", "apply", "build", "from", "into", "clone", "drop",
-    "drain", "take", "poll", "tick", "flush",
+    "new", "get", "set", "insert", "remove", "push", "pop", "clear", "len", "is_empty", "send", "recv", "read", "write", "lock", "run",
+    "start", "stop", "close", "flush", "next", "call", "execute", "handle", "update", "load", "save", "init", "connect", "open", "wait",
+    "apply", "build", "from", "into", "clone", "drop", "drain", "take", "poll", "tick", "flush",
 ];
 
 /// What this code defines, from its production (non-test) items only: a test helper named like
@@ -412,17 +411,13 @@ fn block_value(b: &syn::Block) -> Option<&syn::Expr> {
 fn see_through(e: &syn::Expr) -> &syn::Expr {
     match peel(e) {
         syn::Expr::MethodCall(mc) if TRANSPARENT_METHODS.contains(&mc.method.to_string().as_str()) => see_through(&mc.receiver),
-        syn::Expr::MethodCall(mc)
-            if !mc.args.is_empty() && TRANSPARENT_LAST_ARG_METHODS.contains(&mc.method.to_string().as_str()) =>
-        {
+        syn::Expr::MethodCall(mc) if !mc.args.is_empty() && TRANSPARENT_LAST_ARG_METHODS.contains(&mc.method.to_string().as_str()) => {
             see_through(&mc.args[mc.args.len() - 1])
         }
         syn::Expr::Call(c) if c.args.len() == 1 && last_ident(&c.func).is_some_and(|n| TRANSPARENT_FNS.contains(&n.as_str())) => {
             see_through(&c.args[0])
         }
-        syn::Expr::Call(c)
-            if !c.args.is_empty() && last_ident(&c.func).is_some_and(|n| TRANSPARENT_LAST_ARG_FNS.contains(&n.as_str())) =>
-        {
+        syn::Expr::Call(c) if !c.args.is_empty() && last_ident(&c.func).is_some_and(|n| TRANSPARENT_LAST_ARG_FNS.contains(&n.as_str())) => {
             see_through(&c.args[c.args.len() - 1])
         }
         syn::Expr::Block(b) => match block_value(&b.block) {
@@ -449,7 +444,12 @@ fn call_key(e: &syn::Expr) -> Option<(usize, usize)> {
 }
 
 fn is_string_literal(text: &str) -> bool {
-    text.starts_with('"') || text.starts_with("r\"") || text.starts_with("r#") || text.starts_with("b\"") || text.starts_with("br") || text.starts_with("c\"")
+    text.starts_with('"')
+        || text.starts_with("r\"")
+        || text.starts_with("r#")
+        || text.starts_with("b\"")
+        || text.starts_with("br")
+        || text.starts_with("c\"")
 }
 
 impl Visitor<'_> {
@@ -489,9 +489,7 @@ impl Visitor<'_> {
     }
 
     fn blocks(&self, name: &str, zero_args: bool) -> bool {
-        (zero_args && BLOCKING_ZERO_ARG.contains(&name))
-            || BLOCKING_ANY_ARG.contains(&name)
-            || self.reg.blocking_methods.contains(name)
+        (zero_args && BLOCKING_ZERO_ARG.contains(&name)) || BLOCKING_ANY_ARG.contains(&name) || self.reg.blocking_methods.contains(name)
     }
 
     /// Record an `.await` on a call: a method `name` when `path` is `None`, else a function.
@@ -715,7 +713,9 @@ impl Visitor<'_> {
         while end >= 3 {
             match (&tts[end - 1], &tts[end - 2], &tts[end - 3]) {
                 (TokenTree::Group(g), TokenTree::Ident(name), TokenTree::Punct(p))
-                    if g.delimiter() == Delimiter::Parenthesis && p.as_char() == '.' && TRANSPARENT_METHODS.contains(&name.to_string().as_str()) =>
+                    if g.delimiter() == Delimiter::Parenthesis
+                        && p.as_char() == '.'
+                        && TRANSPARENT_METHODS.contains(&name.to_string().as_str()) =>
                 {
                     end -= 3;
                 }
@@ -785,8 +785,7 @@ fn awaited_after(tts: &[TokenTree], mut at: usize) -> bool {
 fn token_path(tts: &[TokenTree], last: usize) -> Vec<String> {
     let mut path = Vec::new();
     let mut k = last;
-    loop {
-        let TokenTree::Ident(id) = &tts[k] else { break };
+    while let TokenTree::Ident(id) = &tts[k] {
         path.push(id.to_string());
         let colons = k >= 3
             && matches!(&tts[k - 1], TokenTree::Punct(p) if p.as_char() == ':')
@@ -803,7 +802,21 @@ fn token_path(tts: &[TokenTree], last: usize) -> Vec<String> {
 fn is_keyword(s: &str) -> bool {
     matches!(
         s,
-        "async" | "move" | "self" | "Self" | "super" | "crate" | "return" | "break" | "in" | "if" | "else" | "match" | "loop" | "while" | "for"
+        "async"
+            | "move"
+            | "self"
+            | "Self"
+            | "super"
+            | "crate"
+            | "return"
+            | "break"
+            | "in"
+            | "if"
+            | "else"
+            | "match"
+            | "loop"
+            | "while"
+            | "for"
     )
 }
 
@@ -1086,7 +1099,10 @@ fn class_literal(c: &syn::ExprCall) -> Option<(usize, String)> {
 fn is_class_call(path: &[String], args: usize) -> bool {
     let Some(last) = path.last().map(String::as_str) else { return false };
     matches!(last, "holding" | "holding_in" | "waits_on" | "waits_on_in" | "hold" | "scope" | "acquire")
-        || (matches!(last, "new" | "with_default") && path.len() >= 2 && matches!(path[path.len() - 2].as_str(), "Mutex" | "RwLock") && args == 2)
+        || (matches!(last, "new" | "with_default")
+            && path.len() >= 2
+            && matches!(path[path.len() - 2].as_str(), "Mutex" | "RwLock")
+            && args == 2)
 }
 
 /// Is `tts[i]` the first segment of a path — not one after `::`?

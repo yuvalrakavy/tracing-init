@@ -468,11 +468,7 @@ fn a_condvar_wait_holding_a_later_lock_reports_the_reacquisitions_cycle() {
     let (ga, _) = cv.wait_timeout(ga, Duration::from_millis(5)).unwrap();
     drop(gb);
     drop(ga);
-    assert!(
-        cycle_with("cv-ord-a", "cv-ord-b").is_some(),
-        "the re-acquisition's order was not checked before the wait: {:?}",
-        cycles()
-    );
+    assert!(cycle_with("cv-ord-a", "cv-ord-b").is_some(), "the re-acquisition's order was not checked before the wait: {:?}", cycles());
 }
 
 #[test]

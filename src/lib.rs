@@ -647,27 +647,26 @@ impl TracingInit {
         #[cfg(feature = "otel")]
         let mut logger_provider: Option<opentelemetry_sdk::logs::SdkLoggerProvider> = None;
 
-        let skip_on_error =
-            self.on_destination_error == Some(types::OnDestinationError::Skip);
+        let skip_on_error = self.on_destination_error == Some(types::OnDestinationError::Skip);
 
         match self.get_console_layer() {
             Ok(Some(layer)) => layers.push(layer),
             Ok(None) => {}
-            Err(e) if skip_on_error => self.note_destination_failure("console", &e),
+            Err(e) if skip_on_error => self.note_destination_failure("console", &*e),
             Err(e) => return Err(e),
         }
         #[cfg(feature = "file")]
         match self.get_file_layer() {
             Ok(Some(layer)) => layers.push(layer),
             Ok(None) => {}
-            Err(e) if skip_on_error => self.note_destination_failure("file", &e),
+            Err(e) if skip_on_error => self.note_destination_failure("file", &*e),
             Err(e) => return Err(e),
         }
         #[cfg(feature = "gelf")]
         match self.get_gelf_layer() {
             Ok(Some(layer)) => layers.push(layer),
             Ok(None) => {}
-            Err(e) if skip_on_error => self.note_destination_failure("gelf", &e),
+            Err(e) if skip_on_error => self.note_destination_failure("gelf", &*e),
             Err(e) => return Err(e),
         }
         #[cfg(feature = "tokio-console")]
@@ -724,9 +723,8 @@ impl TracingInit {
                     // the availability counters from.
                     otel::circuit_breaker::register(circuit_state.clone());
 
-                    let mut otel_layers: Vec<
-                        Box<dyn Layer<Registry> + Send + Sync + 'static>,
-                    > = Vec::new();
+                    let mut otel_layers: Vec<Box<dyn Layer<Registry> + Send + Sync + 'static>> =
+                        Vec::new();
 
                     // Only the third slot reaches the SDK. It is `None` unless the value
                     // came from TOML, which is how `OTEL_BSP_MAX_QUEUE_SIZE` keeps winning
@@ -777,7 +775,7 @@ impl TracingInit {
                         logger_provider = lp;
                         beacon_handle = Some(beacon);
                     }
-                    Err(e) if skip_on_error => self.note_destination_failure("otel", &e),
+                    Err(e) if skip_on_error => self.note_destination_failure("otel", &*e),
                     Err(e) => return Err(e),
                 }
             }
@@ -1422,7 +1420,7 @@ impl TracingInit {
 
     /// Record a destination that failed to initialize under
     /// `on_destination_error = "skip"`: stderr note now, summary entry later.
-    fn note_destination_failure(&mut self, dest: &str, e: &Box<dyn std::error::Error>) {
+    fn note_destination_failure(&mut self, dest: &str, e: &dyn std::error::Error) {
         eprintln!(
             "tracing-init: {dest} destination failed to initialize: {e} — continuing without it (on_destination_error = \"skip\")"
         );

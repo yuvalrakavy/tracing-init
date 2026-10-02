@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use rumqttc::v5::mqttbytes::v5::{
-    ConnAck, ConnAckProperties, ConnectReturnCode, Packet, PingResp, PubAck, PubComp, PubRec, Publish, SubAck,
-    SubscribeReasonCode, UnsubAck, UnsubAckReason,
+    ConnAck, ConnAckProperties, ConnectReturnCode, Packet, PingResp, PubAck, PubComp, PubRec, Publish, SubAck, SubscribeReasonCode,
+    UnsubAck, UnsubAckReason,
 };
 pub use rumqttc::v5::mqttbytes::QoS;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

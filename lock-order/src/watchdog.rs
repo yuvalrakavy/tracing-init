@@ -91,7 +91,10 @@ impl WaitGuard {
         }
         ensure_thread();
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        waits().lock().unwrap_or_else(|p| p.into_inner()).insert(id, Wait { class, site, instance, since: Instant::now(), reported: false });
+        waits()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, Wait { class, site, instance, since: Instant::now(), reported: false });
         self.0 = Some(id);
     }
 }

@@ -1,5 +1,5 @@
-use super::*;
 use super::crate_of;
+use super::*;
 
 const ROWS: &str = "\
 | Key | Kind | Waits on | Held across | Argument |
@@ -254,7 +254,12 @@ async fn f(e: E, n: N) {
 }
 ";
     let r = run(src);
-    assert_eq!(untagged_lines(&r), vec![10, 11], "the escaping `idle(e)` and `notified()`; the spawned one is its task's: {:?}", r.findings);
+    assert_eq!(
+        untagged_lines(&r),
+        vec![10, 11],
+        "the escaping `idle(e)` and `notified()`; the spawned one is its task's: {:?}",
+        r.findings
+    );
 }
 
 #[test]
@@ -533,10 +538,7 @@ impl Run for S {
 }
 ";
     let r = run_files(&[("src/a.rs", src)], K_ONLY);
-    assert_eq!(
-        r.waiters_block,
-        "```wait-lint-waiters\nk src/a.rs <S as Run>::f\nk src/a.rs a::f\nk src/a.rs b::f\n```\n"
-    );
+    assert_eq!(r.waiters_block, "```wait-lint-waiters\nk src/a.rs <S as Run>::f\nk src/a.rs a::f\nk src/a.rs b::f\n```\n");
     // And the block reads back: a waiter's function may contain spaces.
     let registry = format!("{K_ONLY}\n{}", r.waiters_block);
     let again = run_files(&[("src/a.rs", src)], &registry);
@@ -809,11 +811,7 @@ fn a_declared_local_method_is_this_codes_and_a_stale_one_is_a_finding() {
 
     let stale = format!("{ROWS}\n```wait-lint\nlocal-methods = subscribe\n```\n");
     let r = run_files(&[("src/a.rs", COLLIDES)], &stale);
-    assert!(
-        registry_findings(&r).iter().any(|(_, m)| m.contains("`local-methods` names `subscribe`")),
-        "{:?}",
-        r.findings
-    );
+    assert!(registry_findings(&r).iter().any(|(_, m)| m.contains("`local-methods` names `subscribe`")), "{:?}", r.findings);
 }
 
 #[test]

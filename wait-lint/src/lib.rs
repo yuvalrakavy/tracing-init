@@ -250,7 +250,9 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
                 finding(
                     rel,
                     Some(*line),
-                    format!("`{path}` is a raw lock: build it through the lock-order crate's wrapper, naming its registry key as its class"),
+                    format!(
+                        "`{path}` is a raw lock: build it through the lock-order crate's wrapper, naming its registry key as its class"
+                    ),
                 );
             }
         }
@@ -295,7 +297,10 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
                     finding(
                         &site.file,
                         Some(site.line),
-                        format!("{} names `{key}`, an `acyclic` row: a timeout is a bound, and its row must say what the expiry does", site.what),
+                        format!(
+                            "{} names `{key}`, an `acyclic` row: a timeout is a bound, and its row must say what the expiry does",
+                            site.what
+                        ),
                     );
                 }
             }
@@ -303,7 +308,11 @@ pub fn check(files: &BTreeMap<String, String>, registry: (&str, &str)) -> Report
     }
     for row in &reg.rows {
         if !used_keys.contains(&row.key) {
-            finding(registry_file, Some(row.line), format!("row `{}` is named by no wait — delete it, or tag the waits it covers", row.key));
+            finding(
+                registry_file,
+                Some(row.line),
+                format!("row `{}` is named by no wait — delete it, or tag the waits it covers", row.key),
+            );
         }
     }
 
@@ -492,9 +501,7 @@ impl<'a> Tags<'a> {
         let mut by_line = BTreeMap::new();
         let mut malformed = Vec::new();
         let mut in_doc = Vec::new();
-        let in_literal = |line: usize, col: usize| {
-            literals.iter().any(|&(start, end)| (line, col) >= start && (line, col) < end)
-        };
+        let in_literal = |line: usize, col: usize| literals.iter().any(|&(start, end)| (line, col) >= start && (line, col) < end);
         for (i, line) in lines.iter().enumerate() {
             let n = i + 1;
             if test_ranges.iter().any(|(a, b)| (*a..=*b).contains(&n)) {
@@ -578,14 +585,12 @@ impl<'a> Tags<'a> {
                 }
             }
         }
-        let used: BTreeSet<usize> = found
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| keys[i].as_ref().and(self.nearest(f.line, f.stmt.map(|s| s.0))))
-            .collect();
+        let used: BTreeSet<usize> =
+            found.iter().enumerate().filter_map(|(i, f)| keys[i].as_ref().and(self.nearest(f.line, f.stmt.map(|s| s.0)))).collect();
         for (line, tag) in &self.by_line {
             if !used.contains(line) {
-                problems.push((*line, format!("`// WAIT: {}` covers no wait — remove it, or move it onto the wait it means", tag.join(", "))));
+                problems
+                    .push((*line, format!("`// WAIT: {}` covers no wait — remove it, or move it onto the wait it means", tag.join(", "))));
             }
         }
         for line in &self.malformed {
@@ -604,7 +609,7 @@ fn tag_on(comment: &str) -> Option<Result<Vec<String>, ()>> {
     let rest = comment.strip_prefix("//")?.trim_start_matches('/').trim_start();
     let rest = rest.strip_prefix("WAIT:")?;
     // The keys run to the end of the line, or to prose after them (`// WAIT: k — why`).
-    let list = rest.split(|c: char| c == '—' || c == '(' || c == ';').next().unwrap_or("");
+    let list = rest.split(['—', '(', ';']).next().unwrap_or("");
     let keys: Vec<String> = list.split(',').map(|k| k.trim().to_string()).collect();
     if keys.iter().all(|k| registry::is_key(k)) {
         Some(Ok(keys))

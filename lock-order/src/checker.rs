@@ -127,12 +127,15 @@ pub struct Token {
 
 const SHARDS: usize = 16;
 
-fn shards() -> &'static [Mutex<HashMap<Context, Vec<Held>>>; SHARDS] {
-    static HELD: OnceLock<[Mutex<HashMap<Context, Vec<Held>>>; SHARDS]> = OnceLock::new();
+/// One shard of the held records: each context's holdings.
+type Shard = Mutex<HashMap<Context, Vec<Held>>>;
+
+fn shards() -> &'static [Shard; SHARDS] {
+    static HELD: OnceLock<[Shard; SHARDS]> = OnceLock::new();
     HELD.get_or_init(|| std::array::from_fn(|_| Mutex::new(HashMap::new())))
 }
 
-fn shard(ctx: &Context) -> &'static Mutex<HashMap<Context, Vec<Held>>> {
+fn shard(ctx: &Context) -> &'static Shard {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ctx.hash(&mut h);
