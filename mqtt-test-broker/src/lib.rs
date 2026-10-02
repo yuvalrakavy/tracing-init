@@ -1,12 +1,13 @@
-//! A fake MQTT v5 broker for the fleet's bridge tests (Store no-hang §14.5).
+//! A fake MQTT broker (v5 or v3.1.1) for the fleet's bridge tests (Store no-hang §14.5).
 //!
 //! The bridges' hangs are waits on rumqttc's bounded request channel, which drains only while the
 //! event loop is polled. A healthy broker never fills that channel, so a test against one proves
-//! nothing about them. This broker can **withhold its acknowledgements**: its CONNACK advertises a
-//! small `receive_maximum`, so the client stops at that many in-flight QoS 1 publishes; while the
-//! acks are held, rumqttc stops taking requests from its channel, the channel fills, and the next
-//! `publish(..).await` waits — the saturation a hang needs. [`FakeBroker::release_acks`] lets it
-//! drain again, and a client whose event loop is still being polled then completes.
+//! nothing about them. This broker can **withhold its acknowledgements**: the client stops at its
+//! in-flight limit of QoS 1 publishes (v5: the `receive_maximum` this broker's CONNACK advertises;
+//! v3.1.1: the client's own `MqttOptions::set_inflight`); while the acks are held, rumqttc stops
+//! taking requests from its channel, the channel fills, and the next `publish(..).await` waits —
+//! the saturation a hang needs. [`FakeBroker::release_acks`] lets it drain again, and a client
+//! whose event loop is still being polled then completes.
 //!
 //! Enough of MQTT for that and no more: one client at a time (a reconnect replaces the
 //! connection), QoS 0 to the client, QoS 1 and 2 from the client acknowledged (or held), retained
@@ -17,11 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use rumqttc::v5::mqttbytes::v5::{
-    ConnAck, ConnAckProperties, ConnectReturnCode, Packet, PingResp, PubAck, PubComp, PubRec, Publish, SubAck, SubscribeReasonCode,
-    UnsubAck, UnsubAckReason,
-};
 pub use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::{mqttbytes::v4, v5::mqttbytes::v5};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
@@ -33,6 +31,14 @@ pub struct Received {
     pub payload: Bytes,
     pub qos: QoS,
     pub retain: bool,
+}
+
+/// The protocol the broker speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    V5,
+    /// MQTT 3.1.1, rumqttc's `v4` module.
+    V4,
 }
 
 /// The broker. Dropping it stops it.
@@ -49,6 +55,7 @@ impl Drop for FakeBroker {
 }
 
 struct Shared {
+    protocol: Protocol,
     receive_max: u16,
     received: Mutex<Vec<Received>>,
     subscriptions: Mutex<Vec<String>>,
@@ -56,23 +63,33 @@ struct Shared {
     hold_acks: AtomicBool,
     /// Packet ids of the PUBACKs held on the current connection.
     held: Mutex<Vec<u16>>,
-    /// The current connection's writer.
-    to_client: Mutex<Option<mpsc::UnboundedSender<Packet>>>,
+    /// The current connection's writer, taking encoded packets.
+    to_client: Mutex<Option<mpsc::UnboundedSender<BytesMut>>>,
     /// Any change a test may wait for: a publish received, a subscription, a connection.
     changed: Notify,
 }
 
 impl FakeBroker {
-    /// A broker on `127.0.0.1` with an ephemeral port, advertising `receive_maximum = 10`.
+    /// A v5 broker on `127.0.0.1` with an ephemeral port, advertising `receive_maximum = 10`.
     pub async fn start() -> FakeBroker {
         FakeBroker::start_with_receive_max(10).await
     }
 
-    /// A broker advertising `receive_max` in-flight QoS 1/2 publishes per client.
+    /// A v5 broker advertising `receive_max` in-flight QoS 1/2 publishes per client.
     pub async fn start_with_receive_max(receive_max: u16) -> FakeBroker {
+        FakeBroker::start_protocol(Protocol::V5, receive_max).await
+    }
+
+    /// A v3.1.1 broker. The in-flight limit is the client's (`MqttOptions::set_inflight`).
+    pub async fn start_v4() -> FakeBroker {
+        FakeBroker::start_protocol(Protocol::V4, 0).await
+    }
+
+    async fn start_protocol(protocol: Protocol, receive_max: u16) -> FakeBroker {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind the fake broker");
         let port = listener.local_addr().expect("the fake broker's address").port();
         let shared = Arc::new(Shared {
+            protocol,
             receive_max,
             received: Mutex::new(Vec::new()),
             subscriptions: Mutex::new(Vec::new()),
@@ -97,9 +114,13 @@ impl FakeBroker {
 
     /// Send a QoS 0 publish to the connected client. `false` when no client is connected.
     pub fn send(&self, topic: &str, payload: impl Into<Bytes>) -> bool {
-        let publish = Publish::new(topic, QoS::AtMostOnce, payload.into(), None);
+        let payload = payload.into();
+        let encoded = match self.shared.protocol {
+            Protocol::V5 => encode_v5(v5::Packet::Publish(v5::Publish::new(topic, QoS::AtMostOnce, payload, None))),
+            Protocol::V4 => encode_v4(v4::Packet::Publish(v4::Publish::new(topic, v4_qos(QoS::AtMostOnce), payload.to_vec()))),
+        };
         match &*self.shared.to_client.lock().unwrap() {
-            Some(tx) => tx.send(Packet::Publish(publish)).is_ok(),
+            Some(tx) => tx.send(encoded).is_ok(),
             None => false,
         }
     }
@@ -115,7 +136,7 @@ impl FakeBroker {
         let held = std::mem::take(&mut *self.shared.held.lock().unwrap());
         if let Some(tx) = &*self.shared.to_client.lock().unwrap() {
             for pkid in held {
-                let _ = tx.send(Packet::PubAck(PubAck::new(pkid, None)));
+                let _ = tx.send(puback(self.shared.protocol, pkid));
             }
         }
     }
@@ -173,17 +194,25 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
+/// What reading one packet off the buffer came to.
+enum Read {
+    /// A packet was handled; the connection stays open.
+    Handled,
+    /// The client disconnected.
+    Closed,
+    /// The buffer holds no whole packet yet.
+    NeedMore,
+}
+
 async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     let _ = stream.set_nodelay(true);
     let (mut rd, mut wr) = stream.into_split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Packet>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<BytesMut>();
     *shared.to_client.lock().unwrap() = Some(tx.clone());
     shared.held.lock().unwrap().clear();
     let writer = tokio::spawn(async move {
-        let mut out = BytesMut::new();
         while let Some(packet) = rx.recv().await {
-            out.clear();
-            if packet.write(&mut out, None).is_err() || wr.write_all(&out).await.is_err() {
+            if wr.write_all(&packet).await.is_err() {
                 break;
             }
         }
@@ -191,16 +220,17 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     let mut buf = BytesMut::with_capacity(8 * 1024);
     'read: loop {
         loop {
-            match Packet::read(&mut buf, None) {
-                Ok(packet) => {
-                    let open = handle(packet, &tx, &shared);
+            let read = match shared.protocol {
+                Protocol::V5 => read_v5(&mut buf, &tx, &shared),
+                Protocol::V4 => read_v4(&mut buf, &tx, &shared),
+            };
+            match read {
+                Some(Read::Handled) => shared.changed.notify_waiters(),
+                Some(Read::NeedMore) => break,
+                Some(Read::Closed) | None => {
                     shared.changed.notify_waiters();
-                    if !open {
-                        break 'read;
-                    }
+                    break 'read;
                 }
-                Err(rumqttc::v5::mqttbytes::Error::InsufficientBytes(_)) => break,
-                Err(_) => break 'read,
             }
         }
         match rd.read_buf(&mut buf).await {
@@ -211,12 +241,65 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     writer.abort();
 }
 
-/// Answer one packet. `false` when the client disconnected.
-fn handle(packet: Packet, tx: &mpsc::UnboundedSender<Packet>, shared: &Shared) -> bool {
+fn record(shared: &Shared, topic: String, payload: Bytes, qos: QoS, retain: bool) {
+    shared.received.lock().unwrap().push(Received { topic, payload, qos, retain });
+}
+
+/// Answer a QoS 1 publish now, or hold its ack.
+fn ack_or_hold(shared: &Shared, tx: &mpsc::UnboundedSender<BytesMut>, pkid: u16) {
+    if shared.hold_acks.load(Ordering::SeqCst) {
+        shared.held.lock().unwrap().push(pkid);
+    } else {
+        let _ = tx.send(puback(shared.protocol, pkid));
+    }
+}
+
+fn puback(protocol: Protocol, pkid: u16) -> BytesMut {
+    match protocol {
+        Protocol::V5 => encode_v5(v5::Packet::PubAck(v5::PubAck::new(pkid, None))),
+        Protocol::V4 => encode_v4(v4::Packet::PubAck(v4::PubAck::new(pkid))),
+    }
+}
+
+fn encode_v5(packet: v5::Packet) -> BytesMut {
+    let mut out = BytesMut::new();
+    packet.write(&mut out, None).expect("encode a v5 packet");
+    out
+}
+
+fn encode_v4(packet: v4::Packet) -> BytesMut {
+    let mut out = BytesMut::new();
+    packet.write(&mut out, usize::MAX).expect("encode a v4 packet");
+    out
+}
+
+fn v4_qos(q: QoS) -> rumqttc::mqttbytes::QoS {
+    match q {
+        QoS::AtMostOnce => rumqttc::mqttbytes::QoS::AtMostOnce,
+        QoS::AtLeastOnce => rumqttc::mqttbytes::QoS::AtLeastOnce,
+        QoS::ExactlyOnce => rumqttc::mqttbytes::QoS::ExactlyOnce,
+    }
+}
+
+fn from_v4_qos(q: rumqttc::mqttbytes::QoS) -> QoS {
+    match q {
+        rumqttc::mqttbytes::QoS::AtMostOnce => QoS::AtMostOnce,
+        rumqttc::mqttbytes::QoS::AtLeastOnce => QoS::AtLeastOnce,
+        rumqttc::mqttbytes::QoS::ExactlyOnce => QoS::ExactlyOnce,
+    }
+}
+
+/// Read and answer one v5 packet; `None` on a malformed stream.
+fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Shared) -> Option<Read> {
+    let packet = match v5::Packet::read(buf, None) {
+        Ok(p) => p,
+        Err(rumqttc::v5::mqttbytes::Error::InsufficientBytes(_)) => return Some(Read::NeedMore),
+        Err(_) => return None,
+    };
     match packet {
-        Packet::Connect(..) => {
+        v5::Packet::Connect(..) => {
             shared.connections.fetch_add(1, Ordering::SeqCst);
-            let properties = ConnAckProperties {
+            let properties = v5::ConnAckProperties {
                 session_expiry_interval: None,
                 receive_max: Some(shared.receive_max),
                 max_qos: None,
@@ -235,53 +318,83 @@ fn handle(packet: Packet, tx: &mpsc::UnboundedSender<Packet>, shared: &Shared) -
                 authentication_method: None,
                 authentication_data: None,
             };
-            let _ = tx.send(Packet::ConnAck(ConnAck {
-                session_present: false,
-                code: ConnectReturnCode::Success,
-                properties: Some(properties),
-            }));
+            let ack = v5::ConnAck { session_present: false, code: v5::ConnectReturnCode::Success, properties: Some(properties) };
+            let _ = tx.send(encode_v5(v5::Packet::ConnAck(ack)));
         }
-        Packet::Subscribe(s) => {
-            let codes = s.filters.iter().map(|f| SubscribeReasonCode::Success(f.qos)).collect();
+        v5::Packet::Subscribe(s) => {
+            let codes = s.filters.iter().map(|f| v5::SubscribeReasonCode::Success(f.qos)).collect();
             shared.subscriptions.lock().unwrap().extend(s.filters.iter().map(|f| f.path.clone()));
-            let _ = tx.send(Packet::SubAck(SubAck { pkid: s.pkid, return_codes: codes, properties: None }));
+            let _ = tx.send(encode_v5(v5::Packet::SubAck(v5::SubAck { pkid: s.pkid, return_codes: codes, properties: None })));
         }
-        Packet::Unsubscribe(u) => {
+        v5::Packet::Unsubscribe(u) => {
             shared.subscriptions.lock().unwrap().retain(|f| !u.filters.contains(f));
-            let reasons = u.filters.iter().map(|_| UnsubAckReason::Success).collect();
-            let _ = tx.send(Packet::UnsubAck(UnsubAck { pkid: u.pkid, reasons, properties: None }));
+            let reasons = u.filters.iter().map(|_| v5::UnsubAckReason::Success).collect();
+            let _ = tx.send(encode_v5(v5::Packet::UnsubAck(v5::UnsubAck { pkid: u.pkid, reasons, properties: None })));
         }
-        Packet::Publish(p) => {
-            shared.received.lock().unwrap().push(Received {
-                topic: String::from_utf8_lossy(&p.topic).into_owned(),
-                payload: p.payload.clone(),
-                qos: p.qos,
-                retain: p.retain,
-            });
+        v5::Packet::Publish(p) => {
+            record(shared, String::from_utf8_lossy(&p.topic).into_owned(), p.payload.clone(), p.qos, p.retain);
             match p.qos {
                 QoS::AtMostOnce => {}
-                QoS::AtLeastOnce => {
-                    if shared.hold_acks.load(Ordering::SeqCst) {
-                        shared.held.lock().unwrap().push(p.pkid);
-                    } else {
-                        let _ = tx.send(Packet::PubAck(PubAck::new(p.pkid, None)));
-                    }
-                }
+                QoS::AtLeastOnce => ack_or_hold(shared, tx, p.pkid),
                 QoS::ExactlyOnce => {
-                    let _ = tx.send(Packet::PubRec(PubRec::new(p.pkid, None)));
+                    let _ = tx.send(encode_v5(v5::Packet::PubRec(v5::PubRec::new(p.pkid, None))));
                 }
             }
         }
-        Packet::PubRel(r) => {
-            let _ = tx.send(Packet::PubComp(PubComp::new(r.pkid, None)));
+        v5::Packet::PubRel(r) => {
+            let _ = tx.send(encode_v5(v5::Packet::PubComp(v5::PubComp::new(r.pkid, None))));
         }
-        Packet::PingReq(_) => {
-            let _ = tx.send(Packet::PingResp(PingResp));
+        v5::Packet::PingReq(_) => {
+            let _ = tx.send(encode_v5(v5::Packet::PingResp(v5::PingResp)));
         }
-        Packet::Disconnect(_) => return false,
+        v5::Packet::Disconnect(_) => return Some(Read::Closed),
         _ => {}
     }
-    true
+    Some(Read::Handled)
+}
+
+/// Read and answer one v3.1.1 packet; `None` on a malformed stream.
+fn read_v4(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Shared) -> Option<Read> {
+    let packet = match v4::Packet::read(buf, usize::MAX) {
+        Ok(p) => p,
+        Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => return Some(Read::NeedMore),
+        Err(_) => return None,
+    };
+    match packet {
+        v4::Packet::Connect(_) => {
+            shared.connections.fetch_add(1, Ordering::SeqCst);
+            let _ = tx.send(encode_v4(v4::Packet::ConnAck(v4::ConnAck::new(v4::ConnectReturnCode::Success, false))));
+        }
+        v4::Packet::Subscribe(s) => {
+            let codes = s.filters.iter().map(|f| v4::SubscribeReasonCode::Success(f.qos)).collect();
+            shared.subscriptions.lock().unwrap().extend(s.filters.iter().map(|f| f.path.clone()));
+            let _ = tx.send(encode_v4(v4::Packet::SubAck(v4::SubAck::new(s.pkid, codes))));
+        }
+        v4::Packet::Unsubscribe(u) => {
+            shared.subscriptions.lock().unwrap().retain(|f| !u.topics.contains(f));
+            let _ = tx.send(encode_v4(v4::Packet::UnsubAck(v4::UnsubAck::new(u.pkid))));
+        }
+        v4::Packet::Publish(p) => {
+            let qos = from_v4_qos(p.qos);
+            record(shared, p.topic.clone(), p.payload.clone(), qos, p.retain);
+            match qos {
+                QoS::AtMostOnce => {}
+                QoS::AtLeastOnce => ack_or_hold(shared, tx, p.pkid),
+                QoS::ExactlyOnce => {
+                    let _ = tx.send(encode_v4(v4::Packet::PubRec(v4::PubRec::new(p.pkid))));
+                }
+            }
+        }
+        v4::Packet::PubRel(r) => {
+            let _ = tx.send(encode_v4(v4::Packet::PubComp(v4::PubComp::new(r.pkid))));
+        }
+        v4::Packet::PingReq => {
+            let _ = tx.send(encode_v4(v4::Packet::PingResp));
+        }
+        v4::Packet::Disconnect => return Some(Read::Closed),
+        _ => {}
+    }
+    Some(Read::Handled)
 }
 
 #[cfg(test)]
