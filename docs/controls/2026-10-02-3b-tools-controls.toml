@@ -935,9 +935,9 @@ guard       = "still_dropping_warn"
 
 [[control]]
 name        = "the_workers_flush_on_the_dropping_thread"
-file        = "src/guard.rs"
-anchor      = '''        sink::flush_within(workers, sink::FLUSH_BOUND);'''
-replacement = '''        drop(workers);'''
+file        = "src/sink.rs"
+anchor      = '''    flush_within(workers, FLUSH_BOUND);'''
+replacement = '''    drop(workers);'''
 crate       = "tracing-init"
 target      = "test:stalled_stdio"
 test        = "a_stalled_stdout_drops_lines_instead_of_blocking_the_threads_that_log"
@@ -979,3 +979,37 @@ target      = "test:stalled_stdio"
 test        = "a_flush_thread_that_cannot_start_does_not_hold_the_guards_drop"
 expect_text = "the child's guard did not drop within 10 s while its stdout was stalled"
 guard       = "abandon_unspawned_flush"
+
+[[control]]
+name        = "the_exit_hook_is_never_registered"
+file        = "src/sink.rs"
+anchor      = '''    register_exit_hook();
+'''
+replacement = ""
+crate       = "tracing-init"
+target      = "test:exit_flush"
+test        = "a_line_logged_just_before_process_exit_reaches_stdout_and_the_log_file"
+expect_text = "process::exit lost the line logged just before it"
+guard       = "exit_hook_registered"
+
+[[control]]
+name        = "the_exit_hook_flushes_nothing"
+file        = "src/sink.rs"
+anchor      = '''    let _ = std::panic::catch_unwind(|| end(take_ending()));'''
+replacement = '''    let _ = std::panic::catch_unwind(|| end(None));'''
+crate       = "tracing-init"
+target      = "test:exit_flush"
+test        = "a_line_logged_just_before_process_exit_reaches_stdout_and_the_log_file"
+expect_text = "process::exit lost the line logged just before it"
+guard       = "exit_hook_flushes"
+
+[[control]]
+name        = "the_guard_leaves_the_ending_to_the_exit_hook"
+file        = "src/guard.rs"
+anchor      = '''        let mut ending = sink::take_ending();'''
+replacement = '''        let mut ending: Option<sink::Ending> = None;'''
+crate       = "tracing-init"
+target      = "test:stalled_file"
+test        = "a_stalled_log_file_drops_lines_instead_of_blocking_the_threads_that_log"
+expect_text = "dropping the guard reported no total for the file"
+guard       = "guard_takes_the_ending"

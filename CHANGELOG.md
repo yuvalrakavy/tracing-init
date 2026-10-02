@@ -65,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notes (a skipped destination, the OTel circuit breaker, the beacon listener on the program's
   tokio runtime) go through a small lossy writer of their own. Console and file lines are now
   written a moment after the call that logged them, so a process that ends without dropping its
-  guard can lose the last few.
+  guard or running the exit hook (below) — an abort, a killing signal — can lose the last few.
 - **Lost log lines are counted and reported, never silent.** Each stream destination counts
   the lines it delivered and lost (a full buffer, a failed write); GELF counts failed sends. A
   monitor thread logs WARN `kind = "log_lines_dropped"` when a destination starts losing lines,
@@ -83,6 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a thread of its own, abandoned at 1.5 s. A worker whose flush thread cannot start (resource
   exhaustion) is abandoned too, rather than dropped on the thread dropping the guard (3b round
   3, T5).
+- **`process::exit` no longer loses the last console and file lines** (3b round 3, T6). It runs no
+  destructors, so the guard never flushed the stream workers and a line logged just before it — a
+  server's refusal, a watchdog's last word — was often lost (33 of 100 to a file). The monitor and
+  the workers now wait in a take-once slot, and an `atexit` hook registered by `init` reports and
+  flushes them within the same bounds; a guard dropped first takes the slot, so nothing runs
+  twice. The OTel providers are still shut down only by the guard.
 - **`lock-order`: `Condvar::wait_while` / `wait_timeout_while`** loop over the wrapper's own
   `wait` / `wait_timeout`, so the predicate (which runs under the mutex) runs holding the guard's
   record: a lock taken in it is ordered after the condvar's mutex, and re-taking that mutex there

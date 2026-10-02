@@ -2,8 +2,6 @@
 
 use std::fmt;
 
-use tracing_appender::non_blocking::WorkerGuard;
-
 use crate::sink;
 
 /// Holds logging resources that must live for the application lifetime.
@@ -18,12 +16,13 @@ use crate::sink;
 ///
 /// A destination that is stuck keeps what it still holds; nothing waits on it past its bound.
 ///
+/// If the process exits without dropping the guard — `std::process::exit` runs no destructors —
+/// an exit hook does steps 1 and 3, so a line logged just before the exit still reaches the
+/// console and the file. Whichever comes first does them; nothing runs twice.
+///
 /// Constructed directly via struct literal in `init()`. Use `summary_only()` for testing.
 pub struct TracingGuard {
     pub(crate) summary_text: String,
-    /// The stream destinations' writers (console, file), flushed when the guard drops.
-    pub(crate) workers: Vec<WorkerGuard>,
-    pub(crate) monitor: Option<sink::Monitor>,
     #[cfg(feature = "otel")]
     pub(crate) tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     #[cfg(feature = "otel")]
@@ -38,8 +37,6 @@ impl TracingGuard {
     pub(crate) fn summary_only(summary: String) -> Self {
         TracingGuard {
             summary_text: summary,
-            workers: Vec::new(),
-            monitor: None,
             #[cfg(feature = "otel")]
             tracer_provider: None,
             #[cfg(feature = "otel")]
@@ -57,10 +54,12 @@ impl TracingGuard {
 
 impl Drop for TracingGuard {
     fn drop(&mut self) {
+        // Taken from the exit hook's reach: from here on, the guard ends the destinations.
+        let mut ending = sink::take_ending();
         // First, while every destination still takes lines: the report reaches the OTel log
         // bridge before its shutdown and the stream workers before their flush.
-        if let Some(monitor) = self.monitor.take() {
-            monitor.finish();
+        if let Some(ending) = ending.as_mut() {
+            ending.report();
         }
         #[cfg(feature = "otel")]
         {
@@ -86,9 +85,7 @@ impl Drop for TracingGuard {
             }
         }
         // Last, so the notes the OTel shutdown wrote are flushed too.
-        let mut workers = std::mem::take(&mut self.workers);
-        workers.extend(crate::note::take_worker());
-        sink::flush_within(workers, sink::FLUSH_BOUND);
+        sink::flush_ending(ending);
     }
 }
 

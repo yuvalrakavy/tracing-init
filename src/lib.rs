@@ -882,11 +882,11 @@ impl TracingInit {
             watches.push(s.watch);
             workers.extend(s.worker);
         }
+        // For the guard's drop, or for the exit hook if the process exits without dropping it.
+        sink::hold_until_the_end(sink::Ending::new(sink::Monitor::start(watches), workers));
 
         Ok(TracingGuard {
             summary_text: self.build_summary(),
-            workers,
-            monitor: sink::Monitor::start(watches),
             #[cfg(feature = "otel")]
             tracer_provider,
             #[cfg(feature = "otel")]

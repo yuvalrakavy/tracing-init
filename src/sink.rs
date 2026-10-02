@@ -264,9 +264,8 @@ impl Watched {
 pub(crate) struct Monitor {
     /// Dropped to stop the thread.
     stop: mpsc::Sender<()>,
-    /// The thread's view of each destination, sent back when it stops. In a mutex only so the
-    /// guard that holds the monitor stays `Sync`; it is never contended.
-    done: Mutex<mpsc::Receiver<Vec<Watched>>>,
+    /// The thread's view of each destination, sent back when it stops.
+    done: mpsc::Receiver<Vec<Watched>>,
     watches: Vec<Watch>,
 }
 
@@ -298,7 +297,7 @@ impl Monitor {
         }
         Some(Monitor {
             stop,
-            done: Mutex::new(done),
+            done,
             watches,
         })
     }
@@ -311,9 +310,6 @@ impl Monitor {
             watches,
         } = self;
         drop(stop);
-        let done = done
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let watched = match done.recv_timeout(STOP_BOUND) {
             Ok(watched) => watched,
             // No thread, or one that did not stop in time: every loss is reported as ongoing.
@@ -323,6 +319,96 @@ impl Monitor {
             w.report_total();
         }
     }
+}
+
+/// What ends the stream destinations: the loss monitor and the workers.
+///
+/// Held in a process-wide slot and taken once: by the guard's drop or, when the process exits
+/// without dropping the guard, by the exit hook. `process::exit` runs no destructors, so without
+/// the hook a line logged just before it — a refusal, a watchdog's last word — would still be in
+/// a worker's buffer when the process ended. A guard dropped first takes the slot, so nothing
+/// runs twice.
+pub(crate) struct Ending {
+    monitor: Option<Monitor>,
+    workers: Vec<WorkerGuard>,
+}
+
+impl Ending {
+    pub(crate) fn new(monitor: Option<Monitor>, workers: Vec<WorkerGuard>) -> Self {
+        Ending { monitor, workers }
+    }
+
+    /// Stop the monitor and report the totals, while every destination still takes lines.
+    pub(crate) fn report(&mut self) {
+        if let Some(monitor) = self.monitor.take() {
+            monitor.finish();
+        }
+    }
+
+    /// The workers, for the flush.
+    pub(crate) fn into_workers(self) -> Vec<WorkerGuard> {
+        self.workers
+    }
+}
+
+static ENDING: Mutex<Option<Ending>> = Mutex::new(None);
+
+fn ending_slot() -> std::sync::MutexGuard<'static, Option<Ending>> {
+    ENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Hold `ending` until the guard's drop or the process's exit, whichever comes first.
+pub(crate) fn hold_until_the_end(ending: Ending) {
+    *ending_slot() = Some(ending);
+    register_exit_hook();
+}
+
+/// The ending, if neither the guard's drop nor the exit hook has taken it.
+pub(crate) fn take_ending() -> Option<Ending> {
+    ending_slot().take()
+}
+
+/// Flush the ending's workers and the stderr notes, within [`FLUSH_BOUND`].
+pub(crate) fn flush_ending(ending: Option<Ending>) {
+    let mut workers = ending.map(Ending::into_workers).unwrap_or_default();
+    workers.extend(crate::note::take_worker());
+    flush_within(workers, FLUSH_BOUND);
+}
+
+/// Report, then flush: the guard's drop without its OpenTelemetry shutdown.
+fn end(mut ending: Option<Ending>) {
+    if let Some(ending) = ending.as_mut() {
+        ending.report();
+    }
+    flush_ending(ending);
+}
+
+extern "C" {
+    /// The C library's: `process::exit` ends in `exit(3)`, which calls these.
+    fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
+}
+
+/// The exit hook: what the guard's drop would have done, if the guard was not dropped.
+extern "C" fn end_at_exit() {
+    // Never unwind into the C library.
+    let _ = std::panic::catch_unwind(|| end(take_ending()));
+}
+
+fn register_exit_hook() {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        // SAFETY: `atexit` only records the pointer, and `end_at_exit` is a plain
+        // `extern "C" fn()` that catches every panic before it returns.
+        let refused = unsafe { atexit(end_at_exit) } != 0;
+        if refused {
+            crate::note::note(format_args!(
+                "tracing-init: the exit hook could not be registered — process::exit may lose \
+                 the last console and file lines"
+            ));
+        }
+    });
 }
 
 /// Flush the stream destinations' workers, each on a thread of its own, waiting at most

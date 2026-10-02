@@ -247,6 +247,8 @@ On drop the guard, every step of it bounded:
 3. Calls `provider.shutdown_with_timeout(1s)` on the tracer and logger providers. We cap shutdown at one second so an unreachable collector cannot hang `main` — the circuit breaker has already filtered the queue.
 4. Flushes the console, the log file and `tracing-init`'s own stderr notes, each on a thread of its own, waiting at most 1.5 s for all. A destination that is stuck keeps what it still holds; nothing waits on it past the bound. At most about 4 s in all.
 
+`std::process::exit` runs no destructors, so the guard is never dropped there. An exit hook that `init()` registers does steps 1 and 4 instead, so a line logged just before `process::exit` still reaches the console and the file. Whichever comes first — the guard's drop or the exit — does them; nothing runs twice. The OTel providers are shut down only by the guard's drop.
+
 ## A destination that stops taking writes
 
 A log file on a stalled file system, a FIFO nobody reads at the log path, a stdout pipe whose
@@ -275,8 +277,9 @@ destination (so the ones still working carry it):
 
 One WARN per episode: a file that stays stuck stays in its episode, and a burst-by-burst
 overload with less than 10 s between bursts is one episode. The trade: console and file lines
-are written a moment after the call that logged them, so a process that ends without dropping
-its guard (`std::process::exit`, an abort) can lose the last few.
+are written a moment after the call that logged them, so a process that ends without running
+either the guard's drop or the exit hook (an abort, a signal that kills it) can lose the last
+few.
 
 ## GELF enrichment
 
