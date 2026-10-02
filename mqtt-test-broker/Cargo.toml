@@ -1,0 +1,15 @@
+[package]
+name = "mqtt-test-broker"
+version = "0.1.0"
+edition = "2021"
+description = "A fake MQTT v5 broker for the fleet's bridge tests: connect, subscribe, publish both ways, and withhold acknowledgements to saturate a client."
+license = "MIT"
+publish = false
+
+[dependencies]
+bytes = "1"
+rumqttc = { version = "0.25", default-features = false }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
