@@ -32,15 +32,16 @@
 //!   every call to it a wait to tag, so a new caller is a reviewed diff too.
 //! * **Raw locks** (`raw-locks = forbid`): naming `std::sync`/`tokio::sync`/`parking_lot`
 //!   `Mutex` or `RwLock`, a `std`/`parking_lot` `Condvar`, parking_lot's `ReentrantMutex`,
-//!   `FairMutex` or `const_*` constructors, or `lock_api`'s locks, is a finding — every lock is
-//!   built through the `lock-order` crate's wrappers, whose runtime check owns lock order. So is a
-//!   glob import of one of those modules, an alias for one (`use std::sync as s`, `use
-//!   std::sync::{self as s}`, `extern crate parking_lot as pl`) and a `pub` re-export of one
-//!   (`pub use std::sync`), which would name a raw lock past this check. A path is read through
+//!   `FairMutex` or `const_*` constructors, or `lock_api`'s locks (also as
+//!   `parking_lot::lock_api`), is a finding — every lock is built through the `lock-order` crate's
+//!   wrappers, whose runtime check owns lock order. So is a glob import of one of those modules or
+//!   of a module that holds one (`use std::*` binds `sync`), an alias for one (`use std::sync as
+//!   s`, `use std::sync::{self as s}`, `extern crate parking_lot as pl`) and a `pub` re-export of
+//!   one (`pub use std::sync`), which would name a raw lock past this check. A path is read through
 //!   the file's `use`s (`use std::sync; use sync::*` is a glob of `std::sync`; `use
-//!   lock_order::sync; sync::Mutex` is the wrapper), and a path into the crate (`crate::sync::
-//!   Mutex`) through the names any of its files binds. Syntax cannot see a guard's lifetime, so
-//!   lock order is not this lint's.
+//!   lock_order::sync; sync::Mutex` is the wrapper), and a path into the crate — `crate::sync::
+//!   Mutex`, or `sync::Mutex` under `use crate::sync` or `use super::sync` — through the names any
+//!   of its files binds. Syntax cannot see a guard's lifetime, so lock order is not this lint's.
 //! * **A name collision.** This code's own async methods are recognised by name, not by the
 //!   receiver's type, so `client.publish(..).await` on a dependency's client would pass as this
 //!   code's `publish` if the crate defines one (Store no-hang §14.1: it hid rumqttc's calls in two
@@ -48,10 +49,16 @@
 //!   the registry declares the name: `wait-methods` if any awaited one is a dependency's (every
 //!   call becomes a wait to tag — over-tagging this code's own calls is safe), `local-methods` if
 //!   every one is this code's. A `local-methods` name this code does not define is a finding. A
-//!   function call is read through the file's `use`s: `use dep::publish; publish(..).await` is the
-//!   dependency's, a wait. A bare call to one of this code's async fns in a file that neither
-//!   defines nor imports it by name, but glob-imports from a dependency (`use dep::*`), is a
-//!   collision too, resolved by the same declarations.
+//!   function call is read through the file's `use`s, and on module by module through what each
+//!   module it passes defines, binds by `use` and glob-imports: `use dep::publish;
+//!   publish(..).await` is the dependency's, a wait — and so is a dependency's `publish` that
+//!   `use super::*` carries from a parent's import, that a local module re-exports (`net::publish`,
+//!   `crate::net::publish`), or that `self::publish` names over the file's own import. A call to
+//!   one of this code's async fns where the module it is found in (the file, or the one its path
+//!   names) neither defines nor imports it by name, but glob-imports from a dependency (`use
+//!   dep::*`), is a collision too, resolved by the same declarations. The modules are read from the
+//!   file layout (`src/a/b.rs` is `a::b`); an inline module is read as part of its file, and
+//!   visibility is not read.
 //! * **An empty scan.** [`Report::files_scanned`] counts the production files read;
 //!   [`assert_registered`] and the CLI refuse a scan that read none or found no wait, since a wrong
 //!   source directory is otherwise green.
@@ -222,7 +229,7 @@ fn check_with_crate_names(files: &BTreeMap<String, String>, registry: (&str, &st
         if let Some(own) = own.get(&crate_dir) {
             crate_names.own_crates.extend(own.iter().cloned());
         }
-        crate_names.collect(file);
+        crate_names.collect(file, module_path(rel));
         if let Some(module) = file_module(rel) {
             crate_names.local_paths.insert(module);
         }
@@ -245,7 +252,7 @@ fn check_with_crate_names(files: &BTreeMap<String, String>, registry: (&str, &st
 
     let mut sites = Vec::new();
     for (rel, text, file) in &parsed {
-        let scanned = scan::scan(file, &reg, &names[&crate_of(rel)]);
+        let scanned = scan::scan(file, &reg, &names[&crate_of(rel)], &module_path(rel));
         for (line, name) in &scanned.ambiguous {
             finding(
                 rel,
@@ -263,10 +270,10 @@ fn check_with_crate_names(files: &BTreeMap<String, String>, registry: (&str, &st
                 rel,
                 Some(*line),
                 format!(
-                    "`{name}(..).await`: `{name}` is one of this code's async fns, but this file neither defines nor imports it \
-                     by name and glob-imports from outside this code, so a dependency's `{name}` may be the one called. Declare \
-                     it in {registry_file}: `wait-methods` if any awaited `{name}` is a dependency's, `local-methods` if every \
-                     one is this code's"
+                    "`{name}(..).await`: `{name}` is one of this code's async fns, but the module this call finds it in (this \
+                     file, or the one its path names) neither defines nor imports it by name and glob-imports from outside this \
+                     code, so a dependency's `{name}` may be the one called. Declare it in {registry_file}: `wait-methods` if any \
+                     awaited `{name}` is a dependency's, `local-methods` if every one is this code's"
                 ),
             );
         }
@@ -526,6 +533,21 @@ fn crate_of(rel: &str) -> String {
         Some(at) => parts[..at].join("/"),
         None => String::new(),
     }
+}
+
+/// The module a file is, as a path from its crate's root (the directory after the crate's `src/`):
+/// `src/a/b.rs` and `src/a/b/mod.rs` → `a::b`; `src/lib.rs` and `src/main.rs` → the root; a binary
+/// `src/bin/x.rs` or `src/bin/x/main.rs` → `bin::x`, its own root.
+fn module_path(rel: &str) -> Vec<String> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let inside = parts.iter().position(|p| *p == "src").map_or(&parts[..], |at| &parts[at + 1..]);
+    let mut path: Vec<String> = inside.iter().map(|p| p.to_string()).collect();
+    if let Some(last) = path.pop() {
+        if !matches!(last.as_str(), "lib.rs" | "main.rs" | "mod.rs") {
+            path.push(last.trim_end_matches(".rs").to_string());
+        }
+    }
+    path
 }
 
 /// The module a file is: `a/b.rs` → `b`, `a/b/mod.rs` → `b`; a crate root is none.

@@ -119,10 +119,57 @@ pub struct Names {
     /// `src/bin/`), from its `Cargo.toml` when the scan has one: a path starting with one is a path
     /// into this code.
     pub own_crates: BTreeSet<String>,
+    /// Each file module's own `use`s, globs and functions, by its path from the crate root (`a/b.rs`
+    /// → `[a, b]`), so a call path can be followed module by module ([`Self::reach`]). An inline
+    /// module is read as part of its file's.
+    pub modules: BTreeMap<Vec<String>, Uses>,
+}
+
+/// How deep [`Names::reach`] follows `use`s, globs and module paths.
+const REACH_DEPTH: usize = 8;
+
+/// Where a call path leads, followed through the modules' `use`s and globs ([`Names::reach`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// A function a module of this code defines.
+    Here,
+    /// Out of this code: a `use` (or the path itself) names a dependency's.
+    Outside,
+    /// A glob of a dependency, which may hold the name.
+    Glob,
+    /// Not followed: a type's function, an inline module, a name the module neither defines nor
+    /// imports, a module asked already on another way there, a path too deep.
+    Unknown,
+}
+
+/// The module a module path names ([`Names::places`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Place {
+    Module(Vec<String>),
+    Outside,
+    Unknown,
+}
+
+/// The root of the crate `module` is in: a binary's (`bin::<name>`, from `src/bin/`) or the
+/// library's.
+fn crate_root(module: &[String]) -> Vec<String> {
+    match module {
+        [bin, name, ..] if bin == "bin" => vec![bin.clone(), name.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn parent(module: &[String]) -> Vec<String> {
+    module[..module.len().saturating_sub(1)].to_vec()
+}
+
+fn joined(a: &[String], b: &[String]) -> Vec<String> {
+    a.iter().chain(b).cloned().collect()
 }
 
 impl Names {
-    pub fn collect(&mut self, file: &syn::File) {
+    /// Read one production file, the module `module` of its crate.
+    pub fn collect(&mut self, file: &syn::File, module: Vec<String>) {
         let uses = Uses::of(file);
         for (name, paths) in &uses.bound {
             for path in paths {
@@ -134,6 +181,7 @@ impl Names {
                 }
             }
         }
+        self.modules.entry(module).or_default().merge(&uses);
         struct C<'a>(&'a mut Names);
         impl<'ast> Visit<'ast> for C<'_> {
             fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
@@ -226,6 +274,114 @@ impl Names {
         path.first().is_some_and(|f| {
             matches!(f.as_str(), "crate" | "self" | "super" | "Self") || self.local_paths.contains(f) || self.own_crates.contains(f)
         })
+    }
+
+    /// Where a call through `path`, written in `module`, leads: followed module by module through
+    /// what each module defines, binds by `use` and glob-imports (review finding T3). `use
+    /// tokio::time::sleep` in a parent reached by `use super::*`, a module's `pub use` reached as
+    /// `net::sleep` or `crate::net::sleep`, and `self::sleep` over a file's own import all lead
+    /// [`Reach::Outside`]. Visibility is not read, and an inline module is read as part of its file.
+    fn reach(&self, module: &[String], path: &[String]) -> Vec<Reach> {
+        self.reach_path(module, path, 0, &mut BTreeSet::new())
+    }
+
+    /// [`Self::reach`], `depth` steps in, having asked each module in `seen` for its item already
+    /// (globs that reach each other are asked once).
+    fn reach_path(&self, module: &[String], path: &[String], depth: usize, seen: &mut BTreeSet<(Vec<String>, String)>) -> Vec<Reach> {
+        let Some((name, prefix)) = path.split_last() else { return vec![Reach::Unknown] };
+        if prefix.is_empty() {
+            return self.reach_item(module, name, depth, seen);
+        }
+        let mut out = Vec::new();
+        for place in self.places(module, prefix, depth) {
+            match place {
+                Place::Module(m) => out.extend(self.reach_item(&m, name, depth + 1, seen)),
+                Place::Outside => out.push(Reach::Outside),
+                Place::Unknown => out.push(Reach::Unknown),
+            }
+        }
+        out
+    }
+
+    /// Where the item `name` of `module` leads: a function it defines, or what it binds by name —
+    /// which shadows its globs — or else what its globs hold.
+    fn reach_item(&self, module: &[String], name: &str, depth: usize, seen: &mut BTreeSet<(Vec<String>, String)>) -> Vec<Reach> {
+        let Some(m) = self.modules.get(module).filter(|_| depth <= REACH_DEPTH) else { return vec![Reach::Unknown] };
+        if !seen.insert((module.to_vec(), name.to_string())) {
+            return vec![Reach::Unknown]; // asked already, on another way here: its answer is in
+        }
+        if m.fns.contains(name) {
+            return vec![Reach::Here];
+        }
+        if let Some(targets) = m.bound.get(name) {
+            return targets.iter().flat_map(|t| self.reach_path(module, t, depth + 1, seen)).collect();
+        }
+        let mut out = Vec::new();
+        for glob in &m.globs {
+            for place in self.places(module, glob, depth + 1) {
+                match place {
+                    Place::Module(target) => out.extend(self.reach_item(&target, name, depth + 1, seen)),
+                    Place::Outside => out.push(Reach::Glob),
+                    Place::Unknown => out.push(Reach::Unknown),
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(Reach::Unknown);
+        }
+        out
+    }
+
+    /// The module(s) a module path written in `module` names: its first segment in that module's
+    /// scope (`crate`/`self`/`super`, a child module, a name it binds, the crate's own name; one of
+    /// this code's other modules or types is not followed, and anything else is a dependency), the
+    /// rest inside what that names.
+    fn places(&self, module: &[String], path: &[String], depth: usize) -> Vec<Place> {
+        let Some((first, rest)) = path.split_first() else { return vec![Place::Module(module.to_vec())] };
+        if depth > REACH_DEPTH {
+            return vec![Place::Unknown];
+        }
+        match first.as_str() {
+            "crate" => return self.places_in(&crate_root(module), rest, depth + 1),
+            "self" | "super" => return self.places_in(module, path, depth + 1),
+            _ => {}
+        }
+        let child = joined(module, std::slice::from_ref(first));
+        if self.modules.contains_key(&child) {
+            return self.places_in(&child, rest, depth + 1);
+        }
+        if let Some(targets) = self.modules.get(module).and_then(|m| m.bound.get(first)) {
+            return targets.iter().flat_map(|t| self.places(module, &joined(t, rest), depth + 1)).collect();
+        }
+        if self.own_crates.contains(first) {
+            return self.places_in(&[], rest, depth + 1);
+        }
+        if first == "Self" || self.local_paths.contains(first) {
+            return vec![Place::Unknown];
+        }
+        // Nothing of this code's: a dependency.
+        vec![Place::Outside]
+    }
+
+    /// The module(s) `rest` names inside `module` (`module::rest`).
+    fn places_in(&self, module: &[String], rest: &[String], depth: usize) -> Vec<Place> {
+        let Some((first, more)) = rest.split_first() else { return vec![Place::Module(module.to_vec())] };
+        if depth > REACH_DEPTH {
+            return vec![Place::Unknown];
+        }
+        match first.as_str() {
+            "super" => return self.places_in(&parent(module), more, depth + 1),
+            "self" => return self.places_in(module, more, depth + 1),
+            _ => {}
+        }
+        let child = joined(module, std::slice::from_ref(first));
+        if self.modules.contains_key(&child) {
+            return self.places_in(&child, more, depth + 1);
+        }
+        if let Some(targets) = self.modules.get(module).and_then(|m| m.bound.get(first)) {
+            return targets.iter().flat_map(|t| self.places(module, &joined(t, more), depth + 1)).collect();
+        }
+        vec![Place::Unknown]
     }
 }
 
@@ -326,6 +482,21 @@ impl Uses {
         }
     }
 
+    /// Add another file's to these (two files of one module: a crate's `lib.rs` and `main.rs`).
+    fn merge(&mut self, other: &Uses) {
+        for (name, paths) in &other.bound {
+            for path in paths {
+                self.bind(name.clone(), path.clone());
+            }
+        }
+        for glob in &other.globs {
+            if !self.globs.contains(glob) {
+                self.globs.push(glob.clone());
+            }
+        }
+        self.fns.extend(other.fns.iter().cloned());
+    }
+
     /// Every reading of `segs` through this file's bindings, chained (`use std::sync; use sync as
     /// s;`) a few deep; `None` when no binding names its first segment.
     pub fn readings(&self, segs: &[String]) -> Option<Vec<Vec<String>>> {
@@ -414,10 +585,12 @@ pub struct FileScan {
     pub literals: Vec<Span2>,
 }
 
-pub fn scan(file: &syn::File, reg: &Registry, names: &Names) -> FileScan {
+/// Scan one production file, the module `module` of its crate (see [`Names::modules`]).
+pub fn scan(file: &syn::File, reg: &Registry, names: &Names, module: &[String]) -> FileScan {
     let mut v = Visitor {
         reg,
         names,
+        module: module.to_vec(),
         uses: Uses::of(file),
         test_depth: 0,
         bounded_depth: 0,
@@ -437,6 +610,8 @@ pub fn scan(file: &syn::File, reg: &Registry, names: &Names) -> FileScan {
 struct Visitor<'r> {
     reg: &'r Registry,
     names: &'r Names,
+    /// The module this file is, from its crate's root.
+    module: Vec<String>,
     /// What this file's `use`s bind: a path is read through them.
     uses: Uses,
     test_depth: usize,
@@ -713,9 +888,16 @@ impl Visitor<'_> {
 
     /// Whose function a call through `path` reaches. The path is read through this file's `use`s:
     /// `use dep::publish; publish(..)` calls the dependency's, whatever `async fn publish` this
-    /// code defines elsewhere (review finding C-16). A bare name nothing imports by name is this
-    /// code's, unless the file glob-imports from a dependency and does not define the name itself.
+    /// code defines elsewhere (review finding C-16) — and on through the `use`s and globs of the
+    /// modules it passes, so a dependency's function a local module re-exports or a `use super::*`
+    /// carries is the dependency's too (review finding T3). A bare name nothing imports by name is
+    /// this code's, unless the file glob-imports from a dependency and does not define the name
+    /// itself.
     fn callee(&self, path: &[String]) -> Callee {
+        let reach = self.names.reach(&self.module, path);
+        if reach.contains(&Reach::Outside) {
+            return Callee::Foreign;
+        }
         if let Some(readings) = self.uses.readings(path) {
             return if readings.iter().all(|r| self.names.is_local_fn(r)) { Callee::Local } else { Callee::Foreign };
         }
@@ -723,6 +905,11 @@ impl Visitor<'_> {
             return Callee::Foreign;
         }
         if path.len() == 1 && !self.uses.fns.contains(&path[0]) && self.uses.globs_outside(self.names) {
+            return Callee::Ambiguous;
+        }
+        // `net::sleep`, where `net` neither defines nor imports `sleep` by name but glob-imports
+        // from a dependency.
+        if reach.contains(&Reach::Glob) {
             return Callee::Ambiguous;
         }
         Callee::Local
@@ -734,15 +921,41 @@ impl Visitor<'_> {
         self.callee(path) != Callee::Foreign && readings.iter().all(|r| self.names.escapes_fn(r))
     }
 
-    /// What `segs` may stand for. A path into this crate (`crate::`, `self::`, `super::`) is read
-    /// through the names any of its files binds — a segment that names one of its own modules or
-    /// types stays that module; any other path through this file's `use`s, or as written when
-    /// they bind nothing it starts with.
+    /// What `segs` may stand for. A path is read through this file's `use`s, or as written when
+    /// they bind nothing it starts with. A path into this crate (`crate::`, `self::`, `super::`) —
+    /// as written, or as a `use` reads it — is read through the names any of the crate's files
+    /// binds, a few steps deep: `use std::sync` at the root, `use crate::sync` in a child and `use
+    /// super::sync` in its child all make `sync::Mutex` std's (review finding T2). A path still
+    /// into the crate after that named nothing outside it.
     fn readings(&self, segs: &[String]) -> Vec<Vec<String>> {
-        let lead = segs.iter().take_while(|s| matches!(s.as_str(), "crate" | "self" | "super")).count();
-        if lead == 0 {
-            return self.uses.readings(segs).unwrap_or_else(|| vec![segs.to_vec()]);
+        let into_crate = |p: &[String]| p.first().is_some_and(|f| matches!(f.as_str(), "crate" | "self" | "super"));
+        let mut todo = if into_crate(segs) { vec![segs.to_vec()] } else { self.uses.readings(segs).unwrap_or_else(|| vec![segs.to_vec()]) };
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for path in todo {
+                if !into_crate(&path) {
+                    if !out.contains(&path) {
+                        out.push(path);
+                    }
+                } else if seen.insert(path.clone()) {
+                    next.extend(self.crate_readings(&path));
+                }
+            }
+            todo = next;
+            if todo.is_empty() {
+                break;
+            }
         }
+        out
+    }
+
+    /// One step of [`Self::readings`] for a path into this crate: each segment after the leading
+    /// `crate`/`self`/`super` that names none of the crate's own modules or types, read as what any
+    /// of its files binds that name to.
+    fn crate_readings(&self, segs: &[String]) -> Vec<Vec<String>> {
+        let lead = segs.iter().take_while(|s| matches!(s.as_str(), "crate" | "self" | "super")).count();
         let rest = &segs[lead..];
         let mut out = Vec::new();
         for (i, seg) in rest.iter().enumerate() {
@@ -813,11 +1026,25 @@ impl Visitor<'_> {
                 }
             }
             syn::UseTree::Glob(g) => {
+                let line = g.star_token.span.start().line;
                 if self.lock_module_in(prefix) {
-                    self.out.raw_locks.push((g.star_token.span.start().line, format!("{}::* (a glob import)", prefix.join("::"))));
+                    self.out.raw_locks.push((line, format!("{}::* (a glob import)", prefix.join("::"))));
+                } else if let Some(held) = self.lock_module_held_in(prefix) {
+                    // `use std::*` binds `sync` without naming it, and every module of the crate can
+                    // then name `crate::sync::Mutex` (review finding T2).
+                    self.out.raw_locks.push((line, format!("{}::* (a glob import of a module holding `{held}`)", prefix.join("::"))));
                 }
             }
         }
+    }
+
+    /// `segs`, read through what binds it, is a module that holds a module raw locks live in (`std`
+    /// holds `std::sync`): the module it holds.
+    fn lock_module_held_in(&self, segs: &[String]) -> Option<&'static str> {
+        self.readings(segs).iter().find_map(|r| {
+            let parent = format!("{}::", r.join("::").trim_start_matches("::"));
+            RAW_LOCKS.iter().map(|(m, _)| *m).find(|m| m.starts_with(&parent))
+        })
     }
 
     fn item(&mut self, attrs: &[syn::Attribute], span: proc_macro2::Span, func: Option<String>, f: impl FnOnce(&mut Self)) {
@@ -1452,10 +1679,14 @@ const RAW_LOCKS: &[(&str, &str)] = &[
     ("parking_lot", "const_fair_mutex"),
     ("parking_lot", "const_reentrant_mutex"),
     ("parking_lot", "const_rwlock"),
-    // The generic locks parking_lot's are instances of.
+    // The generic locks parking_lot's are instances of — also named through parking_lot's
+    // re-export of lock_api (review finding T2).
     ("lock_api", "Mutex"),
     ("lock_api", "RwLock"),
     ("lock_api", "ReentrantMutex"),
+    ("parking_lot::lock_api", "Mutex"),
+    ("parking_lot::lock_api", "RwLock"),
+    ("parking_lot::lock_api", "ReentrantMutex"),
 ];
 
 /// The modules raw locks live in: a glob import of one, or an alias for one, would name them past

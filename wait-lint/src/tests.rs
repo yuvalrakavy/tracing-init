@@ -1062,3 +1062,198 @@ async fn main() {
         "[package]\nname = \"mqtt-ynca\"\nversion = \"1.0.0\"\n\n[lib]\nname = \"ynca\"\n\n[dependencies]\nname = { version = \"1\" }\n";
     assert_eq!(crate_names_in(manifest), BTreeSet::from(["mqtt_ynca".to_string(), "ynca".to_string()]));
 }
+
+// The 3b re-review's findings (T2, T3).
+
+/// `(file, line)` pairs, owned, to compare with a report's.
+fn at(expected: &[(&str, usize)]) -> Vec<(String, usize)> {
+    expected.iter().map(|(f, l)| (f.to_string(), *l)).collect()
+}
+
+/// Review finding T2 (a): a lock module bound at the root and rebound in a child through the crate
+/// (`use crate::sync;`, `use super::sync;`), then named through the child's own binding — and a
+/// grandchild's, through its parent's.
+#[test]
+fn a_lock_module_rebound_through_the_crate_is_found() {
+    let lib = "use std::sync;\nmod a;\nmod b;\n";
+    let a = "\
+use crate::sync;
+fn f() {
+    let m = sync::Mutex::new(0);
+}
+mod c;
+";
+    let b = "\
+use super::sync;
+use sync::*;
+fn g() {
+    let c = sync::Condvar::new();
+}
+";
+    let c = "use super::sync;\nfn h() {\n    let r = sync::RwLock::new(0);\n}\n";
+    let files = [("src/lib.rs", lib), ("src/a.rs", a), ("src/b.rs", b), ("src/a/c.rs", c)];
+    let r = run_files(&files, &forbidding());
+    assert_eq!(
+        raw_lock_lines(&r),
+        at(&[("src/a.rs", 3), ("src/a/c.rs", 3), ("src/b.rs", 2), ("src/b.rs", 4)]),
+        "a lock module rebound through the crate named its raw locks past the check: {:?}",
+        r.findings
+    );
+
+    // The wrappers, rebound the same way, are not raw locks.
+    let wrapper_root = "use lock_order::sync;\nmod a;\n";
+    let wrapped = "use crate::sync;\nfn f() {\n    let m = sync::Mutex::new(\"k\", 0);\n}\n";
+    let r = run_files(&[("src/lib.rs", wrapper_root), ("src/a.rs", wrapped)], &forbidding());
+    assert_eq!(raw_lock_lines(&r), at(&[]), "the wrappers rebound through the crate are not raw locks: {:?}", r.findings);
+}
+
+/// Review finding T2 (b): parking_lot re-exports lock_api, so lock_api's locks are named through
+/// `parking_lot::lock_api` too.
+#[test]
+fn lock_api_s_locks_named_through_parking_lot_are_raw_locks() {
+    let src = "\
+fn f() {
+    let a = parking_lot::lock_api::Mutex::<parking_lot::RawMutex, u8>::new(0);
+    let b: parking_lot::lock_api::RwLock<parking_lot::RawRwLock, u8> = todo();
+    let c = parking_lot::lock_api::ReentrantMutex::<R, G, u8>::new(0);
+}
+use parking_lot::lock_api::*;
+";
+    let r = run_files(&[("src/a.rs", src)], &forbidding());
+    let lines: Vec<usize> = raw_lock_lines(&r).into_iter().map(|(_, l)| l).collect();
+    assert_eq!(lines, vec![2, 3, 4, 6], "lock_api's locks through parking_lot passed: {:?}", r.findings);
+}
+
+/// Review finding T2 (c): a glob of a module that holds a lock module (`use std::*`, `pub use
+/// tokio::*`) binds `sync` without naming it, so a child's `crate::sync::Mutex` named a raw lock
+/// past the check. A glob of a module holding none is not one.
+#[test]
+fn a_glob_of_a_module_holding_a_lock_module_is_found() {
+    let lib = "\
+use std::*;
+pub use tokio::*;
+use ::std::{*};
+mod a;
+use std::collections::*;
+use tokio::time::*;
+";
+    let a = "fn f() {\n    let m = crate::sync::Mutex::new(0);\n}\n";
+    let r = run_files(&[("src/lib.rs", lib), ("src/a.rs", a)], &forbidding());
+    assert_eq!(
+        raw_lock_lines(&r),
+        at(&[("src/lib.rs", 1), ("src/lib.rs", 2), ("src/lib.rs", 3)]),
+        "a glob of a module holding a lock module passed: {:?}",
+        r.findings
+    );
+}
+
+/// Untagged waits, by file and line.
+fn untagged_at(r: &Report) -> Vec<(String, usize)> {
+    r.findings.iter().filter(|f| f.message.contains("untagged wait")).map(|f| (f.file.clone(), f.line.unwrap_or(0))).collect()
+}
+
+/// This code's own `async fn sleep`, which a dependency's `sleep` must not hide behind.
+const OWN_SLEEP: &str = "pub async fn sleep(d: u64) {}\n";
+
+/// Review finding T3 (a): `use super::*` carries the parent's private `use tokio::time::sleep`, so
+/// the child's bare `sleep(..)` is tokio's — this code's own `async fn sleep` elsewhere hid it.
+#[test]
+fn a_dependency_fn_carried_by_a_glob_of_this_code_is_the_dependency_s() {
+    let a = "use tokio::time::sleep;\nmod inner;\n";
+    let inner = "use super::*;\nasync fn settle(d: u64) {\n    sleep(d).await;\n}\n";
+    let files = [("src/lib.rs", "pub mod util;\nmod a;\n"), ("src/util.rs", OWN_SLEEP), ("src/a.rs", a), ("src/a/inner.rs", inner)];
+    let r = run_files(&files, ROWS);
+    assert_eq!(
+        untagged_at(&r),
+        at(&[("src/a/inner.rs", 3)]),
+        "tokio's `sleep`, carried by `use super::*`, hid behind this code's: {:?}",
+        r.findings
+    );
+
+    // The fixture's control: with no `sleep` of this code's, the call is a wait already.
+    let r = run_files(&[("src/lib.rs", "mod a;\n"), ("src/a.rs", a), ("src/a/inner.rs", inner)], ROWS);
+    assert_eq!(untagged_at(&r), at(&[("src/a/inner.rs", 3)]), "{:?}", r.findings);
+
+    // A glob of a module that defines its own `sleep` carries this code's.
+    let own = "pub async fn sleep(d: u64) {}\nmod inner;\n";
+    let r = run_files(&[("src/lib.rs", "mod a;\n"), ("src/a.rs", own), ("src/a/inner.rs", inner)], ROWS);
+    assert_eq!(untagged_at(&r), at(&[]), "the parent's own `sleep` is this code's: {:?}", r.findings);
+}
+
+/// Review finding T3 (b, c): a local module re-exports tokio's `sleep`, and it is called through
+/// that module (`net::sleep`, `crate::net::sleep`, a `use` of it) — or a file calls its own import
+/// as `self::sleep`.
+#[test]
+fn a_dependency_fn_re_exported_by_a_local_module_is_the_dependency_s() {
+    let lib = "pub mod util;\nmod net;\nmod user;\nmod me;\nuse net as nn;\nasync fn f(d: u64) {\n    net::sleep(d).await;\n}\n";
+    let user = "\
+async fn g(d: u64) {
+    crate::net::sleep(d).await;
+}
+use crate::net::sleep as nap;
+async fn h(d: u64) {
+    nap(d).await;
+}
+use crate::net as n;
+async fn i(d: u64) {
+    n::sleep(d).await;
+    crate::nn::sleep(d).await;
+}
+";
+    let me = "use tokio::time::sleep;\nasync fn k(d: u64) {\n    self::sleep(d).await;\n}\n";
+    let files = |net: &'static str| {
+        [("src/lib.rs", lib), ("src/util.rs", OWN_SLEEP), ("src/net.rs", net), ("src/user.rs", user), ("src/me.rs", me)]
+    };
+    let r = run_files(&files("pub use tokio::time::sleep;\n"), ROWS);
+    assert_eq!(
+        untagged_at(&r),
+        at(&[("src/lib.rs", 7), ("src/me.rs", 3), ("src/user.rs", 2), ("src/user.rs", 6), ("src/user.rs", 10), ("src/user.rs", 11)]),
+        "tokio's `sleep`, re-exported by a local module, hid behind this code's: {:?}",
+        r.findings
+    );
+
+    // A local module re-exporting this code's own `sleep` is this code's.
+    let r = run_files(&files("pub use crate::util::sleep;\n"), ROWS);
+    assert_eq!(untagged_at(&r), at(&[("src/me.rs", 3)]), "only `self::sleep`, tokio's, is a wait: {:?}", r.findings);
+}
+
+/// Review finding T3's collision side: a module path into a module that neither defines nor imports
+/// the name but glob-imports from a dependency (`pub use tokio::time::*`) may be the dependency's,
+/// a collision for the registry; one into a module that defines it beside such a glob is the
+/// module's own, since a definition shadows a glob.
+#[test]
+fn a_module_s_dependency_glob_may_hold_the_name() {
+    let lib = "pub mod util;\nmod net;\nmod own;\nasync fn f(d: u64) {\n    net::sleep(d).await;\n    own::sleep(d).await;\n}\n";
+    let net = "pub use tokio::time::*;\n";
+    let own = "use tokio::time::*;\npub async fn sleep(d: u64) {}\n";
+    let files = [("src/lib.rs", lib), ("src/util.rs", OWN_SLEEP), ("src/net.rs", net), ("src/own.rs", own)];
+    let r = run_files(&files, ROWS);
+    let collisions: Vec<(String, usize)> =
+        r.findings.iter().filter(|f| f.message.contains("glob-imports")).map(|f| (f.file.clone(), f.line.unwrap_or(0))).collect();
+    assert_eq!(collisions, at(&[("src/lib.rs", 5)]), "`net::sleep` may be tokio's, `own::sleep` is the module's: {:?}", r.findings);
+    assert_eq!(untagged_at(&r), at(&[]), "{:?}", r.findings);
+}
+
+/// Following T3's globs: modules that glob-import each other are each asked once, not once per way
+/// there — sixteen of them would otherwise be 15^8 questions for one call.
+#[test]
+fn globs_that_reach_each_other_are_followed_once() {
+    let n = 16;
+    let mut files: Vec<(String, String)> = (0..n)
+        .map(|i| {
+            let globs: String = (0..n).filter(|k| *k != i).map(|k| format!("use crate::m{k}::*;\n")).collect();
+            (format!("src/m{i}.rs"), format!("{globs}async fn f{i}() {{\n    go().await;\n}}\n"))
+        })
+        .collect();
+    files.push(("src/util.rs".into(), "pub async fn go() {}\n".into()));
+    let worker = std::thread::spawn(move || {
+        let files: BTreeMap<String, String> = files.into_iter().collect();
+        check(&files, ("docs/wait-registry.md", ROWS)).sites.len()
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !worker.is_finished() {
+        assert!(std::time::Instant::now() < deadline, "the check of modules globbing each other did not finish within 20 s");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(worker.join().unwrap(), 0, "`go` is this code's");
+}
