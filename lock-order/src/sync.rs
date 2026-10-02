@@ -6,7 +6,7 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::panic::Location;
 use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult, WaitTimeoutResult};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{hooks, watchdog::WaitGuard, Held};
 
@@ -92,6 +92,12 @@ impl<T: ?Sized> Mutex<T> {
     pub fn is_poisoned(&self) -> bool {
         self.inner.is_poisoned()
     }
+
+    /// The std lock, past the checker — for a test that must see the lock without recording.
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn raw(&self) -> &std::sync::Mutex<T> {
+        &self.inner
+    }
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
@@ -100,9 +106,12 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
     }
 }
 
+// A guard's fields drop in order: the record (`_held`) goes BEFORE the lock (`inner`), so a thread
+// that takes the lock the moment it comes free never finds this holder still on file (review
+// finding C-12). The same in every guard here and in `tokio_sync`.
 pub struct MutexGuard<'a, T: ?Sized> {
-    inner: std::sync::MutexGuard<'a, T>,
     _held: Held,
+    inner: std::sync::MutexGuard<'a, T>,
     // Kept beside the token, which is empty in a release build: a `Condvar` wait gives the token
     // up and takes it back under the same identity.
     class: &'static str,
@@ -149,6 +158,9 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
 /// std offers no hook between the notification and the re-acquisition, so the watchdog cannot see
 /// a stall there, and `wait_timeout`'s bound covers the wait, not the re-acquisition. Step 2 is
 /// what covers it.
+///
+/// `wait_while` and `wait_timeout_while` loop over `wait` and `wait_timeout`, so their predicate,
+/// which runs under the mutex, runs holding the guard's record like any code under it.
 #[derive(Debug, Default)]
 pub struct Condvar {
     inner: std::sync::Condvar,
@@ -174,14 +186,19 @@ impl Condvar {
         map_lock(self.inner.wait(inner), |g| MutexGuard::new(g, class, instance, site))
     }
 
+    /// std's own `wait_while` is this loop over its `wait`. Written over this wrapper's `wait`, the
+    /// predicate — which runs under the mutex — runs holding the guard's record, so a lock it takes
+    /// orders after this one and re-taking this one there is reported (review finding X-4); std's
+    /// would run it with the record given up.
     #[track_caller]
-    pub fn wait_while<'a, T, F>(&self, guard: MutexGuard<'a, T>, condition: F) -> LockResult<MutexGuard<'a, T>>
+    pub fn wait_while<'a, T, F>(&self, mut guard: MutexGuard<'a, T>, mut condition: F) -> LockResult<MutexGuard<'a, T>>
     where
         F: FnMut(&mut T) -> bool,
     {
-        let site = Location::caller();
-        let (inner, class, instance) = release_for_wait(guard, site);
-        map_lock(self.inner.wait_while(inner, condition), |g| MutexGuard::new(g, class, instance, site))
+        while condition(&mut *guard) {
+            guard = self.wait(guard)?;
+        }
+        Ok(guard)
     }
 
     #[track_caller]
@@ -191,20 +208,42 @@ impl Condvar {
         map_lock(self.inner.wait_timeout(inner, dur), |(g, t)| (MutexGuard::new(g, class, instance, site), t))
     }
 
+    /// std's own loop over its `wait_timeout`, over this wrapper's instead (see [`Self::wait_while`]):
+    /// the predicate runs holding the guard's record, and `dur` bounds the whole wait, however
+    /// often it is woken.
     #[track_caller]
     pub fn wait_timeout_while<'a, T, F>(
         &self,
-        guard: MutexGuard<'a, T>,
+        mut guard: MutexGuard<'a, T>,
         dur: Duration,
-        condition: F,
+        mut condition: F,
     ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)>
     where
         F: FnMut(&mut T) -> bool,
     {
-        let site = Location::caller();
-        let (inner, class, instance) = release_for_wait(guard, site);
-        map_lock(self.inner.wait_timeout_while(inner, dur, condition), |(g, t)| (MutexGuard::new(g, class, instance, site), t))
+        let start = Instant::now();
+        loop {
+            if !condition(&mut *guard) {
+                return Ok((guard, wait_result(false)));
+            }
+            let Some(left) = dur.checked_sub(start.elapsed()) else {
+                return Ok((guard, wait_result(true)));
+            };
+            guard = self.wait_timeout(guard, left)?.0;
+        }
     }
+}
+
+/// A `WaitTimeoutResult` saying `timed_out`. std gives the type no constructor, so a std wait that
+/// cannot block mints it: on a mutex of its own, which nothing else can hold, with a zero bound and
+/// a constant predicate (`false` returns at once; `true` returns timed out once any time passed).
+fn wait_result(timed_out: bool) -> WaitTimeoutResult {
+    let m = std::sync::Mutex::new(());
+    let cv = std::sync::Condvar::new();
+    let g = m.lock().unwrap_or_else(PoisonError::into_inner);
+    let (_g, result) = cv.wait_timeout_while(g, Duration::ZERO, |_| timed_out).unwrap_or_else(PoisonError::into_inner);
+    debug_assert_eq!(result.timed_out(), timed_out);
+    result
 }
 
 /// Steps 1 and 2 of a [`Condvar`] wait: give up the token, then check the re-acquisition.
@@ -282,6 +321,12 @@ impl<T: ?Sized> RwLock<T> {
     pub fn is_poisoned(&self) -> bool {
         self.inner.is_poisoned()
     }
+
+    /// The std lock, past the checker — for a test that must see the lock without recording.
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn raw(&self) -> &std::sync::RwLock<T> {
+        &self.inner
+    }
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
@@ -291,8 +336,8 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
 }
 
 pub struct RwLockReadGuard<'a, T: ?Sized> {
+    _held: Held, // before `inner`: see `MutexGuard`
     inner: std::sync::RwLockReadGuard<'a, T>,
-    _held: Held,
 }
 
 impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
@@ -303,8 +348,8 @@ impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
 }
 
 pub struct RwLockWriteGuard<'a, T: ?Sized> {
+    _held: Held, // before `inner`: see `MutexGuard`
     inner: std::sync::RwLockWriteGuard<'a, T>,
-    _held: Held,
 }
 
 impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {

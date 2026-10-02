@@ -164,6 +164,22 @@ fn held_by(ctx: &Context) -> Vec<Held> {
     out
 }
 
+/// Whether the context running now holds `instance` — for a test of what a wait gives up.
+#[cfg(test)]
+pub fn holds_now(instance: usize) -> bool {
+    held_by(&current()).iter().any(|h| h.instance == instance)
+}
+
+/// Run `f` with `ctx`'s shard of the held records locked, so no record of `ctx` is added or
+/// removed meanwhile; `f` is told whether `instance` is on file for `ctx`. For a test of the order
+/// a guard gives up its record and its lock in: nothing `f` does may take a wrapped lock.
+#[cfg(test)]
+pub fn with_records_frozen<R>(ctx: Context, instance: usize, f: impl FnOnce(&dyn Fn() -> bool) -> R) -> R {
+    let map = shard(&ctx).lock().unwrap_or_else(|p| p.into_inner());
+    let on_file = || map.get(&ctx).is_some_and(|list| list.iter().any(|h| h.instance == instance));
+    f(&on_file)
+}
+
 /// Where `instance` is held now, across every context — for a wedge report. Takes each shard
 /// in turn, never two at once.
 pub fn holders_of(instance: usize) -> Vec<Site> {

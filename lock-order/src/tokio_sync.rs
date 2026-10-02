@@ -64,6 +64,12 @@ impl<T: ?Sized> Mutex<T> {
     pub fn get_mut(&mut self) -> &mut T {
         Arc::get_mut(&mut self.inner).expect("get_mut while an owned guard is alive").get_mut()
     }
+
+    /// The tokio lock, past the checker — for a test that must see the lock without recording.
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn raw(&self) -> &tokio::sync::Mutex<T> {
+        &self.inner
+    }
 }
 
 impl<T: ?Sized + Send + 'static> Mutex<T> {
@@ -92,9 +98,10 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
     }
 }
 
+// The record goes before the lock, as in `sync`: see `sync::MutexGuard` (review finding C-12).
 pub struct MutexGuard<'a, T: ?Sized> {
-    inner: tokio::sync::MutexGuard<'a, T>,
     _held: Held,
+    inner: tokio::sync::MutexGuard<'a, T>,
 }
 
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
@@ -111,8 +118,8 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
 }
 
 pub struct OwnedMutexGuard<T: ?Sized> {
+    held: Held, // before `inner`: see `MutexGuard`
     inner: tokio::sync::OwnedMutexGuard<T>,
-    held: Held,
 }
 
 impl<T: ?Sized> OwnedMutexGuard<T> {
@@ -206,6 +213,12 @@ impl<T: ?Sized> RwLock<T> {
     pub fn get_mut(&mut self) -> &mut T {
         Arc::get_mut(&mut self.inner).expect("get_mut while an owned guard is alive").get_mut()
     }
+
+    /// The tokio lock, past the checker — for a test that must see the lock without recording.
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn raw(&self) -> &tokio::sync::RwLock<T> {
+        &self.inner
+    }
 }
 
 impl<T: ?Sized + Send + Sync + 'static> RwLock<T> {
@@ -253,8 +266,8 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
 }
 
 pub struct RwLockReadGuard<'a, T: ?Sized> {
+    _held: Held, // before `inner`: see `MutexGuard`
     inner: tokio::sync::RwLockReadGuard<'a, T>,
-    _held: Held,
 }
 
 impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
@@ -265,8 +278,8 @@ impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
 }
 
 pub struct RwLockWriteGuard<'a, T: ?Sized> {
+    held: Held, // before `inner`: see `MutexGuard`
     inner: tokio::sync::RwLockWriteGuard<'a, T>,
-    held: Held,
 }
 
 impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
@@ -290,8 +303,8 @@ impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
 }
 
 pub struct OwnedRwLockReadGuard<T: ?Sized> {
+    held: Held, // before `inner`: see `MutexGuard`
     inner: tokio::sync::OwnedRwLockReadGuard<T>,
-    held: Held,
 }
 
 impl<T: ?Sized> OwnedRwLockReadGuard<T> {
@@ -310,8 +323,8 @@ impl<T: ?Sized> Deref for OwnedRwLockReadGuard<T> {
 }
 
 pub struct OwnedRwLockWriteGuard<T: ?Sized> {
+    held: Held, // before `inner`: see `MutexGuard`
     inner: tokio::sync::OwnedRwLockWriteGuard<T>,
-    held: Held,
 }
 
 impl<T: ?Sized> OwnedRwLockWriteGuard<T> {

@@ -1,10 +1,24 @@
 //! Each test uses its own class names: the order graph and the recorded cycles are global, and
 //! tests run in parallel.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use crate::{branch, cycles, holding, long_waits, scope, set_report_after, sync, tokio_sync, waits_on};
+
+/// How long a test waits on another thread before it fails instead of hanging the suite.
+const BOUND: Duration = Duration::from_secs(10);
+
+/// Join `h`, or fail the test if it has not finished within [`BOUND`].
+fn join_within<T>(h: std::thread::JoinHandle<T>, what: &str) -> std::thread::Result<T> {
+    let deadline = Instant::now() + BOUND;
+    while !h.is_finished() {
+        assert!(Instant::now() < deadline, "{what} did not finish within {BOUND:?}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    h.join()
+}
 
 fn cycle_with(a: &str, b: &str) -> Option<String> {
     cycles().into_iter().find(|c| c.contains(&format!("`{a}`")) && c.contains(&format!("`{b}`")))
@@ -19,19 +33,17 @@ fn two_std_locks_taken_in_both_orders_on_two_threads_are_a_cycle_without_deadloc
     let a = Arc::new(sync::Mutex::new("std-inv-a", ()));
     let b = Arc::new(sync::Mutex::new("std-inv-b", ()));
     let (a1, b1) = (a.clone(), b.clone());
-    std::thread::spawn(move || {
+    let first = std::thread::spawn(move || {
         let _ga = a1.lock().unwrap();
         let _gb = b1.lock().unwrap();
-    })
-    .join()
-    .unwrap();
+    });
+    join_within(first, "the first thread").unwrap();
     assert!(cycle_with("std-inv-a", "std-inv-b").is_none(), "one order alone is no cycle");
-    std::thread::spawn(move || {
+    let second = std::thread::spawn(move || {
         let _gb = b.lock().unwrap();
         let _ga = a.lock().unwrap();
-    })
-    .join()
-    .unwrap();
+    });
+    join_within(second, "the second thread").unwrap();
     let c = cycle_with("std-inv-a", "std-inv-b").expect("both orders are a cycle, though nothing deadlocked");
     assert!(c.contains("tests.rs"), "each edge names where it was taken: {c}");
 }
@@ -136,7 +148,7 @@ async fn a_guard_dropped_on_another_thread_is_released_and_an_adopted_one_is_hel
     let a = tokio_sync::RwLock::new("moved-a", ());
     let b = tokio_sync::Mutex::new("moved-b", ());
     let guard = a.read_owned().await;
-    std::thread::spawn(move || drop(guard)).join().unwrap();
+    join_within(std::thread::spawn(move || drop(guard)), "the dropping thread").unwrap();
     let _gb = b.lock().await; // a was released: no a → b edge.
     drop(_gb);
     let _gb = b.lock().await;
@@ -227,19 +239,19 @@ fn a_consistent_order_a_thousand_times_is_no_cycle() {
 fn a_long_wait_is_reported_by_the_watchdog_thread_while_the_waiter_blocks() {
     set_report_after("long-std", Duration::from_millis(200));
     let l = Arc::new(sync::Mutex::new("long-std", ()));
-    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (held_tx, held_rx) = mpsc::channel();
     let l1 = l.clone();
     let holder = std::thread::spawn(move || {
         let _g = l1.lock().unwrap();
         held_tx.send(()).unwrap();
         std::thread::sleep(Duration::from_millis(700));
     });
-    held_rx.recv().unwrap();
+    held_rx.recv_timeout(BOUND).expect("the holder took the lock");
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let _g = l.lock().unwrap(); // blocks the runtime's only worker for ~700 ms
     });
-    holder.join().unwrap();
+    join_within(holder, "the holder").unwrap();
     let seen: Vec<_> = long_waits().into_iter().filter(|w| w.class == "long-std").collect();
     assert_eq!(seen.len(), 1, "one report per wait: {seen:?}");
     assert!(seen[0].holders.iter().any(|h| h.contains("tests.rs")), "names the holder: {:?}", seen[0]);
@@ -405,19 +417,21 @@ async fn a_semaphore_permit_is_a_pseudo_lock_while_it_lives() {
 }
 
 // `sync::Condvar` (Store no-hang §14.2). A notifier on another thread proves nothing about the
-// waiter's own record — holdings are per thread — so these look at the record itself.
+// waiter's own record — holdings are per thread — so these look at the record itself. Every wait
+// in them is bounded, so a regression fails the test instead of hanging the suite (review finding
+// C-13).
 
 /// Lock `m` from this thread until `state` reads `want`, the waiter's signal that it is inside
 /// its wait (it set the state under the lock, and released the lock only by waiting).
 fn until_state(m: &sync::Mutex<u8>, want: u8) -> sync::MutexGuard<'_, u8> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + BOUND;
     loop {
         if let Ok(g) = m.try_lock() {
             if *g == want {
                 return g;
             }
         }
-        assert!(std::time::Instant::now() < deadline, "the waiter never reached its wait");
+        assert!(Instant::now() < deadline, "the waiter never reached its wait");
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -426,8 +440,8 @@ fn until_state(m: &sync::Mutex<u8>, want: u8) -> sync::MutexGuard<'_, u8> {
 fn a_condvar_wait_gives_up_its_class_and_takes_it_back() {
     let pair = Arc::new((sync::Mutex::new("cv-own", 0u8), sync::Condvar::new()));
     let instance = pair.0.instance();
-    let (woke_tx, woke_rx) = std::sync::mpsc::channel();
-    let (looked_tx, looked_rx) = std::sync::mpsc::channel::<()>();
+    let (woke_tx, woke_rx) = mpsc::channel();
+    let (looked_tx, looked_rx) = mpsc::channel::<()>();
     let p = pair.clone();
     let waiter = std::thread::spawn(move || {
         let (m, cv) = &*p;
@@ -437,7 +451,8 @@ fn a_condvar_wait_gives_up_its_class_and_takes_it_back() {
             g = cv.wait(g).unwrap();
         }
         woke_tx.send(()).unwrap();
-        looked_rx.recv().unwrap(); // hold the re-taken guard while the test looks
+        // Hold the re-taken guard while the test looks (or until it gives up).
+        let _ = looked_rx.recv_timeout(BOUND);
     });
     let mut g = until_state(&pair.0, 1);
     // This thread holds the mutex now; the waiter, inside its wait, must not be recorded too.
@@ -445,10 +460,10 @@ fn a_condvar_wait_gives_up_its_class_and_takes_it_back() {
     *g = 2;
     pair.1.notify_all();
     drop(g);
-    woke_rx.recv().unwrap();
+    woke_rx.recv_timeout(BOUND).expect("the waiter woke");
     assert_eq!(crate::checker::holders_of(instance).len(), 1, "the waiter did not take its record back on wake");
     looked_tx.send(()).unwrap();
-    waiter.join().unwrap();
+    join_within(waiter, "the waiter").unwrap();
 }
 
 #[test]
@@ -469,6 +484,45 @@ fn a_condvar_wait_holding_a_later_lock_reports_the_reacquisitions_cycle() {
     drop(gb);
     drop(ga);
     assert!(cycle_with("cv-ord-a", "cv-ord-b").is_some(), "the re-acquisition's order was not checked before the wait: {:?}", cycles());
+}
+
+/// A genuinely blocked re-acquisition is caught by the pre-wait check (Store no-hang §14.5; review
+/// finding C-M3 / X-8). The waiter holds `a` and `b` and waits on `a`, so its wake re-takes `a`
+/// under `b`; this thread takes `a`, notifies, and keeps `a` — the waiter is woken into a
+/// re-acquisition it cannot complete while `a` is held here. Its cycle must already be on record:
+/// a check made when `wait` returns has not run yet, and in a real deadlock never would.
+#[test]
+fn a_blocked_reacquisition_is_on_record_before_the_wait_returns() {
+    let locks = Arc::new((sync::Mutex::new("cv-blk-a", 0u8), sync::Mutex::new("cv-blk-b", ()), sync::Condvar::new()));
+    {
+        let _ga = locks.0.lock().unwrap();
+        let _gb = locks.1.lock().unwrap(); // a → b
+    }
+    assert!(cycle_with("cv-blk-a", "cv-blk-b").is_none(), "one order alone is no cycle");
+    let (done_tx, done_rx) = mpsc::channel();
+    let l = locks.clone();
+    let waiter = std::thread::spawn(move || {
+        let (a, b, cv) = &*l;
+        let mut ga = a.lock().unwrap();
+        let gb = b.lock().unwrap();
+        *ga = 1;
+        while *ga != 2 {
+            ga = cv.wait(ga).unwrap();
+        }
+        drop(gb);
+        drop(ga);
+        done_tx.send(()).unwrap();
+    });
+    let mut ga = until_state(&locks.0, 1); // the waiter is inside its wait
+    *ga = 2;
+    locks.2.notify_all();
+    // Woken, the waiter now blocks re-taking `a`, which this thread holds.
+    std::thread::sleep(Duration::from_millis(50));
+    let on_record = cycle_with("cv-blk-a", "cv-blk-b");
+    drop(ga);
+    done_rx.recv_timeout(BOUND).expect("the waiter finishes once `a` is free");
+    join_within(waiter, "the waiter").unwrap();
+    assert!(on_record.is_some(), "the re-acquisition's order was not checked before the wait: {:?}", cycles());
 }
 
 #[test]
@@ -496,18 +550,235 @@ fn a_poisoned_wake_takes_the_class_back_too() {
         p.1.notify_all();
         panic!("poison the mutex under the waiter");
     });
-    assert!(poisoner.join().is_err());
-    assert_eq!(waiter.join().unwrap(), 1, "a poisoned wake left the waiter without its record");
+    assert!(join_within(poisoner, "the poisoner").is_err());
+    assert_eq!(join_within(waiter, "the waiter").unwrap(), 1, "a poisoned wake left the waiter without its record");
 }
 
 #[test]
 fn a_condvar_wait_timeout_returns_at_its_bound() {
     let m = sync::Mutex::new("cv-timeout", ());
     let cv = sync::Condvar::new();
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let (g, timed_out) = cv.wait_timeout(m.lock().unwrap(), Duration::from_millis(20)).unwrap();
     assert!(timed_out.timed_out());
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     drop(g);
     assert!(any_cycle_with("cv-timeout").is_none(), "{:?}", cycles());
+}
+
+/// `wait_while`'s predicate runs under the mutex, so it runs holding the guard's record: a lock it
+/// takes orders after the condvar's mutex, like any lock taken under it, and re-taking the mutex
+/// there is a self-wait the checker can see (review finding X-4 / C-11). Before the wait and after
+/// the wake both.
+#[test]
+fn a_wait_while_predicate_runs_holding_the_condvar_s_mutex() {
+    let locks = Arc::new((sync::Mutex::new("cv-pred-m", 0u8), sync::Mutex::new("cv-pred-b", ()), sync::Condvar::new()));
+    let instance = locks.0.instance();
+    let l = locks.clone();
+    let waiter = std::thread::spawn(move || {
+        let (m, b, cv) = &*l;
+        let mut g = m.lock().unwrap();
+        *g = 1;
+        let mut held = Vec::new();
+        let g = cv
+            .wait_while(g, |s| {
+                held.push(crate::checker::holds_now(instance));
+                let _gb = b.lock().unwrap();
+                *s != 2
+            })
+            .unwrap();
+        drop(g);
+        held
+    });
+    let mut g = until_state(&locks.0, 1);
+    *g = 2;
+    locks.2.notify_all();
+    drop(g);
+    let held = join_within(waiter, "the waiter").unwrap();
+    assert!(
+        held.len() >= 2 && held.iter().all(|h| *h),
+        "the predicate ran without the guard's record (before the wait, after the wake): {held:?}"
+    );
+    {
+        let _gb = locks.1.lock().unwrap();
+        let _gm = locks.0.lock().unwrap(); // b → m, against the m → b the predicate took
+    }
+    assert!(
+        cycle_with("cv-pred-m", "cv-pred-b").is_some(),
+        "a lock taken in the predicate was not ordered after the condvar's mutex: {:?}",
+        cycles()
+    );
+}
+
+/// The same for `wait_timeout_while`, whose predicate stops the wait after one timed-out round.
+#[test]
+fn a_wait_timeout_while_predicate_runs_holding_the_condvar_s_mutex() {
+    let m = sync::Mutex::new("cv-tpred-m", ());
+    let b = sync::Mutex::new("cv-tpred-b", ());
+    let cv = sync::Condvar::new();
+    let mut held = Vec::new();
+    let (g, result) = cv
+        .wait_timeout_while(m.lock().unwrap(), Duration::from_millis(20), |_| {
+            held.push(crate::checker::holds_now(m.instance()));
+            let _gb = b.lock().unwrap();
+            held.len() < 2
+        })
+        .unwrap();
+    drop(g);
+    assert!(!result.timed_out(), "the predicate ended the wait, not the bound");
+    assert!(held.len() >= 2 && held.iter().all(|h| *h), "the predicate ran without the guard's record: {held:?}");
+    {
+        let _gb = b.lock().unwrap();
+        let _gm = m.lock().unwrap();
+    }
+    assert!(
+        cycle_with("cv-tpred-m", "cv-tpred-b").is_some(),
+        "a lock taken in the predicate was not ordered after the condvar's mutex: {:?}",
+        cycles()
+    );
+}
+
+/// `wait_timeout_while` bounds the whole wait however often it is woken: std's contract, kept now
+/// that it loops over this wrapper's `wait_timeout`.
+#[test]
+fn a_wait_timeout_while_keeps_its_bound_across_wakes() {
+    let shared = Arc::new((sync::Mutex::new("cv-bound", ()), sync::Condvar::new(), AtomicBool::new(false)));
+    let s = shared.clone();
+    let notifier = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !s.2.load(Ordering::SeqCst) && Instant::now() < until {
+            s.1.notify_all();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    let started = Instant::now();
+    let (g, result) = shared.1.wait_timeout_while(shared.0.lock().unwrap(), Duration::from_millis(100), |_| true).unwrap();
+    let took = started.elapsed();
+    drop(g);
+    shared.2.store(true, Ordering::SeqCst);
+    join_within(notifier, "the notifier").unwrap();
+    assert!(result.timed_out(), "a condition that never cleared reports its timeout");
+    assert!(took < Duration::from_secs(2), "the bound restarted at each wake: the wait took {took:?}");
+}
+
+// A guard gives up its record before its lock (review finding C-12). The next holder can take the
+// lock the moment it is free, and must not find the last holder's record still on file: a wedge
+// report naming a holder that has let go, a holder count one too many (the poisoned-wake test's
+// flake).
+
+/// The holder's half: keep `guard` until the test says to drop it.
+struct Holder {
+    ctx: mpsc::Sender<crate::checker::Context>,
+    go: mpsc::Receiver<()>,
+    done: mpsc::Sender<()>,
+}
+
+impl Holder {
+    fn hold<G>(self, guard: G) {
+        self.ctx.send(crate::checker::current()).unwrap();
+        let go = self.go.recv_timeout(BOUND);
+        drop(guard);
+        let _ = self.done.send(());
+        go.expect("the test said when to drop the guard");
+    }
+}
+
+/// `spawn` takes the lock on a thread of its own and hands the guard to [`Holder::hold`]. With the
+/// holder's records frozen, the guard is dropped: its record cannot go meanwhile, so the lock must
+/// not come free — the record goes first.
+fn gives_up_its_record_before_its_lock(
+    what: &str,
+    instance: usize,
+    raw_free: impl Fn() -> bool,
+    spawn: impl FnOnce(Holder) -> std::thread::JoinHandle<()>,
+) {
+    let (ctx_tx, ctx_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let holder = spawn(Holder { ctx: ctx_tx, go: go_rx, done: done_tx });
+    let ctx = ctx_rx.recv_timeout(BOUND).unwrap_or_else(|_| panic!("{what}: the holder never took its lock"));
+    assert!(!raw_free(), "{what}: the lock is taken");
+    crate::checker::with_records_frozen(ctx, instance, |on_file| {
+        assert!(on_file(), "{what}: the holder's record is on file");
+        go_tx.send(()).unwrap();
+        let until = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < until {
+            assert!(!(raw_free() && on_file()), "{what}: the lock was free while its holder's record was still on file");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    done_rx.recv_timeout(BOUND).unwrap_or_else(|_| panic!("{what}: the holder never finished dropping its guard"));
+    join_within(holder, what).unwrap();
+    assert!(raw_free(), "{what}: the lock is free once the guard is gone");
+    assert!(crate::checker::holders_of(instance).is_empty(), "{what}: and so is its record");
+}
+
+#[test]
+fn a_std_guard_gives_up_its_record_before_its_lock() {
+    let m = Arc::new(sync::Mutex::new("drop-std-mutex", ()));
+    let m1 = m.clone();
+    gives_up_its_record_before_its_lock(
+        "sync::MutexGuard",
+        m.instance(),
+        || m.raw().try_lock().is_ok(),
+        move |h| std::thread::spawn(move || h.hold(m1.lock().unwrap())),
+    );
+    let l = Arc::new(sync::RwLock::new("drop-std-rwlock", ()));
+    let l1 = l.clone();
+    gives_up_its_record_before_its_lock(
+        "sync::RwLockReadGuard",
+        l.instance(),
+        || l.raw().try_write().is_ok(),
+        move |h| std::thread::spawn(move || h.hold(l1.read().unwrap())),
+    );
+    let l1 = l.clone();
+    gives_up_its_record_before_its_lock(
+        "sync::RwLockWriteGuard",
+        l.instance(),
+        || l.raw().try_write().is_ok(),
+        move |h| std::thread::spawn(move || h.hold(l1.write().unwrap())),
+    );
+}
+
+/// The tokio guards, taken through a root `block_on` (whose context is its thread) and dropped
+/// outside it.
+#[test]
+fn a_tokio_guard_gives_up_its_record_before_its_lock() {
+    fn on_a_runtime<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+    }
+    let m = Arc::new(tokio_sync::Mutex::new("drop-tok-mutex", ()));
+    for owned in [false, true] {
+        let m1 = m.clone();
+        gives_up_its_record_before_its_lock(
+            if owned { "tokio_sync::OwnedMutexGuard" } else { "tokio_sync::MutexGuard" },
+            m.instance(),
+            || m.raw().try_lock().is_ok(),
+            move |h| {
+                std::thread::spawn(move || if owned { h.hold(on_a_runtime(m1.lock_owned())) } else { h.hold(on_a_runtime(m1.lock())) })
+            },
+        );
+    }
+    let l = Arc::new(tokio_sync::RwLock::new("drop-tok-rwlock", ()));
+    for (what, which) in [
+        ("tokio_sync::RwLockReadGuard", 0),
+        ("tokio_sync::RwLockWriteGuard", 1),
+        ("tokio_sync::OwnedRwLockReadGuard", 2),
+        ("tokio_sync::OwnedRwLockWriteGuard", 3),
+    ] {
+        let l1 = l.clone();
+        gives_up_its_record_before_its_lock(
+            what,
+            l.instance(),
+            || l.raw().try_write().is_ok(),
+            move |h| {
+                std::thread::spawn(move || match which {
+                    0 => h.hold(on_a_runtime(l1.read())),
+                    1 => h.hold(on_a_runtime(l1.write())),
+                    2 => h.hold(on_a_runtime(l1.read_owned())),
+                    _ => h.hold(on_a_runtime(l1.write_owned())),
+                })
+            },
+        );
+    }
 }
