@@ -143,9 +143,11 @@ fn join_within<T>(h: std::thread::JoinHandle<T>, what: &str) -> std::thread::Res
 
 /// Review finding X-7 / C-20: an ack is decided and held under the `held` lock, which the hold
 /// flag changes under, so a release cannot slip between the decision and the push and strand the
-/// ack. The probe holds that lock while another thread decides an ack, turns the hold off under it
+/// ack. The probe holds that lock while another thread decides an ack, waits until that thread has
+/// reached the lock (so it has decided whatever it decides before it), turns the hold off under it
 /// — as a release does — and only then lets the ack go on: it must see the release, not a hold it
-/// read before.
+/// read before. Review finding T1: the wait is on the lock's arrival count, not a sleep, so a slow
+/// acker is seen as surely as a prompt one.
 #[test]
 fn an_ack_decided_during_a_release_is_not_stranded() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -154,10 +156,15 @@ fn an_ack_decided_during_a_release_is_not_stranded() {
     broker.hold_acks();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let held = shared.held.lock().unwrap();
+    let reached = shared.held_lock_reached.load(Ordering::SeqCst);
     let s = shared.clone();
     let acker = std::thread::spawn(move || ack_or_hold(&s, &tx, 7));
-    // The acker is now blocked on the lock this thread holds.
-    std::thread::sleep(Duration::from_millis(100));
+    let deadline = std::time::Instant::now() + BOUND;
+    while shared.held_lock_reached.load(Ordering::SeqCst) == reached {
+        assert!(std::time::Instant::now() < deadline, "the acker did not reach the held lock within {BOUND:?}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The acker is at the lock this thread holds, or about to block on it.
     shared.hold_acks.store(false, Ordering::SeqCst); // a release, made under the lock
     drop(held);
     join_within(acker, "the acker").unwrap();
@@ -166,11 +173,8 @@ fn an_ack_decided_during_a_release_is_not_stranded() {
     assert!(rx.try_recv().is_ok(), "the ack was sent at once");
 }
 
-/// Review finding C-19: dropping the broker stops it — its connections too, which used to go on
-/// acknowledging and holding the client's socket open.
-#[tokio::test(flavor = "multi_thread")]
-async fn dropping_the_broker_closes_its_connections() {
-    let broker = FakeBroker::start().await;
+/// A raw TCP client of `broker`, connected: its CONNECT sent and the CONNACK read.
+async fn raw_client(broker: &FakeBroker) -> tokio::net::TcpStream {
     let mut stream = tokio::time::timeout(BOUND, tokio::net::TcpStream::connect(broker.address())).await.expect("connect").unwrap();
     let connect = v5::Connect { keep_alive: 30, client_id: "raw".into(), clean_start: true, properties: None };
     tokio::time::timeout(BOUND, stream.write_all(&encode_v5(v5::Packet::Connect(connect, None, None))))
@@ -181,10 +185,53 @@ async fn dropping_the_broker_closes_its_connections() {
     let n = tokio::time::timeout(BOUND, stream.read(&mut buf)).await.expect("a CONNACK").unwrap();
     assert!(n > 0 && buf[0] >> 4 == 2, "a CONNACK: {:?}", &buf[..n]);
     assert!(broker.wait_until(BOUND, |b| b.connections() == 1).await);
+    stream
+}
+
+/// Review finding C-19: dropping the broker stops it — its connections too, which used to go on
+/// acknowledging and holding the client's socket open.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_broker_closes_its_connections() {
+    let broker = FakeBroker::start().await;
+    let mut stream = raw_client(&broker).await;
+    let mut buf = [0u8; 256];
     drop(broker);
     match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
         Ok(Ok(0)) | Ok(Err(_)) => {}
         Ok(Ok(n)) => panic!("the dropped broker still wrote to its client: {:?}", &buf[..n]),
         Err(_) => panic!("the broker was dropped but its connection still holds the client's socket open"),
     }
+}
+
+/// Review finding T4: a connection's writer goes with its connection, also when it is blocked in
+/// `write_all` on a client that has stopped reading. Detached, it held the client's socket open
+/// past `drop(broker)`, and once the client read again it delivered everything still queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_broker_stops_a_writer_blocked_on_its_client() {
+    let broker = FakeBroker::start().await;
+    let mut stream = raw_client(&broker).await;
+    // Far more than the two sockets' buffers hold (a few MB each, at most, on macOS and Linux),
+    // queued while the client reads nothing: the writer blocks in `write_all`.
+    const CHUNK: usize = 1 << 20;
+    const CHUNKS: usize = 64;
+    let payload = Bytes::from(vec![0u8; CHUNK]);
+    for _ in 0..CHUNKS {
+        assert!(broker.send("big", payload.clone()), "the client is connected");
+    }
+    drop(broker);
+    // Now read to the end: what the sockets held at the drop, then the close.
+    let mut buf = vec![0u8; 1 << 16];
+    let mut read = 0usize;
+    let ended = tokio::time::timeout(BOUND, async {
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => read += n,
+            }
+        }
+    })
+    .await;
+    let queued = CHUNK * CHUNKS;
+    assert!(read < queued / 2, "the dropped broker's writer went on writing: the client read {read} of the {queued} bytes queued for it");
+    assert!(ended.is_ok(), "the broker was dropped but a writer still holds the client's socket open ({read} bytes read)");
 }

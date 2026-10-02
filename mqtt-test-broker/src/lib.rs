@@ -71,6 +71,9 @@ struct Shared {
     to_client: Mutex<Option<mpsc::UnboundedSender<BytesMut>>>,
     /// Any change a test may wait for: a publish received, a subscription, a connection.
     changed: Notify,
+    /// Arrivals at the `held` lock (see `lock_held`).
+    #[cfg(test)]
+    held_lock_reached: AtomicUsize,
 }
 
 impl FakeBroker {
@@ -102,6 +105,8 @@ impl FakeBroker {
             held: Mutex::new(Vec::new()),
             to_client: Mutex::new(None),
             changed: Notify::new(),
+            #[cfg(test)]
+            held_lock_reached: AtomicUsize::new(0),
         });
         let task = tokio::spawn(serve(listener, shared.clone()));
         FakeBroker { shared, port, task }
@@ -132,7 +137,7 @@ impl FakeBroker {
     /// Stop acknowledging the client's QoS 1 publishes (see the module documentation). QoS 2
     /// publishes are still acknowledged.
     pub fn hold_acks(&self) {
-        let _held = self.shared.held.lock().unwrap();
+        let _held = lock_held(&self.shared);
         self.shared.hold_acks.store(true, Ordering::SeqCst);
     }
 
@@ -140,7 +145,7 @@ impl FakeBroker {
     /// go out under the `held` lock, so no ack decided meanwhile is left behind, and the released
     /// acks precede any later one.
     pub fn release_acks(&self) {
-        let mut held = self.shared.held.lock().unwrap();
+        let mut held = lock_held(&self.shared);
         self.shared.hold_acks.store(false, Ordering::SeqCst);
         let held = std::mem::take(&mut *held);
         if let Some(tx) = &*self.shared.to_client.lock().unwrap() {
@@ -152,7 +157,7 @@ impl FakeBroker {
 
     /// How many PUBACKs are being held right now.
     pub fn held_acks(&self) -> usize {
-        self.shared.held.lock().unwrap().len()
+        lock_held(&self.shared).len()
     }
 
     /// Every publish received so far, in order.
@@ -217,21 +222,32 @@ enum Read {
     NeedMore,
 }
 
+/// A task aborted when this is dropped. A plain `JoinHandle` detaches its task instead.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     let _ = stream.set_nodelay(true);
     let (mut rd, mut wr) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<BytesMut>();
     *shared.to_client.lock().unwrap() = Some(tx.clone());
-    shared.held.lock().unwrap().clear();
-    // Aborted when the client goes. When this task is aborted instead (the broker dropped), the
-    // writer ends when the last sender does: `to_client`'s, freed with the broker's `Shared`.
-    let writer = tokio::spawn(async move {
+    lock_held(&shared).clear();
+    // The writer goes with this task: when the client goes, and when the task is aborted (the
+    // broker dropped) — also while the writer is blocked in `write_all` on a client that stopped
+    // reading, which a detached writer survived, holding the client's socket open (review
+    // finding T4).
+    let _writer = AbortOnDrop(tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {
             if wr.write_all(&packet).await.is_err() {
                 break;
             }
         }
-    });
+    }));
     let mut buf = BytesMut::with_capacity(8 * 1024);
     'read: loop {
         loop {
@@ -253,18 +269,26 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
             Ok(_) => {}
         }
     }
-    writer.abort();
 }
 
 fn record(shared: &Shared, topic: String, payload: Bytes, qos: QoS, retain: bool) {
     shared.received.lock().unwrap().push(Received { topic, payload, qos, retain });
 }
 
+/// The `held` lock. Under test, each arrival at it is counted first, so a test can tell a thread
+/// has reached it — and decided whatever it decides before it — instead of sleeping on that
+/// (review finding T1).
+fn lock_held(shared: &Shared) -> std::sync::MutexGuard<'_, Vec<u16>> {
+    #[cfg(test)]
+    shared.held_lock_reached.fetch_add(1, Ordering::SeqCst);
+    shared.held.lock().unwrap()
+}
+
 /// Answer a QoS 1 publish now, or hold its ack — decided and done under the `held` lock, which the
 /// hold flag changes under: read first and pushed after, a release in between would take the held
 /// acks before this one joined them, and strand it (review finding X-7).
 fn ack_or_hold(shared: &Shared, tx: &mpsc::UnboundedSender<BytesMut>, pkid: u16) {
-    let mut held = shared.held.lock().unwrap();
+    let mut held = lock_held(shared);
     if shared.hold_acks.load(Ordering::SeqCst) {
         held.push(pkid);
     } else {
