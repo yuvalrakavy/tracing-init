@@ -1,6 +1,10 @@
 # Negative controls for the phase-3b tool changes (Store no-hang §14.2): wait-lint's name
-# collision, empty scan and raw-lock escapes; lock-order's Condvar. Run from Store with
-#     scripts/negative-control.py --root ../tracing-init ../tracing-init/docs/controls/2026-10-02-3b-tools-controls.toml
+# collision, empty scan and raw-lock escapes; lock-order's Condvar; the fake broker. The rows
+# after the first ten are the 3b review's fix pass (findings C-12..C-22, C-M3, X-4, X-7, X-8,
+# X-10). Run from Store with
+#     CARGO_TARGET_DIR=<a scratch dir> scripts/negative-control.py --root ../tracing-init ../tracing-init/docs/controls/2026-10-02-3b-tools-controls.toml
+# The scratch target dir matters: a row that builds wait-lint's binary (`--test cli`) builds it
+# from the mutant, and other sessions run `wait-lint/target/debug/wait-lint --write`.
 
 [[control]]
 name        = "the_condvar_checks_nothing_before_the_wait"
@@ -36,7 +40,7 @@ anchor      = '''                self.out.ambiguous.push((line, name.to_string()
 '''
 replacement = ""
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "is_ambiguous_until_declared"]
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "is_ambiguous_until_declared"]
 expect_text = "a_local_name_awaited_on_another_receiver_is_ambiguous_until_declared"
 guard       = "collision"
 
@@ -48,7 +52,7 @@ anchor      = '''                let on_self = matches!(see_through(&mc.receiver
 replacement = '''                let on_self = false;
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "is_ambiguous_until_declared"]
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "is_ambiguous_until_declared"]
 expect_text = "left: [5, 9]"
 guard       = "collision_self"
 
@@ -60,7 +64,7 @@ anchor      = '''        } else if method && self.waits_when_awaited(name) {
 replacement = '''        } else if method && self.waits_when_awaited(name) && !self.names.is_local_method(name) {
             (format!("`.{name}(..).await`"), false)'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "wins_over_this_codes_name"]
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "wins_over_this_codes_name"]
 expect_text = "a_declared_wait_method_wins_over_this_codes_name"
 guard       = "precedence"
 
@@ -70,7 +74,7 @@ file        = "wait-lint/src/lib.rs"
 anchor      = '''        if !names.values().any(|n| n.local_async.contains(name)) {'''
 replacement = '''        if false {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "a_stale_one_is_a_finding"]
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_stale_one_is_a_finding"]
 expect_text = "a_declared_local_method_is_this_codes_and_a_stale_one_is_a_finding"
 guard       = "stale_local"
 
@@ -80,7 +84,7 @@ file        = "wait-lint/src/lib.rs"
 anchor      = '''        report.files_scanned > 0 && !report.sites.is_empty(),'''
 replacement = '''        true,'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "refuses_a_scan_that_read_nothing"]
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "refuses_a_scan_that_read_nothing"]
 expect_text = "assert_registered_refuses_a_scan_that_read_nothing"
 guard       = "empty_scan"
 
@@ -91,19 +95,19 @@ anchor      = '''    ("std::sync", "Condvar"),
 '''
 replacement = ""
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "raw_condvars_aliases_and_globs"]
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "raw_condvars_aliases_and_globs"]
 expect_text = "raw_condvars_aliases_and_globs_are_raw_locks"
 guard       = "raw_condvar"
 
 [[control]]
 name        = "a_glob_import_passes"
 file        = "wait-lint/src/scan.rs"
-anchor      = '''            if lock_module(prefix) {
-                out.push((g.star_token.span.start().line, format!("{}::* (a glob import)", prefix.join("::"))));
-            }'''
-replacement = '''            let _ = g;'''
+anchor      = '''                if self.lock_module_in(prefix) {
+                    self.out.raw_locks.push((g.star_token.span.start().line, format!("{}::* (a glob import)", prefix.join("::"))));
+                }'''
+replacement = '''                let _ = g;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--", "raw_condvars_aliases_and_globs"]
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "raw_condvars_aliases_and_globs"]
 expect_text = "raw_condvars_aliases_and_globs_are_raw_locks"
 guard       = "raw_glob"
 
@@ -116,3 +120,390 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "held_acks_saturate"]
 expect_text = "the channel never filled: the acks are not being held"
 guard       = "fake_broker_saturation"
+
+# --- The 3b review's fix pass ---------------------------------------------------------------
+
+# lock-order: the Condvar (C-M3 / X-8, X-4 / C-11, C-22).
+
+[[control]]
+name        = "the_condvar_checks_the_reacquisition_after_the_wait"
+file        = "lock-order/src/sync.rs"
+anchor      = '''        let (inner, class, instance) = release_for_wait(guard, site);
+        map_lock(self.inner.wait(inner), |g| MutexGuard::new(g, class, instance, site))'''
+replacement = '''        let MutexGuard { _held, inner, class, instance } = guard;
+        drop(_held);
+        let woke = self.inner.wait(inner);
+        hooks::attempt(class, instance, site);
+        map_lock(woke, |g| MutexGuard::new(g, class, instance, site))'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_blocked_reacquisition_is_on_record"]
+expect_text = "the re-acquisition's order was not checked before the wait"
+guard       = "condvar_check_precedes_wait"
+
+[[control]]
+name        = "a_poisoned_wake_leaves_the_record_behind"
+file        = "lock-order/src/sync.rs"
+anchor      = '''        map_lock(self.inner.wait(inner), |g| MutexGuard::new(g, class, instance, site))'''
+replacement = '''        match self.inner.wait(inner) {
+            Ok(g) => Ok(MutexGuard::new(g, class, instance, site)),
+            Err(p) => {
+                let g = MutexGuard::new(p.into_inner(), class, instance, site);
+                hooks::released(&g._held.0);
+                Err(PoisonError::new(g))
+            }
+        }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_poisoned_wake_takes_the_class_back"]
+expect_text = "a poisoned wake left the waiter without its record"
+guard       = "condvar_poisoned_restore"
+
+[[control]]
+name        = "the_wait_while_predicate_runs_without_the_record"
+file        = "lock-order/src/sync.rs"
+anchor      = '''        while condition(&mut *guard) {
+            guard = self.wait(guard)?;
+        }
+        Ok(guard)'''
+replacement = '''        let site = Location::caller();
+        let (inner, class, instance) = release_for_wait(guard, site);
+        map_lock(self.inner.wait_while(inner, condition), |g| MutexGuard::new(g, class, instance, site))'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_wait_while_predicate_runs_holding"]
+expect_text = "the predicate ran without the guard's record (before the wait, after the wake)"
+guard       = "condvar_wait_while_predicate"
+
+[[control]]
+name        = "the_wait_timeout_while_predicate_runs_without_the_record"
+file        = "lock-order/src/sync.rs"
+anchor      = '''        let start = Instant::now();
+        loop {
+            if !condition(&mut *guard) {
+                return Ok((guard, wait_result(false)));
+            }
+            let Some(left) = dur.checked_sub(start.elapsed()) else {
+                return Ok((guard, wait_result(true)));
+            };
+            guard = self.wait_timeout(guard, left)?.0;
+        }'''
+replacement = '''        let site = Location::caller();
+        let (inner, class, instance) = release_for_wait(guard, site);
+        map_lock(self.inner.wait_timeout_while(inner, dur, condition), |(g, t)| (MutexGuard::new(g, class, instance, site), t))'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_wait_timeout_while_predicate_runs_holding"]
+expect_text = "the predicate ran without the guard's record: ["
+guard       = "condvar_wait_timeout_while_predicate"
+
+[[control]]
+name        = "the_wait_timeout_while_bound_restarts_at_each_wake"
+file        = "lock-order/src/sync.rs"
+anchor      = '''        let start = Instant::now();
+        loop {
+            if !condition(&mut *guard) {
+                return Ok((guard, wait_result(false)));
+            }
+            let Some(left) = dur.checked_sub(start.elapsed()) else {
+                return Ok((guard, wait_result(true)));
+            };
+            guard = self.wait_timeout(guard, left)?.0;
+        }'''
+replacement = '''        loop {
+            if !condition(&mut *guard) {
+                return Ok((guard, wait_result(false)));
+            }
+            let (g, result) = self.wait_timeout(guard, dur)?;
+            guard = g;
+            if result.timed_out() && condition(&mut *guard) {
+                return Ok((guard, result));
+            }
+        }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_wait_timeout_while_keeps_its_bound"]
+expect_text = "the bound restarted at each wake"
+guard       = "condvar_wait_timeout_while_bound"
+
+# lock-order: a guard's record goes before its lock (C-12), one row per guard type.
+
+[[control]]
+name        = "the_std_mutex_guard_unlocks_before_its_record_goes"
+file        = "lock-order/src/sync.rs"
+anchor      = '''    _held: Held,
+    inner: std::sync::MutexGuard<'a, T>,'''
+replacement = '''    inner: std::sync::MutexGuard<'a, T>,
+    _held: Held,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_std_guard_gives_up_its_record"]
+expect_text = "sync::MutexGuard: the lock was free while its holder's record was still on file"
+guard       = "drop_order_std_mutex"
+
+[[control]]
+name        = "the_std_read_guard_unlocks_before_its_record_goes"
+file        = "lock-order/src/sync.rs"
+anchor      = '''    _held: Held, // before `inner`: see `MutexGuard`
+    inner: std::sync::RwLockReadGuard<'a, T>,'''
+replacement = '''    inner: std::sync::RwLockReadGuard<'a, T>,
+    _held: Held,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_std_guard_gives_up_its_record"]
+expect_text = "sync::RwLockReadGuard: the lock was free while its holder's record was still on file"
+guard       = "drop_order_std_read"
+
+[[control]]
+name        = "the_std_write_guard_unlocks_before_its_record_goes"
+file        = "lock-order/src/sync.rs"
+anchor      = '''    _held: Held, // before `inner`: see `MutexGuard`
+    inner: std::sync::RwLockWriteGuard<'a, T>,'''
+replacement = '''    inner: std::sync::RwLockWriteGuard<'a, T>,
+    _held: Held,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_std_guard_gives_up_its_record"]
+expect_text = "sync::RwLockWriteGuard: the lock was free while its holder's record was still on file"
+guard       = "drop_order_std_write"
+
+[[control]]
+name        = "the_tokio_mutex_guard_unlocks_before_its_record_goes"
+file        = "lock-order/src/tokio_sync.rs"
+anchor      = '''    _held: Held,
+    inner: tokio::sync::MutexGuard<'a, T>,'''
+replacement = '''    inner: tokio::sync::MutexGuard<'a, T>,
+    _held: Held,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_tokio_guard_gives_up_its_record"]
+expect_text = "tokio_sync::MutexGuard: the lock was free while its holder's record was still on file"
+guard       = "drop_order_tokio_mutex"
+
+[[control]]
+name        = "the_tokio_owned_mutex_guard_unlocks_before_its_record_goes"
+file        = "lock-order/src/tokio_sync.rs"
+anchor      = '''    held: Held, // before `inner`: see `MutexGuard`
+    inner: tokio::sync::OwnedMutexGuard<T>,'''
+replacement = '''    inner: tokio::sync::OwnedMutexGuard<T>,
+    held: Held,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_tokio_guard_gives_up_its_record"]
+expect_text = "tokio_sync::OwnedMutexGuard: the lock was free while its holder's record was still on file"
+guard       = "drop_order_tokio_owned_mutex"
+
+[[control]]
+name        = "the_tokio_read_guard_unlocks_before_its_record_goes"
+file        = "lock-order/src/tokio_sync.rs"
+anchor      = '''    _held: Held, // before `inner`: see `MutexGuard`
+    inner: tokio::sync::RwLockReadGuard<'a, T>,'''
+replacement = '''    inner: tokio::sync::RwLockReadGuard<'a, T>,
+    _held: Held,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_tokio_guard_gives_up_its_record"]
+expect_text = "tokio_sync::RwLockReadGuard: the lock was free while its holder's record was still on file"
+guard       = "drop_order_tokio_read"
+
+[[control]]
+name        = "the_tokio_write_guard_unlocks_before_its_record_goes"
+file        = "lock-order/src/tokio_sync.rs"
+anchor      = '''    held: Held, // before `inner`: see `MutexGuard`
+    inner: tokio::sync::RwLockWriteGuard<'a, T>,'''
+replacement = '''    inner: tokio::sync::RwLockWriteGuard<'a, T>,
+    held: Held,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_tokio_guard_gives_up_its_record"]
+expect_text = "tokio_sync::RwLockWriteGuard: the lock was free while its holder's record was still on file"
+guard       = "drop_order_tokio_write"
+
+[[control]]
+name        = "the_tokio_owned_read_guard_unlocks_before_its_record_goes"
+file        = "lock-order/src/tokio_sync.rs"
+anchor      = '''    held: Held, // before `inner`: see `MutexGuard`
+    inner: tokio::sync::OwnedRwLockReadGuard<T>,'''
+replacement = '''    inner: tokio::sync::OwnedRwLockReadGuard<T>,
+    held: Held,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_tokio_guard_gives_up_its_record"]
+expect_text = "tokio_sync::OwnedRwLockReadGuard: the lock was free while its holder's record was still on file"
+guard       = "drop_order_tokio_owned_read"
+
+[[control]]
+name        = "the_tokio_owned_write_guard_unlocks_before_its_record_goes"
+file        = "lock-order/src/tokio_sync.rs"
+anchor      = '''    held: Held, // before `inner`: see `MutexGuard`
+    inner: tokio::sync::OwnedRwLockWriteGuard<T>,'''
+replacement = '''    inner: tokio::sync::OwnedRwLockWriteGuard<T>,
+    held: Held,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "lock-order/Cargo.toml", "--lib", "--", "a_tokio_guard_gives_up_its_record"]
+expect_text = "tokio_sync::OwnedRwLockWriteGuard: the lock was free while its holder's record was still on file"
+guard       = "drop_order_tokio_owned_write"
+
+# wait-lint: raw-lock escapes (C-14 / X-10), the bound-module false positive (C-15), the
+# module-alias refusal (C-22).
+
+[[control]]
+name        = "a_self_alias_of_a_lock_module_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''                let mut segs = prefix.clone();
+                if r.ident != "self" {
+                    segs.push(r.ident.to_string());
+                }'''
+replacement = '''                let mut segs = prefix.clone();
+                segs.push(r.ident.to_string());'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "raw_lock_escapes_through_self_aliases"]
+expect_text = "raw_lock_escapes_through_self_aliases_extern_crates_and_bound_modules_are_found"
+guard       = "raw_self_alias"
+
+[[control]]
+name        = "an_extern_crate_alias_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''            if lock_module(&segs) {
+                self.out.raw_locks.push((rename.span().start().line, format!("{} as {rename} (a module alias)", e.ident)));'''
+replacement = '''            if false {
+                self.out.raw_locks.push((rename.span().start().line, format!("{} as {rename} (a module alias)", e.ident)));'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "raw_lock_escapes_through_self_aliases"]
+expect_text = "raw_lock_escapes_through_self_aliases_extern_crates_and_bound_modules_are_found"
+guard       = "raw_extern_crate_alias"
+
+[[control]]
+name        = "a_glob_through_a_bound_module_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''                if self.lock_module_in(prefix) {'''
+replacement = '''                if lock_module(prefix) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "raw_lock_escapes_through_self_aliases"]
+expect_text = "raw_lock_escapes_through_self_aliases_extern_crates_and_bound_modules_are_found"
+guard       = "raw_glob_bound"
+
+[[control]]
+name        = "a_reexported_lock_module_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''                } else if public && self.lock_module_in(&segs) {'''
+replacement = '''                } else if public && false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_raw_lock_module_named_through_the_crate"]
+expect_text = "a_raw_lock_module_named_through_the_crate_is_found"
+guard       = "raw_reexport"
+
+[[control]]
+name        = "a_lock_module_named_through_the_crate_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''                reading.extend_from_slice(&rest[i + 1..]);
+                out.push(reading);'''
+replacement = '''                reading.extend_from_slice(&rest[i + 1..]);
+                let _ = reading;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_raw_lock_module_named_through_the_crate"]
+expect_text = "a_raw_lock_module_named_through_the_crate_is_found"
+guard       = "raw_crate_path"
+
+[[control]]
+name        = "parking_lot_s_other_locks_pass"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''    ("parking_lot", "ReentrantMutex"),
+    ("parking_lot", "FairMutex"),
+'''
+replacement = ""
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "every_parking_lot_and_lock_api_lock"]
+expect_text = "every_parking_lot_and_lock_api_lock_is_a_raw_lock"
+guard       = "raw_lock_kinds"
+
+[[control]]
+name        = "a_bound_module_is_read_as_written"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''            return self.uses.readings(segs).unwrap_or_else(|| vec![segs.to_vec()]);'''
+replacement = '''            return vec![segs.to_vec()];'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "the_wrappers_named_through_a_bound_module"]
+expect_text = "the_wrappers_named_through_a_bound_module_are_not_raw_locks"
+guard       = "raw_bound_wrapper"
+
+[[control]]
+name        = "a_module_alias_passes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''                } else if self.lock_module_in(&segs) {
+                    self.out.raw_locks.push((line, format!("{} as {} (a module alias)", segs.join("::"), r.rename)));'''
+replacement = '''                } else if false {
+                    self.out.raw_locks.push((line, format!("{} as {} (a module alias)", segs.join("::"), r.rename)));'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "raw_condvars_aliases_and_globs"]
+expect_text = "raw_condvars_aliases_and_globs_are_raw_locks"
+guard       = "raw_module_alias"
+
+# wait-lint: an imported function's name (C-16), the crate's own name, the empty scan (C-18).
+
+[[control]]
+name        = "an_imported_function_is_read_as_this_codes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''        if let Some(readings) = self.uses.readings(path) {
+            return if readings.iter().all(|r| self.names.is_local_fn(r)) { Callee::Local } else { Callee::Foreign };'''
+replacement = '''        if let Some(readings) = None::<Vec<Vec<String>>> {
+            return if readings.iter().all(|r| self.names.is_local_fn(r)) { Callee::Local } else { Callee::Foreign };'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "an_imported_function_named_like"]
+expect_text = "the imported `publish` is a wait"
+guard       = "collision_imported_fn"
+
+[[control]]
+name        = "a_name_a_dependency_s_glob_may_hold_is_this_codes"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''            return Callee::Ambiguous;'''
+replacement = '''            return Callee::Local;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "an_imported_function_named_like"]
+expect_text = "a dependency's glob may hold this `publish`"
+guard       = "collision_glob_fn"
+
+[[control]]
+name        = "the_crate_s_own_name_is_a_dependency"
+file        = "wait-lint/src/scan.rs"
+anchor      = '''            Some(first) => self.local_paths.contains(first) || self.own_crates.contains(first),'''
+replacement = '''            Some(first) => self.local_paths.contains(first),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_path_through_the_crate_s_own_name"]
+expect_text = "a_path_through_the_crate_s_own_name_is_this_code"
+guard       = "own_crate_name"
+
+[[control]]
+name        = "a_scan_that_found_no_wait_is_green"
+file        = "wait-lint/src/lib.rs"
+anchor      = '''        report.files_scanned > 0 && !report.sites.is_empty(),'''
+replacement = '''        report.files_scanned > 0,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "refuses_a_scan_that_found_no_wait"]
+expect_text = "assert_registered_refuses_a_scan_that_found_no_wait"
+guard       = "empty_scan_no_wait"
+
+[[control]]
+name        = "the_cli_passes_a_scan_that_found_no_wait"
+file        = "wait-lint/src/main.rs"
+anchor      = '''    if mode == "check" && (report.files_scanned == 0 || report.sites.is_empty()) {'''
+replacement = '''    if mode == "check" && report.files_scanned == 0 {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--test", "cli"]
+expect_text = "a scan that read files but found no wait must fail"
+guard       = "cli_empty_scan"
+
+# mqtt-test-broker: the hold/release race (X-7 / C-20), dropping the broker (C-19).
+
+[[control]]
+name        = "an_ack_is_decided_before_the_held_lock"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''    let mut held = shared.held.lock().unwrap();
+    if shared.hold_acks.load(Ordering::SeqCst) {
+        held.push(pkid);'''
+replacement = '''    let holding = shared.hold_acks.load(Ordering::SeqCst);
+    let mut held = shared.held.lock().unwrap();
+    if holding {
+        held.push(pkid);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "an_ack_decided_during_a_release"]
+expect_text = "an ack decided during a release was stranded"
+guard       = "fake_broker_ack_race"
+
+[[control]]
+name        = "a_dropped_broker_keeps_its_connections"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''        connections.spawn(connection(stream, shared.clone()));'''
+replacement = '''        drop(tokio::spawn(connection(stream, shared.clone())));
+        connections.spawn(async {});'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "dropping_the_broker_closes"]
+expect_text = "the broker was dropped but its connection still holds the client's socket open"
+guard       = "fake_broker_drop_connections"

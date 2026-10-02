@@ -53,6 +53,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   README, CONTRIBUTING guide, CHANGELOG, beacon-protocol spec, and Medium
   intro article.
 
+### Fixed
+- **`lock-order`: `Condvar::wait_while` / `wait_timeout_while`** loop over the wrapper's own
+  `wait` / `wait_timeout`, so the predicate (which runs under the mutex) runs holding the guard's
+  record: a lock taken in it is ordered after the condvar's mutex, and re-taking that mutex there
+  is reported. `wait_timeout_while` still bounds the whole wait.
+- **`lock-order`: a guard gives up its record before its lock**, in every `sync` and
+  `tokio_sync` guard: the next holder never finds the last one still on file (a wedge report
+  naming a holder that had let go; a flaky holder count).
+- **`wait-lint`: raw-lock escapes.** `use std::sync::{self as s}`, `extern crate parking_lot as
+  pl`, a `pub use` of a lock module, `crate::sync::Mutex` through a binding anywhere in the
+  crate, a glob through a bound module (`use std::sync; use sync::*`), parking_lot's
+  `ReentrantMutex`, `FairMutex` and `const_*` constructors, and `lock_api`'s locks are refused.
+  Paths are read through the file's `use`s, so `use lock_order::sync; sync::Mutex` is no longer
+  reported as raw.
+- **`wait-lint`: an imported function's name.** A call is read through the file's `use`s: `use
+  dep::publish; publish(..).await` is the dependency's wait even where this code defines an
+  `async fn publish`; a bare call to this code's async fn in a file that glob-imports from a
+  dependency is a collision for `wait-methods` / `local-methods`. `check_dirs` reads each crate's
+  `Cargo.toml` for its own name, so a `src/bin/` binary's `use my_crate::…` stays this code.
+- **`mqtt-test-broker`:** an ack's hold-or-send decision and its push are one step under the
+  `held` lock (a release could strand an ack); dropping the broker now closes its connections
+  (they kept acknowledging and held the client's socket open); the docs say QoS 2 is
+  acknowledged, never held.
+
 ## [0.2.0]
 
 ### Added
