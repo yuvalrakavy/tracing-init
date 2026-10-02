@@ -452,9 +452,9 @@ guard       = "collision_imported_fn"
 [[control]]
 name        = "a_name_a_dependency_s_glob_may_hold_is_this_codes"
 file        = "wait-lint/src/scan.rs"
-anchor      = '''        if path.len() == 1 && !self.uses.fns.contains(&path[0]) && self.uses.globs_outside(self.names) {
+anchor      = '''        if path.len() == 1 && !defined_here && self.uses.globs_outside(self.names) {
             return Callee::Ambiguous;'''
-replacement = '''        if path.len() == 1 && !self.uses.fns.contains(&path[0]) && self.uses.globs_outside(self.names) {
+replacement = '''        if path.len() == 1 && !defined_here && self.uses.globs_outside(self.names) {
             return Callee::Local;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "an_imported_function_named_like"]
@@ -585,12 +585,12 @@ guard       = "raw_glob_of_holder"
 [[control]]
 name        = "a_use_leading_out_of_this_code_is_ignored"
 file        = "wait-lint/src/scan.rs"
-anchor      = '''        let reach = self.names.reach(&self.module, path);
+anchor      = '''        let reach = self.names.reach(&scope, path);
         if reach.contains(&Reach::Outside) {
             return Callee::Foreign;
         }
 '''
-replacement = '''        let reach = self.names.reach(&self.module, path);
+replacement = '''        let reach = self.names.reach(&scope, path);
 '''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "wait-lint/Cargo.toml", "--lib", "--", "a_dependency_fn_"]

@@ -423,20 +423,27 @@ async fn f() {
     assert_eq!(untagged_lines(&r), vec![5, 6], "{:?}", r.sites);
 }
 
+/// An inline module's path is followed into the module (review finding T7); a local type's is
+/// this code's without being followed.
 #[test]
 fn a_local_path_is_delegated_and_a_dependency_path_is_not() {
     let src = "\
 mod helpers {
     pub async fn settle() {}
 }
+struct Pool;
+impl Pool {
+    pub async fn refill() {}
+}
 async fn f() {
     helpers::settle().await;
     crate::helpers::settle().await;
+    Pool::refill().await;
     tokio::settle().await;
 }
 ";
     let r = run(src);
-    assert_eq!(untagged_lines(&r), vec![7], "{:?}", r.sites);
+    assert_eq!(untagged_lines(&r), vec![12], "{:?}", r.sites);
 }
 
 #[test]
