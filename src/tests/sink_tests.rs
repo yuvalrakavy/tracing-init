@@ -235,7 +235,11 @@ fn the_total_is_reported_once_more_at_the_end() {
         "one total per destination that lost lines: {totals:?}"
     );
     let still = &totals[0];
-    assert_eq!(still.level, Level::WARN);
+    assert_eq!(
+        still.level,
+        Level::WARN,
+        "a destination still dropping ends the run at WARN: {still:?}"
+    );
     assert_eq!(still.field("dropped_total"), Some("7"));
     assert_eq!(still.field("still_dropping"), Some("true"));
     assert_eq!(

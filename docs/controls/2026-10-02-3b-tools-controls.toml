@@ -1,7 +1,8 @@
 # Negative controls for the phase-3b tool changes (Store no-hang §14.2): wait-lint's name
 # collision, empty scan and raw-lock escapes; lock-order's Condvar; the fake broker. The rows
 # after the first ten are the 3b review's fix pass (findings C-12..C-22, C-M3, X-4, X-7, X-8,
-# X-10); the rows at the end are the re-review's (T1..T4). Run from Store with
+# X-10); then the re-review's (T1..T4); the last 18 are tracing-init's own destinations (a
+# stuck destination costs lines, never a thread — Store no-hang 3b). Run from Store with
 #     CARGO_TARGET_DIR=<a scratch dir> scripts/negative-control.py --root ../tracing-init ../tracing-init/docs/controls/2026-10-02-3b-tools-controls.toml
 # The scratch target dir matters: a row that builds wait-lint's binary (`--test cli`) builds it
 # from the mutant, and other sessions run `wait-lint/target/debug/wait-lint --write`.
@@ -758,3 +759,210 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "dropping_the_broker_stops_a_writer"]
 expect_text = "the dropped broker's writer went on writing"
 guard       = "fake_broker_writer_abort"
+
+# ── tracing-init's own destinations: a stuck destination costs lines, never a thread ──
+
+[[control]]
+name        = "the_buffer_waits_instead_of_dropping"
+file        = "src/sink.rs"
+anchor      = '''        .lossy(true)'''
+replacement = '''        .lossy(false)'''
+crate       = "tracing-init"
+target      = "test:stalled_file"
+test        = "a_stalled_log_file_drops_lines_instead_of_blocking_the_threads_that_log"
+expect_text = "the threads that log blocked on the stalled log file"
+guard       = "lossy_buffer"
+
+[[control]]
+name        = "the_file_is_written_by_the_thread_that_logs"
+file        = "src/lib.rs"
+anchor      = '''        let (file_writer, sink) = sink::lossy("file", appender);'''
+replacement = '''        let (_unused, sink) = sink::lossy("file", std::io::sink());
+        let file_writer = appender;'''
+crate       = "tracing-init"
+target      = "test:stalled_file"
+test        = "a_stalled_log_file_drops_lines_instead_of_blocking_the_threads_that_log"
+expect_text = "the threads that log blocked on the stalled log file"
+guard       = "file_through_buffer"
+
+[[control]]
+name        = "the_console_is_written_by_the_thread_that_logs"
+file        = "src/lib.rs"
+anchor      = '''        let (writer, sink) = sink::lossy("console", std::io::stdout());'''
+replacement = '''        let (_unused, sink) = sink::lossy("console", std::io::sink());
+        let writer = std::io::stdout;'''
+crate       = "tracing-init"
+target      = "test:stalled_stdio"
+test        = "a_stalled_stdout_drops_lines_instead_of_blocking_the_threads_that_log"
+expect_text = "the child's threads blocked on its stalled stdout"
+guard       = "console_through_buffer"
+
+[[control]]
+name        = "a_note_waits_on_stderr"
+file        = "src/note.rs"
+anchor      = '''    let _ = writer.write_all(text.as_bytes());'''
+replacement = '''    let _ = &mut writer;
+    let _ = std::io::stderr().write_all(text.as_bytes());'''
+crate       = "tracing-init"
+target      = "test:stalled_stdio"
+test        = "a_stalled_stderr_does_not_block_init"
+expect_text = "the child's init blocked on its stalled stderr"
+guard       = "notes_never_wait"
+
+[[control]]
+name        = "the_gelf_socket_blocks"
+file        = "src/gelf.rs"
+anchor      = '''        socket.set_nonblocking(true)?;
+'''
+replacement = ""
+crate       = "tracing-init"
+target      = "lib"
+test        = "gelf::send_tests::the_gelf_socket_never_waits"
+expect_text = "the GELF socket waits"
+guard       = "gelf_nonblocking"
+
+[[control]]
+name        = "a_failed_gelf_send_is_not_counted"
+file        = "src/gelf.rs"
+anchor      = '''            None => self.counts.note_lost(),'''
+replacement = '''            None => {}'''
+crate       = "tracing-init"
+target      = "lib"
+test        = "gelf::send_tests::a_failed_send_is_counted_as_lost"
+expect_text = "the record that could not be sent is counted"
+guard       = "gelf_loss_counted"
+
+[[control]]
+name        = "a_refused_write_is_not_counted"
+file        = "src/sink.rs"
+anchor      = '''            Err(_) => self.counts.note_lost(),'''
+replacement = '''            Err(_) => {}'''
+crate       = "tracing-init"
+target      = "lib"
+test        = "tests::sink_tests::a_stream_that_refuses_a_line_loses_it_and_the_loss_is_counted"
+expect_text = "every refused line is a lost line"
+guard       = "write_failure_counted"
+
+[[control]]
+name        = "a_line_the_full_buffer_dropped_is_not_counted"
+file        = "src/sink.rs"
+anchor      = '''    let watch = Watch::new(destination, counts, Some(writer.error_counter()));'''
+replacement = '''    let watch = Watch::new(destination, counts, None);'''
+crate       = "tracing-init"
+target      = "test:stalled_file"
+test        = "a_stalled_log_file_drops_lines_instead_of_blocking_the_threads_that_log"
+expect_text = "no WARN kind=log_lines_dropped destination=file reached GELF"
+guard       = "buffer_drops_counted"
+
+[[control]]
+name        = "the_monitor_never_ticks"
+file        = "src/sink.rs"
+anchor      = '''stopped.recv_timeout(TICK)'''
+replacement = '''stopped.recv_timeout(TICK * 3_600)'''
+crate       = "tracing-init"
+target      = "test:stalled_file"
+test        = "a_stalled_log_file_drops_lines_instead_of_blocking_the_threads_that_log"
+expect_text = "no WARN kind=log_lines_dropped destination=file reached GELF"
+guard       = "monitor_runs"
+
+[[control]]
+name        = "a_loss_opens_no_episode"
+file        = "src/sink.rs"
+anchor      = '''            None if lost > self.lost_seen => {'''
+replacement = '''            None if false => {'''
+crate       = "tracing-init"
+target      = "lib"
+test        = "tests::sink_tests::a_loss_opens_one_episode_with_one_warn"
+expect_text = "one record per episode"
+guard       = "episode_warn"
+
+[[control]]
+name        = "an_episode_ends_without_a_delivery"
+file        = "src/sink.rs"
+anchor      = '''                if delivered > episode.delivered_at_last_loss
+'''
+replacement = '''                if true
+'''
+crate       = "tracing-init"
+target      = "lib"
+test        = "tests::sink_tests::a_destination_that_delivers_nothing_stays_in_its_episode"
+expect_text = "a destination that delivered nothing has not recovered"
+guard       = "recovery_needs_delivery"
+
+[[control]]
+name        = "an_episode_ends_without_the_quiet_period"
+file        = "src/sink.rs"
+anchor      = '''&& now.saturating_duration_since(episode.last_loss) >= QUIET =>'''
+replacement = '''&& true =>'''
+crate       = "tracing-init"
+target      = "lib"
+test        = "tests::sink_tests::an_episode_ends_once_lines_are_delivered_and_none_lost_for_the_quiet_period"
+expect_text = "the quiet period runs from the last loss"
+guard       = "recovery_quiet_period"
+
+[[control]]
+name        = "the_monitors_own_drop_is_a_new_loss"
+file        = "src/sink.rs"
+anchor      = '''        self.lost_seen = self.watch.lost();'''
+replacement = '''        self.lost_seen = lost;'''
+crate       = "tracing-init"
+target      = "lib"
+test        = "tests::sink_tests::the_monitors_own_record_dropped_by_the_stuck_destination_is_not_a_new_loss"
+expect_text = "the WARN's own drop restarted the quiet period"
+guard       = "own_record_absorbed"
+
+[[control]]
+name        = "no_total_at_the_guards_drop"
+file        = "src/sink.rs"
+anchor      = '''            w.report_total();'''
+replacement = '''            let _ = w;'''
+crate       = "tracing-init"
+target      = "test:stalled_file"
+test        = "a_stalled_log_file_drops_lines_instead_of_blocking_the_threads_that_log"
+expect_text = "dropping the guard reported no total for the file"
+guard       = "total_at_drop"
+
+[[control]]
+name        = "a_still_dropping_destination_ends_the_run_at_info"
+file        = "src/sink.rs"
+anchor      = '''        let still_dropping = self.episode.is_some() || dropped_total > self.lost_seen;'''
+replacement = '''        let still_dropping = false;'''
+crate       = "tracing-init"
+target      = "lib"
+test        = "tests::sink_tests::the_total_is_reported_once_more_at_the_end"
+expect_text = "a destination still dropping ends the run at WARN"
+guard       = "still_dropping_warn"
+
+[[control]]
+name        = "the_workers_flush_on_the_dropping_thread"
+file        = "src/guard.rs"
+anchor      = '''        sink::flush_within(workers, sink::FLUSH_BOUND);'''
+replacement = '''        drop(workers);'''
+crate       = "tracing-init"
+target      = "test:stalled_stdio"
+test        = "a_stalled_stdout_drops_lines_instead_of_blocking_the_threads_that_log"
+expect_text = "the child's guard did not drop within 10 s while its stdout was stalled"
+guard       = "bounded_flush"
+
+[[control]]
+name        = "a_destinations_start_waits_without_bound"
+file        = "src/lib.rs"
+anchor      = '''    match started.recv_timeout(bound) {'''
+replacement = '''    let _ = bound;
+    match started.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected) {'''
+crate       = "tracing-init"
+target      = "test:stalled_open"
+test        = "a_log_file_that_cannot_be_opened_does_not_stall_init"
+expect_text = "init did not return within 20 s with a FIFO nobody reads at the log path (fail)"
+guard       = "bounded_start"
+
+[[control]]
+name        = "a_skipped_destination_is_not_warned"
+file        = "src/lib.rs"
+anchor      = '''        for (destination, error) in &self.failed_destinations {'''
+replacement = '''        for (destination, error) in self.failed_destinations.iter().take(0) {'''
+crate       = "tracing-init"
+target      = "test:stalled_open"
+test        = "a_log_file_that_cannot_be_opened_does_not_stall_init"
+expect_text = "no WARN kind=log_destination_skipped destination=file reached GELF"
+guard       = "skip_warn"
