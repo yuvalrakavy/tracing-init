@@ -55,8 +55,9 @@
 //! level = "info"
 //! on_destination_error = "skip" # "fail" (default): init() errors when a
 //!                               # destination can't initialize; "skip":
-//!                               # stderr note + summary entry, continue
-//!                               # with the remaining destinations
+//!                               # stderr note + summary entry + a WARN on
+//!                               # the destinations that did start, continue
+//!                               # with them
 //!
 //! [logging.console]
 //! format = "pretty"
@@ -103,8 +104,10 @@ mod config;
 mod gelf;
 mod guard;
 pub mod loss;
+mod note;
 #[cfg(feature = "otel")]
 mod otel;
+mod sink;
 #[cfg(feature = "otel")]
 pub mod traceparent;
 
@@ -227,7 +230,47 @@ pub struct TracingInit {
     ignore_env_vars: bool,
 }
 
+#[cfg(feature = "tokio-console")]
 type BoxedLayer = Option<Box<dyn Layer<Registry> + Send + Sync + 'static>>;
+
+/// A stream destination's layer, with its writing side: what watches it for lost lines, and
+/// the worker the guard flushes.
+type DestinationLayer = (Box<dyn Layer<Registry> + Send + Sync + 'static>, sink::Sink);
+
+/// How long a destination may take to start: opening the log file, resolving the GELF host.
+///
+/// A FIFO nobody reads at the log path, or a stalled file system, blocks the open without end,
+/// and a name lookup waits on the network. Past the bound the destination did not start, and
+/// `on_destination_error` decides: `init` returns the error, or goes on without it.
+#[cfg(any(feature = "file", feature = "gelf"))]
+const DESTINATION_START_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run a destination's start on a thread of its own, waiting for it at most `bound`.
+///
+/// Past the bound the thread is abandoned: it ends when its call returns, or with the process.
+/// A start that completes after it was abandoned drops what it made (an open file is closed).
+#[cfg(any(feature = "file", feature = "gelf"))]
+fn start_within<T: Send + 'static>(
+    what: &str,
+    bound: std::time::Duration,
+    start: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let (started_tx, started) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("tracing-init-start".into())
+        .spawn(move || {
+            let _ = started_tx.send(start());
+        })?;
+    match started.recv_timeout(bound) {
+        Ok(result) => Ok(result?),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("{what} did not finish within {} s", bound.as_secs()).into())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("{what} panicked").into())
+        }
+    }
+}
 
 impl TracingInit {
     /// Create a new builder with the given application name.
@@ -316,8 +359,11 @@ impl TracingInit {
     /// unresolvable GELF host, an unwritable log directory): `Fail`
     /// propagates the error out of [`init`](Self::init) (the default);
     /// `Skip` prints a note to stderr, records the failure in the
-    /// summary, and continues with the remaining destinations — for
-    /// long-lived daemons where telemetry must never prevent startup.
+    /// summary, logs a WARN `kind = "log_destination_skipped"` (`destination`,
+    /// `error`) to the destinations that did start, and continues with them —
+    /// for long-lived daemons where telemetry must never prevent startup.
+    /// A destination whose start (opening the log file, resolving the GELF
+    /// host) takes longer than 5 seconds has failed to initialize.
     /// Config key: `on_destination_error = "fail" | "skip"`.
     pub fn on_destination_error(&mut self, v: types::OnDestinationError) -> &mut Self {
         self.on_destination_error = Some(v);
@@ -618,11 +664,20 @@ impl TracingInit {
     ///
     /// Returns a [`TracingGuard`] that holds resources and provides a summary.
     ///
+    /// Nothing here, and nothing a thread that logs does afterwards, waits on a destination
+    /// without a bound. A destination's start — opening the log file, resolving the GELF
+    /// host — gets 5 seconds, after which it has failed. The console and the log file are
+    /// written by threads of their own through bounded, lossy buffers, and GELF never waits to
+    /// send: a destination that stops taking lines loses lines, which are counted and reported
+    /// on the other destinations (WARN `kind = "log_lines_dropped"`), never a thread.
+    ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The log file directory cannot be created or written to.
-    /// - The GELF server address cannot be resolved.
+    /// Returns an error if (under `on_destination_error = "skip"`, the destination is skipped
+    /// instead, with a WARN `kind = "log_destination_skipped"` on the ones that did start):
+    /// - The log file directory cannot be created or written to, or opening the file did not
+    ///   finish within 5 seconds.
+    /// - The GELF server address cannot be resolved, or not within 5 seconds.
     /// - The filter directive string is invalid.
     pub fn init(&mut self) -> Result<TracingGuard, Box<dyn std::error::Error>> {
         if !self.ignore_env_vars {
@@ -649,22 +704,34 @@ impl TracingInit {
 
         let skip_on_error = self.on_destination_error == Some(types::OnDestinationError::Skip);
 
+        // Each destination's writing side: watched for lost lines, flushed by the guard.
+        let mut sinks: Vec<sink::Sink> = Vec::new();
+
         match self.get_console_layer() {
-            Ok(Some(layer)) => layers.push(layer),
+            Ok(Some((layer, s))) => {
+                layers.push(layer);
+                sinks.push(s);
+            }
             Ok(None) => {}
             Err(e) if skip_on_error => self.note_destination_failure("console", &*e),
             Err(e) => return Err(e),
         }
         #[cfg(feature = "file")]
         match self.get_file_layer() {
-            Ok(Some(layer)) => layers.push(layer),
+            Ok(Some((layer, s))) => {
+                layers.push(layer);
+                sinks.push(s);
+            }
             Ok(None) => {}
             Err(e) if skip_on_error => self.note_destination_failure("file", &*e),
             Err(e) => return Err(e),
         }
         #[cfg(feature = "gelf")]
         match self.get_gelf_layer() {
-            Ok(Some(layer)) => layers.push(layer),
+            Ok(Some((layer, s))) => {
+                layers.push(layer);
+                sinks.push(s);
+            }
             Ok(None) => {}
             Err(e) if skip_on_error => self.note_destination_failure("gelf", &*e),
             Err(e) => return Err(e),
@@ -676,7 +743,7 @@ impl TracingInit {
         #[cfg(not(feature = "tokio-console"))]
         {
             if self.destination.as_ref().is_some_and(|d| d.contains('t')) {
-                eprintln!("Warning: Destination 't' (tokio-console) requested but feature not enabled — skipping");
+                note::note(format_args!("Warning: Destination 't' (tokio-console) requested but feature not enabled — skipping"));
             }
         }
 
@@ -784,18 +851,35 @@ impl TracingInit {
         #[cfg(not(feature = "otel"))]
         {
             if self.destination.as_ref().is_some_and(|d| d.contains('o')) {
-                eprintln!(
+                note::note(format_args!(
                     "Warning: Destination 'o' requested but 'otel' feature not enabled — skipping"
-                );
+                ));
             }
         }
 
         tracing_subscriber::registry().with(layers).init();
 
+        // Said once the subscriber is installed, so the destinations that did start carry it.
+        for (destination, error) in &self.failed_destinations {
+            tracing::warn!(
+                kind = "log_destination_skipped",
+                destination = destination.as_str(),
+                error = error.as_str(),
+                "log destination skipped: it could not start"
+            );
+        }
+
+        let mut workers = Vec::new();
+        let mut watches = Vec::new();
+        for s in sinks {
+            watches.push(s.watch);
+            workers.extend(s.worker);
+        }
+
         Ok(TracingGuard {
             summary_text: self.build_summary(),
-            #[cfg(feature = "file")]
-            _file_guard: None, // TODO: use non_blocking writer in future
+            workers,
+            monitor: sink::Monitor::start(watches),
             #[cfg(feature = "otel")]
             tracer_provider,
             #[cfg(feature = "otel")]
@@ -878,7 +962,10 @@ impl TracingInit {
             .from_env_lossy())
     }
 
-    fn get_console_layer(&self) -> Result<BoxedLayer, Box<dyn std::error::Error>> {
+    /// The console: stdout, written by a worker thread of its own through a lossy buffer, so a
+    /// stdout whose reader stalled (a supervisor's pipe, journald, `tee`) costs lines, never the
+    /// thread that logged (`sink.rs`).
+    fn get_console_layer(&self) -> Result<Option<DestinationLayer>, Box<dyn std::error::Error>> {
         if !self.is_dest_enabled('c') {
             return Ok(None);
         }
@@ -903,6 +990,7 @@ impl TracingInit {
             .unwrap_or(types::SpanEvents::NONE)
             .to_fmt_span();
 
+        let (writer, sink) = sink::lossy("console", std::io::stdout());
         let layer = match format {
             types::Format::Pretty => tracing_subscriber::fmt::layer()
                 .pretty()
@@ -912,7 +1000,7 @@ impl TracingInit {
                 .with_file(file_line)
                 .with_line_number(file_line)
                 .with_span_events(span_events)
-                .with_writer(std::io::stdout)
+                .with_writer(writer)
                 .boxed(),
             types::Format::Json => tracing_subscriber::fmt::layer()
                 .json()
@@ -922,7 +1010,7 @@ impl TracingInit {
                 .with_file(file_line)
                 .with_line_number(file_line)
                 .with_span_events(span_events)
-                .with_writer(std::io::stdout)
+                .with_writer(writer)
                 .boxed(),
             types::Format::Compact => tracing_subscriber::fmt::layer()
                 .compact()
@@ -932,7 +1020,7 @@ impl TracingInit {
                 .with_file(file_line)
                 .with_line_number(file_line)
                 .with_span_events(span_events)
-                .with_writer(std::io::stdout)
+                .with_writer(writer)
                 .boxed(),
             types::Format::Full => tracing_subscriber::fmt::layer()
                 .with_ansi(ansi)
@@ -941,14 +1029,19 @@ impl TracingInit {
                 .with_file(file_line)
                 .with_line_number(file_line)
                 .with_span_events(span_events)
-                .with_writer(std::io::stdout)
+                .with_writer(writer)
                 .boxed(),
         };
-        Ok(Some(layer.with_filter(filter).boxed()))
+        Ok(Some((layer.with_filter(filter).boxed(), sink)))
     }
 
+    /// The log file. Its open runs within [`DESTINATION_START_BOUND`], since a FIFO nobody reads
+    /// at the log path or a stalled file system blocks it without end; its lines are written by
+    /// a worker thread of its own through a lossy buffer, so a file that stops taking writes
+    /// costs lines, never the thread that logged (`sink.rs`). Rotation, and the pruning of old
+    /// files, run on that worker too.
     #[cfg(feature = "file")]
-    fn get_file_layer(&self) -> Result<BoxedLayer, Box<dyn std::error::Error>> {
+    fn get_file_layer(&self) -> Result<Option<DestinationLayer>, Box<dyn std::error::Error>> {
         if !self.is_dest_enabled('f') {
             return Ok(None);
         }
@@ -971,14 +1064,23 @@ impl TracingInit {
 
         let rotation_str = self.file_rotation.as_deref().unwrap_or("d:3");
         let (rotation, max_files) = Self::parse_rotation_string(rotation_str);
-        let file_path = self.file_path.as_deref().unwrap_or("");
+        let file_path = self.file_path.clone().unwrap_or_default();
 
-        let file_writer = tracing_appender::rolling::RollingFileAppender::builder()
+        let appender = tracing_appender::rolling::RollingFileAppender::builder()
             .filename_prefix(&self.file_prefix)
             .filename_suffix("log")
             .rotation(rotation)
-            .max_log_files(max_files)
-            .build(file_path)?;
+            .max_log_files(max_files);
+        let shown = if file_path.is_empty() {
+            "."
+        } else {
+            &file_path
+        };
+        let opening = format!("opening the log file in '{shown}'");
+        let appender = start_within(&opening, DESTINATION_START_BOUND, move || {
+            appender.build(file_path).map_err(|e| e.to_string())
+        })?;
+        let (file_writer, sink) = sink::lossy("file", appender);
 
         let format = self
             .dest_settings
@@ -1025,7 +1127,7 @@ impl TracingInit {
                 .with_writer(file_writer)
                 .boxed(),
         };
-        Ok(Some(layer.with_filter(filter).boxed()))
+        Ok(Some((layer.with_filter(filter).boxed(), sink)))
     }
 
     /// Build the `console-subscriber` layer.
@@ -1051,7 +1153,7 @@ impl TracingInit {
                     builder = builder.server_addr(sa);
                 }
                 Err(e) => {
-                    eprintln!("Warning: tokio_console_bind '{}' is not a valid SocketAddr: {} — using default", addr, e);
+                    note::note(format_args!("Warning: tokio_console_bind '{}' is not a valid SocketAddr: {} — using default", addr, e));
                 }
             }
         }
@@ -1068,20 +1170,37 @@ impl TracingInit {
         self
     }
 
+    /// GELF. Its start resolves the server's name, which waits on the network, so it runs
+    /// within [`DESTINATION_START_BOUND`]; its sends never wait (`gelf.rs`).
     #[cfg(feature = "gelf")]
-    fn get_gelf_layer(&self) -> Result<BoxedLayer, Box<dyn std::error::Error>> {
+    fn get_gelf_layer(&self) -> Result<Option<DestinationLayer>, Box<dyn std::error::Error>> {
         if !self.is_dest_enabled('g') {
             return Ok(None);
         }
         let filter = self.build_env_filter("gelf")?;
-        let addr = self.gelf_address.as_deref().unwrap_or("localhost:12201");
-        let service = self.service_name.as_deref().unwrap_or(&self.app_name);
-        let mut fields: Vec<(&str, String)> = vec![("app", self.app_name.clone())];
-        for (k, v) in &self.gelf_extra_fields {
-            fields.push((k.as_str(), v.clone()));
-        }
-        let layer = gelf::GelfLayer::new(addr, fields, Some(service.to_string()))?;
-        Ok(Some(layer.with_filter(filter).boxed()))
+        let addr = self
+            .gelf_address
+            .clone()
+            .unwrap_or_else(|| "localhost:12201".to_string());
+        let service = self
+            .service_name
+            .clone()
+            .unwrap_or_else(|| self.app_name.clone());
+        let mut fields: Vec<(String, String)> = vec![("app".to_string(), self.app_name.clone())];
+        fields.extend(self.gelf_extra_fields.iter().cloned());
+        let starting = format!("resolving the GELF address '{addr}'");
+        let layer = start_within(&starting, DESTINATION_START_BOUND, move || {
+            let fields = fields
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            gelf::GelfLayer::new(&addr, fields, Some(service)).map_err(|e| e.to_string())
+        })?;
+        let sink = sink::Sink {
+            watch: layer.watch(),
+            worker: None,
+        };
+        Ok(Some((layer.with_filter(filter).boxed(), sink)))
     }
 
     /// Parse a rotation string like `"d:3"` into a rotation policy and backup count.
@@ -1211,7 +1330,7 @@ impl TracingInit {
             if let Some(ref s) = config.on_destination_error {
                 match s.parse::<types::OnDestinationError>() {
                     Ok(v) => self.on_destination_error = Some(v),
-                    Err(e) => eprintln!("tracing-init: {e} — using \"fail\""),
+                    Err(e) => note::note(format_args!("tracing-init: {e} — using \"fail\"")),
                 }
             }
         }
@@ -1419,11 +1538,13 @@ impl TracingInit {
     }
 
     /// Record a destination that failed to initialize under
-    /// `on_destination_error = "skip"`: stderr note now, summary entry later.
+    /// `on_destination_error = "skip"`: stderr note now (one that never waits on stderr),
+    /// then a summary entry and a WARN `kind = "log_destination_skipped"` on the destinations
+    /// that did start, once the subscriber is installed.
     fn note_destination_failure(&mut self, dest: &str, e: &dyn std::error::Error) {
-        eprintln!(
+        note::note(format_args!(
             "tracing-init: {dest} destination failed to initialize: {e} — continuing without it (on_destination_error = \"skip\")"
-        );
+        ));
         self.failed_destinations
             .push((dest.to_string(), e.to_string()));
     }

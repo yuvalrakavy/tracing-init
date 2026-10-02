@@ -54,6 +54,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   intro article.
 
 ### Fixed
+- **A destination that stops taking writes no longer stalls the threads that log** (Store
+  no-hang 3b). The log file was written synchronously by every thread that logged (the
+  `non_blocking` writer was a TODO), and so was stdout: a stalled file system, a FIFO at the
+  log path, or a stdout pipe whose reader stopped (journald, a supervisor, `tee`) blocked every
+  such thread — shutdown paths included — once the buffer filled. Both are now written by a
+  thread of their own through tracing-appender's lossy non-blocking writer (128,000 lines); the
+  guard keeps the worker and flushes it on drop. GELF sends on a non-blocking socket (a blocking
+  UDP send waits for room a stalled interface queue never makes). tracing-init's own stderr
+  notes (a skipped destination, the OTel circuit breaker, the beacon listener on the program's
+  tokio runtime) go through a small lossy writer of their own. Console and file lines are now
+  written a moment after the call that logged them, so a process that ends without dropping its
+  guard can lose the last few.
+- **Lost log lines are counted and reported, never silent.** Each stream destination counts
+  the lines it delivered and lost (a full buffer, a failed write); GELF counts failed sends. A
+  monitor thread logs WARN `kind = "log_lines_dropped"` when a destination starts losing lines,
+  INFO when it has delivered again and lost nothing for 10 s (with the episode's count and
+  `lasted_ms`), and the guard's drop reports each destination's total once more — WARN while it
+  is still dropping. The records reach the destinations that still work.
+- **A destination's start is bounded.** Opening the log file (blocked without end by a FIFO
+  nobody reads, or a stalled file system) and resolving the GELF host (a name lookup) each get
+  5 s; past that the destination has failed to initialize. Under `on_destination_error =
+  "skip"` a skipped destination is now also a WARN `kind = "log_destination_skipped"`
+  (`destination`, `error`) on the destinations that did start.
+- **The guard's drop is bounded** (about 4 s at most): tracing-appender's `WorkerGuard` drop
+  waits at most 1.1 s, except that when its shutdown hand-over times out — a full buffer — it
+  `println!`s to stdout, which waits without bound on a stalled stdout. Each worker is flushed on
+  a thread of its own, abandoned at 1.5 s.
 - **`lock-order`: `Condvar::wait_while` / `wait_timeout_while`** loop over the wrapper's own
   `wait` / `wait_timeout`, so the predicate (which runs under the mutex) runs holding the guard's
   record: a lock taken in it is ordered after the condvar's mutex, and re-taking that mutex there

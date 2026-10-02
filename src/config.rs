@@ -147,8 +147,9 @@ pub struct LoggingConfig {
     pub service_name: Option<String>,
     /// What to do when a destination fails to initialize: `"fail"`
     /// (default — `init()` returns the error) or `"skip"` (print a note
-    /// to stderr, record it in the summary, continue with the remaining
-    /// destinations). For long-lived daemons where telemetry must never
+    /// to stderr, record it in the summary, WARN `kind =
+    /// "log_destination_skipped"` on the destinations that did start, and
+    /// continue with them). For long-lived daemons where telemetry must never
     /// prevent startup.
     pub on_destination_error: Option<String>,
     /// Console-specific settings.

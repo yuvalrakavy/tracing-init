@@ -2,7 +2,8 @@
 //!
 //! Silently drops exports when the collector is unreachable, avoiding
 //! repeated error messages from the batch processor. State transitions
-//! are logged once via `eprintln!`.
+//! are noted once on stderr, through a writer that never waits on it
+//! (`note.rs`): the notes are written on the exporters' threads.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -181,11 +182,11 @@ impl CircuitState {
             // (transition from Open/HalfOpen to Closed), not on every
             // successful export while already Closed.
             self.has_logged_offline.store(false, Ordering::Relaxed);
-            eprintln!(
+            crate::note::note(format_args!(
                 "[{}] [{}] OTel collector online, sending traces",
                 now_timestamp(),
                 self.app_name
-            );
+            ));
         }
     }
 
@@ -224,10 +225,10 @@ impl CircuitState {
         // Log exactly once per offline period using atomic flag
         if !self.has_logged_offline.swap(true, Ordering::AcqRel) {
             let secs = self.reprobe_interval_ms / 1000;
-            eprintln!(
+            crate::note::note(format_args!(
                 "[{}] [{}] OTel collector not online. Start the collector and traces will begin flowing within {secs}s",
                 now_timestamp(), self.app_name
-            );
+            ));
         }
     }
 
@@ -257,11 +258,11 @@ impl CircuitState {
         self.failure_count.store(0, Ordering::Relaxed);
         self.has_logged_offline.store(false, Ordering::Relaxed);
         if prev != CLOSED {
-            eprintln!(
+            crate::note::note(format_args!(
                 "[{}] [{}] OTel collector online, sending traces",
                 now_timestamp(),
                 self.app_name
-            );
+            ));
         }
     }
 
@@ -272,10 +273,10 @@ impl CircuitState {
         self.last_probe_ms.store(self.now_ms(), Ordering::Relaxed);
         if !self.has_logged_offline.swap(true, Ordering::AcqRel) {
             let secs = self.reprobe_interval_ms / 1000;
-            eprintln!(
+            crate::note::note(format_args!(
                 "[{}] [{}] OTel collector not online. Start the collector and traces will begin flowing within {secs}s",
                 now_timestamp(), self.app_name
-            );
+            ));
         }
     }
 }

@@ -7,4 +7,5 @@ mod guard_tests;
 #[cfg(feature = "config")]
 mod integration_tests;
 mod loss_tests;
+mod sink_tests;
 mod types_tests;

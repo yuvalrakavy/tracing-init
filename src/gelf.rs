@@ -3,9 +3,14 @@
 //! Sends JSON-encoded [GELF 1.1](https://go2docs.graylog.org/current/getting_in_log_data/gelf.html)
 //! messages over a `std::net::UdpSocket`. The implementation is deliberately simple:
 //!
-//! - **No async runtime required** -- uses blocking UDP sends.
-//! - **No background threads or channels** -- each event is serialized and sent inline.
-//! - **Best-effort delivery** -- send failures are silently ignored (standard for UDP logging).
+//! - **No async runtime required** -- each event is serialized and sent inline.
+//! - **Never waits** -- the socket is non-blocking. A blocking UDP send waits for room in the
+//!   socket's send buffer, which a stalled interface queue never makes, holding the thread that
+//!   logged; here that send fails at once instead.
+//! - **Best-effort delivery, counted loss** -- a send that fails loses its record, as UDP does
+//!   on the wire, but the failure is counted and reported like any destination's lost lines
+//!   (`sink.rs`). "Delivered" means handed to the kernel; a datagram lost in the network is not
+//!   seen.
 //!
 //! # GELF Field Mapping
 //!
@@ -32,12 +37,15 @@
 
 use serde_json::{json, Map, Value};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::Arc;
 use tracing::field::{Field, Visit};
 use tracing::Level;
 use tracing_log::NormalizeEvent;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
+
+use crate::sink::{LineCounts, Watch};
 
 /// A [`tracing_subscriber::Layer`] that sends events as GELF messages over UDP.
 ///
@@ -48,6 +56,7 @@ pub struct GelfLayer {
     addr: SocketAddr,
     base_fields: Map<String, Value>,
     service_name: Option<String>,
+    counts: Arc<LineCounts>,
 }
 
 impl GelfLayer {
@@ -58,7 +67,8 @@ impl GelfLayer {
     ///
     /// # Errors
     ///
-    /// Returns an error if the address cannot be resolved or the UDP socket cannot be bound.
+    /// Returns an error if the address cannot be resolved, or the UDP socket cannot be bound or
+    /// made non-blocking.
     pub fn new(
         addr: &str,
         additional_fields: Vec<(&str, String)>,
@@ -75,6 +85,7 @@ impl GelfLayer {
             "[::]:0"
         };
         let socket = UdpSocket::bind(bind_addr)?;
+        socket.set_nonblocking(true)?;
 
         let hostname = hostname::get()
             .unwrap_or_else(|_| "unknown".into())
@@ -93,7 +104,13 @@ impl GelfLayer {
             addr: resolved,
             base_fields,
             service_name,
+            counts: Arc::new(LineCounts::default()),
         })
+    }
+
+    /// This destination's counts, for the loss monitor.
+    pub(crate) fn watch(&self) -> Watch {
+        Watch::new("gelf", self.counts.clone(), None)
     }
 }
 
@@ -384,9 +401,65 @@ where
             fields.insert("short_message".into(), json!(""));
         }
 
-        // Best-effort send -- silently drop on failure
-        if let Ok(bytes) = serde_json::to_vec(&Value::Object(fields)) {
-            let _ = self.socket.send_to(&bytes, self.addr);
+        // Best-effort and never waiting: a record that cannot be sent now is lost, and counted.
+        let sent = serde_json::to_vec(&Value::Object(fields))
+            .ok()
+            .and_then(|bytes| self.socket.send_to(&bytes, self.addr).ok());
+        match sent {
+            Some(_) => self.counts.note_delivered(),
+            None => self.counts.note_lost(),
         }
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::GelfLayer;
+    use std::time::{Duration, Instant};
+
+    /// The socket's mode is what decides whether a send can wait: a blocking UDP socket whose
+    /// send buffer is full (a stalled interface queue) waits in `send_to` for room, holding
+    /// the thread that logged. A full send buffer cannot be produced over loopback, so the
+    /// mode is read through the one call that shows it without one — a receive with nothing
+    /// to read returns at once on a non-blocking socket and waits out its timeout otherwise.
+    #[test]
+    fn the_gelf_socket_never_waits() {
+        let layer = GelfLayer::new("127.0.0.1:9", vec![], None).expect("a GELF layer");
+        layer
+            .socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("a read timeout");
+        let started = Instant::now();
+        let mut buf = [0u8; 16];
+        let received = layer.socket.recv_from(&mut buf);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "the GELF socket waits: a receive with nothing to read took {took:?} ({received:?}), so a \
+             send into a full buffer would hold the thread that logged"
+        );
+    }
+
+    /// A send that fails loses its record, and the loss is counted for the monitor; a send the
+    /// kernel takes is counted as delivered. A record past UDP's 64 KiB limit cannot be sent.
+    #[test]
+    fn a_failed_send_is_counted_as_lost() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").expect("a listener");
+        let address = listener.local_addr().expect("its address").to_string();
+        let layer = GelfLayer::new(&address, vec![], None).expect("a GELF layer");
+        let watch = layer.watch();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("a record that fits");
+            tracing::info!(padding = %"x".repeat(70_000), "a record that does not");
+        });
+        assert_eq!(watch.delivered(), 1, "the record that fits was sent");
+        assert_eq!(
+            watch.lost(),
+            1,
+            "the record that could not be sent is counted"
+        );
     }
 }

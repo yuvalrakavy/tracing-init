@@ -13,7 +13,10 @@ categories = ["development-tools::debugging"]
 [features]
 default = ["config", "file", "gelf"]
 config = ["dep:toml", "dep:serde"]
-file = ["dep:tracing-appender"]
+# The rotating file destination. tracing-appender itself is not optional: its lossy
+# non-blocking writer carries the console and stderr too, so a stalled stream never
+# blocks a thread that logs.
+file = []
 gelf = ["dep:serde_json", "dep:hostname", "dep:tracing-log"]
 otel = [
     "dep:opentelemetry",
@@ -44,8 +47,9 @@ console-subscriber = { version = "0.4", optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 
-# Optional - file
-tracing-appender = { version = "0.2", optional = true }
+# The lossy non-blocking writer every stream destination writes through; the
+# rotating file appender for `file`.
+tracing-appender = "0.2"
 
 # Optional - gelf
 serde_json = { version = "1", optional = true }

@@ -94,7 +94,7 @@ address = "graylog.internal:12201"
 | Feature     | Default | Pulls in                                                | What you get                                  |
 |-------------|---------|---------------------------------------------------------|-----------------------------------------------|
 | `config`    | yes     | `toml`, `serde`                                          | TOML configuration files                       |
-| `file`      | yes     | `tracing-appender`                                       | Rotating file appender                         |
+| `file`      | yes     | — (`tracing-appender` is always in: its non-blocking writer carries the console too) | Rotating file appender |
 | `gelf`      | yes     | `serde_json`, `hostname`                                 | GELF 1.1 over UDP                              |
 | `otel`      | no      | `opentelemetry`, `opentelemetry_sdk`, `tokio`, …         | OTLP/HTTP traces + logs, circuit breaker, beacon |
 | `otel-grpc` | no      | adds `tonic` to `opentelemetry-otlp`                     | gRPC transport for OTLP                        |
@@ -240,11 +240,43 @@ println!("{}", guard.summary());
 
 `Display` and `Debug` are implemented; printing the guard prints a one-line summary of every active destination, which is handy as the first log line of a service.
 
-On drop the guard:
+On drop the guard, every step of it bounded:
 
-1. Aborts the OTel beacon listener (if any).
-2. Calls `provider.shutdown_with_timeout(1s)` on the tracer and logger providers. We cap shutdown at one second so an unreachable collector cannot hang `main` — the circuit breaker has already filtered the queue.
-3. Drops the file appender's worker guard, flushing buffered writes.
+1. Stops the log-loss monitor and reports, once more, every destination that lost lines (below), within 0.5 s.
+2. Aborts the OTel beacon listener (if any).
+3. Calls `provider.shutdown_with_timeout(1s)` on the tracer and logger providers. We cap shutdown at one second so an unreachable collector cannot hang `main` — the circuit breaker has already filtered the queue.
+4. Flushes the console, the log file and `tracing-init`'s own stderr notes, each on a thread of its own, waiting at most 1.5 s for all. A destination that is stuck keeps what it still holds; nothing waits on it past the bound. At most about 4 s in all.
+
+## A destination that stops taking writes
+
+A log file on a stalled file system, a FIFO nobody reads at the log path, a stdout pipe whose
+reader stopped (a supervisor, journald, `tee`), an interface queue that never drains: none of
+them stalls a thread that logs.
+
+- **The console and the log file** are written by a thread of their own, through a bounded,
+  lossy buffer (tracing-appender's non-blocking writer, 128,000 lines). A thread that logs
+  hands its line over and returns; a line that does not fit is dropped and counted. A write the
+  stream refuses (a full disk, a closed pipe) is counted too. Rotation runs on that thread.
+- **GELF** sends on a non-blocking socket: a datagram that cannot be sent now is lost, as UDP
+  loses datagrams anyway, and counted.
+- **Starting a destination** — opening the log file, resolving the GELF host — gets 5 seconds.
+  Past that it has failed to initialize, and `on_destination_error` decides.
+- **tracing-init's own stderr notes** go through a small lossy buffer of their own.
+
+Loss is never silent. A monitor thread reads the counts every second and logs, through every
+destination (so the ones still working carry it):
+
+| Record | Level | Fields |
+|---|---|---|
+| `log destination is dropping lines` | WARN `kind = "log_lines_dropped"` | `destination`, `dropped` |
+| `log destination stopped dropping lines` — it has delivered again and lost nothing for 10 s | INFO, same kind | `destination`, `dropped` (the episode's), `lasted_ms` |
+| `log destination dropped lines during this run` — at the guard's drop | WARN while still dropping, else INFO; same kind | `destination`, `dropped_total`, `still_dropping` |
+| `log destination skipped: it could not start` — under `on_destination_error = "skip"` | WARN `kind = "log_destination_skipped"` | `destination`, `error` |
+
+One WARN per episode: a file that stays stuck stays in its episode, and a burst-by-burst
+overload with less than 10 s between bursts is one episode. The trade: console and file lines
+are written a moment after the call that logged them, so a process that ends without dropping
+its guard (`std::process::exit`, an abort) can lose the last few.
 
 ## GELF enrichment
 

@@ -2,6 +2,10 @@
 //!
 //! Listens for `OTEL:ONLINE\n` and `OTEL:OFFLINE\n` messages on a multicast
 //! group to immediately open or close the circuit breaker.
+//!
+//! The listener runs on the program's tokio runtime, so it never waits on anything but its
+//! socket: the socket is non-blocking, and its notes go to stderr through a writer that never
+//! waits on it (`note.rs`) — a blocked write here would hold one of the runtime's threads.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
@@ -25,7 +29,7 @@ pub fn start_beacon_listener(
         let socket = match setup_multicast_socket(bind_addr, group_addr) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("OTel beacon listener failed to start: {e}");
+                crate::note::note(format_args!("OTel beacon listener failed to start: {e}"));
                 return;
             }
         };
@@ -33,7 +37,9 @@ pub fn start_beacon_listener(
         let udp = match tokio::net::UdpSocket::from_std(socket) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("OTel beacon listener failed to convert socket: {e}");
+                crate::note::note(format_args!(
+                    "OTel beacon listener failed to convert socket: {e}"
+                ));
                 return;
             }
         };
@@ -52,7 +58,7 @@ pub fn start_beacon_listener(
                     }
                 }
                 Err(e) => {
-                    eprintln!("OTel beacon listener recv error: {e}");
+                    crate::note::note(format_args!("OTel beacon listener recv error: {e}"));
                     // Brief pause before retrying to avoid tight error loop
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
