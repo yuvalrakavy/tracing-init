@@ -1022,3 +1022,17 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_connection", "--exact"]
 expect_text = '''a session panic with a stderr nobody reads did not end the bridge with a failure'''
 guard       = "panic_hook_installed"
+
+# M5: a helper that ends is the link lost.
+[[control]]
+name        = "a_helpers_end_goes_unseen"
+file        = "mqtt-bridge-kit/src/link.rs"
+anchor      = '''            Ok(Poll::Ready(())) => {
+                this.handle.link_lost("a helper of the link ended");
+                Poll::Ready(())
+            }'''
+replacement = '''            Ok(Poll::Ready(())) => Poll::Ready(()),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_helper_that_ends_is_a_lost_link", "--exact"]
+expect_text = '''ReturnAfter(200ms): the helper's end went unseen'''
+guard       = "helpers_watched"

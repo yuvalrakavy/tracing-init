@@ -209,3 +209,37 @@ async fn a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline() {
     assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the refused command was not answered");
     assert!(h.stop().await);
 }
+
+/// A helper the link cannot run without — an unsolicited-input reader — that ends is a lost link:
+/// one that returns (end of file, given up without a word), and one that panics, which is also a
+/// driver bug, ERROR `driver_contract_violation` (review M5). Unwatched, a listening driver stayed
+/// "connected" and deaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_helper_that_ends_is_a_lost_link() {
+    for helper in [Helper::ReturnAfter(Duration::from_millis(200)), Helper::PanicAfter(Duration::from_millis(200))] {
+        let h = Harness::start_with("helper", acknowledged(), quick_timing(), |_, _, device| {
+            device.set("t1", "temp", json!(20));
+            device.helper(helper);
+        })
+        .await;
+        assert!(connected(&h).await);
+        assert!(
+            h.eventually(Duration::from_secs(3), |h| h.device.calls_of(Op::Connect).len() >= 2).await,
+            "{helper:?}: the helper's end went unseen: {:?}",
+            h.device.calls().iter().map(|c| c.op).collect::<Vec<_>>()
+        );
+        let lost = h.log.of_kind("device_connection_lost");
+        assert!(lost.len() == 1 && lost[0].field("error").is_some_and(|e| e.contains("helper")), "{helper:?}: {:#?}", h.log.records());
+        let violations = h.log.of_kind("driver_contract_violation");
+        match helper {
+            Helper::PanicAfter(_) => assert!(
+                violations.len() == 1 && violations[0].level == tracing::Level::ERROR,
+                "a helper's panic was not one ERROR: {:#?}",
+                h.log.records()
+            ),
+            Helper::ReturnAfter(_) => assert!(violations.is_empty(), "a helper that returned was taken for a bug: {violations:#?}"),
+        }
+        assert!(connected(&h).await, "the device was not connected again");
+        assert!(h.stop().await);
+    }
+}

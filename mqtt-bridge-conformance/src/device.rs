@@ -55,6 +55,17 @@ pub enum Answer {
     Block(Duration),
 }
 
+/// A helper the fake driver starts through its link's context at its next connect, as a driver
+/// starts an unsolicited-input reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Helper {
+    /// Ends this long after the connect, as a reader that reads end of file and gives up without
+    /// saying the link is lost.
+    ReturnAfter(Duration),
+    /// Panics this long after the connect (a bug).
+    PanicAfter(Duration),
+}
+
 #[derive(Debug, Clone)]
 struct Rule {
     op: Op,
@@ -73,6 +84,7 @@ struct State {
     rules: Vec<Rule>,
     link: Option<LinkHandle>,
     connect_cap: Option<usize>,
+    helper: Option<Helper>,
 }
 
 impl State {
@@ -160,6 +172,11 @@ impl Device {
     /// Answer as the device does again.
     pub fn answer_normally(&self) {
         self.locked().rules.clear();
+    }
+
+    /// Start `helper` at the next connect (once).
+    pub fn helper(&self, helper: Helper) {
+        self.locked().helper = Some(helper);
     }
 
     /// Refuse every connect past `cap` connects in all: a bridge that reconnects in a loop is
@@ -278,6 +295,17 @@ impl DeviceDriver for FakeDevice {
         }
         state.connected = true;
         state.link = Some(ctx.handle());
+        if let Some(helper) = state.helper.take() {
+            ctx.spawn(async move {
+                match helper {
+                    Helper::ReturnAfter(after) => tokio::time::sleep(after).await,
+                    Helper::PanicAfter(after) => {
+                        tokio::time::sleep(after).await;
+                        panic!("the fake driver's helper's scripted panic");
+                    }
+                }
+            });
+        }
         Ok(())
     }
 

@@ -20,7 +20,7 @@ pub use mqtt_test_broker::{BrokerEvent, FakeBroker, QoS, Received, SendOptions};
 use serde_json::Value;
 
 pub use capture::{Capture, Record};
-pub use device::{fake_device, Answer, Call, Device, FakeDevice, Op};
+pub use device::{fake_device, Answer, Call, Device, FakeDevice, Helper, Op};
 
 /// The bound on any one wait of a scenario: a regression fails the test, never hangs the suite.
 pub const BOUND: Duration = Duration::from_secs(20);

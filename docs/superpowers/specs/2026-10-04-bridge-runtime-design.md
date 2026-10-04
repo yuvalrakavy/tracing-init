@@ -78,8 +78,9 @@ lost link, never a hang.
 - `ctx.report.state(target, values, assumed?)`: observed or assumed state, from an operation or a
   helper.
 - `ctx.report.event(event)`: something that happened.
-- `ctx.spawn(task)`: a helper the runtime owns (an unsolicited-input reader), cancelled when the link
-  drops.
+- `ctx.spawn(task)`: a helper the runtime owns (an unsolicited-input reader), for the life of the link:
+  cancelled when the link drops, and watched — a helper that ends, by returning or panicking, is the
+  link lost (a panic is also ERROR `driver_contract_violation`).
 - `ctx.link_lost(reason)`: a helper noticed the link died.
 - `ctx.blocking(fn)`: a synchronous library call on a worker thread, under the current deadline. An
   overrun abandons the thread (capped in number) and counts as a lost link.
@@ -160,7 +161,7 @@ commands are refused, and reads are dropped.
   `Option`.
 - **Kinds:**
   - `event_report_dropped` (WARN) and `event_report_drop_ended` (INFO);
-  - `driver_contract_violation` (ERROR);
+  - `driver_contract_violation` (ERROR): an event without a string `kind`; a helper's panic;
   - `device_recovered` gains `expired`;
   - the runtime also emits `startup_failed` and `bridge_shutdown_cut`;
   - `panic` (ERROR), from the panic hook: `thread`, `location`, `payload`.

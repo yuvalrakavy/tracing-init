@@ -12,8 +12,10 @@
 //! episode ([`crate::reports`]).
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -235,6 +237,39 @@ impl LinkHandle {
     }
 }
 
+/// A helper, watched: its end is the link's loss. A helper the link cannot run without that returns
+/// (it read end of file, or gave up) has lost the link without saying so; one that panics is a
+/// driver bug too. Unwatched, a listening driver stayed "connected" and deaf (review M5).
+struct Watched<F> {
+    task: Pin<Box<F>>,
+    handle: LinkHandle,
+}
+
+impl<F: Future<Output = ()>> Future for Watched<F> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| this.task.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(())) => {
+                this.handle.link_lost("a helper of the link ended");
+                Poll::Ready(())
+            }
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                error!(kind = "driver_contract_violation", error = %message, "A helper of the device link panicked; the link is lost");
+                this.handle.link_lost("a helper of the link panicked");
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
 /// What a driver's `connect` is given (spec §4.2).
 pub struct LinkContext {
     /// The reporter: observed or assumed state, and events.
@@ -267,13 +302,14 @@ impl LinkContext {
         LinkContext { report: report.clone(), handle: LinkHandle { shared, report }, helpers: tokio::task::JoinSet::new() }
     }
 
-    /// Start a helper the runtime owns — an unsolicited-input reader, say — cancelled when the link
-    /// drops.
+    /// Start a helper the runtime owns — an unsolicited-input reader, say — for the life of the
+    /// link: cancelled when the link drops, and watched — a helper that ends, returning or
+    /// panicking, is the link lost (a panic is also a driver bug, ERROR `driver_contract_violation`).
     pub fn spawn<F>(&mut self, task: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.helpers.spawn(task.in_current_span());
+        self.helpers.spawn(Watched { task: Box::pin(task), handle: self.handle.clone() }.in_current_span());
     }
 
     /// The link died, as the driver noticed outside an operation.
