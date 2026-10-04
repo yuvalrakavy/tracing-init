@@ -289,6 +289,71 @@ async fn a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_conn
     );
 }
 
+/// A logging start that fails says so on stderr — the one message the bridge writes there itself —
+/// and runs without a log; with a stderr nobody drains that line must hold neither the start nor
+/// the stop (review MINOR 1: it was written on the start's thread, which the start waits for). The
+/// failure comes from the debug build's seam: a gate file that says `fail`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_logging_start_with_a_stderr_nobody_reads_holds_neither_the_start_nor_the_stop() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(20);
+    let dir = workdir("failed_start");
+    let gate = dir.join("logging-gate");
+    std::fs::write(&gate, "fail").expect("the gate file");
+    let (full, unread) = full_stream();
+    let stdout = OwnedFd::from(full.try_clone().expect("a second handle on the full socket"));
+    let mut child = bridge(&dir, &broker, &[])
+        .env(mqtt_bridge_kit::logging::TEST_LOGGING_GATE, &gate)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(OwnedFd::from(full)))
+        .spawn()
+        .expect("start the bridge");
+    let active = format!("Proc/Active/{INSTANCE}");
+    let started = broker.wait_until(Duration::from_secs(10), |b| b.received_on(&active).iter().any(|r| &r.payload[..] == b"true")).await;
+    signal(&child, "-TERM");
+    let status = exit_within(&mut child, Duration::from_secs(15)).await;
+    drop(unread);
+    assert!(started, "the bridge never announced itself: its failed logging start waited on a stderr nobody reads");
+    assert!(status.is_some_and(|s| s.success()), "the bridge did not stop cleanly on SIGTERM: {status:?}");
+}
+
+/// When the stop signals cannot be taken the bridge does not start — and does not wait without a
+/// bound for its logging start first, to say so (review, process.rs:208). The start is held by the
+/// debug build's gate (a FIFO nobody writes); the signals are refused by its seam.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_its_stop_signals_the_bridge_ends_within_a_bound_whatever_its_logging_start_does() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(20);
+    let dir = workdir("no_signals");
+    let fifo = dir.join("logging-gate");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.is_ok_and(|s| s.success()), "could not make the FIFO");
+    let mut child = bridge(&dir, &broker, &[])
+        .env(mqtt_bridge_kit::logging::TEST_LOGGING_GATE, &fifo)
+        .env(mqtt_bridge_kit::process::TEST_NO_SIGNALS, "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the bridge");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let gate = loop {
+        match std::fs::OpenOptions::new().write(true).custom_flags(O_NONBLOCK).open(&fifo) {
+            Ok(gate) => break gate,
+            Err(e) if e.raw_os_error() == Some(ENXIO) && Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(e) => panic!("the bridge's logging start never began reading its gate: {e}"),
+        }
+    };
+    let status = exit_within(&mut child, Duration::from_secs(12)).await;
+    drop(gate);
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "without its stop signals the bridge did not end with a failure within its bound while its logging start was held: {status:?}"
+    );
+    assert_eq!(broker.connections(), 0, "the bridge started without its stop signals");
+}
+
 /// A usage error is said on stderr — the command line's own output, before anything has started —
 /// with exit status 2.
 #[tokio::test(flavor = "multi_thread")]

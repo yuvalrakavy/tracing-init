@@ -1103,3 +1103,31 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::replacing_an_unproven_value_keeps_the_oldest_proof_deadline", "--exact"]
 expect_text = '''a newer write of the same key reset the proof deadline'''
 guard       = "proof_deadline_oldest"
+
+# MINOR 1: the logging's own failure is written to stderr by a thread of its own.
+[[control]]
+name        = "the_logging_failure_is_written_on_the_start_thread"
+file        = "mqtt-bridge-kit/src/logging.rs"
+anchor      = '''    let _ = std::thread::Builder::new().name("logging-failed".into()).spawn(move || {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{line}");
+    });'''
+replacement = '''    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_failed_logging_start_with_a_stderr_nobody_reads_holds_neither_the_start_nor_the_stop", "--exact"]
+expect_text = '''its failed logging start waited on a stderr nobody reads'''
+guard       = "logging_failure_off_thread"
+
+# process.rs:208: without the stop signals, the logging start is waited for within a bound only.
+[[control]]
+name        = "without_signals_the_logging_start_is_awaited_unbounded"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''                match tokio::time::timeout(SHUTDOWN_GRACE, starting).await {
+                    Ok(started) => started,'''
+replacement = '''                match Ok::<_, ()>(starting.await) {
+                    Ok(started) => started,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "without_its_stop_signals_the_bridge_ends_within_a_bound_whatever_its_logging_start_does", "--exact"]
+expect_text = '''without its stop signals the bridge did not end with a failure within its bound'''
+guard       = "no_signals_bounded"

@@ -4,7 +4,9 @@
 //! [`Bridge::run`] is `main`'s whole body:
 //! - **Stop signals first:** SIGINT and SIGTERM are taken before anything else, so from then on
 //!   either is a stop request — the bounded shutdown — whatever the start is doing. A failure to
-//!   take them is WARN `signal_handler_unavailable`, and the bridge does not start.
+//!   take them is WARN `signal_handler_unavailable`, and the bridge does not start; the logging
+//!   start is waited for only within [`SHUTDOWN_GRACE`], to say so (past it, the failure status
+//!   alone says it).
 //! - **The logging start, raced against the stop:** tracing-init's start reads its configuration,
 //!   opens today's log file and resolves the GELF host, synchronously; on a blocking thread, a stop
 //!   ends the wait at once and the thread is abandoned.
@@ -257,8 +259,13 @@ impl Bridge {
                 }
             }
             Err(_) => {
+                // The bridge will not start; the wait is only to say why, so it is bounded.
                 // WAIT: logging-start
-                starting.await
+                match tokio::time::timeout(SHUTDOWN_GRACE, starting).await {
+                    Ok(started) => started,
+                    // No log to say it in: the status says it.
+                    Err(_) => return ExitCode::FAILURE,
+                }
             }
         };
         // A start that failed said so on its own thread; one that panicked, through the hook.
@@ -478,6 +485,10 @@ pub(crate) async fn serve(mut running: Running, stop: impl Future<Output = &'sta
     ending
 }
 
+/// The test seam's environment variable (debug builds only): set, the stop signals cannot be
+/// taken (`StopSignals::register` fails), as when the process may not install handlers.
+pub const TEST_NO_SIGNALS: &str = "MQTT_BRIDGE_TEST_NO_SIGNALS";
+
 /// What stops the bridge: SIGINT (ctrl-c) and SIGTERM (`kill`, systemd), registered first thing.
 struct StopSignals {
     #[cfg(unix)]
@@ -490,6 +501,10 @@ impl StopSignals {
     #[cfg(unix)]
     fn register() -> std::io::Result<StopSignals> {
         use tokio::signal::unix::{signal, SignalKind};
+        #[cfg(debug_assertions)]
+        if std::env::var_os(TEST_NO_SIGNALS).is_some() {
+            return Err(std::io::Error::other("the test seam refused the stop signals"));
+        }
         Ok(StopSignals { interrupt: signal(SignalKind::interrupt())?, terminate: signal(SignalKind::terminate())? })
     }
 
