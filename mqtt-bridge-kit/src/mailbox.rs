@@ -19,6 +19,7 @@
 //! - **Momentary** (a command that acts once): queued in order while the device is connected, at
 //!   most [`MOMENTARY_CAP`] (past it, refused); refused at once while it is down — by the time it
 //!   is back the command would mean nothing — and refused if the device drops before taking it.
+//!   One still waiting at its expiry is handed over as expired, to be reported, never executed.
 //! - **Read** (`refresh`, or a read-class command): coalesced per key and moved to the back;
 //!   dropped while the device is down — its return reads everything anyway.
 //!
@@ -164,6 +165,13 @@ pub enum Work {
         key: ReadKey,
         call: Option<CommandCall>,
         replies: Vec<ReplyTo>,
+    },
+    /// A momentary command that reached its expiry while it waited: not executed, but reported
+    /// and answered (review MINOR 4, C13).
+    Expired {
+        target: Option<String>,
+        call: CommandCall,
+        reply: Option<ReplyTo>,
     },
 }
 
@@ -632,8 +640,7 @@ impl Mailbox {
                             inner.full_logged = false;
                         }
                         if deadline.is_some_and(|d| now >= d) {
-                            *dropped += 1;
-                            continue;
+                            return Some(Work::Expired { target, call, reply });
                         }
                         return Some(Work::Execute { target, call, reply });
                     }

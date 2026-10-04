@@ -211,7 +211,8 @@ fn momentary_commands_and_reads() {
     assert_eq!(mailbox.connected(), MOMENTARY_CAP as u32 + 1, "the refusals of the outage were not counted");
 }
 
-/// A momentary command still waiting at its deadline (its message expiry) is dropped, not run.
+/// A momentary command still waiting at its deadline (its message expiry) is handed over as
+/// expired — to be reported and answered — never run.
 #[test]
 fn a_momentary_command_past_its_deadline_is_dropped() {
     let mailbox = up();
@@ -221,10 +222,11 @@ fn a_momentary_command_past_its_deadline_is_dropped() {
         .into_iter()
         .filter_map(|w| match w {
             Work::Execute { call, .. } => Some(call.command),
+            Work::Expired { call, .. } => Some(format!("expired {}", call.command)),
             _ => None,
         })
         .collect();
-    assert_eq!(commands, ["timely"], "a momentary command past its deadline was run");
+    assert_eq!(commands, ["expired late", "timely"], "a momentary command past its deadline was run");
 }
 
 /// A write to an unacknowledged device stays unproven until a later probe or read; if the link

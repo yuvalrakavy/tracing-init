@@ -433,13 +433,33 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
             }
         }
         Inbound::Command => {
+            let reply = ReplyTo::from_properties(properties, &shared.topics);
+            // A command refused as it arrives still answers on its response topic, if it named
+            // one the bridge can publish to (review C13).
+            let refuse = |error: String| {
+                if let Ok(Some(reply)) = &reply {
+                    let (target, command) = wire::command_names(payload);
+                    shared.reports.event(Outbound {
+                        topic: Some(reply.topic.clone()),
+                        payload: reply_payload(
+                            target.as_deref(),
+                            &command,
+                            &Answer::Failed { reason: Reason::Malformed, error: error.clone() },
+                        ),
+                        correlation: reply.correlation.clone(),
+                    });
+                }
+                malformed(error, blank());
+            };
             if publish.retain {
-                return malformed("a command is never retained".into(), blank());
+                return refuse("a command is never retained".into());
             }
-            let decoded = wire::decode_command(payload)
-                .and_then(|(target, call)| Ok((target, call, ReplyTo::from_properties(properties, &shared.topics)?)));
-            let (target, call, reply) = match decoded {
-                Err(e) => return malformed(e, blank()),
+            let reply = match &reply {
+                Err(e) => return malformed(e.clone(), blank()),
+                Ok(reply) => reply.clone(),
+            };
+            let (target, call) = match wire::decode_command(payload) {
+                Err(e) => return refuse(e),
                 Ok(decoded) => decoded,
             };
             command(
@@ -479,7 +499,7 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
         "refresh" => {
             let posted = shared.mailbox.post_read(ReadKey::Refresh(target.clone()), None, reply.clone());
             if posted == Posted::Dropped {
-                answer(Answer::Failed { reason: Reason::Refused, error: "the device is not connected".into() });
+                refused(Reason::Refused, "the device is not connected");
             }
         }
         "assume" => match &target {
@@ -500,7 +520,7 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
             Some(CommandClass::Read) => {
                 let key = ReadKey::Command { target: target.clone(), command: name.to_owned() };
                 if shared.mailbox.post_read(key, Some(call.clone()), reply.clone()) == Posted::Dropped {
-                    answer(Answer::Failed { reason: Reason::Refused, error: "the device is not connected".into() });
+                    refused(Reason::Refused, "the device is not connected");
                 }
             }
             Some(CommandClass::Momentary | CommandClass::WithReply) => {

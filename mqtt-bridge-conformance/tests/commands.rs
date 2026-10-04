@@ -97,7 +97,8 @@ async fn a_read_command_is_answered_while_up_and_dropped_while_down() {
     assert!(connected(&h).await);
     h.settle(Duration::from_millis(400)).await;
     assert_eq!(h.device.calls_of(Op::Execute).len(), executed, "a read dropped while down ran later");
-    assert!(h.errors().is_empty(), "a dropped read was reported on Error: {:?}", h.errors());
+    // A failure, so on Error too (review C13).
+    assert!(h.errors_for("refused").iter().any(|e| e["command"] == "status"), "a dropped read was not reported on Error: {:?}", h.errors());
     assert!(h.stop().await);
 }
 
@@ -231,6 +232,70 @@ async fn an_unchanged_config_is_not_configured_again_while_the_link_stays_up() {
         h.eventually(BOUND, |h| configures(h) == 3).await,
         "a config replayed after the link was lost was not configured: {}",
         configures(&h)
+    );
+    assert!(h.stop().await);
+}
+
+/// A command refused as it arrives — malformed, or retained — still answers on its response topic,
+/// with its correlation data, as well as on `Error` (review C13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_refused_on_arrival_answers_on_its_response_topic() {
+    let h = Harness::start_with("refused-reply", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    let replies = "Store/replies/refused";
+    let options = |c: &[u8]| SendOptions::default().expiry(30).response_topic(replies).correlation_data(c.to_vec());
+    assert!(h.broker.publish(&h.topics.command(), "not json", &options(b"m-1")));
+    assert!(h.broker.publish(&h.topics.command(), json!({"target": "t1", "command": "pulse"}).to_string(), &options(b"r-1").retained()));
+    assert!(
+        h.eventually(BOUND, |h| h.published(replies).len() == 2).await,
+        "a command refused on arrival was not answered: {:?}",
+        h.published(replies)
+    );
+    for (reply, correlation) in h.published(replies).iter().zip([&b"m-1"[..], &b"r-1"[..]]) {
+        assert_eq!(reply.correlation_data().map(|c| &c[..]), Some(correlation), "the reply lost its correlation data");
+        assert_eq!(json_of(reply)["reason"], "malformed", "{:?}", json_of(reply));
+    }
+    assert!(h.eventually(BOUND, |h| h.errors_for("malformed").len() == 2).await, "{:?}", h.errors());
+    assert!(h.device.calls_of(Op::Execute).is_empty());
+    assert!(h.stop().await);
+}
+
+/// A momentary command still waiting at its expiry is dropped — and said: on `Error` (`refused`)
+/// and on its response topic (review MINOR 4, C13: it was dropped silently).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_expires_while_queued_is_reported_and_answered() {
+    // Operations may take 3 s here: the slow command below must not cost the link.
+    let timing = mqtt_bridge_kit::TimingOverrides { operation: Some(Duration::from_secs(3)), ..quick_timing() };
+    let h = Harness::start_with("expired-reply", acknowledged(), timing, up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(1500)), 1);
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), None));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await);
+    let replies = "Store/replies/expired";
+    let options = SendOptions::default().expiry(1).response_topic(replies).correlation_data(b"e-1".to_vec());
+    assert!(h.broker.publish(&h.topics.command(), json!({"target": "t1", "command": "pulse"}).to_string(), &options));
+    assert!(h.eventually(BOUND, |h| !h.published(replies).is_empty()).await, "a command that expired while queued was not answered");
+    let reply = &h.published(replies)[0];
+    assert_eq!(reply.correlation_data().map(|c| &c[..]), Some(&b"e-1"[..]));
+    assert_eq!(json_of(reply)["reason"], "refused");
+    assert!(h.errors_for("refused").iter().any(|e| e["command"] == "pulse"), "the expiry was not on Error: {:?}", h.errors());
+    assert_eq!(h.device.calls_of(Op::Execute).len(), 1, "a command past its expiry was executed");
+    assert!(h.stop().await);
+}
+
+/// A `refresh` the device refuses goes to `Error` as well as to its response topic, as every
+/// failure does (review C13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_refresh_goes_to_error_too() {
+    let h = Harness::start_with("refresh-error", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer(Op::Read, Some("t1"), Answer::Rejected);
+    assert!(h.command(json!({"target": "t1", "command": "refresh"}), Some(("Store/r", b"f-1"))));
+    assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the failed refresh was not answered");
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("rejected").iter().any(|e| e["command"] == "refresh")).await,
+        "a failed refresh was not on Error: {:?}",
+        h.errors()
     );
     assert!(h.stop().await);
 }

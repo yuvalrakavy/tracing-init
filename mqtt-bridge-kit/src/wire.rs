@@ -115,6 +115,14 @@ pub fn decode_command(payload: &[u8]) -> Result<(Option<String>, CommandCall), S
     Ok((target, CommandCall { command, params: fields }))
 }
 
+/// The target and command a `Command` payload names, as far as they can be read — for the reply to
+/// one refused as malformed; `?` for a command name that cannot be read.
+pub fn command_names(payload: &[u8]) -> (Option<String>, String) {
+    let fields = serde_json::from_slice::<Value>(payload).ok();
+    let field = |name: &str| fields.as_ref().and_then(|f| f.get(name)).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    (field("target").filter(|t| valid_segment(t)), field("command").unwrap_or_else(|| "?".to_owned()))
+}
+
 /// `Config/{instance}/{target}`: any JSON, or (an empty payload) a retraction.
 pub fn decode_config(payload: &[u8]) -> Result<Option<Value>, String> {
     if payload.is_empty() {

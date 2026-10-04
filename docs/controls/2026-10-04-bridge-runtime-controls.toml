@@ -1517,3 +1517,42 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_reads_it", "--exact"]
 expect_text = '''a command executed past its expiry, counted from when the session read it'''
 guard       = "expiry_from_arrival"
+
+# C13: a command refused on arrival answers on its response topic.
+[[control]]
+name        = "a_command_refused_on_arrival_is_not_answered"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''                if let Ok(Some(reply)) = &reply {
+                    let (target, command) = wire::command_names(payload);'''
+replacement = '''                if let (false, Ok(Some(reply))) = (true, &reply) {
+                    let (target, command) = wire::command_names(payload);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_refused_on_arrival_answers_on_its_response_topic", "--exact"]
+expect_text = '''a command refused on arrival was not answered'''
+guard       = "reply_on_refusal"
+
+# MINOR 4 / C13: a command that expires while queued is reported and answered.
+[[control]]
+name        = "an_expired_command_is_dropped_silently"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                report_refused(
+                    &self.reports,
+                    vec![Unanswered { target, command: call.command, momentary: true, replies: reply.into_iter().collect() }],
+                    message,
+                );'''
+replacement = '''                let _ = (target, call, reply, message);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_that_expires_while_queued_is_reported_and_answered", "--exact"]
+expect_text = '''a command that expired while queued was not answered'''
+guard       = "expired_command_answered"
+
+# C13: a failed refresh goes to Error too.
+[[control]]
+name        = "a_failed_refresh_is_not_on_error"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                self.answered(target.as_deref(), "refresh", result, replies, true)'''
+replacement = '''                self.answered(target.as_deref(), "refresh", result, replies, false)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_failed_refresh_goes_to_error_too", "--exact"]
+expect_text = '''a failed refresh was not on Error'''
+guard       = "refresh_failure_on_error"

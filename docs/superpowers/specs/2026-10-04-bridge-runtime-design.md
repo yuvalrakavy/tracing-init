@@ -147,7 +147,11 @@ commands are refused, and reads are dropped.
   `unsupported`, `superseded`, `link_lost`. It may also carry `target`, `property`, `command` and an
   `error` text.
 - **Replies are Event-shaped** (`"kind":"reply"`), sent to the response topic of any command that
-  names one, with its correlation data. Failures also go to `Error`.
+  names one, with its correlation data. Failures also go to `Error`. Every terminal path of a
+  command answers: refused as it arrives (malformed or retained; a command name that cannot be
+  read is `?`), refused while the device is down or at a disconnect (reads included), expired
+  while queued (`refused`), and a failed `refresh`. (No command path supersedes a command: a
+  coalesced read answers every reply waiting on it.)
 - **Request rules:**
   - A missing `conflict` user property means `DeviceWins`, the conservative choice: a manual change is
     never reverted on a guess.
@@ -184,7 +188,8 @@ commands are refused, and reads are dropped.
     once `configure` has taken it. A config identical to the one `configure` last took on the
     current link is not handed over again (every reconnect replays the retained configs); a lost
     link forgets what was taken.
-  - A momentary command still waiting at its message expiry is dropped.
+  - A momentary command still waiting at its message expiry is dropped — on `Error` (`refused`) and
+    answered.
 - **Command line:** a zero `--retry` or `--probe-interval`, a `--mqtt-keep-alive` under 5 s
   (rumqttc's floor) and a duration too long to count are usage errors (exit 2); the same timings
   set in code fail the start. `--poll 0`, in any unit, and `--poll off` turn polling off.

@@ -434,7 +434,7 @@ impl Running {
             over = blocked(&self.clock), if watching => {
                 self.watching = false;
                 self.reports.status(LinkStatus::Unreachable);
-                worker::report_refused(&self.reports, self.mailbox.disconnected());
+                worker::report_refused(&self.reports, self.mailbox.disconnected(), worker::LINK_LOST_BEFORE);
                 Died {
                     part: "device",
                     cause: format!("the device worker blocked its thread {} ms past its operation's deadline", over.as_millis()),

@@ -563,6 +563,16 @@ impl<D: DeviceDriver> Worker<D> {
                 self.write_values(handle, &target, values).await.map(drop)
             }
             Work::Configure { target, config } => self.configure(handle, &target, config).await,
+            Work::Expired { target, call, reply } => {
+                let message = "the command reached its expiry while it waited for the device; not executed";
+                debug!(target = target.as_deref(), command = %call.command, "A command expired while it waited");
+                report_refused(
+                    &self.reports,
+                    vec![Unanswered { target, command: call.command, momentary: true, replies: reply.into_iter().collect() }],
+                    message,
+                );
+                Ok(())
+            }
             Work::Execute { target, call, reply } => {
                 let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref().unwrap_or(""), &call)).await;
                 self.answered(target.as_deref(), &call.command, result, reply.into_iter().collect(), true)
@@ -575,7 +585,8 @@ impl<D: DeviceDriver> Worker<D> {
                     self.fold(&states);
                     None
                 });
-                self.answered(target.as_deref(), "refresh", result, replies, false)
+                // A failure goes to Error too, as every command's does (review C13).
+                self.answered(target.as_deref(), "refresh", result, replies, true)
             }
             Work::Read { key: ReadKey::Command { target, command }, call, replies } => {
                 let call = call.unwrap_or_else(|| crate::driver::CommandCall { command: command.clone(), params: PropertyMap::new() });
@@ -709,19 +720,20 @@ impl<D: DeviceDriver> Worker<D> {
         let _ = tokio::time::timeout(self.info.timing.operation, self.driver.disconnect()).await;
         self.clock.set(None);
         let unanswered = self.mailbox.disconnected();
-        report_refused(&self.reports, unanswered);
+        report_refused(&self.reports, unanswered, LINK_LOST_BEFORE);
         self.reports.status(LinkStatus::Unreachable);
         self.outage.failed(&error);
     }
 }
 
-/// What a disconnect refused: each momentary command on `Error`, and every reply waited for.
-pub(crate) fn report_refused(reports: &Reports, unanswered: Vec<Unanswered>) {
-    let message = "the device link was lost before it ran";
+/// What a disconnect refuses: a command the device never took.
+pub(crate) const LINK_LOST_BEFORE: &str = "the device link was lost before it ran";
+
+/// What a disconnect refused, or what expired: each command on `Error`, and every reply waited for.
+pub(crate) fn report_refused(reports: &Reports, unanswered: Vec<Unanswered>, message: &str) {
     for u in unanswered {
-        if u.momentary {
-            reports.error(ErrorReport::new(Reason::Refused, message).target(u.target.as_deref()).command(&u.command));
-        }
+        // A read refused is a failure too: on Error, as every command's (review C13).
+        reports.error(ErrorReport::new(Reason::Refused, message).target(u.target.as_deref()).command(&u.command));
         let answer = Answer::Failed { reason: Reason::Refused, error: message.to_owned() };
         for reply in u.replies {
             reports.event(Outbound {
