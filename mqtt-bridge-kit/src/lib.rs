@@ -24,8 +24,8 @@
 //! | Area | Module |
 //! |---|---|
 //! | the topic grammar from `--root` and `--instance`; the subscriptions | [`topics`], [`session`] |
-//! | the pump: polls only; an unbounded forward with a backlog episode; rumqttc 0.25's collision fix | [`pump`] |
-//! | every CONNACK: subscribe, `Active=true`, `Version`, the retained model again | [`session`] |
+//! | the pump: polls only, one connection per client; an unbounded forward with a backlog episode; MQTT progress bounded | [`pump`] |
+//! | every CONNACK: subscribe (the read-back first, its SUBACK awaited), `Active=true`, `Version`, the retained model again | [`session`] |
 //! | the start-up read-back of the bridge's own retained `State` | [`session`], [`reports`] |
 //! | requests: both `Desired` forms, the deadline from the message expiry, `conflict`, retractions, malformed payloads answered on `Error` | [`session`], [`wire`] |
 //! | the mailbox: latest per (target, property), momentary FIFO (64) refused while down, reads coalesced, held values dropped at their deadline, unproven writes held again | [`mailbox`] |
@@ -33,7 +33,7 @@
 //! | reports that never wait; capped `Event` and `Error` queues | [`reports`], [`link`] |
 //! | replies on the response topic, with the correlation data | [`replies`] |
 //! | outage episodes with the fleet's kind names | [`pump`], [`worker`] |
-//! | the process: signals first, the logging start raced against the stop, a bounded end | [`process`], [`logging`] |
+//! | the process: signals first, the logging start raced against the stop, a bounded end, a panic hook, a watchdog on the device worker | [`process`], [`logging`] |
 
 pub mod config;
 pub mod driver;

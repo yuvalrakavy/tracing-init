@@ -1,6 +1,7 @@
 # Bridge Runtime (`mqtt-bridge-kit`) — design
 
-**Status:** approved by the owner, 2026-10-04. Not yet built.
+**Status:** approved by the owner, 2026-10-04. R1 built; its gate's findings fixed (§5.2 and the
+notes through §5.1, §12), 2026-10-04.
 **Companions (kept in sync, owner rule 2026-10-04):**
 - the SDL Bridge Support Kit spec (Store, `docs/superpowers/specs/2026-10-04-sdl-bridge-kit-design.md`),
   which owns the wire contract;

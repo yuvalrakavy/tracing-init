@@ -1,18 +1,18 @@
 //! The MQTT side (lifted from mqtt_ac's `service.rs`, `mqtt_subscriber.rs` and
 //! `mqtt_publisher.rs`; Store no-hang §14.3, §14.8–§14.9).
 //!
-//! One session per MQTT client: the pump polls in a task of its own and forwards what arrives; the
-//! session reads it, posts requests to the device's mailbox — a post never waits — and publishes
-//! what [`Reports`] holds. It may wait on rumqttc's request channel: back-pressure, which the
-//! pump's polling keeps moving. It never waits on the device, so every CONNACK is read and answered
-//! whatever the device is doing (no-hang 3b, review B3).
+//! One session per connection, each with a client of its own: the pump polls in a task of its own
+//! and forwards what arrives; the session reads it, posts requests to the device's mailbox — a post
+//! never waits — and publishes what [`Reports`] holds. It may wait on rumqttc's request channel:
+//! back-pressure, which the pump's polling keeps moving, and which the pump bounds (a broker that
+//! acknowledges nothing, or stops reading, ends the session). It never waits on the device, so
+//! every CONNACK is read and answered whatever the device is doing (no-hang 3b, review B3).
 //!
-//! **On every CONNACK** (rumqttc reconnects inside one event loop, and the broker keeps no
-//! session): subscribe, then `Active=true`, then the version, then the whole retained model again
-//! from the bridge's own state — a clean-start reconnect dropped whatever rumqttc still held, and a
-//! broker restarted without persistence lost the retained messages (the fleet's F4). rumqttc's
-//! `pending` is never replayed: it comes back in packet-id order, so after a wrap an older value of
-//! a topic would follow a newer one.
+//! **On every CONNACK** (the broker keeps no session): subscribe, then `Active=true`, then the
+//! version, then the whole retained model again from the bridge's own state — a broker restarted
+//! without persistence lost the retained messages (the fleet's F4). Nothing a previous connection
+//! queued goes out: its client went with it. A publish rumqttc refuses is that one message
+//! dropped.
 //!
 //! **The start-up read-back:** the process's first CONNACK subscribes to the bridge's own retained
 //! `State` before anything else, and subscribes to its requests only once that subscription is
