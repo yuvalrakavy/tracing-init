@@ -119,7 +119,7 @@ capped queue whose overflow is counted and logged once per episode.
 | Area | Behaviour |
 |---|---|
 | Topics | the grammar from `--root` and `--instance`; subscriptions to `Desired`, `Command`, `Config` |
-| Pump | polls only; unbounded forward with a backlog episode; the 0.25 collision fix |
+| Pump | polls only; unbounded forward with a backlog episode; one connection per client: the first failed poll ends the session, and the next connection gets a fresh client (rumqttc's in-loop reconnect would send what the session queued meanwhile ahead of the next CONNACK's subscriptions, and carries the 0.25 packet-id collision across connections); progress bounded at twice the keep-alive (§5.2) |
 | Every CONNACK | subscribe, then `Active=true`, then republish the retained model; `Version` |
 | Start-up read-back | reads its own retained `State`, for the conflict rule's "before" values after a restart |
 | Requests | decodes both `Desired` forms; the deadline from the MQTT message expiry; `conflict` from the user property; retractions; malformed payloads answered with `Error` |
@@ -163,6 +163,17 @@ commands are refused, and reads are dropped.
   - `driver_contract_violation` (ERROR);
   - `device_recovered` gains `expired`;
   - the runtime also emits `startup_failed` and `bridge_shutdown_cut`.
+
+### 5.2 Bounds and repairs from the R1 gate (2026-10-04)
+
+- **MQTT progress:** a request outstanding with nothing acknowledged for twice the keep-alive
+  (10 s at the default) ends the session, and so does one poll that has not returned within it.
+  The event loop is dropped, never polled again, and the paced retry makes a fresh client. A
+  PINGRESP or a publish from the broker is not progress: a broker that answers PINGREQ and
+  withholds its acknowledgements fills rumqttc's in-flight window, and rumqttc then takes no
+  request while its pings succeed; a broker that stops reading holds rumqttc in its flush,
+  inside the poll, where its keep-alive cannot fire. Reconnects are paced by `poll_retry`, and by
+  `retry` after every fifth failed connect in a row.
 
 **Out of scope:** airzoned (a media daemon) keeps its own structure. mqtt_mdns adopts only the pump,
 reports and process pieces, since it has no device link.

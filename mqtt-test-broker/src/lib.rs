@@ -33,6 +33,12 @@
 //! - **A cap:** [`FakeBroker::cap_connections`] stops the listener past a number of connections, so
 //!   a client that reconnects in a loop is refused by the operating system rather than spinning
 //!   through the host's ephemeral ports.
+//! - **A wedged connection:** [`FakeBroker::stop_reading`] stops reading the current connection —
+//!   no packet of it is handled any more, PINGREQ included — as a broker that stopped reading
+//!   does, so a client that goes on writing fills the sockets' buffers and blocks in its flush.
+//!   A new connection reads again.
+//! - **A broker that is down:** [`FakeBroker::refuse_connections`] closes every new connection
+//!   at once, unanswered, until it is turned off.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -206,6 +212,12 @@ struct Shared {
     /// The listener stops past this many accepted connections.
     cap: AtomicUsize,
     accepted: AtomicUsize,
+    /// The connection `stop_reading` wedged, by its number (`accepted` when it was taken).
+    wedged: watch::Sender<Option<usize>>,
+    /// The current connection's number.
+    current: AtomicUsize,
+    /// Close every new connection at once (`refuse_connections`).
+    refusing: AtomicBool,
     /// Arrivals at the `held` lock (see `lock_held`).
     #[cfg(test)]
     held_lock_reached: AtomicUsize,
@@ -246,6 +258,9 @@ impl FakeBroker {
             kick: watch::Sender::new(0),
             cap: AtomicUsize::new(usize::MAX),
             accepted: AtomicUsize::new(0),
+            wedged: watch::Sender::new(None),
+            current: AtomicUsize::new(0),
+            refusing: AtomicBool::new(false),
             #[cfg(test)]
             held_lock_reached: AtomicUsize::new(0),
         });
@@ -320,6 +335,19 @@ impl FakeBroker {
     /// then on, instead of spinning through the host's ephemeral ports.
     pub fn cap_connections(&self, cap: usize) {
         self.shared.cap.store(cap, Ordering::SeqCst);
+    }
+
+    /// Stop reading the current connection, as a broker that stopped reading does: nothing more
+    /// of it is handled (no PINGRESP, no ack), and it stays open, so a client that goes on writing
+    /// fills the sockets' buffers and then waits in its flush. A new connection is read again.
+    pub fn stop_reading(&self) {
+        self.shared.wedged.send_replace(Some(self.shared.current.load(Ordering::SeqCst)));
+    }
+
+    /// Close every new connection at once, unanswered (a broker that is down), or (`false`)
+    /// serve them again. Refused connections count towards the cap.
+    pub fn refuse_connections(&self, refusing: bool) {
+        self.shared.refusing.store(refusing, Ordering::SeqCst);
     }
 
     /// How many TCP connections the broker has accepted.
@@ -406,7 +434,12 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
             drop(stream);
             break;
         }
-        connections.spawn(connection(stream, shared.clone()));
+        if shared.refusing.load(Ordering::SeqCst) {
+            drop(stream);
+            shared.changed.notify_waiters();
+            continue;
+        }
+        connections.spawn(connection(stream, shared.clone(), accepted));
     }
     // Past the cap: no more connections, and the open ones go on until they end or the broker is
     // dropped (which aborts this task, and with it the set).
@@ -433,7 +466,7 @@ impl Drop for AbortOnDrop {
     }
 }
 
-async fn connection(stream: TcpStream, shared: Arc<Shared>) {
+async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
     let _ = stream.set_nodelay(true);
     let (mut rd, mut wr) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<BytesMut>();
@@ -443,6 +476,8 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     shared.active.lock().unwrap().clear();
     let mut kick = shared.kick.subscribe();
     kick.mark_unchanged();
+    shared.current.store(number, Ordering::SeqCst);
+    let mut wedged = shared.wedged.subscribe();
     // The writer goes with this task: when the client goes, and when the task is aborted (the
     // broker dropped) — also while the writer is blocked in `write_all` on a client that stopped
     // reading, which a detached writer survived, holding the client's socket open (review
@@ -456,6 +491,13 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     }));
     let mut buf = BytesMut::with_capacity(8 * 1024);
     'read: loop {
+        while *wedged.borrow_and_update() == Some(number) {
+            // Wedged (`stop_reading`): nothing more of this connection is read or handled.
+            tokio::select! {
+                _ = wedged.changed() => {}
+                _ = kick.changed() => break 'read,
+            }
+        }
         loop {
             let read = match shared.protocol {
                 Protocol::V5 => read_v5(&mut buf, &tx, &shared),

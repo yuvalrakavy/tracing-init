@@ -96,3 +96,39 @@ async fn a_broker_restarted_without_persistence_gets_the_retained_model_again() 
     assert_eq!(h.broker.retained_on(&t.status()).as_deref(), Some(&b"connected"[..]));
     assert!(h.stop().await);
 }
+
+/// On a reconnect, as on the first connection, nothing goes out before the subscriptions and
+/// `Active=true`: a state reported while the broker was away, already handed to the client, must
+/// not reach the broker ahead of them (review MINOR 14).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconnect_publishes_nothing_before_its_subscriptions() {
+    let h = Harness::start_with("requeued", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "n", json!(0))).await;
+    let t = h.topics.clone();
+    assert!(h.eventually(BOUND, |h| h.state("t1").is_some() && h.status().as_deref() == Some("connected")).await);
+    h.broker.refuse_connections(true);
+    h.broker.drop_connection();
+    // While the broker is away, the device reports, every 10 ms, for 600 ms; the broker takes
+    // connections again half-way through.
+    let device = h.device.clone();
+    let reporting = tokio::spawn(async move {
+        for n in 1..=60 {
+            let values: mqtt_bridge_kit::PropertyMap = [("n".to_owned(), json!(n))].into_iter().collect();
+            device.report("t1", values);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    h.broker.refuse_connections(false);
+    let _ = reporting.await;
+    assert!(
+        h.eventually(BOUND, |h| position(&from_connection(&h.broker, 2), &format!("pub {} true", t.active())).is_some()).await,
+        "the bridge never announced itself again: {:#?}",
+        from_connection(&h.broker, 2)
+    );
+    let again = from_connection(&h.broker, 2);
+    let first_publish = position(&again, "pub ").expect("nothing was published");
+    let last_sub = again.iter().rposition(|l| l.starts_with("sub ")).expect("no subscription");
+    assert!(last_sub < first_publish, "something went out before the subscriptions on the reconnect: {again:#?}");
+    assert!(again[first_publish].starts_with(&format!("pub {} true", t.active())), "the first publish was not Active=true: {again:#?}");
+    assert!(h.stop().await);
+}

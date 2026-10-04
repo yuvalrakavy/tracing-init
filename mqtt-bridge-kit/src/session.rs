@@ -35,7 +35,7 @@ use tracing::{debug, info, Instrument};
 
 use crate::driver::{CommandClass, CommandSpec};
 use crate::mailbox::{Mailbox, Posted, ReadKey, StateValue};
-use crate::pump::{BrokerOutage, Incoming, Pump, PumpEvent};
+use crate::pump::{stall_bound, BrokerOutage, Incoming, Pump, PumpEvent, MAX_CONSECUTIVE_ERRORS};
 use crate::replies::{reply_payload, Answer, ReplyTo};
 use crate::reports::{Changes, Model, Outbound, Reports};
 use crate::topics::{Inbound, Topics};
@@ -47,10 +47,13 @@ pub const FLUSH_BOUND: Duration = Duration::from_secs(2);
 /// The MQTT side's timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MqttTiming {
+    /// MQTT keep-alive (at least 5 s, rumqttc's floor). Twice it bounds how long the broker may
+    /// leave a request unacknowledged, and one poll may take ([`crate::pump::stall_bound`]).
     pub keep_alive: Duration,
-    /// Between sessions: after one gives up (five failed polls in a row), a fresh client.
+    /// After `MAX_CONSECUTIVE_ERRORS` failed connects in a row (five), the pause before the next.
     pub retry: Duration,
-    /// The pause after a failed poll, before rumqttc's reconnect.
+    /// The pause before a reconnect otherwise. Each connection is a session of its own, with a
+    /// fresh client.
     pub poll_retry: Duration,
     /// A broker outage this long is one WARN (`external_failure`).
     pub warn_after: Duration,
@@ -87,23 +90,30 @@ pub(crate) struct Shared {
 
 /// How a session ended.
 enum SessionEnd {
-    /// The pump gave up; a new session follows.
-    Ended,
+    /// Its connection failed, or never came (`connected`: whether the broker accepted it); a new
+    /// session follows.
+    Ended { connected: bool },
     /// The shutdown.
     Shutdown,
 }
 
-/// The MQTT side, for the life of the bridge: sessions one after another, until `shutdown` turns
-/// true.
+/// The MQTT side, for the life of the bridge: sessions one after another, one per connection,
+/// until `shutdown` turns true. The pause before the next is `poll_retry`, and `retry` after every
+/// `MAX_CONSECUTIVE_ERRORS`th failed connect in a row.
 pub(crate) async fn run(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
+    let mut failed: u32 = 0;
     loop {
-        if let SessionEnd::Shutdown = session(&shared, &mut shutdown).await {
-            return;
-        }
-        debug!(retry_ms = shared.timing.retry.as_millis() as u64, "MQTT session ended; starting a new one");
+        let connected = match session(&shared, &mut shutdown).await {
+            SessionEnd::Shutdown => return,
+            SessionEnd::Ended { connected } => connected,
+        };
+        // A connection lost is the first failure of what follows; a connect refused, one more.
+        failed = if connected { 1 } else { failed + 1 };
+        let pause = if failed % MAX_CONSECUTIVE_ERRORS == 0 { shared.timing.retry } else { shared.timing.poll_retry };
+        debug!(pause_ms = pause.as_millis() as u64, failed, "MQTT session ended; starting a new one");
         // WAIT: session-retry
         tokio::select! {
-            () = tokio::time::sleep(shared.timing.retry) => {}
+            () = tokio::time::sleep(pause) => {}
             _ = shutdown.wait_for(|stop| *stop) => return,
         }
     }
@@ -134,15 +144,17 @@ async fn emit(client: &AsyncClient, topic: String, retain: bool, payload: Vec<u8
     client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await
 }
 
-/// One session: a fresh client and its pump, until the pump gives up or the shutdown.
+/// One session: a fresh client and its pump, for one connection, until it ends or the shutdown.
 async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> SessionEnd {
     let (client, events) = client(shared);
     // Polling first, so every request below has an event loop draining it.
-    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), shared.timing.poll_retry);
+    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), stall_bound(shared.timing.keep_alive));
     // Nothing is published before the first CONNACK's duties are done: the subscriptions come
     // first, and a state published ahead of the read-back's subscription would overwrite the
     // retained state it is there to read.
     let mut announced = false;
+    // Whether the broker accepted this session's connection.
+    let mut accepted = false;
     loop {
         // WAIT: session-events
         let step = tokio::select! {
@@ -151,6 +163,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
             _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
         };
         let connack = matches!(step, Step::Event(Some(PumpEvent::Connected)));
+        accepted |= connack;
         let work = async {
             match step {
                 Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client).await.map(|()| None),
@@ -159,7 +172,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                     Ok(None)
                 }
                 Step::Event(Some(PumpEvent::Disconnected)) => Ok(None),
-                Step::Event(Some(PumpEvent::Ended(_)) | None) => Ok(Some(SessionEnd::Ended)),
+                Step::Event(Some(PumpEvent::Ended(_)) | None) => Ok(Some(SessionEnd::Ended { connected: false })),
                 Step::Reported => publish_changes(shared, &client, shared.reports.take()).await.map(|()| None),
                 Step::Shutdown => Ok(Some(SessionEnd::Shutdown)),
             }
@@ -172,7 +185,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
         };
         match done {
             Ok(None) => announced |= connack,
-            Ok(Some(SessionEnd::Ended)) => return SessionEnd::Ended,
+            Ok(Some(SessionEnd::Ended { .. })) => return SessionEnd::Ended { connected: accepted },
             Ok(Some(SessionEnd::Shutdown)) => {
                 flush(shared, &client, &mut incoming).await;
                 return SessionEnd::Shutdown;

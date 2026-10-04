@@ -19,20 +19,6 @@
 # device's state before its first CONNACK's subscriptions, overwriting the retained state the
 # read-back reads; the row `reports_are_published_before_the_connack` undoes that fix.
 
-# rumqttc 0.25's packet-id collision survives a failed poll unless the pump moves it into `pending`.
-[[control]]
-name        = "the_pump_leaves_a_collision_standing"
-file        = "mqtt-bridge-kit/src/pump.rs"
-anchor      = '''                    if let Some(publish) = events.state.collision.take() {
-                        events.pending.push_back(Request::Publish(publish));
-                    }
-'''
-replacement = ''''''
-target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "pump::tests::a_collision_standing_when_the_connection_drops_does_not_stop_the_event_loop_for_good", "--exact"]
-expect_text = '''nothing was sent after the reconnect'''
-guard       = "pump_collision_fix"
-
 # The forward queue's high-water WARN (`mqtt_backlog_high`).
 [[control]]
 name        = "the_backlog_never_flags_high_water"
@@ -940,3 +926,56 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "tests::a_clients_disconnect_is_recorded", "--exact"]
 expect_text = '''the client's DISCONNECT was not recorded'''
 guard       = "fake_broker_disconnect"
+
+# ---------------------------------------------------------------------------------------------
+# The R1 gate's fixes (2026-10-04, branch fix/r1-gate). Each row undoes one guard a finding added.
+# The collision row (`the_pump_leaves_a_collision_standing`) was retired with its guard: each
+# connection now has a client of its own, so no collision outlives its connection.
+
+# C1: a broker that answers PINGREQ but withholds its acknowledgements ends the session.
+[[control]]
+name        = "the_pump_lets_requests_stand_unacknowledged"
+file        = "mqtt-bridge-kit/src/pump.rs"
+anchor      = '''            (true, None) => Some(Instant::now()),'''
+replacement = '''            (true, None) => None,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "pump::tests::a_broker_that_acknowledges_nothing_ends_the_session_within_twice_the_keep_alive", "--exact"]
+expect_text = '''the pump went on for 20 s with a publish its broker never acknowledged'''
+guard       = "mqtt_ack_progress"
+
+# C1: one poll is bounded (a broker that stops reading holds rumqttc in its flush).
+[[control]]
+name        = "the_pump_lets_a_poll_run_unbounded"
+file        = "mqtt-bridge-kit/src/pump.rs"
+anchor      = '''                None => polled_at + stall,'''
+replacement = '''                None => polled_at + Duration::from_secs(3600),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "pump::tests::a_poll_that_does_not_return_ends_the_session_within_twice_the_keep_alive", "--exact"]
+expect_text = '''the pump's poll did not return for 20 s with the broker not reading'''
+guard       = "mqtt_poll_bound"
+
+# MINOR 14: each connection a fresh client, so nothing queued in one goes out ahead of the next CONNACK's subscriptions.
+[[control]]
+name        = "the_pump_reconnects_inside_its_event_loop"
+file        = "mqtt-bridge-kit/src/pump.rs"
+anchor      = '''                Ok(Err(e)) => return end(e.to_string()),'''
+replacement = '''                Ok(Err(e)) => {
+                    outage.failed(&e.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_reconnect_publishes_nothing_before_its_subscriptions", "--exact"]
+expect_text = '''something went out before the subscriptions on the reconnect'''
+guard       = "fresh_client_per_connection"
+
+# C14: the stalled-broker scenario proves its session was parked on a full request channel.
+[[control]]
+name        = "the_stalled_session_is_never_parked"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    AsyncClient::new(options, 100)'''
+replacement = '''    AsyncClient::new(options, 1_000_000)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
+expect_text = '''the session was not parked on a full request channel'''
+guard       = "stalled_test_barrier"

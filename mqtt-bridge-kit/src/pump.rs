@@ -5,19 +5,35 @@
 //! request channel (its publishes and subscribes), so a poller that did any of that work could wait
 //! on itself. So the pump polls, and forwards what arrives on an unbounded queue — with a
 //! high-water episode, since growth is a symptom to see — and the session does the rest.
+//!
+//! **One connection per event loop.** The pump never lets rumqttc reconnect inside an event loop:
+//! the first failed poll ends the session, and the MQTT worker makes a fresh client for the next
+//! connection. A reconnect inside one event loop would send whatever the session had handed the
+//! request channel meanwhile ahead of the next CONNACK's subscriptions (review MINOR 14), and would
+//! carry a packet-id collision across the connections (rumqttc 0.25's `MqttState::clean` leaves it
+//! standing, and the event loop then takes no request).
+//!
+//! **Progress, bounded** (review C1). Nothing in rumqttc bounds how long the broker may go without
+//! progress: a broker that answers PINGREQ but withholds its acknowledgements fills the in-flight
+//! window, and rumqttc then takes no request while its pings go on succeeding; a broker that stops
+//! reading leaves rumqttc in its flush, inside `poll`, where its keep-alive cannot fire. So the pump
+//! ends the session when a request has been outstanding for [`stall_bound`] (twice the keep-alive)
+//! with no acknowledgement of any, and when one poll has not returned within it — dropping the
+//! event loop rather than polling a cancelled one again. A PINGRESP or a publish from the broker is
+//! not progress on what the bridge asked.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rumqttc::v5::mqttbytes::v5::{Packet, Publish};
-use rumqttc::v5::{ConnectionError, Event, EventLoop, Request};
+use rumqttc::v5::{Event, EventLoop};
 use rumqttc::Outgoing;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info, warn, Instrument};
 
-/// Poll errors in a row before the pump gives up and the MQTT worker starts a new session; below
-/// it, rumqttc reconnects on the next poll.
+/// Failed connects in a row, each a session of its own, after which the MQTT worker pauses for
+/// `MqttTiming::retry` rather than `MqttTiming::poll_retry` before the next.
 pub const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
 /// A forward queue past this many unread publishes is a WARN, once; back under [`LOW_WATER`], an
@@ -25,17 +41,26 @@ pub const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 pub const HIGH_WATER: usize = 1000;
 pub const LOW_WATER: usize = 100;
 
+/// How long a request may stay outstanding with nothing acknowledged, and how long one poll may
+/// take, before the pump ends the session: twice the keep-alive — as long as rumqttc gives a
+/// PINGREQ its answer. A poll returns at least once per keep-alive while connected (its ping), and
+/// a connect is bounded by rumqttc's connection timeout (5 s), under the 10 s this gives at the
+/// smallest keep-alive rumqttc takes.
+pub fn stall_bound(keep_alive: Duration) -> Duration {
+    keep_alive * 2
+}
+
 /// What the pump hands the session.
 #[derive(Debug)]
 pub enum PumpEvent {
-    /// The broker accepted the connection: the first, or rumqttc's reconnect inside the same event
-    /// loop. The broker keeps no session, so the session subscribes and announces itself again.
+    /// The broker accepted the connection. The broker keeps no session, so the session subscribes
+    /// and announces itself.
     Connected,
     Publish(Publish),
     /// The DISCONNECT the session asked for was written: the session's end.
     Disconnected,
-    /// The connection failed [`MAX_CONSECUTIVE_ERRORS`] times in a row; the session ends and the
-    /// MQTT worker starts a new one.
+    /// The connection failed or stalled, and its event loop is dropped: the session ends and the
+    /// MQTT worker makes a fresh one.
     Ended(String),
 }
 
@@ -89,14 +114,13 @@ impl Backlog {
     }
 }
 
-/// The broker's reachability as the pumps see it. It outlives every session — the pump gives up
-/// after [`MAX_CONSECUTIVE_ERRORS`] and the MQTT worker starts a new session — so an outage is one
-/// episode however many attempts and sessions it takes (the logging policy): an INFO
-/// `connection_lost` when it starts, one WARN `external_failure` once it has lasted `warn_after`,
-/// the attempts in between at DEBUG, and an INFO `external_recovered` with its length once a
-/// connection has lasted `stable_after` — a connection lost sooner is one more failed attempt of
-/// the same outage (the fleet's F2: recovery on proof of life, never on a bare CONNACK). Atomics
-/// only: one pump at a time uses it, and nothing is logged under a lock.
+/// The broker's reachability as the pumps see it. It outlives every session — each connection is
+/// a session of its own — so an outage is one episode however many attempts and sessions it takes
+/// (the logging policy): an INFO `connection_lost` when it starts, one WARN `external_failure` once
+/// it has lasted `warn_after`, the attempts in between at DEBUG, and an INFO `external_recovered`
+/// with its length once a connection has lasted `stable_after` — a connection lost sooner is one
+/// more failed attempt of the same outage (the fleet's F2: recovery on proof of life, never on a
+/// bare CONNACK). Atomics only: one pump at a time uses it, and nothing is logged under a lock.
 pub struct BrokerOutage {
     warn_after: Duration,
     stable_after: Duration,
@@ -128,24 +152,24 @@ impl BrokerOutage {
         self.epoch.elapsed().as_millis() as u64 + 1
     }
 
-    /// A poll failed: the connection was lost, or a reconnect failed. A connection on trial lost
+    /// A connection was lost, a connect failed, or the broker stalled. A connection on trial lost
     /// is one more attempt of its outage.
-    fn failed(&self, error: &ConnectionError) {
+    fn failed(&self, error: &str) {
         let now = self.stamp();
         self.connected_at.store(0, Ordering::SeqCst);
         if self.since.compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             self.attempts.store(1, Ordering::SeqCst);
             self.warned.store(false, Ordering::SeqCst);
-            info!(kind = "connection_lost", error = %error, "MQTT broker connection lost; reconnecting");
+            info!(kind = "connection_lost", error, "MQTT broker connection lost; reconnecting");
             return;
         }
         let attempts = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
         let down_for_ms = now.saturating_sub(self.since.load(Ordering::SeqCst));
         let past_threshold = down_for_ms >= self.warn_after.as_millis() as u64;
         if past_threshold && !self.warned.swap(true, Ordering::SeqCst) {
-            warn!(kind = "external_failure", error = %error, attempts, down_for_ms, "MQTT broker unreachable; still reconnecting");
+            warn!(kind = "external_failure", error, attempts, down_for_ms, "MQTT broker unreachable; still reconnecting");
         } else {
-            debug!(error = %error, attempts, down_for_ms, "MQTT broker still unreachable");
+            debug!(error, attempts, down_for_ms, "MQTT broker still unreachable");
         }
     }
 
@@ -183,6 +207,38 @@ impl BrokerOutage {
     /// Whether an outage is under way (the shutdown skips its flush then).
     pub fn down(&self) -> bool {
         self.since.load(Ordering::SeqCst) != 0
+    }
+}
+
+/// What the bridge asked and the broker has not acknowledged yet, and since when nothing has been:
+/// the publishes in flight (rumqttc's count) and the subscribes and unsubscribes sent.
+#[derive(Debug, Default)]
+struct Outstanding {
+    subscribes: usize,
+    /// While something is outstanding: when it began to be, or the last acknowledgement since.
+    since: Option<Instant>,
+}
+
+impl Outstanding {
+    fn after(&mut self, event: &Event, in_flight: u16) {
+        let acknowledged = match event {
+            Event::Outgoing(Outgoing::Subscribe(_) | Outgoing::Unsubscribe(_)) => {
+                self.subscribes += 1;
+                false
+            }
+            Event::Incoming(Packet::SubAck(_) | Packet::UnsubAck(_)) => {
+                self.subscribes = self.subscribes.saturating_sub(1);
+                true
+            }
+            Event::Incoming(Packet::PubAck(_) | Packet::PubRec(_) | Packet::PubComp(_)) => true,
+            _ => false,
+        };
+        self.since = match (in_flight > 0 || self.subscribes > 0, self.since) {
+            (false, _) => None,
+            (true, Some(_)) if acknowledged => Some(Instant::now()),
+            (true, Some(since)) => Some(since),
+            (true, None) => Some(Instant::now()),
+        };
     }
 }
 
@@ -231,53 +287,49 @@ impl Drop for Incoming {
 }
 
 impl Pump {
-    /// Start polling; `poll_retry` is the pause after a failed poll before the next (rumqttc's
-    /// reconnect).
-    pub fn start(events: EventLoop, outage: Arc<BrokerOutage>, poll_retry: Duration) -> (Pump, Incoming) {
+    /// Start polling; `stall` is [`stall_bound`] of the keep-alive.
+    pub fn start(events: EventLoop, outage: Arc<BrokerOutage>, stall: Duration) -> (Pump, Incoming) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let backlog = Arc::new(Backlog::new());
-        let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), outage, poll_retry).in_current_span());
+        let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), outage, stall).in_current_span());
         (Pump { task }, Incoming { rx, backlog })
     }
 
-    async fn run(
-        mut events: EventLoop,
-        tx: UnboundedSender<PumpEvent>,
-        backlog: Arc<Backlog>,
-        outage: Arc<BrokerOutage>,
-        poll_retry: Duration,
-    ) {
-        let mut consecutive_errors: u32 = 0;
+    async fn run(mut events: EventLoop, tx: UnboundedSender<PumpEvent>, backlog: Arc<Backlog>, outage: Arc<BrokerOutage>, stall: Duration) {
+        let mut outstanding = Outstanding::default();
+        let end = |reason: String| {
+            // Part of the outage's one episode; the event loop goes with this task, and the MQTT
+            // worker makes a fresh client.
+            outage.failed(&reason);
+            debug!(error = %reason, "The MQTT connection ended; its session ends with it");
+            let _ = tx.send(PumpEvent::Ended(reason));
+        };
         loop {
+            let polled_at = Instant::now();
+            let deadline = match outstanding.since {
+                Some(since) => (since + stall).min(polled_at + stall),
+                None => polled_at + stall,
+            };
             // WAIT: mqtt-poll
-            let event = match events.poll().await {
-                Ok(event) => event,
-                Err(e) => {
-                    // rumqttc 0.25's clean-up after a failed poll moves the in-flight publishes to
-                    // `pending` but leaves a packet-id collision standing, and while one stands the
-                    // event loop takes no request — waiting for a PUBACK that cannot come once the
-                    // connection is gone. Move it with the rest (`MqttState::clean`).
-                    if let Some(publish) = events.state.collision.take() {
-                        events.pending.push_back(Request::Publish(publish));
-                    }
-                    outage.failed(&e);
-                    consecutive_errors += 1;
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        // Part of the outage's one episode: the MQTT worker starts a new session.
-                        debug!(error = %e, consecutive_errors, "MQTT poll failed repeatedly; ending the session");
-                        let _ = tx.send(PumpEvent::Ended(e.to_string()));
-                        return;
-                    }
-                    // rumqttc reconnects on the next poll.
-                    tokio::time::sleep(poll_retry).await;
-                    continue;
+            let polled = tokio::time::timeout_at(deadline.into(), events.poll()).await;
+            let event = match polled {
+                Ok(Ok(event)) => event,
+                Ok(Err(e)) => return end(e.to_string()),
+                Err(_) => {
+                    let stall_ms = stall.as_millis() as u64;
+                    return end(match outstanding.since {
+                        Some(since) if Instant::now() >= since + stall => format!(
+                            "the broker acknowledged nothing for {stall_ms} ms with requests outstanding (it may answer pings, but takes no request)"
+                        ),
+                        _ => format!("a poll did not return within {stall_ms} ms: the broker stopped reading"),
+                    });
                 }
             };
+            outstanding.after(&event, events.state.inflight());
 
             // Only an incoming event is proof of the broker; an outgoing one (a connect request)
             // is rumqttc trying.
             if matches!(event, Event::Incoming(_)) {
-                consecutive_errors = 0;
                 outage.alive();
             }
 
