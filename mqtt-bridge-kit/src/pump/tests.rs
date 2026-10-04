@@ -184,7 +184,11 @@ async fn a_broker_that_acknowledges_nothing_ends_the_session_within_twice_the_ke
 async fn a_poll_that_does_not_return_ends_the_session_within_twice_the_keep_alive() {
     let broker = FakeBroker::start().await;
     broker.cap_connections(20);
-    let (client, events) = direct_client(&broker, "unread", 128);
+    // A long keep-alive, so rumqttc's own ping check cannot end the session first: what ends it
+    // must be the pump's bound on the poll (twice 5 s, given below).
+    let mut options = MqttOptions::new("unread", "127.0.0.1", broker.port());
+    options.set_keep_alive(Duration::from_secs(60));
+    let (client, events) = AsyncClient::new(options, 128);
     let outage = Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5)));
     let (_pump, mut incoming) = Pump::start(events, outage, stall_bound(Duration::from_secs(5)), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no first CONNACK");
