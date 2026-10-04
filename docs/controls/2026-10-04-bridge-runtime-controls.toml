@@ -1425,8 +1425,8 @@ file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''                if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { held: true, .. })) {'''
 replacement = '''                if let Some(i) = inner.pending.iter().take(1).position(|e| matches!(e, Entry::Config { held: true, .. })) {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_targets_config_is_configured_before_its_held_values_are_applied", "--exact"]
-expect_text = '''the held value reached apply before the target's config'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_targets_config_goes_before_its_values", "--exact"]
+expect_text = '''a held value went before the held config'''
 guard       = "config_first_held"
 
 # M4: while up, a target's waiting config goes before its values.
@@ -1488,3 +1488,20 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violation", "--exact"]
 expect_text = '''an unsupported probe of an unacknowledged driver was not one ERROR'''
 guard       = "unsupported_probe"
+
+# M4: Config is subscribed before Desired (a device already up when the replays arrive).
+[[control]]
+name        = "desired_is_subscribed_before_config"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        (topics.config_filter(), false),
+        (topics.desired_target_filter(), true),
+        (topics.desired_property_filter(), false),
+        (topics.command(), true),'''
+replacement = '''        (topics.desired_target_filter(), true),
+        (topics.desired_property_filter(), false),
+        (topics.command(), true),
+        (topics.config_filter(), false),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_targets_config_is_configured_before_its_replayed_values_for_a_device_already_up", "--exact"]
+expect_text = '''the replayed value reached apply before the target's config'''
+guard       = "config_subscribed_first"

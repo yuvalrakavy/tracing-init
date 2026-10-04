@@ -531,3 +531,31 @@ async fn a_target_writes_copies_arriving_after_its_apply_are_skipped() {
     assert_eq!(h.device.applies().len(), 1, "a property copy arriving after the target write was applied again: {:?}", h.device.applies());
     assert!(h.stop().await);
 }
+
+/// For a device already up when the retained requests arrive, a target's retained config still
+/// reaches `configure` before its retained value reaches `apply`: `Config` is subscribed first, so
+/// its replay is queued ahead (review M4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_targets_config_is_configured_before_its_replayed_values_for_a_device_already_up() {
+    let h = Harness::start_unwaited("cfgorder-up", acknowledged(), quick_timing(), |broker, topics, _| {
+        broker.hold_subacks();
+        broker.retain(&topics.config("ir"), json!({"code_set": "lg"}).to_string(), &SendOptions::default());
+        broker.retain(
+            &topics.desired("ir", "power"),
+            "true",
+            &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"),
+        );
+    })
+    .await;
+    assert!(h.eventually(BOUND, |h| h.device.connected() && !h.device.calls_of(Op::Read).is_empty()).await, "the device never connected");
+    h.settle(Duration::from_millis(200)).await;
+    h.broker.release_subacks();
+    assert!(
+        h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty() && !h.device.calls_of(Op::Configure).is_empty()).await,
+        "the config or the value never reached the driver: {:?}",
+        h.device.calls()
+    );
+    let order: Vec<Op> = h.device.calls().iter().map(|c| c.op).filter(|op| matches!(op, Op::Apply | Op::Configure)).collect();
+    assert_eq!(order.first(), Some(&Op::Configure), "the replayed value reached apply before the target's config: {order:?}");
+    assert!(h.stop().await);
+}
