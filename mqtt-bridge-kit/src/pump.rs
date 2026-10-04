@@ -57,6 +57,8 @@ pub enum PumpEvent {
     /// and announces itself.
     Connected,
     Publish(Publish),
+    /// The broker acknowledged a subscription (the session waits for the read-back's).
+    SubAck,
     /// The DISCONNECT the session asked for was written: the session's end.
     Disconnected,
     /// The connection failed or stalled, and its event loop is dropped: the session ends and the
@@ -366,6 +368,7 @@ impl Pump {
                     backlog.pushed();
                     PumpEvent::Publish(publish)
                 }
+                Event::Incoming(Packet::SubAck(_)) => PumpEvent::SubAck,
                 Event::Outgoing(Outgoing::Disconnect) => PumpEvent::Disconnected,
                 _ => continue,
             };

@@ -15,10 +15,13 @@
 //! a topic would follow a newer one.
 //!
 //! **The start-up read-back:** the process's first CONNACK subscribes to the bridge's own retained
-//! `State` before anything else, so the broker delivers it ahead of any retained request, and keeps
-//! it as the outage conflict rule's "before" values after a restart (Store kit spec §4.5). Only
-//! retained deliveries count: the bridge's own later publishes come back unflagged, and are
-//! ignored.
+//! `State` before anything else, and subscribes to its requests only once that subscription is
+//! acknowledged (within [`READ_BACK_WAIT`]): the broker queues a subscription's retained messages
+//! behind its SUBACK, so the retained `State` is on the one stream ahead of every retained request
+//! (review C9). It is kept as the outage conflict rule's "before" values after a restart (Store
+//! kit spec §4.5). Only retained deliveries count: the bridge's own later publishes come back
+//! unflagged, and are ignored. A session that ends before the SUBACK leaves the read-back to the
+//! next.
 //!
 //! **Shutdown:** `Active=false`, then DISCONNECT, polling until it is written — within
 //! [`FLUSH_BOUND`]; past it the last will says `Active=false` instead (INFO `bridge_shutdown_cut`).
@@ -31,7 +34,7 @@ use rumqttc::v5::mqttbytes::v5::{Filter, LastWill, Publish, PublishProperties};
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, MqttOptions};
 use tokio::sync::watch;
-use tracing::{debug, info, Instrument};
+use tracing::{debug, info, warn, Instrument};
 
 use crate::driver::{CommandClass, CommandSpec};
 use crate::mailbox::{Check, Mailbox, Posted, ReadKey, StateValue};
@@ -43,6 +46,10 @@ use crate::wire::{self, ErrorReport, Reason};
 
 /// The bound on the shutdown's flush: `Active=false` and DISCONNECT, written.
 pub const FLUSH_BOUND: Duration = Duration::from_secs(2);
+
+/// How long the first CONNACK waits for the read-back's SUBACK before it subscribes to the
+/// requests without it (WARN `read_back_incomplete`).
+pub const READ_BACK_WAIT: Duration = Duration::from_secs(5);
 
 /// The largest packet the bridge takes, advertised in its CONNECT, so a broker discards a larger
 /// message for it rather than send it. rumqttc's default, 10 KiB, is enforced but not advertised:
@@ -187,12 +194,18 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
         accepted |= connack;
         let work = async {
             match step {
-                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client).await.map(|()| None),
+                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client, &mut incoming).await.map(|goes_on| {
+                    if goes_on {
+                        None
+                    } else {
+                        Some(SessionEnd::Ended { connected: false })
+                    }
+                }),
                 Step::Event(Some(PumpEvent::Publish(publish))) => {
                     handle(shared, &publish);
                     Ok(None)
                 }
-                Step::Event(Some(PumpEvent::Disconnected)) => Ok(None),
+                Step::Event(Some(PumpEvent::Disconnected | PumpEvent::SubAck)) => Ok(None),
                 Step::Event(Some(PumpEvent::Ended(_)) | None) => Ok(Some(SessionEnd::Ended { connected: false })),
                 Step::Reported => {
                     publish_changes(shared, &client, shared.reports.take()).await;
@@ -230,11 +243,20 @@ enum Step {
 
 /// The CONNACK duties, in order: the subscriptions (the read-back's first, once per process), then
 /// `Active=true`, the version, and the whole retained model.
-async fn connected(shared: &Shared, client: &AsyncClient) -> Result<(), Failed> {
+async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) -> Result<bool, Failed> {
     let topics = &shared.topics;
     if !shared.read_back_requested.load(Ordering::SeqCst) {
         // WAIT: mqtt-request
         client.subscribe(topics.state_filter(), QoS::AtLeastOnce).await?;
+        match read_back_acknowledged(shared, incoming).await {
+            None => return Ok(false),
+            Some(true) => {}
+            Some(false) => warn!(
+                kind = "read_back_incomplete",
+                waited_ms = READ_BACK_WAIT.as_millis() as u64,
+                "The broker did not acknowledge the read-back's subscription in time; subscribing to requests without it — a replay may meet no \"before\" values"
+            ),
+        }
         shared.read_back_requested.store(true, Ordering::SeqCst);
     }
     // Target-level writes and commands are never retained: subscribed retain-as-published, a
@@ -254,7 +276,23 @@ async fn connected(shared: &Shared, client: &AsyncClient) -> Result<(), Failed> 
     emit(client, topics.active(), true, b"true".to_vec(), properties()).await;
     emit(client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
     republish(shared, client, shared.reports.model()).await;
-    Ok(())
+    Ok(true)
+}
+
+/// The read-back's SUBACK, within [`READ_BACK_WAIT`], handling what arrives meanwhile: `Some(true)`
+/// when it came, `Some(false)` past the wait, `None` when the session ended.
+async fn read_back_acknowledged(shared: &Shared, incoming: &mut Incoming) -> Option<bool> {
+    let deadline = Instant::now() + READ_BACK_WAIT;
+    loop {
+        // WAIT: read-back-suback
+        match tokio::time::timeout_at(deadline.into(), incoming.recv()).await {
+            Err(_) => return Some(false),
+            Ok(Some(PumpEvent::SubAck)) => return Some(true),
+            Ok(Some(PumpEvent::Publish(publish))) => handle(shared, &publish),
+            Ok(Some(PumpEvent::Connected | PumpEvent::Disconnected)) => {}
+            Ok(Some(PumpEvent::Ended(_)) | None) => return None,
+        }
+    }
 }
 
 /// Everything known, again. A message refused is dropped alone.

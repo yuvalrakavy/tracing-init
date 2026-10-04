@@ -124,7 +124,7 @@ capped queue whose overflow is counted and logged once per episode.
 | Topics | the grammar from `--root` and `--instance`; subscriptions to `Desired` (target-level `…/+` and `Command` retain-as-published; property-level `…/+/+` not), `Command`, `Config` |
 | Pump | polls only; unbounded forward with a backlog episode; one connection per client: the first failed poll ends the session, and the next connection gets a fresh client (rumqttc's in-loop reconnect would send what the session queued meanwhile ahead of the next CONNACK's subscriptions, and carries the 0.25 packet-id collision across connections); progress bounded at twice the keep-alive (§5.2) |
 | Every CONNACK | subscribe, then `Active=true`, then republish the retained model; `Version` |
-| Start-up read-back | reads its own retained `State`, for the conflict rule's "before" values after a restart |
+| Start-up read-back | reads its own retained `State`, for the conflict rule's "before" values after a restart; the requests are subscribed only once its SUBACK has come (at most 5 s), so its retained messages are queued ahead of every retained request |
 | Requests | decodes both `Desired` forms; the deadline from the MQTT message expiry; `conflict` from the user property; retractions; malformed payloads answered with `Error` |
 | Mailbox | latest per (target, property), moved to the back; momentary FIFO (cap 64) refused while down; reads coalesced; held values dropped at their deadline; unproven writes held again |
 | Worker | connect with pacing; proof of life before declaring recovery; catch-up (read, resolve conflicts, apply held state); poll; probes |
@@ -194,7 +194,9 @@ commands are refused, and reads are dropped.
     per name);
   - `device_recovered` gains `expired`;
   - the runtime also emits `startup_failed` and `bridge_shutdown_cut`;
-  - `panic` (ERROR), from the panic hook: `thread`, `location`, `payload`.
+  - `panic` (ERROR), from the panic hook: `thread`, `location`, `payload`;
+  - `read_back_incomplete` (WARN): the read-back's SUBACK did not come within 5 s; the requests
+    were subscribed without it.
 
 ### 5.2 Bounds and repairs from the R1 gate (2026-10-04)
 
@@ -370,3 +372,8 @@ schemas/                  JSON Schemas for each lane's payload
   the model as it stood when the connection was lost; the read-back serves only the process's first
   session (and held values until the device's first outage snapshot). A change at the device the
   bridge never saw — made while the bridge was away, between two reads — is still a change.
+- **The read-back's order rests on the broker.** The requests are subscribed once the read-back's
+  SUBACK has come, so a broker that writes a subscription's retained messages right behind its
+  SUBACK (Mosquitto does) queues the retained `State` ahead of every retained request. A broker
+  that sent retained messages later, on its own schedule, could still interleave them; and past
+  5 s without the SUBACK the requests are subscribed anyway (WARN `read_back_incomplete`).

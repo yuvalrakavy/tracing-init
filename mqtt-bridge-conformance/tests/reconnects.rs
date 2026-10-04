@@ -132,3 +132,23 @@ async fn a_reconnect_publishes_nothing_before_its_subscriptions() {
     assert!(again[first_publish].starts_with(&format!("pub {} true", t.active())), "the first publish was not Active=true: {again:#?}");
     assert!(h.stop().await);
 }
+
+/// The bridge subscribes to its requests only once the read-back's subscription is acknowledged,
+/// so the broker's retained `State` is queued ahead of every retained request on the one stream —
+/// the "before" values are in before any replay (review C9).
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_are_subscribed_only_once_the_read_back_is_acknowledged() {
+    let h = Harness::start_unwaited("readback-order", acknowledged(), quick_timing(), |broker, _, device| {
+        broker.hold_subacks();
+        device.set("t1", "power", json!(true));
+    })
+    .await;
+    let t = h.topics.clone();
+    assert!(h.broker.wait_for_subscription(&t.state_filter(), BOUND).await, "the read-back was never subscribed");
+    h.settle(std::time::Duration::from_millis(500)).await;
+    let early: Vec<String> = h.broker.subscriptions().into_iter().filter(|f| *f != t.state_filter()).collect();
+    assert!(early.is_empty(), "requests were subscribed before the read-back was acknowledged: {early:?}");
+    h.broker.release_subacks();
+    assert!(h.broker.wait_for_subscription(&t.command(), BOUND).await, "the requests were never subscribed");
+    assert!(h.stop().await);
+}

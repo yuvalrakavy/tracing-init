@@ -68,9 +68,9 @@ guard       = "broker_outage_proof_of_life"
 [[control]]
 name        = "the_connack_duties_are_done_once_per_session"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client).await.map(|()| None),'''
-replacement = '''                Step::Event(Some(PumpEvent::Connected)) if announced => Ok(None),
-                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client).await.map(|()| None),'''
+anchor      = '''                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client, &mut incoming).await.map(|goes_on| {'''
+replacement = '''                Step::Event(Some(PumpEvent::Connected)) if shared.read_back_requested.load(Ordering::SeqCst) => Ok(None),
+                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client, &mut incoming).await.map(|goes_on| {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the state was not published again after the reconnect'''
@@ -127,13 +127,8 @@ guard       = "nothing_before_connack"
 [[control]]
 name        = "the_read_back_is_never_subscribed"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    if !shared.read_back_requested.load(Ordering::SeqCst) {
-        // WAIT: mqtt-request
-        client.subscribe(topics.state_filter(), QoS::AtLeastOnce).await?;
-        shared.read_back_requested.store(true, Ordering::SeqCst);
-    }
-'''
-replacement = ''''''
+anchor      = '''        client.subscribe(topics.state_filter(), QoS::AtLeastOnce).await?;'''
+replacement = '''        let _ = topics.state_filter();'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
 expect_text = '''no Error said the request was superseded'''
@@ -1405,3 +1400,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_level_write_reaches_apply_once_with_all_values", "--exact"]
 expect_text = '''the target write did not reach apply once with all its values'''
 guard       = "copy_window"
+
+# C9: the requests are subscribed only once the read-back's SUBACK has come.
+[[control]]
+name        = "requests_are_subscribed_before_the_read_back_is_acknowledged"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        match read_back_acknowledged(shared, incoming).await {'''
+replacement = '''        match Some(true) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "requests_are_subscribed_only_once_the_read_back_is_acknowledged", "--exact"]
+expect_text = '''requests were subscribed before the read-back was acknowledged'''
+guard       = "read_back_suback_first"
