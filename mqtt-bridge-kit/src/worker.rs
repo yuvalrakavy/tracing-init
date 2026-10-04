@@ -422,7 +422,7 @@ impl<D: DeviceDriver> Worker<D> {
         // WAIT: device-op
         match op(handle, timing.operation, "configure", self.driver.configure(target, config.as_ref())).await {
             Ok(()) => {
-                self.mailbox.applied(false);
+                self.mailbox.configured(target, config.as_ref());
                 Ok(())
             }
             Err(OpError::Link(e)) => Err(e),

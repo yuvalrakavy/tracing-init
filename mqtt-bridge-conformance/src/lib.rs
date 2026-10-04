@@ -150,6 +150,14 @@ impl Harness {
         }
     }
 
+    /// Whether the bridge's current connection — the broker's latest — has made its subscriptions
+    /// (its last is `Command`): after a reconnect, requests sent sooner reach nothing.
+    pub fn subscribed_again(&self) -> bool {
+        let events = self.broker.events();
+        let last_connect = events.iter().rposition(|e| matches!(e, BrokerEvent::Connected));
+        last_connect.is_some_and(|i| events[i..].iter().any(|e| matches!(e, BrokerEvent::Subscribed(f) if *f == self.topics.command())))
+    }
+
     /// Hold for `d`, letting the bridge work.
     pub async fn settle(&self, d: Duration) {
         tokio::time::sleep(d).await;

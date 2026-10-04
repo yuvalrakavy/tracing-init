@@ -259,15 +259,16 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
         }
         shared.read_back_requested.store(true, Ordering::SeqCst);
     }
-    // Target-level writes and commands are never retained: subscribed retain-as-published, a
+    // Configs first, so a target's retained setup is queued ahead of its retained values (review
+    // M4). Target-level writes and commands are never retained: subscribed retain-as-published, a
     // live retained one keeps its flag and is refused like a replayed one. Property writes are
     // retained by design: their subscription clears the flag on a live delivery, so only a replay
     // arrives flagged (review C10).
     for (filter, retain_as_published) in [
+        (topics.config_filter(), false),
         (topics.desired_target_filter(), true),
         (topics.desired_property_filter(), false),
         (topics.command(), true),
-        (topics.config_filter(), false),
     ] {
         let filter = Filter { preserve_retain: retain_as_published, ..Filter::new(filter, QoS::AtLeastOnce) };
         // WAIT: mqtt-request

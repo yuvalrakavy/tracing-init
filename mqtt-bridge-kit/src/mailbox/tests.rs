@@ -326,15 +326,19 @@ fn configs_are_the_latest_per_target_and_may_set_the_feedback() {
     let mailbox = Mailbox::new();
     mailbox.post_config("tv", Some(json!({"code": "a"})));
     mailbox.post_config("tv", Some(json!({"code": "b", "feedback": "assumed"})));
-    assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Assumed);
     mailbox.connected();
     let mut configs = Vec::new();
     while let Some(held) = mailbox.take_held() {
-        mailbox.applied(false);
+        if let Held::Config { target, config } = &held {
+            mailbox.configured(target, config.as_ref());
+        }
         configs.push(held);
     }
     assert_eq!(configs, vec![Held::Config { target: "tv".into(), config: Some(json!({"code": "b", "feedback": "assumed"})) }]);
+    assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Assumed);
     mailbox.post_config("tv", None);
+    let Some(Work::Configure { target, config }) = mailbox.try_take() else { panic!("no configure") };
+    mailbox.configured(&target, config.as_ref());
     assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Observed, "a retracted config kept its feedback override");
 }
 
@@ -356,6 +360,54 @@ fn a_value_retracted_replaced_or_expired_during_a_read_is_dropped() {
     let kept = mailbox.revalidate(values);
     assert_eq!(kept.iter().map(|v| v.property.as_str()).collect::<Vec<_>>(), ["d"], "a value changed during the read was kept");
     assert_eq!(mailbox.take_expired(), 1, "the value past its deadline was not counted");
+}
+
+/// A target's config goes before its values: held, every config is taken before any value; while
+/// up, a waiting config of a target is taken before that target's values (review M4: a code set
+/// replayed after its value reached `apply` second).
+#[test]
+fn a_targets_config_goes_before_its_values() {
+    let mailbox = Mailbox::new();
+    mailbox.post_state(value("ir", "power", json!(true)), false);
+    mailbox.post_state(value("tv", "power", json!(true)), false);
+    mailbox.post_config("ir", Some(json!({"code_set": "lg"})));
+    mailbox.connected();
+    let first = mailbox.take_held();
+    assert!(
+        matches!(first, Some(Held::Config { ref target, .. }) if target == "ir"),
+        "a held value went before the held config: {first:?}"
+    );
+    mailbox.applied(false);
+
+    let mailbox = up();
+    mailbox.post_state(value("ir", "power", json!(true)), false);
+    mailbox.post_state(value("tv", "power", json!(true)), false);
+    mailbox.post_config("ir", Some(json!({"code_set": "lg"})));
+    let order: Vec<String> = drain(&mailbox)
+        .iter()
+        .map(|w| match w {
+            Work::Apply { target, .. } => format!("apply {target}"),
+            Work::Configure { target, .. } => format!("configure {target}"),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(order, ["configure ir", "apply ir", "apply tv"], "a target's value went before its waiting config");
+}
+
+/// A config's feedback override takes effect once `configure` has taken it — not at the post, and
+/// not when `configure` refused it (review, mailbox.rs:394).
+#[test]
+fn a_configs_feedback_override_is_committed_when_configure_takes_it() {
+    let mailbox = up();
+    mailbox.post_config("tv", Some(json!({"feedback": "assumed"})));
+    assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Observed, "the override took effect before configure took it");
+    let Some(Work::Configure { target, config }) = mailbox.try_take() else { panic!("no configure") };
+    mailbox.configured(&target, config.as_ref());
+    assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Assumed, "the override did not take effect when configure took it");
+    mailbox.post_config("tv", None);
+    assert!(mailbox.try_take().is_some());
+    mailbox.failed();
+    assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Assumed, "a retraction configure refused removed the override");
 }
 
 /// Nothing is logged while the mailbox's lock is held.

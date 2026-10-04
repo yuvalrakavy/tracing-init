@@ -426,8 +426,14 @@ guard       = "proof_clears_unproven"
 [[control]]
 name        = "a_configs_feedback_is_ignored"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''                Some(feedback) => inner.feedback.insert(target.to_owned(), feedback),'''
-replacement = '''                Some(_) => None,'''
+anchor      = '''            Some(feedback) => inner.feedback.insert(target.to_owned(), feedback),
+            None => inner.feedback.remove(target),
+        };
+    }'''
+replacement = '''            Some(_) => None,
+            None => inner.feedback.remove(target),
+        };
+    }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_targets_config_is_configured_and_may_override_the_feedback", "--exact"]
 expect_text = '''the config's feedback did not apply'''
@@ -1260,7 +1266,7 @@ guard       = "reply_not_on_request_lanes"
 name        = "replays_are_decided_against_the_read_back"
 file        = "mqtt-bridge-kit/src/reports.rs"
 anchor      = '''        state.broker_lost = Some((Instant::now(), values));'''
-replacement = '''        let _ = values;'''
+replacement = '''        let _: BTreeMap<String, PropertyMap> = values;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_made_during_a_broker_outage_is_decided_against_what_the_bridge_last_knew", "--exact"]
 expect_text = '''a request made during a broker outage was superseded though nobody touched the device'''
@@ -1328,7 +1334,7 @@ replacement = '''self.driver.read_state(Scope::Target(target.to_owned()))).await
                     let mut current: Option<PropertyMap> = None;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_catch_up_reads_a_target_the_proving_read_did_not_give", "--exact"]
-expect_text = '''DeviceWins reverted a change at the wall on a device read target by target'''
+expect_text = '''the request for the target nobody touched was not applied'''
 guard       = "catch_up_reads_target"
 
 # M6: under DeviceWins an unknown current value is not applied on a guess.
@@ -1397,8 +1403,8 @@ file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''pub const COPY_WINDOW: Duration = Duration::from_secs(60);'''
 replacement = '''pub const COPY_WINDOW: Duration = Duration::from_secs(0);'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_level_write_reaches_apply_once_with_all_values", "--exact"]
-expect_text = '''the target write did not reach apply once with all its values'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_writes_copies_arriving_after_its_apply_are_skipped", "--exact"]
+expect_text = '''a property copy arriving after the target write was applied again'''
 guard       = "copy_window"
 
 # C9: the requests are subscribed only once the read-back's SUBACK has come.
@@ -1411,3 +1417,41 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "requests_are_subscribed_only_once_the_read_back_is_acknowledged", "--exact"]
 expect_text = '''requests were subscribed before the read-back was acknowledged'''
 guard       = "read_back_suback_first"
+
+# M4 / MINOR 15: a target's config goes before its values.
+[[control]]
+name        = "held_values_go_before_their_config"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { held: true, .. })) {'''
+replacement = '''                if let Some(i) = inner.pending.iter().take(1).position(|e| matches!(e, Entry::Config { held: true, .. })) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_targets_config_is_configured_before_its_held_values_are_applied", "--exact"]
+expect_text = '''the held value reached apply before the target's config'''
+guard       = "config_first_held"
+
+# M4: while up, a target's waiting config goes before its values.
+[[control]]
+name        = "a_waiting_config_goes_after_its_targets_values"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                    if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { target: t, .. } if *t == target)) {'''
+replacement = '''                    if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { target: t, .. } if *t == target && false)) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_targets_config_goes_before_its_values", "--exact"]
+expect_text = '''a target's value went before its waiting config'''
+guard       = "config_first_up"
+
+# mailbox.rs:394: a config's feedback override takes effect once configure has taken it.
+[[control]]
+name        = "a_configs_feedback_takes_effect_at_the_post"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''            let mut inner = self.locked();
+            inner.pending.retain(|e| !matches!(e, Entry::Config { target: t, .. } if t == target));'''
+replacement = '''            let mut inner = self.locked();
+            if let Some(feedback) = config.as_ref().and_then(|c| c.get("feedback")).and_then(Value::as_str).and_then(Feedback::parse) {
+                inner.feedback.insert(target.to_owned(), feedback);
+            }
+            inner.pending.retain(|e| !matches!(e, Entry::Config { target: t, .. } if t == target));'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_configs_feedback_override_is_committed_when_configure_takes_it", "--exact"]
+expect_text = '''the override took effect before configure took it'''
+guard       = "feedback_on_configure"

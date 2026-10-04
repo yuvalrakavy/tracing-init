@@ -179,7 +179,9 @@ commands are refused, and reads are dropped.
     as `malformed`: the reply would be read back as a request.
   - A target-level write's property copies are skipped for 60 s.
   - `configure` is called only while connected. Configs are held while down and applied first in the
-    catch-up.
+    catch-up: every held config before any held value; while up, a target's waiting config before
+    its values; `Config` is subscribed before `Desired`. A config's `feedback` override takes effect
+    once `configure` has taken it.
   - A momentary command still waiting at its message expiry is dropped.
 - **Command line:** a zero `--retry` or `--probe-interval`, a `--mqtt-keep-alive` under 5 s
   (rumqttc's floor) and a duration too long to count are usage errors (exit 2); the same timings

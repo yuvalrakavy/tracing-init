@@ -286,7 +286,7 @@ async fn a_reported_name_that_is_no_topic_segment_is_dropped_and_the_session_goe
     assert!(h.eventually(BOUND, |h| h.state("t2").is_some()).await, "the target beside the bad name was not published");
     let connects = h.broker.connections();
     h.broker.drop_connection();
-    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects).await, "the bridge did not reconnect");
+    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await, "the bridge did not reconnect");
     h.device.set("t1", "temp", json!(25));
     assert!(h.command(json!({"target": "t1", "command": "refresh"}), Some(("Store/r", b"1"))));
     assert!(

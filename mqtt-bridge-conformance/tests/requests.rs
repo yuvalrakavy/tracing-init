@@ -312,8 +312,8 @@ async fn a_live_request_grouped_with_a_replayed_one_is_not_checked() {
     h.broker.retain(&h.topics.desired("t1", "temp"), "22", &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"));
     let connects = h.broker.connections();
     h.broker.drop_connection();
-    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects).await);
-    h.settle(Duration::from_millis(200)).await;
+    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await);
+    h.settle(Duration::from_millis(100)).await;
     // …and a live write, not retained, for the same target.
     assert!(h.broker.publish(
         &h.topics.desired("t1", "mode"),
@@ -403,17 +403,25 @@ async fn the_read_back_decides_replays_held_for_a_device_down() {
 async fn the_catch_up_reads_a_target_the_proving_read_did_not_give() {
     let h = Harness::start_with("onebyone", acknowledged(), quick_timing(), |_, _, device| {
         device.set("t1", "temp", json!(20));
+        device.set("t2", "temp", json!(20));
     })
     .await;
-    // Seen at 20 before the outage, through a read of t1 alone.
-    assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
+    // Seen at 20 before the outage.
+    assert!(h.eventually(BOUND, |h| h.state("t1").is_some() && h.state("t2").is_some()).await);
     h.device.answer_read_all(Answer::Unsupported);
     h.device.set_up(false);
     assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    // t1 changed at the wall during the outage, t2 not; a request for each.
     h.device.set("t1", "temp", json!(18));
     assert!(h.desire("t1", "temp", json!(22), DEVICE_WINS));
+    assert!(h.desire("t2", "temp", json!(22), DEVICE_WINS));
     h.settle(Duration::from_millis(200)).await;
     h.device.set_up(true);
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t2", "temp") == Some(json!(22))).await,
+        "the request for the target nobody touched was not applied: its current value was not read: {:?}",
+        h.errors()
+    );
     assert!(
         h.eventually(BOUND, |h| !h.errors_for("superseded").is_empty() || h.device.get("t1", "temp") == Some(json!(22))).await,
         "nothing became of the held request"
@@ -472,5 +480,54 @@ async fn a_request_retracted_during_its_conflict_read_is_not_applied() {
     h.settle(Duration::from_millis(1200)).await;
     assert!(h.device.applies().is_empty(), "a request retracted during its conflict read was applied: {:?}", h.device.applies());
     assert_eq!(h.device.calls_of(Op::Connect).len(), 1, "the link was lost, so this test proves nothing");
+    assert!(h.stop().await);
+}
+
+/// A target's config goes before its values: at start the retained `Config` reaches `configure`
+/// before the retained `Desired` reaches `apply` (review M4: `Desired` was subscribed first, and the
+/// catch-up took arrival order — an IR blaster saw a value before its code set).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_targets_config_is_configured_before_its_held_values_are_applied() {
+    let h = Harness::start_with("cfgorder", acknowledged(), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.config("ir"), json!({"code_set": "lg"}).to_string(), &SendOptions::default());
+        broker.retain(
+            &topics.desired("ir", "power"),
+            "true",
+            &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"),
+        );
+        device.set_up(false);
+    })
+    .await;
+    h.settle(Duration::from_millis(400)).await;
+    h.device.set_up(true);
+    assert!(
+        h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty() && !h.device.calls_of(Op::Configure).is_empty()).await,
+        "the config or the value never reached the driver: {:?}",
+        h.device.calls()
+    );
+    let order: Vec<Op> = h.device.calls().iter().map(|c| c.op).filter(|op| matches!(op, Op::Apply | Op::Configure)).collect();
+    assert_eq!(order.first(), Some(&Op::Configure), "the held value reached apply before the target's config: {order:?}");
+    assert!(h.stop().await);
+}
+
+/// A target-level write's property copies — the Store publishes them retained right after it —
+/// arriving after the write was applied are skipped within the copy window (60 s), so the device
+/// sees the values once (review MINOR 15).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_writes_copies_arriving_after_its_apply_are_skipped() {
+    let h = Harness::start_with("copies", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    let req = Req { expiry: Some(60), conflict: Some("DeviceWins") };
+    assert!(h.broker.publish(
+        &h.topics.desired_target("t1"),
+        json!({"power": true, "temp": 22}).to_string(),
+        &SendOptions::default().expiry(60)
+    ));
+    assert!(h.eventually(BOUND, |h| !h.device.applies().is_empty()).await, "the target write was never applied");
+    h.settle(Duration::from_millis(100)).await;
+    assert!(h.desire("t1", "power", json!(true), req));
+    assert!(h.desire("t1", "temp", json!(22), req));
+    h.settle(SETTLE).await;
+    assert_eq!(h.device.applies().len(), 1, "a property copy arriving after the target write was applied again: {:?}", h.device.applies());
     assert!(h.stop().await);
 }

@@ -12,7 +12,10 @@
 //!   value per key, in the order the values were last set. Held while the device is down, until
 //!   the request's deadline (its MQTT message expiry): a value past it is dropped, never applied.
 //!   The worker takes a target's waiting values together, for one atomic `apply`.
-//! - **Config** (a target's setup), the latest per target; held while the device is down.
+//! - **Config** (a target's setup), the latest per target; held while the device is down. A
+//!   target's setup comes before its values: every held config is taken before any held value,
+//!   and while up a waiting config of a target is taken before that target's values (review M4).
+//!   Its `feedback` override takes effect once `configure` has taken it.
 //! - **Momentary** (a command that acts once): queued in order while the device is connected, at
 //!   most [`MOMENTARY_CAP`] (past it, refused); refused at once while it is down — by the time it
 //!   is back the command would mean nothing — and refused if the device drops before taking it.
@@ -136,10 +139,6 @@ impl Entry {
                 target.as_deref()
             }
         }
-    }
-
-    fn held(&self) -> bool {
-        matches!(self, Entry::State { held: true, .. } | Entry::Config { held: true, .. })
     }
 }
 
@@ -413,14 +412,11 @@ impl Mailbox {
     }
 
     /// A target's setup, or (`None`) its retraction; the latest per target. Its `feedback`, if it
-    /// names one, overrides the driver's for that target at once. Never waits.
+    /// names one, overrides the driver's for that target once `configure` has taken it
+    /// ([`configured`](Self::configured)). Never waits.
     pub fn post_config(&self, target: &str, config: Option<Value>) -> Posted {
         let posted = {
             let mut inner = self.locked();
-            match config.as_ref().and_then(|c| c.get("feedback")).and_then(Value::as_str).and_then(Feedback::parse) {
-                Some(feedback) => inner.feedback.insert(target.to_owned(), feedback),
-                None => inner.feedback.remove(target),
-            };
             inner.pending.retain(|e| !matches!(e, Entry::Config { target: t, .. } if t == target));
             let held = !inner.connected;
             inner.pending.push_back(Entry::Config { target: target.to_owned(), config, held });
@@ -574,15 +570,16 @@ impl Mailbox {
             let mut inner = self.locked();
             let mut expired = 0;
             let held = loop {
-                match inner.pending.front() {
-                    Some(entry) if entry.held() => {}
-                    _ => break None,
-                }
-                if let Some(Entry::Config { .. }) = inner.pending.front() {
-                    if let Some(Entry::Config { target, config, .. }) = inner.pending.pop_front() {
+                // Every held config before any held value: a target's setup comes first.
+                if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { held: true, .. })) {
+                    if let Some(Entry::Config { target, config, .. }) = inner.pending.remove(i) {
                         inner.in_flight_config = Some((target.clone(), config.clone()));
                         break Some(Held::Config { target, config });
                     }
+                }
+                match inner.pending.front() {
+                    Some(Entry::State { held: true, .. }) => {}
+                    _ => break None,
                 }
                 let (target, mut values) = inner.take_group(0);
                 expired += inner.drop_expired(&mut values, now);
@@ -605,7 +602,15 @@ impl Mailbox {
     fn next(inner: &mut Inner, now: Instant, dropped: &mut usize) -> Option<Work> {
         loop {
             match inner.pending.front()? {
-                Entry::State { .. } => {
+                Entry::State { value, .. } => {
+                    // A target's waiting config goes before its values.
+                    let target = value.target.clone();
+                    if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { target: t, .. } if *t == target)) {
+                        if let Some(Entry::Config { target, config, .. }) = inner.pending.remove(i) {
+                            inner.in_flight_config = Some((target.clone(), config.clone()));
+                            return Some(Work::Configure { target, config });
+                        }
+                    }
                     let (target, mut values) = inner.take_group(0);
                     *dropped += inner.drop_expired(&mut values, now);
                     if values.is_empty() {
@@ -721,6 +726,19 @@ impl Mailbox {
                 inner.unproven.push((value, at));
             }
         }
+    }
+
+    /// `configure` took the config in flight for `target`: its `feedback`, if it names one, now
+    /// overrides the driver's for that target, and a config naming none (or a retraction) ends an
+    /// override (review, mailbox.rs:394: the override took effect at the post, and outlived a
+    /// refusal).
+    pub fn configured(&self, target: &str, config: Option<&Value>) {
+        let mut inner = self.locked();
+        inner.in_flight_config = None;
+        match config.and_then(|c| c.get("feedback")).and_then(Value::as_str).and_then(Feedback::parse) {
+            Some(feedback) => inner.feedback.insert(target.to_owned(), feedback),
+            None => inner.feedback.remove(target),
+        };
     }
 
     /// What was in flight failed on its own (refused, unusable, unsupported): passed over.
