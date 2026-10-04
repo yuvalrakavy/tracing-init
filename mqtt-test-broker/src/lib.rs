@@ -12,18 +12,41 @@
 //! Enough of MQTT for that and no more: one client at a time (a reconnect replaces the
 //! connection), QoS 0 to the client, QoS 1 from the client acknowledged or held, QoS 2 from the
 //! client always acknowledged (PUBREC, then PUBCOMP for its PUBREL — never held, so a QoS 2
-//! publish does not saturate a client), retained flags recorded but not replayed.
+//! publish does not saturate a client).
+//!
+//! For the Bridge Runtime's conformance suite (tracing-init `mqtt-bridge-conformance`) it also
+//! plays the rest of a broker a bridge relies on, still for one client:
+//! - **v5 properties both ways:** [`FakeBroker::send_with`] sends a publish with a message expiry,
+//!   user properties, a response topic and correlation data ([`SendOptions`]); a publish received
+//!   keeps its properties ([`Received::properties`]).
+//! - **Retained messages:** a retained publish from the client is kept (an empty one clears its
+//!   topic), and so is one the test leaves with [`FakeBroker::retain`] — as another client would;
+//!   each is replayed, flagged retained and with its remaining expiry, on every subscription that
+//!   matches it, after the SUBACK.
+//! - **Routing:** a publish from the client goes back to it on its current connection's matching
+//!   subscriptions, unflagged (retain-as-published off), as a broker forwards it.
+//! - **Faults:** [`FakeBroker::drop_connection`] cuts the connection, as a network fault does;
+//!   [`FakeBroker::restart_without_persistence`] cuts it and forgets every retained message and
+//!   subscription, as a broker restarted without persistence does.
+//! - **Order:** [`FakeBroker::events`] lists connections, subscriptions and publishes in the order
+//!   the broker saw them.
+//! - **A cap:** [`FakeBroker::cap_connections`] stops the listener past a number of connections, so
+//!   a client that reconnects in a loop is refused by the operating system rather than spinning
+//!   through the host's ephemeral ports.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 pub use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::{mqttbytes::v4, v5::mqttbytes::v5};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
+
+pub use rumqttc::v5::mqttbytes::v5::PublishProperties;
 
 /// A publish the broker received from the client.
 #[derive(Debug, Clone)]
@@ -32,6 +55,108 @@ pub struct Received {
     pub payload: Bytes,
     pub qos: QoS,
     pub retain: bool,
+    /// Its v5 properties, if it had any (always `None` from a v3.1.1 client).
+    pub properties: Option<PublishProperties>,
+}
+
+impl Received {
+    /// The value of the user property `name`, if the publish carried one.
+    pub fn user_property(&self, name: &str) -> Option<&str> {
+        self.properties.as_ref()?.user_properties.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
+    /// The publish's correlation data, if it carried any.
+    pub fn correlation_data(&self) -> Option<&Bytes> {
+        self.properties.as_ref()?.correlation_data.as_ref()
+    }
+}
+
+/// How the broker sends a publish of its own ([`FakeBroker::send_with`]) or keeps a retained one
+/// ([`FakeBroker::retain`]). The v5 properties are dropped on a v3.1.1 connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SendOptions {
+    /// Flag the publish retained, as a broker does when it replays a retained message.
+    pub retain: bool,
+    /// The message expiry interval, in seconds.
+    pub message_expiry: Option<u32>,
+    pub user_properties: Vec<(String, String)>,
+    pub response_topic: Option<String>,
+    pub correlation_data: Option<Bytes>,
+}
+
+impl SendOptions {
+    pub fn retained(mut self) -> SendOptions {
+        self.retain = true;
+        self
+    }
+
+    pub fn expiry(mut self, seconds: u32) -> SendOptions {
+        self.message_expiry = Some(seconds);
+        self
+    }
+
+    pub fn user_property(mut self, name: &str, value: &str) -> SendOptions {
+        self.user_properties.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    pub fn response_topic(mut self, topic: &str) -> SendOptions {
+        self.response_topic = Some(topic.to_owned());
+        self
+    }
+
+    pub fn correlation_data(mut self, data: impl Into<Bytes>) -> SendOptions {
+        self.correlation_data = Some(data.into());
+        self
+    }
+
+    fn properties(&self, expiry: Option<u32>) -> Option<PublishProperties> {
+        if expiry.is_none() && self.user_properties.is_empty() && self.response_topic.is_none() && self.correlation_data.is_none() {
+            return None;
+        }
+        Some(PublishProperties {
+            message_expiry_interval: expiry,
+            user_properties: self.user_properties.clone(),
+            response_topic: self.response_topic.clone(),
+            correlation_data: self.correlation_data.clone(),
+            ..PublishProperties::default()
+        })
+    }
+}
+
+/// Something the broker saw, in order ([`FakeBroker::events`]).
+#[derive(Debug, Clone)]
+pub enum BrokerEvent {
+    /// A CONNECT was accepted.
+    Connected,
+    /// The client subscribed to this filter.
+    Subscribed(String),
+    Unsubscribed(String),
+    /// A publish from the client.
+    Published(Received),
+    /// The client sent DISCONNECT.
+    Disconnected,
+}
+
+/// A retained message: what the client or the test left on a topic.
+#[derive(Debug, Clone)]
+struct Retained {
+    payload: Bytes,
+    options: SendOptions,
+    stored_at: Instant,
+}
+
+impl Retained {
+    /// Its expiry as a replay now gives it: what is left of it, or `None` when it has expired.
+    fn remaining(&self) -> Option<Option<u32>> {
+        match self.options.message_expiry {
+            None => Some(None),
+            Some(expiry) => {
+                let elapsed = self.stored_at.elapsed().as_secs();
+                (elapsed < expiry as u64).then(|| Some(expiry - elapsed as u32))
+            }
+        }
+    }
 }
 
 /// The protocol the broker speaks.
@@ -71,6 +196,16 @@ struct Shared {
     to_client: Mutex<Option<mpsc::UnboundedSender<BytesMut>>>,
     /// Any change a test may wait for: a publish received, a subscription, a connection.
     changed: Notify,
+    /// The retained messages, by topic.
+    retained: Mutex<BTreeMap<String, Retained>>,
+    /// The current connection's subscriptions (`subscriptions` keeps every one ever made).
+    active: Mutex<Vec<String>>,
+    events: Mutex<Vec<BrokerEvent>>,
+    /// Bumped to close the current connection (`drop_connection`).
+    kick: watch::Sender<u64>,
+    /// The listener stops past this many accepted connections.
+    cap: AtomicUsize,
+    accepted: AtomicUsize,
     /// Arrivals at the `held` lock (see `lock_held`).
     #[cfg(test)]
     held_lock_reached: AtomicUsize,
@@ -105,6 +240,12 @@ impl FakeBroker {
             held: Mutex::new(Vec::new()),
             to_client: Mutex::new(None),
             changed: Notify::new(),
+            retained: Mutex::new(BTreeMap::new()),
+            active: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
+            kick: watch::Sender::new(0),
+            cap: AtomicUsize::new(usize::MAX),
+            accepted: AtomicUsize::new(0),
             #[cfg(test)]
             held_lock_reached: AtomicUsize::new(0),
         });
@@ -123,15 +264,67 @@ impl FakeBroker {
 
     /// Send a QoS 0 publish to the connected client. `false` when no client is connected.
     pub fn send(&self, topic: &str, payload: impl Into<Bytes>) -> bool {
-        let payload = payload.into();
-        let encoded = match self.shared.protocol {
-            Protocol::V5 => encode_v5(v5::Packet::Publish(v5::Publish::new(topic, QoS::AtMostOnce, payload, None))),
-            Protocol::V4 => encode_v4(v4::Packet::Publish(v4::Publish::new(topic, v4_qos(QoS::AtMostOnce), payload.to_vec()))),
-        };
+        self.send_with(topic, payload, &SendOptions::default())
+    }
+
+    /// Send a QoS 0 publish with `options` (its retain flag and v5 properties) to the connected
+    /// client. `false` when no client is connected.
+    pub fn send_with(&self, topic: &str, payload: impl Into<Bytes>, options: &SendOptions) -> bool {
+        let encoded =
+            encode_publish(self.shared.protocol, topic, payload.into(), options.retain, options.properties(options.message_expiry));
         match &*self.shared.to_client.lock().unwrap() {
             Some(tx) => tx.send(encoded).is_ok(),
             None => false,
         }
+    }
+
+    /// Leave a retained message on `topic`, as another client publishing it retained would: it is
+    /// replayed on every later subscription that matches it, with what is left of its expiry. An
+    /// empty payload clears the topic. Nothing is sent to a subscription already made.
+    pub fn retain(&self, topic: &str, payload: impl Into<Bytes>, options: &SendOptions) {
+        store_retained(&self.shared, topic, payload.into(), options.clone());
+    }
+
+    /// The payload retained on `topic`, if any (an expired one counts as none).
+    pub fn retained_on(&self, topic: &str) -> Option<Bytes> {
+        let retained = self.shared.retained.lock().unwrap();
+        retained.get(topic).filter(|r| r.remaining().is_some()).map(|r| r.payload.clone())
+    }
+
+    /// Every topic with a retained message, and its payload.
+    pub fn retained(&self) -> Vec<(String, Bytes)> {
+        let retained = self.shared.retained.lock().unwrap();
+        retained.iter().filter(|(_, r)| r.remaining().is_some()).map(|(t, r)| (t.clone(), r.payload.clone())).collect()
+    }
+
+    /// Everything the broker saw, in order.
+    pub fn events(&self) -> Vec<BrokerEvent> {
+        self.shared.events.lock().unwrap().clone()
+    }
+
+    /// Close the current connection, as a network fault would. The client may reconnect.
+    pub fn drop_connection(&self) {
+        self.shared.kick.send_modify(|k| *k += 1);
+    }
+
+    /// Close the current connection and forget every retained message and subscription, as a
+    /// broker restarted without persistence would. The client may reconnect.
+    pub fn restart_without_persistence(&self) {
+        self.shared.retained.lock().unwrap().clear();
+        self.shared.active.lock().unwrap().clear();
+        self.drop_connection();
+    }
+
+    /// Accept at most `cap` connections in all, then stop listening (the connection open then
+    /// stays open): a client that reconnects in a loop is refused by the operating system from
+    /// then on, instead of spinning through the host's ephemeral ports.
+    pub fn cap_connections(&self, cap: usize) {
+        self.shared.cap.store(cap, Ordering::SeqCst);
+    }
+
+    /// How many TCP connections the broker has accepted.
+    pub fn accepted(&self) -> usize {
+        self.shared.accepted.load(Ordering::SeqCst)
     }
 
     /// Stop acknowledging the client's QoS 1 publishes (see the module documentation). QoS 2
@@ -208,8 +401,17 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
     let mut connections = tokio::task::JoinSet::new();
     while let Ok((stream, _)) = listener.accept().await {
         while connections.try_join_next().is_some() {}
+        let accepted = shared.accepted.fetch_add(1, Ordering::SeqCst) + 1;
+        if accepted > shared.cap.load(Ordering::SeqCst) {
+            drop(stream);
+            break;
+        }
         connections.spawn(connection(stream, shared.clone()));
     }
+    // Past the cap: no more connections, and the open ones go on until they end or the broker is
+    // dropped (which aborts this task, and with it the set).
+    drop(listener);
+    while connections.join_next().await.is_some() {}
 }
 
 /// What reading one packet off the buffer came to.
@@ -237,6 +439,10 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<BytesMut>();
     *shared.to_client.lock().unwrap() = Some(tx.clone());
     lock_held(&shared).clear();
+    // A new connection starts without a session: no subscription carries over.
+    shared.active.lock().unwrap().clear();
+    let mut kick = shared.kick.subscribe();
+    kick.mark_unchanged();
     // The writer goes with this task: when the client goes, and when the task is aborted (the
     // broker dropped) — also while the writer is blocked in `write_all` on a client that stopped
     // reading, which a detached writer survived, holding the client's socket open (review
@@ -264,15 +470,89 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>) {
                 }
             }
         }
-        match rd.read_buf(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        tokio::select! {
+            read = rd.read_buf(&mut buf) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            },
+            _ = kick.changed() => break,
+        }
+    }
+    shared.changed.notify_waiters();
+}
+
+fn record(shared: &Shared, received: Received) {
+    shared.events.lock().unwrap().push(BrokerEvent::Published(received.clone()));
+    shared.received.lock().unwrap().push(received);
+}
+
+fn event(shared: &Shared, event: BrokerEvent) {
+    shared.events.lock().unwrap().push(event);
+}
+
+/// Keep `payload` retained on `topic`, or clear the topic for an empty one.
+fn store_retained(shared: &Shared, topic: &str, payload: Bytes, options: SendOptions) {
+    let mut retained = shared.retained.lock().unwrap();
+    if payload.is_empty() {
+        retained.remove(topic);
+    } else {
+        retained.insert(topic.to_owned(), Retained { payload, options, stored_at: Instant::now() });
+    }
+}
+
+/// A publish from the client: kept if retained, then forwarded to the client's own subscriptions
+/// that match it, once, unflagged.
+fn route(
+    shared: &Shared,
+    tx: &mpsc::UnboundedSender<BytesMut>,
+    topic: &str,
+    payload: &Bytes,
+    retain: bool,
+    properties: Option<PublishProperties>,
+) {
+    if retain {
+        let options = SendOptions {
+            retain: true,
+            message_expiry: properties.as_ref().and_then(|p| p.message_expiry_interval),
+            user_properties: properties.as_ref().map(|p| p.user_properties.clone()).unwrap_or_default(),
+            response_topic: properties.as_ref().and_then(|p| p.response_topic.clone()),
+            correlation_data: properties.as_ref().and_then(|p| p.correlation_data.clone()),
+        };
+        store_retained(shared, topic, payload.clone(), options);
+    }
+    let subscribed = shared.active.lock().unwrap().iter().any(|filter| rumqttc::v5::mqttbytes::matches(topic, filter));
+    if subscribed {
+        let _ = tx.send(encode_publish(shared.protocol, topic, payload.clone(), false, properties));
+    }
+}
+
+/// After a SUBACK: the retained messages matching `filter`, flagged retained, each with what is
+/// left of its expiry (an expired one is dropped).
+fn replay(shared: &Shared, tx: &mpsc::UnboundedSender<BytesMut>, filter: &str) {
+    let mut retained = shared.retained.lock().unwrap();
+    retained.retain(|_, r| r.remaining().is_some());
+    for (topic, r) in retained.iter() {
+        if rumqttc::v5::mqttbytes::matches(topic, filter) {
+            let expiry = r.remaining().flatten();
+            let _ = tx.send(encode_publish(shared.protocol, topic, r.payload.clone(), true, r.options.properties(expiry)));
         }
     }
 }
 
-fn record(shared: &Shared, topic: String, payload: Bytes, qos: QoS, retain: bool) {
-    shared.received.lock().unwrap().push(Received { topic, payload, qos, retain });
+/// A QoS 0 publish to the client.
+fn encode_publish(protocol: Protocol, topic: &str, payload: Bytes, retain: bool, properties: Option<PublishProperties>) -> BytesMut {
+    match protocol {
+        Protocol::V5 => {
+            let mut publish = v5::Publish::new(topic, QoS::AtMostOnce, payload, properties);
+            publish.retain = retain;
+            encode_v5(v5::Packet::Publish(publish))
+        }
+        Protocol::V4 => {
+            let mut publish = v4::Publish::new(topic, v4_qos(QoS::AtMostOnce), payload.to_vec());
+            publish.retain = retain;
+            encode_v4(v4::Packet::Publish(publish))
+        }
+    }
 }
 
 /// The `held` lock. Under test, each arrival at it is counted first, so a test can tell a thread
@@ -341,6 +621,7 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
     match packet {
         v5::Packet::Connect(..) => {
             shared.connections.fetch_add(1, Ordering::SeqCst);
+            event(shared, BrokerEvent::Connected);
             let properties = v5::ConnAckProperties {
                 session_expiry_interval: None,
                 receive_max: Some(shared.receive_max),
@@ -366,15 +647,35 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
         v5::Packet::Subscribe(s) => {
             let codes = s.filters.iter().map(|f| v5::SubscribeReasonCode::Success(f.qos)).collect();
             shared.subscriptions.lock().unwrap().extend(s.filters.iter().map(|f| f.path.clone()));
+            shared.active.lock().unwrap().extend(s.filters.iter().map(|f| f.path.clone()));
+            for f in &s.filters {
+                event(shared, BrokerEvent::Subscribed(f.path.clone()));
+            }
             let _ = tx.send(encode_v5(v5::Packet::SubAck(v5::SubAck { pkid: s.pkid, return_codes: codes, properties: None })));
+            for f in &s.filters {
+                replay(shared, tx, &f.path);
+            }
         }
         v5::Packet::Unsubscribe(u) => {
             shared.subscriptions.lock().unwrap().retain(|f| !u.filters.contains(f));
+            shared.active.lock().unwrap().retain(|f| !u.filters.contains(f));
+            for f in &u.filters {
+                event(shared, BrokerEvent::Unsubscribed(f.clone()));
+            }
             let reasons = u.filters.iter().map(|_| v5::UnsubAckReason::Success).collect();
             let _ = tx.send(encode_v5(v5::Packet::UnsubAck(v5::UnsubAck { pkid: u.pkid, reasons, properties: None })));
         }
         v5::Packet::Publish(p) => {
-            record(shared, String::from_utf8_lossy(&p.topic).into_owned(), p.payload.clone(), p.qos, p.retain);
+            let topic = String::from_utf8_lossy(&p.topic).into_owned();
+            let received = Received {
+                topic: topic.clone(),
+                payload: p.payload.clone(),
+                qos: p.qos,
+                retain: p.retain,
+                properties: p.properties.clone(),
+            };
+            record(shared, received);
+            route(shared, tx, &topic, &p.payload, p.retain, p.properties.clone());
             match p.qos {
                 QoS::AtMostOnce => {}
                 QoS::AtLeastOnce => ack_or_hold(shared, tx, p.pkid),
@@ -389,7 +690,10 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
         v5::Packet::PingReq(_) => {
             let _ = tx.send(encode_v5(v5::Packet::PingResp(v5::PingResp)));
         }
-        v5::Packet::Disconnect(_) => return Some(Read::Closed),
+        v5::Packet::Disconnect(_) => {
+            event(shared, BrokerEvent::Disconnected);
+            return Some(Read::Closed);
+        }
         _ => {}
     }
     Some(Read::Handled)
@@ -405,20 +709,34 @@ fn read_v4(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
     match packet {
         v4::Packet::Connect(_) => {
             shared.connections.fetch_add(1, Ordering::SeqCst);
+            event(shared, BrokerEvent::Connected);
             let _ = tx.send(encode_v4(v4::Packet::ConnAck(v4::ConnAck::new(v4::ConnectReturnCode::Success, false))));
         }
         v4::Packet::Subscribe(s) => {
             let codes = s.filters.iter().map(|f| v4::SubscribeReasonCode::Success(f.qos)).collect();
             shared.subscriptions.lock().unwrap().extend(s.filters.iter().map(|f| f.path.clone()));
+            shared.active.lock().unwrap().extend(s.filters.iter().map(|f| f.path.clone()));
+            for f in &s.filters {
+                event(shared, BrokerEvent::Subscribed(f.path.clone()));
+            }
             let _ = tx.send(encode_v4(v4::Packet::SubAck(v4::SubAck::new(s.pkid, codes))));
+            for f in &s.filters {
+                replay(shared, tx, &f.path);
+            }
         }
         v4::Packet::Unsubscribe(u) => {
             shared.subscriptions.lock().unwrap().retain(|f| !u.topics.contains(f));
+            shared.active.lock().unwrap().retain(|f| !u.topics.contains(f));
+            for f in &u.topics {
+                event(shared, BrokerEvent::Unsubscribed(f.clone()));
+            }
             let _ = tx.send(encode_v4(v4::Packet::UnsubAck(v4::UnsubAck::new(u.pkid))));
         }
         v4::Packet::Publish(p) => {
             let qos = from_v4_qos(p.qos);
-            record(shared, p.topic.clone(), p.payload.clone(), qos, p.retain);
+            let payload = Bytes::copy_from_slice(&p.payload);
+            record(shared, Received { topic: p.topic.clone(), payload: payload.clone(), qos, retain: p.retain, properties: None });
+            route(shared, tx, &p.topic, &payload, p.retain, None);
             match qos {
                 QoS::AtMostOnce => {}
                 QoS::AtLeastOnce => ack_or_hold(shared, tx, p.pkid),
@@ -433,7 +751,10 @@ fn read_v4(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
         v4::Packet::PingReq => {
             let _ = tx.send(encode_v4(v4::Packet::PingResp));
         }
-        v4::Packet::Disconnect => return Some(Read::Closed),
+        v4::Packet::Disconnect => {
+            event(shared, BrokerEvent::Disconnected);
+            return Some(Read::Closed);
+        }
         _ => {}
     }
     Some(Read::Handled)

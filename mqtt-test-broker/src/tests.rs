@@ -235,3 +235,144 @@ async fn dropping_the_broker_stops_a_writer_blocked_on_its_client() {
     assert!(read < queued / 2, "the dropped broker's writer went on writing: the client read {read} of the {queued} bytes queued for it");
     assert!(ended.is_ok(), "the broker was dropped but a writer still holds the client's socket open ({read} bytes read)");
 }
+
+/// Poll the event loop in a task of its own, collecting every incoming publish whole.
+fn pump_publishes(mut events: rumqttc::v5::EventLoop) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedReceiver<v5::Publish>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        loop {
+            match events.poll().await {
+                Ok(Event::Incoming(rumqttc::v5::Incoming::Publish(p))) => {
+                    let _ = tx.send(p);
+                }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    });
+    (task, rx)
+}
+
+async fn next_publish(incoming: &mut mpsc::UnboundedReceiver<v5::Publish>) -> v5::Publish {
+    tokio::time::timeout(BOUND, incoming.recv()).await.expect("a publish within the bound").expect("the pump is running")
+}
+
+/// A retained message — the test's own, or one the client published — is replayed on a matching
+/// subscription, flagged retained and with what is left of its expiry; an empty retained publish
+/// clears it; an expired one is not replayed.
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_messages_are_replayed_on_subscription_with_their_remaining_expiry() {
+    let broker = FakeBroker::start().await;
+    broker.retain("r/kept", "kept", &SendOptions::default().expiry(60).user_property("conflict", "DeviceWins"));
+    broker.retain("r/cleared", "gone", &SendOptions::default());
+    broker.retain("r/cleared", "", &SendOptions::default());
+    broker.retain("r/expired", "old", &SendOptions::default().expiry(0));
+    let (client, events) = client(&broker, 10);
+    let (task, mut incoming) = pump_publishes(events);
+    client.publish("r/own", QoS::AtLeastOnce, true, "own").await.unwrap();
+    assert!(broker.wait_until(BOUND, |b| b.retained_on("r/own").is_some()).await, "the client's retained publish was not kept");
+    client.subscribe("r/#", QoS::AtLeastOnce).await.unwrap();
+    let mut replayed = Vec::new();
+    for _ in 0..2 {
+        replayed.push(next_publish(&mut incoming).await);
+    }
+    let topics: Vec<String> = replayed.iter().map(|p| String::from_utf8_lossy(&p.topic).into_owned()).collect();
+    assert_eq!(topics, ["r/kept", "r/own"], "the replay is not the live retained messages, in topic order");
+    assert!(replayed.iter().all(|p| p.retain), "a replayed message was not flagged retained");
+    let kept = replayed[0].properties.clone().expect("the kept message's properties");
+    assert!(matches!(kept.message_expiry_interval, Some(59..=60)), "the remaining expiry: {:?}", kept.message_expiry_interval);
+    assert_eq!(kept.user_properties, vec![("conflict".to_owned(), "DeviceWins".to_owned())]);
+    assert!(tokio::time::timeout(Duration::from_millis(300), incoming.recv()).await.is_err(), "a cleared or expired message was replayed");
+    task.abort();
+}
+
+/// A publish from the client goes back to it on a matching subscription of its current
+/// connection, unflagged; one the broker sends carries its v5 properties; one the client sends
+/// keeps them in `received`.
+#[tokio::test(flavor = "multi_thread")]
+async fn publishes_are_routed_and_keep_their_properties_both_ways() {
+    let broker = FakeBroker::start().await;
+    let (client, events) = client(&broker, 10);
+    let (task, mut incoming) = pump_publishes(events);
+    client.subscribe("echo/#", QoS::AtLeastOnce).await.unwrap();
+    assert!(broker.wait_for_subscription("echo/#", BOUND).await);
+    let properties = PublishProperties { correlation_data: Some(Bytes::from_static(b"c-1")), ..PublishProperties::default() };
+    client.publish_with_properties("echo/a", QoS::AtLeastOnce, true, "x", properties).await.unwrap();
+    let echoed = next_publish(&mut incoming).await;
+    assert_eq!(&echoed.topic[..], b"echo/a");
+    assert!(!echoed.retain, "a forwarded publish kept its retain flag");
+    assert!(broker.wait_until(BOUND, |b| b.received_on("echo/a").len() == 1).await);
+    assert_eq!(broker.received_on("echo/a")[0].correlation_data(), Some(&Bytes::from_static(b"c-1")));
+
+    let options =
+        SendOptions::default().expiry(30).response_topic("echo/reply").correlation_data("c-2").user_property("conflict", "RequestWins");
+    assert!(broker.send_with("in/x", "y", &options));
+    let sent = next_publish(&mut incoming).await;
+    let p = sent.properties.expect("the sent publish's properties");
+    assert_eq!(p.message_expiry_interval, Some(30));
+    assert_eq!(p.response_topic.as_deref(), Some("echo/reply"));
+    assert_eq!(p.correlation_data, Some(Bytes::from_static(b"c-2")));
+    assert_eq!(p.user_properties, vec![("conflict".to_owned(), "RequestWins".to_owned())]);
+    task.abort();
+}
+
+/// `drop_connection` cuts the connection and the client reconnects without its subscriptions;
+/// `restart_without_persistence` also forgets the retained messages; `events` lists it all in
+/// order.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_connection_and_a_restart_without_persistence() {
+    let broker = FakeBroker::start().await;
+    let (client, events) = client(&broker, 10);
+    let (task, _incoming) = pump_publishes(events);
+    client.subscribe("s/#", QoS::AtLeastOnce).await.unwrap();
+    client.publish("s/kept", QoS::AtLeastOnce, true, "v").await.unwrap();
+    assert!(broker.wait_until(BOUND, |b| b.retained_on("s/kept").is_some()).await);
+    broker.drop_connection();
+    assert!(broker.wait_until(BOUND, |b| b.connections() == 2).await, "the client did not reconnect after the cut");
+    assert!(broker.retained_on("s/kept").is_some(), "a dropped connection lost a retained message");
+    broker.restart_without_persistence();
+    assert!(broker.wait_until(BOUND, |b| b.connections() == 3).await, "the client did not reconnect after the restart");
+    assert!(broker.retained().is_empty(), "a restart without persistence kept a retained message");
+    let kinds: Vec<&str> = broker
+        .events()
+        .iter()
+        .map(|e| match e {
+            BrokerEvent::Connected => "connected",
+            BrokerEvent::Subscribed(_) => "subscribed",
+            BrokerEvent::Unsubscribed(_) => "unsubscribed",
+            BrokerEvent::Published(_) => "published",
+            BrokerEvent::Disconnected => "disconnected",
+        })
+        .collect();
+    assert_eq!(kinds, ["connected", "subscribed", "published", "connected", "connected"]);
+    task.abort();
+}
+
+/// Past its cap the broker stops listening: a further connection is refused by the operating
+/// system, and the open one goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_broker_stops_listening_past_its_cap() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(1);
+    let mut first = raw_client(&broker).await;
+    let refused = tokio::time::timeout(BOUND, async {
+        loop {
+            match tokio::net::TcpStream::connect(broker.address()).await {
+                Err(_) => return,
+                Ok(mut extra) => {
+                    // Accepted by the kernel before the listener closed: closed unanswered.
+                    let mut buf = [0u8; 16];
+                    let read = tokio::time::timeout(BOUND, extra.read(&mut buf)).await.expect("the extra connection is closed");
+                    assert!(matches!(read, Ok(0) | Err(_)), "a connection past the cap was served");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(refused.is_ok(), "the broker went on listening past its cap");
+    assert!(broker.send("still", "open"), "the open connection was closed at the cap");
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(BOUND, first.read(&mut buf)).await.expect("the open connection still delivers").unwrap();
+    assert!(n > 0);
+}
