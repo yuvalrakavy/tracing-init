@@ -22,9 +22,11 @@
 //! **Held state and its conflict check.** A value posted while the device is down, a value the
 //! broker replayed as retained (made while the bridge was not listening), and a value held again
 //! are *checked*: before it is applied the worker reads the device and the outage conflict rule
-//! decides it (Store kit spec §4.5). Held values are taken first when the device is back, one
-//! target at a time ([`Mailbox::take_held`]), and stay in the mailbox until then — so a value set
-//! meanwhile replaces its held one, which is never applied (mqtt_ac re-review C3).
+//! decides it (Store kit spec §4.5). Each value says why ([`Check`]): the rule's "before" values
+//! depend on it, and a live value taken together with a checked one is not checked for its
+//! company (review MINOR 3). Held values are taken first when the device is back, one target at
+//! a time ([`Mailbox::take_held`]), and stay in the mailbox until then — so a value set meanwhile
+//! replaces its held one, which is never applied (mqtt_ac re-review C3).
 //!
 //! **Unproven writes** (`Writes::Unacknowledged`): an applied value is kept until a later
 //! successful probe or read proves the device took it ([`Mailbox::proven`]) — by order, never by
@@ -69,6 +71,28 @@ pub struct StateValue {
     /// When it is dropped if not yet applied.
     pub deadline: Option<Instant>,
     pub conflict: Conflict,
+    /// Why the outage conflict rule decides it, if it does; the mailbox sets it when the value is
+    /// posted, and when it is held again.
+    pub check: Check,
+}
+
+/// Why a value is checked by the outage conflict rule — which decides its "before" values (Store
+/// kit spec §4.5). Neither: a live request to a connected device, applied as it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Check {
+    /// The broker replayed it as retained: made while the bridge was not listening. Its "before"
+    /// values are what the bridge knew when it stopped listening.
+    pub replayed: bool,
+    /// Posted, or held again, while the device was down. Its "before" values are what the bridge
+    /// knew of the device when its outage began.
+    pub held: bool,
+}
+
+impl Check {
+    /// Whether the conflict rule decides the value at all.
+    pub fn any(self) -> bool {
+        self.replayed || self.held
+    }
 }
 
 impl StateValue {
@@ -96,7 +120,7 @@ pub enum ReadKey {
 
 #[derive(Debug)]
 enum Entry {
-    State { value: StateValue, held: bool, check: bool },
+    State { value: StateValue, held: bool },
     Config { target: String, config: Option<Value>, held: bool },
     Momentary { target: Option<String>, call: CommandCall, reply: Option<ReplyTo>, deadline: Option<Instant> },
     Read { key: ReadKey, call: Option<CommandCall>, replies: Vec<ReplyTo> },
@@ -122,11 +146,11 @@ impl Entry {
 /// What the worker takes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Work {
-    /// One target's waiting values, for one `apply`; `check`: the conflict rule decides them first.
+    /// One target's waiting values, for one `apply`; those whose [`Check`] says so are decided by
+    /// the conflict rule first, each on its own.
     Apply {
         target: String,
         values: Vec<StateValue>,
-        check: bool,
     },
     Configure {
         target: String,
@@ -239,9 +263,9 @@ struct Inner {
 
 impl Inner {
     /// Replace a waiting value with the same key, and put this one at the back.
-    fn replace_state(&mut self, value: StateValue, held: bool, check: bool) {
+    fn replace_state(&mut self, value: StateValue, held: bool) {
         self.pending.retain(|e| !matches!(e, Entry::State { value: v, .. } if v.same_key(&value)));
-        self.pending.push_back(Entry::State { value, held, check });
+        self.pending.push_back(Entry::State { value, held });
     }
 
     fn waits_for(&self, value: &StateValue) -> bool {
@@ -262,7 +286,7 @@ impl Inner {
     /// Remove and return the group of State entries for the target of the entry at `first`: that
     /// one, and every later one for the same target with the same `held`, up to the first entry for
     /// that target that is not a state value (a command or a config keeps its place after them).
-    fn take_group(&mut self, first: usize) -> (String, Vec<StateValue>, bool) {
+    fn take_group(&mut self, first: usize) -> (String, Vec<StateValue>) {
         let (target, held) = match &self.pending[first] {
             Entry::State { value, held, .. } => (value.target.clone(), *held),
             _ => unreachable!("take_group starts at a state value"),
@@ -276,15 +300,13 @@ impl Inner {
             }
         }
         let mut values = Vec::new();
-        let mut check = false;
         for i in indices.into_iter().rev() {
-            if let Some(Entry::State { value, check: c, .. }) = self.pending.remove(i) {
-                check |= c;
+            if let Some(Entry::State { value, .. }) = self.pending.remove(i) {
                 values.push(value);
             }
         }
         values.reverse();
-        (target, values, check)
+        (target, values)
     }
 
     /// Drop the values past their deadline, counting them.
@@ -337,7 +359,7 @@ impl Mailbox {
 
     /// A property's requested value; `replay`: the broker delivered it as retained, so it was made
     /// while the bridge was not listening, and is checked like a held one. Never waits.
-    pub fn post_state(&self, value: StateValue, replay: bool) -> Posted {
+    pub fn post_state(&self, mut value: StateValue, replay: bool) -> Posted {
         let now = Instant::now();
         let posted = {
             let mut inner = self.locked();
@@ -346,7 +368,8 @@ impl Mailbox {
                 Some((copy, until)) if copy == value.value && now < until => Posted::Skipped,
                 _ => {
                     let held = !inner.connected;
-                    inner.replace_state(value, held, held || replay);
+                    value.check = Check { replayed: replay, held };
+                    inner.replace_state(value, held);
                     if held {
                         Posted::Held
                     } else {
@@ -365,9 +388,10 @@ impl Mailbox {
         let posted = {
             let mut inner = self.locked();
             let held = !inner.connected;
-            for value in values {
+            for mut value in values {
                 inner.copies.insert((value.target.clone(), value.property.clone()), (value.value.clone(), until));
-                inner.replace_state(value, held, held);
+                value.check = Check { replayed: false, held };
+                inner.replace_state(value, held);
             }
             if held {
                 Posted::Held
@@ -494,8 +518,9 @@ impl Mailbox {
                 }
             }
             // `newest` is newest first: each to the front leaves them oldest first.
-            for value in newest {
-                inner.pending.push_front(Entry::State { value, held: true, check: true });
+            for mut value in newest {
+                value.check.held = true;
+                inner.pending.push_front(Entry::State { value, held: true });
             }
             // A config in flight goes first of all: a target's setup comes before its values.
             if let Some((target, config)) = inner.in_flight_config.take() {
@@ -506,7 +531,10 @@ impl Mailbox {
             let waiting = std::mem::take(&mut inner.pending);
             for entry in waiting {
                 match entry {
-                    Entry::State { value, .. } => inner.pending.push_back(Entry::State { value, held: true, check: true }),
+                    Entry::State { mut value, .. } => {
+                        value.check.held = true;
+                        inner.pending.push_back(Entry::State { value, held: true });
+                    }
                     Entry::Config { target, config, .. } => inner.pending.push_back(Entry::Config { target, config, held: true }),
                     Entry::Momentary { target, call, reply, .. } => {
                         unanswered.push(Unanswered { target, command: call.command, momentary: true, replies: reply.into_iter().collect() })
@@ -555,7 +583,7 @@ impl Mailbox {
                         break Some(Held::Config { target, config });
                     }
                 }
-                let (target, mut values, _) = inner.take_group(0);
+                let (target, mut values) = inner.take_group(0);
                 expired += inner.drop_expired(&mut values, now);
                 if values.is_empty() {
                     continue;
@@ -585,13 +613,13 @@ impl Mailbox {
         loop {
             match inner.pending.front()? {
                 Entry::State { .. } => {
-                    let (target, mut values, check) = inner.take_group(0);
+                    let (target, mut values) = inner.take_group(0);
                     *dropped += inner.drop_expired(&mut values, now);
                     if values.is_empty() {
                         continue;
                     }
                     inner.in_flight = values.clone();
-                    return Some(Work::Apply { target, values, check });
+                    return Some(Work::Apply { target, values });
                 }
                 Entry::Config { .. } => {
                     if let Some(Entry::Config { target, config, .. }) = inner.pending.pop_front() {

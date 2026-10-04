@@ -124,7 +124,11 @@ async fn the_outage_conflict_device_wins() {
     assert_eq!(superseded.len(), 1, "{superseded:?}");
     assert_eq!((superseded[0]["target"].as_str(), superseded[0]["property"].as_str()), (Some("t1"), Some("temp")));
     assert_eq!(h.device.get("t1", "temp"), Some(json!(18)), "the change at the device was reverted");
-    assert_eq!(h.device.applies(), vec![("t1".to_owned(), values(&[("power", json!(true))]))]);
+    assert_eq!(
+        h.device.applies(),
+        vec![("t1".to_owned(), values(&[("power", json!(true))]))],
+        "a held value the device already had was written again, or the superseded one was"
+    );
     assert!(h.stop().await);
 }
 
@@ -206,5 +210,185 @@ async fn a_retraction_before_the_device_returns_is_never_applied() {
     assert!(connected(&h).await);
     h.settle(SETTLE).await;
     assert!(h.device.applies().is_empty(), "a retracted request was applied: {:?}", h.device.applies());
+    assert!(h.stop().await);
+}
+
+const DEVICE_WINS: Req = Req { expiry: Some(3600), conflict: Some("DeviceWins") };
+
+/// A request made during a broker outage — kept at the broker, replayed on the next connection —
+/// is decided against what the bridge knew when it stopped listening, not the start-up read-back:
+/// a value the Store itself set since start-up is no change at the device (review B1: it was
+/// taken for one, and DeviceWins dropped every replay of a property changed since start-up).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_made_during_a_broker_outage_is_decided_against_what_the_bridge_last_knew() {
+    let h = Harness::start_with("blip", acknowledged(), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("t1"), json!({"temp": 20}).to_string(), &SendOptions::default());
+        device.set("t1", "temp", json!(20));
+    })
+    .await;
+    assert!(connected(&h).await);
+    // The Store sets 23; the device takes it; its State says 23; the Store retracts.
+    assert!(h.desire("t1", "temp", json!(23), DEVICE_WINS));
+    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(23))).await);
+    assert!(h.command(json!({"target": "t1", "command": "refresh"}), None));
+    assert!(h.eventually(BOUND, |h| h.state("t1") == Some(json!({"temp": 23}))).await, "the bridge never saw the device at 23");
+    assert!(h.retract("t1", "temp"));
+    h.settle(Duration::from_millis(300)).await;
+    // The broker goes away; meanwhile the Store asks for 25, kept at the broker.
+    h.broker.refuse_connections(true);
+    h.broker.drop_connection();
+    h.settle(Duration::from_millis(300)).await;
+    h.broker.retain(&h.topics.desired("t1", "temp"), "25", &SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins"));
+    h.broker.refuse_connections(false);
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(25)) || !h.errors_for("superseded").is_empty()).await,
+        "nothing became of the replayed request"
+    );
+    assert!(
+        h.errors_for("superseded").is_empty(),
+        "a request made during a broker outage was superseded though nobody touched the device: {:?}",
+        h.errors()
+    );
+    assert_eq!(h.device.get("t1", "temp"), Some(json!(25)));
+    assert!(h.stop().await);
+}
+
+/// A link lost during the catch-up — after the proving read, before the held values are all
+/// written — does not make the device's current values the next link's "before" values: a change
+/// made at the device during the outage still counts (review M1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_lost_during_the_catch_up_does_not_forget_a_change_at_the_device() {
+    let h = Harness::start_with("flap", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.set("t2", "temp", json!(20));
+    })
+    .await;
+    assert!(h.eventually(BOUND, |h| h.state("t2").is_some() && h.status().as_deref() == Some("connected")).await);
+    h.device.set_up(false);
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    // At the wall, during the outage: t2 to 18. Requests for both.
+    h.device.set("t2", "temp", json!(18));
+    assert!(h.desire("t1", "temp", json!(22), DEVICE_WINS));
+    assert!(h.desire("t2", "temp", json!(22), DEVICE_WINS));
+    h.settle(Duration::from_millis(200)).await;
+    // The catch-up's first write loses the link.
+    h.device.answer_times(Op::Apply, Some("t1"), Answer::Link, 1);
+    h.device.set_up(true);
+    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await, "t1 was never applied: {:?}", h.device.calls());
+    h.settle(Duration::from_millis(600)).await;
+    assert_eq!(
+        h.device.get("t2", "temp"),
+        Some(json!(18)),
+        "the change at the wall during the outage was reverted after a link lost during the catch-up: {:?}",
+        h.errors()
+    );
+    assert!(h.errors_for("superseded").iter().any(|e| e["target"] == "t2"), "t2's request was not reported superseded: {:?}", h.errors());
+    assert!(h.stop().await);
+}
+
+/// The conflict check applies to each value on its own: a live request taken together with a
+/// replayed one for the same target is applied, never superseded for its company (review MINOR 3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_request_grouped_with_a_replayed_one_is_not_checked() {
+    // Operations may take 3 s here: the busy write below must not cost the link.
+    let timing = mqtt_bridge_kit::TimingOverrides { operation: Some(Duration::from_secs(3)), ..quick_timing() };
+    let h = Harness::start_with("grouped", acknowledged(), timing, |broker, topics, device| {
+        // What the previous run published; since then mode was changed at the device.
+        broker.retain(&topics.state("t1"), json!({"temp": 20, "mode": "heat"}).to_string(), &SendOptions::default());
+        device.set("t1", "temp", json!(20));
+        device.set("t1", "mode", json!("auto"));
+        device.set("t0", "x", json!(0));
+    })
+    .await;
+    assert!(connected(&h).await);
+    // Keep the worker busy while a replay and a live write for t1 arrive.
+    h.device.answer_times(Op::Apply, Some("t0"), Answer::Delay(Duration::from_millis(1500)), 1);
+    assert!(h.desire("t0", "x", json!(1), Req::default()));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty()).await);
+    // A replay (the broker brings back what was retained while the bridge was away)…
+    h.broker.retain(&h.topics.desired("t1", "temp"), "22", &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"));
+    let connects = h.broker.connections();
+    h.broker.drop_connection();
+    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects).await);
+    h.settle(Duration::from_millis(200)).await;
+    // …and a live write, not retained, for the same target.
+    assert!(h.broker.publish(
+        &h.topics.desired("t1", "mode"),
+        "\"cool\"",
+        &SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins")
+    ));
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "mode") == Some(json!("cool")) || !h.errors_for("superseded").is_empty()).await,
+        "nothing became of the live request"
+    );
+    assert!(h.errors_for("superseded").is_empty(), "a live request was superseded for its company: {:?}", h.errors());
+    assert_eq!(h.device.get("t1", "mode"), Some(json!("cool")));
+    assert!(
+        h.device.applies().iter().any(|(t, v)| t == "t1" && v.get("temp").is_some() && v.get("mode").is_some()),
+        "the live and the replayed request were not taken together, so this test proves nothing: {:?}",
+        h.device.applies()
+    );
+    assert_eq!(h.device.calls_of(Op::Connect).len(), 1, "the link was lost, so this test proves nothing");
+    assert!(h.stop().await);
+}
+
+/// The read-back, deterministically on the replay path: the device is up and proven before the
+/// broker acknowledges the read-back's subscription, so the retained requests arrive for a device
+/// that is up and are checked because they were replayed (review MINOR 15).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_back_decides_replays_for_a_device_already_up() {
+    let h = Harness::start_unwaited("readback-up", acknowledged(), quick_timing(), |broker, topics, device| {
+        broker.hold_subacks();
+        broker.retain(&topics.state("t1"), json!({"temp": 20, "power": false}).to_string(), &SendOptions::default());
+        let req = SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins");
+        broker.retain(&topics.desired("t1", "temp"), "22", &req);
+        broker.retain(&topics.desired("t1", "power"), "true", &req);
+        device.set("t1", "temp", json!(18));
+        device.set("t1", "power", json!(false));
+    })
+    .await;
+    assert!(h.eventually(BOUND, |h| h.device.connected() && !h.device.calls_of(Op::Read).is_empty()).await, "the device never connected");
+    h.settle(Duration::from_millis(200)).await;
+    h.broker.release_subacks();
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "power") == Some(json!(true))).await,
+        "the unchanged property's request was not applied"
+    );
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("superseded").iter().any(|e| e["property"] == "temp")).await,
+        "the replayed request was not decided against the read-back: {:?}",
+        h.errors()
+    );
+    assert_eq!(h.device.get("t1", "temp"), Some(json!(18)));
+    assert!(h.stop().await);
+}
+
+/// The read-back, deterministically on the held path: the device comes up only after the retained
+/// requests were taken, so they are held as well as replayed (review MINOR 15).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_back_decides_replays_held_for_a_device_down() {
+    let h = Harness::start_with("readback-down", acknowledged(), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("t1"), json!({"temp": 20, "power": false}).to_string(), &SendOptions::default());
+        let req = SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins");
+        broker.retain(&topics.desired("t1", "temp"), "22", &req);
+        broker.retain(&topics.desired("t1", "power"), "true", &req);
+        device.set("t1", "temp", json!(18));
+        device.set("t1", "power", json!(false));
+        device.set_up(false);
+    })
+    .await;
+    assert!(h.broker.wait_for_subscription(&h.topics.desired_property_filter(), BOUND).await);
+    h.settle(Duration::from_millis(300)).await;
+    h.device.set_up(true);
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "power") == Some(json!(true))).await,
+        "the unchanged property's request was not applied"
+    );
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("superseded").iter().any(|e| e["property"] == "temp")).await,
+        "the held replay was not decided against the read-back: {:?}",
+        h.errors()
+    );
+    assert_eq!(h.device.get("t1", "temp"), Some(json!(18)));
     assert!(h.stop().await);
 }

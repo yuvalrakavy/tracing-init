@@ -150,6 +150,34 @@ pub(crate) fn resolve(value: &StateValue, current: Option<&Value>, before: Optio
 /// Values by target and property, for the conflict rule.
 type Values = HashMap<(String, String), Value>;
 
+/// The conflict rule's "before" values, each with when it was taken.
+struct Befores {
+    /// What the bridge knew of the device when its outage began (the read-back before any).
+    device: (Instant, Values),
+    /// What the bridge knew when it stopped listening to the broker (the read-back in the
+    /// process's first session).
+    broker: (Instant, Values),
+}
+
+impl Befores {
+    /// A checked value's "before" value (review B1): a replayed one's is what the bridge knew when
+    /// it stopped listening; a held one's, what it knew of the device when its outage began; one
+    /// both replayed and held takes the older of the two first, and the other where the older
+    /// lacks the key.
+    fn of(&self, value: &StateValue) -> Option<&Value> {
+        let key = (value.target.clone(), value.property.clone());
+        let mut sources: Vec<&(Instant, Values)> = Vec::new();
+        if value.check.replayed {
+            sources.push(&self.broker);
+        }
+        if value.check.held {
+            sources.push(&self.device);
+        }
+        sources.sort_by_key(|(at, _)| *at);
+        sources.into_iter().find_map(|(_, values)| values.get(&key))
+    }
+}
+
 fn index(states: &[TargetState]) -> Values {
     let mut values = HashMap::new();
     for state in states {
@@ -189,10 +217,13 @@ pub(crate) struct Worker<D: DeviceDriver> {
     generation: u64,
     /// When the last connect began: the next waits out `retry` from it.
     last_attempt: Option<Instant>,
-    /// What the bridge knew of the device when its link was last lost from `Up`: the conflict
-    /// rule's "before" values for a device outage. Before any, the read-back stands for it.
-    before: Option<BTreeMap<String, PropertyMap>>,
-    up: bool,
+    /// What the bridge knew of the device when a link that had recovered (its catch-up done) was
+    /// last lost, and when: the conflict rule's "before" values for a device outage. Before any,
+    /// the read-back stands for it. A link lost before its catch-up is done leaves it as it is
+    /// (review M1: retaken from the proving read's values, it forgot a change at the wall).
+    before: Option<(Instant, BTreeMap<String, PropertyMap>)>,
+    /// Whether the current link has recovered: proven, and its catch-up done.
+    recovered: bool,
 }
 
 impl<D: DeviceDriver> Worker<D> {
@@ -209,7 +240,7 @@ impl<D: DeviceDriver> Worker<D> {
             generation: 0,
             last_attempt: None,
             before: None,
-            up: false,
+            recovered: false,
         }
     }
 
@@ -248,12 +279,12 @@ impl<D: DeviceDriver> Worker<D> {
             Err(e) => return e,
         };
         let refused = self.mailbox.connected();
-        self.up = true;
         self.reports.status(LinkStatus::Connected);
         let applied = match self.catch_up(handle, read).await {
             Ok(applied) => applied,
             Err(e) => return e,
         };
+        self.recovered = true;
         self.outage.recovered(applied, refused, self.mailbox.take_expired());
         self.serve(handle).await
     }
@@ -282,14 +313,15 @@ impl<D: DeviceDriver> Worker<D> {
         }
     }
 
-    /// The conflict rule's "before" values: the last device outage's, over the read-back.
-    fn before(&self) -> Values {
-        let mut before = HashMap::new();
-        index_map(&self.reports.read_back_all(), &mut before);
-        if let Some(snapshot) = &self.before {
-            index_map(snapshot, &mut before);
-        }
-        before
+    /// The conflict rule's "before" values, for each way a value can be checked (Store kit spec
+    /// §4.5): see [`Befores::of`].
+    fn befores(&self) -> Befores {
+        let (device_at, device) = self.before.clone().unwrap_or_else(|| self.reports.read_back_before());
+        let (broker_at, broker) = self.reports.broker_before();
+        let (mut device_values, mut broker_values) = (HashMap::new(), HashMap::new());
+        index_map(&device, &mut device_values);
+        index_map(&broker, &mut broker_values);
+        Befores { device: (device_at, device_values), broker: (broker_at, broker_values) }
     }
 
     /// Entering `Up`: what was held while the device was down, decided by the conflict rule
@@ -297,12 +329,12 @@ impl<D: DeviceDriver> Worker<D> {
     /// device, a probe proves it taken. Returns how many values were written.
     async fn catch_up(&mut self, handle: &LinkHandle, read: Option<Vec<TargetState>>) -> Result<usize, LinkError> {
         let current = read.as_deref().map(index).unwrap_or_default();
-        let before = self.before();
+        let befores = self.befores();
         let mut applied = 0;
         loop {
             let held = self.mailbox.take_held(|v| {
                 let key = (v.target.clone(), v.property.clone());
-                resolve(v, current.get(&key), before.get(&key))
+                resolve(v, current.get(&key), befores.of(v))
             });
             match held {
                 None => break,
@@ -488,8 +520,8 @@ impl<D: DeviceDriver> Worker<D> {
     async fn work(&mut self, handle: &LinkHandle, work: Work) -> Result<(), LinkError> {
         let timing = self.info.timing;
         match work {
-            Work::Apply { target, values, check } => {
-                let values = if check { self.check(handle, &target, values).await? } else { values };
+            Work::Apply { target, values } => {
+                let values = if values.iter().any(|v| v.check.any()) { self.check(handle, &target, values).await? } else { values };
                 self.write_values(handle, &target, values).await.map(drop)
             }
             Work::Configure { target, config } => self.configure(handle, &target, config).await,
@@ -529,12 +561,17 @@ impl<D: DeviceDriver> Worker<D> {
             Err(OpError::Link(e)) => return Err(e),
             Err(_) => HashMap::new(),
         };
-        let before = self.before();
+        let befores = self.befores();
         let mut apply = Vec::new();
         let mut superseded = Vec::new();
         for value in values {
             let key = (value.target.clone(), value.property.clone());
-            match resolve(&value, current.get(&key), before.get(&key)) {
+            if !value.check.any() {
+                // A live value, taken with a checked one: applied as it is (review MINOR 3).
+                apply.push(value);
+                continue;
+            }
+            match resolve(&value, current.get(&key), befores.of(&value)) {
                 Resolution::Apply => apply.push(value),
                 Resolution::Satisfied => {}
                 Resolution::Superseded => superseded.push(value),
@@ -593,8 +630,8 @@ impl<D: DeviceDriver> Worker<D> {
     /// have taken held again, the momentary commands waiting refused, the outage episode advanced.
     async fn down(&mut self, ctx: LinkContext, error: LinkError) {
         drop(ctx);
-        if std::mem::take(&mut self.up) {
-            self.before = Some(self.reports.snapshot());
+        if std::mem::take(&mut self.recovered) {
+            self.before = Some((Instant::now(), self.reports.snapshot()));
         }
         // Watched like an operation: a disconnect that blocks the thread is a dead worker too.
         self.clock.set(Some(Instant::now() + self.info.timing.operation));

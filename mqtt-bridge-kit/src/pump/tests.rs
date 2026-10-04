@@ -163,7 +163,7 @@ async fn a_broker_that_acknowledges_nothing_ends_the_session_within_twice_the_ke
     broker.cap_connections(20);
     let (client, events) = direct_client(&broker, "unacknowledged", 100);
     let outage = Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5)));
-    let (_pump, mut incoming) = Pump::start(events, outage, stall_bound(Duration::from_secs(5)));
+    let (_pump, mut incoming) = Pump::start(events, outage, stall_bound(Duration::from_secs(5)), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no first CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     broker.hold_acks();
@@ -186,7 +186,7 @@ async fn a_poll_that_does_not_return_ends_the_session_within_twice_the_keep_aliv
     broker.cap_connections(20);
     let (client, events) = direct_client(&broker, "unread", 128);
     let outage = Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5)));
-    let (_pump, mut incoming) = Pump::start(events, outage, stall_bound(Duration::from_secs(5)));
+    let (_pump, mut incoming) = Pump::start(events, outage, stall_bound(Duration::from_secs(5)), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no first CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     broker.stop_reading();

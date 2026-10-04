@@ -287,17 +287,37 @@ impl Drop for Incoming {
 }
 
 impl Pump {
-    /// Start polling; `stall` is [`stall_bound`] of the keep-alive.
-    pub fn start(events: EventLoop, outage: Arc<BrokerOutage>, stall: Duration) -> (Pump, Incoming) {
+    /// Start polling; `stall` is [`stall_bound`] of the keep-alive; `on_lost` is called, once, when a
+    /// connection the broker accepted is lost or stalls — at once, whatever the session is doing.
+    pub fn start(
+        events: EventLoop,
+        outage: Arc<BrokerOutage>,
+        stall: Duration,
+        on_lost: impl FnOnce() + Send + 'static,
+    ) -> (Pump, Incoming) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let backlog = Arc::new(Backlog::new());
-        let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), outage, stall).in_current_span());
+        let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), outage, stall, on_lost).in_current_span());
         (Pump { task }, Incoming { rx, backlog })
     }
 
-    async fn run(mut events: EventLoop, tx: UnboundedSender<PumpEvent>, backlog: Arc<Backlog>, outage: Arc<BrokerOutage>, stall: Duration) {
+    async fn run(
+        mut events: EventLoop,
+        tx: UnboundedSender<PumpEvent>,
+        backlog: Arc<Backlog>,
+        outage: Arc<BrokerOutage>,
+        stall: Duration,
+        on_lost: impl FnOnce() + Send + 'static,
+    ) {
         let mut outstanding = Outstanding::default();
-        let end = |reason: String| {
+        let mut on_lost = Some(on_lost);
+        let mut connected = false;
+        let mut end = |reason: String, connected: bool| {
+            if connected {
+                if let Some(on_lost) = on_lost.take() {
+                    on_lost();
+                }
+            }
             // Part of the outage's one episode; the event loop goes with this task, and the MQTT
             // worker makes a fresh client.
             outage.failed(&reason);
@@ -314,15 +334,18 @@ impl Pump {
             let polled = tokio::time::timeout_at(deadline.into(), events.poll()).await;
             let event = match polled {
                 Ok(Ok(event)) => event,
-                Ok(Err(e)) => return end(e.to_string()),
+                Ok(Err(e)) => return end(e.to_string(), connected),
                 Err(_) => {
                     let stall_ms = stall.as_millis() as u64;
-                    return end(match outstanding.since {
+                    return end(
+                        match outstanding.since {
                         Some(since) if Instant::now() >= since + stall => format!(
                             "the broker acknowledged nothing for {stall_ms} ms with requests outstanding (it may answer pings, but takes no request)"
                         ),
-                        _ => format!("a poll did not return within {stall_ms} ms: the broker stopped reading"),
-                    });
+                            _ => format!("a poll did not return within {stall_ms} ms: the broker stopped reading"),
+                        },
+                        connected,
+                    );
                 }
             };
             outstanding.after(&event, events.state.inflight());
@@ -336,6 +359,7 @@ impl Pump {
             let forward = match event {
                 Event::Incoming(Packet::ConnAck(_)) => {
                     outage.connected();
+                    connected = true;
                     PumpEvent::Connected
                 }
                 Event::Incoming(Packet::Publish(publish)) => {

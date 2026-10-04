@@ -154,6 +154,15 @@ commands are refused, and reads are dropped.
   - A held value the device already has is satisfied: it is dropped, with no `Error`.
   - A `Desired` replayed as retained gets the conflict check even while the device is up (the
     bridge-restart case).
+  - **"Before" values, per value, by where it came from** (kit spec §4.5, "the last value it saw
+    before the outage"): a value the broker replayed resolves against the model as it stood when
+    the MQTT connection was lost (the first failed poll of a connection) — in the process's first
+    session, against the read-back; a value held while the device was down resolves against the
+    model as it stood when the device's last recovered link was lost — before any, the read-back;
+    a value both replayed and held takes the older snapshot first. A device snapshot is taken only
+    when a link whose catch-up was done is lost, so a link lost during its catch-up keeps the
+    pre-outage values. The check applies to each value on its own: a live value taken with a
+    checked one is applied as it is.
   - A retained target-level `Desired`, or a retained `Command`, is refused as `malformed` — replayed
     or live: both are subscribed retain-as-published, so the broker keeps the flag on a live
     delivery. Property writes are subscribed without it, so a live retained one (every Store write)
@@ -349,5 +358,7 @@ schemas/                  JSON Schemas for each lane's payload
 - **A plugin is a second process to deploy.** The host supervises it.
 - **The read-back can miss.** If the broker connection drops after the read-back subscribe is queued
   but before it is written, rumqttc's clean start loses it. That run then has no "before" values, so
-  replayed requests are applied. For a broker-only outage, replayed requests are checked against the
-  last device outage's snapshot, or the read-back.
+  replayed requests are applied. After a broker-only outage, replayed requests are checked against
+  the model as it stood when the connection was lost; the read-back serves only the process's first
+  session (and held values until the device's first outage snapshot). A change at the device the
+  bridge never saw — made while the bridge was away, between two reads — is still a change.

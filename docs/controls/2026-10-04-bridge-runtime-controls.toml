@@ -291,11 +291,11 @@ name        = "state_is_not_held_while_down"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''                _ => {
                     let held = !inner.connected;
-                    inner.replace_state(value, held, held || replay);'''
+                    value.check = Check { replayed: replay, held };'''
 replacement = '''                _ if !inner.connected => Posted::Dropped,
                 _ => {
                     let held = !inner.connected;
-                    inner.replace_state(value, held, held || replay);'''
+                    value.check = Check { replayed: replay, held };'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_while_the_device_is_down_is_applied_on_recovery_within_its_expiry", "--exact"]
 expect_text = '''the held request was never applied'''
@@ -588,7 +588,7 @@ guard       = "conflict_unchanged"
 [[control]]
 name        = "no_before_values_after_a_device_outage"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''            self.before = Some(self.reports.snapshot());
+anchor      = '''            self.before = Some((Instant::now(), self.reports.snapshot()));
 '''
 replacement = '''            let _ = self.reports.snapshot();
 '''
@@ -957,7 +957,7 @@ guard       = "mqtt_poll_bound"
 [[control]]
 name        = "the_pump_reconnects_inside_its_event_loop"
 file        = "mqtt-bridge-kit/src/pump.rs"
-anchor      = '''                Ok(Err(e)) => return end(e.to_string()),'''
+anchor      = '''                Ok(Err(e)) => return end(e.to_string(), connected),'''
 replacement = '''                Ok(Err(e)) => {
                     outage.failed(&e.to_string());
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1257,3 +1257,60 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_response_topic_on_the_bridges_own_request_lanes_is_refused", "--exact"]
 expect_text = '''a response topic on the bridge's own lanes was not refused'''
 guard       = "reply_not_on_request_lanes"
+
+# B1: a replayed request resolves against the model as it stood when the connection was lost.
+[[control]]
+name        = "replays_are_decided_against_the_read_back"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''        state.broker_lost = Some((Instant::now(), values));'''
+replacement = '''        let _ = values;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_made_during_a_broker_outage_is_decided_against_what_the_bridge_last_knew", "--exact"]
+expect_text = '''a request made during a broker outage was superseded though nobody touched the device'''
+guard       = "broker_loss_snapshot"
+
+# M1: the device snapshot is taken only when a link that recovered is lost.
+[[control]]
+name        = "a_link_lost_during_its_catch_up_retakes_the_snapshot"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        if std::mem::take(&mut self.recovered) {'''
+replacement = '''        if {
+            self.recovered = false;
+            true
+        } {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_link_lost_during_the_catch_up_does_not_forget_a_change_at_the_device", "--exact"]
+expect_text = '''the change at the wall during the outage was reverted after a link lost during the catch-up'''
+guard       = "snapshot_after_recovery"
+
+# MINOR 3: each value is checked on its own, not by its group's company.
+[[control]]
+name        = "a_groups_checks_are_merged"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''        values.reverse();
+        (target, values)
+    }'''
+replacement = '''        values.reverse();
+        let any = values.iter().any(|v| v.check.any());
+        for v in &mut values {
+            if any {
+                v.check.replayed = true;
+            }
+        }
+        (target, values)
+    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_replayed_value_is_checked_on_its_own", "--exact"]
+expect_text = '''the checks are not each value's own'''
+guard       = "check_per_value"
+
+# MINOR 15: a replayed value is checked (the read-back scenario, deterministically on the replay path).
+[[control]]
+name        = "a_replay_is_not_checked"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                    value.check = Check { replayed: replay, held };'''
+replacement = '''                    value.check = Check { replayed: false, held };'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_read_back_decides_replays_for_a_device_already_up", "--exact"]
+expect_text = '''the replayed request was not decided against the read-back'''
+guard       = "replay_checked"

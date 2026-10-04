@@ -36,7 +36,7 @@ async fn a_refused_publish_is_one_message_dropped() {
     broker.cap_connections(5);
     let shared = shared_for(&broker);
     let (client, events) = client(&shared);
-    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10));
+    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     let model = Model { status: None, states: vec![("a#b".to_owned(), b"{}".to_vec()), ("t1".to_owned(), br#"{"x":1}"#.to_vec())] };

@@ -9,7 +9,14 @@ use crate::driver::PropertyMap;
 use crate::test_support::Capture;
 
 fn value(target: &str, property: &str, v: Value) -> StateValue {
-    StateValue { target: target.into(), property: property.into(), value: v, deadline: None, conflict: Conflict::DeviceWins }
+    StateValue {
+        target: target.into(),
+        property: property.into(),
+        value: v,
+        deadline: None,
+        conflict: Conflict::DeviceWins,
+        check: Check::default(),
+    }
 }
 
 fn call(command: &str) -> CommandCall {
@@ -282,20 +289,34 @@ fn a_value_in_flight_when_the_link_dies_is_held_again() {
     assert_eq!(held_values(&mailbox).len(), 1, "the value in flight was lost with the link");
 }
 
-/// A value the broker replayed as retained is checked by the conflict rule, like a held one.
+/// A value the broker replayed as retained is checked by the conflict rule, like a held one —
+/// each value on its own: a live value taken with a replayed one for the same target is not
+/// (review MINOR 3).
 #[test]
-fn a_replayed_value_is_checked() {
+fn a_replayed_value_is_checked_on_its_own() {
     let mailbox = up();
     mailbox.post_state(value("a", "level", json!(10)), true);
+    mailbox.post_state(value("a", "mode", json!("cool")), false);
     mailbox.post_state(value("b", "level", json!(20)), false);
-    let checks: Vec<bool> = drain(&mailbox)
+    let checks: Vec<(String, Check)> = drain(&mailbox)
         .iter()
-        .map(|w| match w {
-            Work::Apply { check, .. } => *check,
-            _ => false,
+        .flat_map(|w| match w {
+            Work::Apply { values, .. } => values.iter().map(|v| (v.property.clone(), v.check)).collect(),
+            _ => Vec::new(),
         })
         .collect();
-    assert_eq!(checks, [true, false]);
+    let replayed = Check { replayed: true, held: false };
+    assert_eq!(
+        checks,
+        [("level".to_owned(), replayed), ("mode".to_owned(), Check::default()), ("level".to_owned(), Check::default())],
+        "the checks are not each value's own"
+    );
+    // Held while down, and held again at a disconnect: checked as held.
+    let mailbox = Mailbox::new();
+    mailbox.post_state(value("a", "level", json!(1)), false);
+    mailbox.connected();
+    let Some(Held::Values(held)) = mailbox.take_held(|_| Resolution::Apply) else { panic!("nothing held") };
+    assert_eq!(held.apply[0].check, Check { replayed: false, held: true });
 }
 
 /// A config is the latest per target, held while the device is down; one naming a feedback mode

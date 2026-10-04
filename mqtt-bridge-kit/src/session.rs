@@ -34,7 +34,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, Instrument};
 
 use crate::driver::{CommandClass, CommandSpec};
-use crate::mailbox::{Mailbox, Posted, ReadKey, StateValue};
+use crate::mailbox::{Check, Mailbox, Posted, ReadKey, StateValue};
 use crate::pump::{stall_bound, BrokerOutage, Incoming, Pump, PumpEvent, MAX_CONSECUTIVE_ERRORS};
 use crate::replies::{reply_payload, Answer, ReplyTo};
 use crate::reports::{Changes, Model, Outbound, Reports};
@@ -165,7 +165,11 @@ async fn emit(client: &AsyncClient, topic: String, retain: bool, payload: Vec<u8
 async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> SessionEnd {
     let (client, events) = client(shared);
     // Polling first, so every request below has an event loop draining it.
-    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), stall_bound(shared.timing.keep_alive));
+    // When the connection is lost, what the bridge knew then is the conflict rule's "before" values
+    // for what the broker replays on the next one (review B1).
+    let reports = shared.reports.clone();
+    let (_pump, mut incoming) =
+        Pump::start(events, shared.outage.clone(), stall_bound(shared.timing.keep_alive), move || reports.broker_lost());
     // Nothing is published before the first CONNACK's duties are done: the subscriptions come
     // first, and a state published ahead of the read-back's subscription would overwrite the
     // retained state it is there to read.
@@ -353,7 +357,14 @@ fn route(shared: &Shared, topic: &str, publish: &Publish) {
                 Ok(Some(value)) => match wire::request_meta(properties, now) {
                     Err(e) => malformed(e, report),
                     Ok(meta) => {
-                        let value = StateValue { target, property, value, deadline: meta.deadline, conflict: meta.conflict };
+                        let value = StateValue {
+                            target,
+                            property,
+                            value,
+                            deadline: meta.deadline,
+                            conflict: meta.conflict,
+                            check: Check::default(),
+                        };
                         shared.mailbox.post_state(value, publish.retain);
                     }
                 },
@@ -375,6 +386,7 @@ fn route(shared: &Shared, topic: &str, publish: &Publish) {
                             value,
                             deadline: meta.deadline,
                             conflict: meta.conflict,
+                            check: Check::default(),
                         })
                         .collect();
                     shared.mailbox.post_target(values);

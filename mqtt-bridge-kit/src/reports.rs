@@ -17,6 +17,10 @@
 //!   INFO (`…_drop_ended`, with how many and how long) once the session takes the queue.
 //! - **The read-back:** the bridge's own retained `State` as it found it at start, for the outage
 //!   conflict rule's "before" values after a restart (Store kit spec §4.5). Never published.
+//! - **The broker-loss snapshot:** the model as it stood when the MQTT connection was last lost —
+//!   what the bridge knew when it stopped listening, the "before" values of what the broker
+//!   replays on the next connection (review B1). Until the first loss, the read-back stands for
+//!   it.
 //!
 //! The lock is held only to change or copy what is waiting: never across an await, no other lock
 //! under it, and nothing logged under it.
@@ -122,6 +126,8 @@ struct State {
     errors: Capped<ErrorReport>,
     events: Capped<Outbound>,
     readback: BTreeMap<String, PropertyMap>,
+    /// The model when the MQTT connection was last lost, and when.
+    broker_lost: Option<(Instant, BTreeMap<String, PropertyMap>)>,
     /// The names a driver reported that cannot stand as a topic segment, each said once.
     refused_names: std::collections::BTreeSet<String>,
 }
@@ -131,6 +137,8 @@ struct State {
 pub struct Reports {
     state: Mutex<State>,
     ready: Notify,
+    /// When the bridge started: the read-back is what the bridge knew then.
+    epoch: Instant,
 }
 
 /// What changed since the session last took it.
@@ -163,10 +171,12 @@ impl Reports {
                     errors: Capped::new(ERROR_CAP),
                     events: Capped::new(EVENT_CAP),
                     readback: BTreeMap::new(),
+                    broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
                 },
             ),
             ready: Notify::new(),
+            epoch: Instant::now(),
         })
     }
 
@@ -320,6 +330,30 @@ impl Reports {
     /// How many reports `target` has had.
     pub fn reports_for(&self, target: &str) -> u64 {
         self.locked().targets.get(target).map_or(0, |m| m.reports)
+    }
+
+    /// The MQTT connection was lost: what the bridge knows now is what it knew when it stopped
+    /// listening, the "before" values of what the broker replays on the next connection. Never
+    /// waits.
+    pub fn broker_lost(&self) {
+        let mut state = self.locked();
+        let values = state.targets.iter().map(|(t, m)| (t.clone(), m.values.clone())).collect();
+        state.broker_lost = Some((Instant::now(), values));
+    }
+
+    /// The "before" values of a replayed request, and as of when: the broker-loss snapshot, or —
+    /// in the process's first session — the read-back, as of the start.
+    pub fn broker_before(&self) -> (Instant, BTreeMap<String, PropertyMap>) {
+        let state = self.locked();
+        match &state.broker_lost {
+            Some((at, values)) => (*at, values.clone()),
+            None => (self.epoch, state.readback.clone()),
+        }
+    }
+
+    /// The read-back, as of the start.
+    pub fn read_back_before(&self) -> (Instant, BTreeMap<String, PropertyMap>) {
+        (self.epoch, self.locked().readback.clone())
     }
 
     /// A target's state as the bridge's retained `State` held it at start.
