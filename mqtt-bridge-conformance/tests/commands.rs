@@ -299,3 +299,32 @@ async fn a_failed_refresh_goes_to_error_too() {
     );
     assert!(h.stop().await);
 }
+
+/// A driver retracts a target gone from the device — its retained `State` cleared with an empty
+/// retained payload, and not published again after a reconnect — or one property of it (review
+/// MINOR 8: nothing was ever removed, and a unit gone from the CoolMaster's list stayed retained).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_driver_retracts_a_target_or_a_property() {
+    let h = Harness::start_with("retract", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.set("t1", "mode", json!("cool"));
+        device.set("u2", "power", json!(true));
+    })
+    .await;
+    let t = h.topics.clone();
+    assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("u2")).is_some() && h.state("t1").is_some()).await);
+    assert!(h.device.remove("u2"));
+    assert!(h.device.remove_property("t1", "mode"));
+    assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("u2")).is_none()).await, "the removed target's State is still retained");
+    assert!(
+        h.eventually(BOUND, |h| h.state("t1") == Some(json!({"temp": 20}))).await,
+        "the removed property is still published: {:?}",
+        h.state("t1")
+    );
+    let connects = h.broker.connections();
+    h.broker.drop_connection();
+    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await);
+    h.settle(Duration::from_millis(300)).await;
+    assert!(h.broker.retained_on(&t.state("u2")).is_none(), "the removed target came back with the model");
+    assert!(h.stop().await);
+}

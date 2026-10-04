@@ -49,6 +49,19 @@ impl Reporter {
         self.reports.state(target, values, assumed);
     }
 
+    /// Retract a target gone from the device (a unit no longer in the controller's list): its
+    /// retained `State` is cleared — an empty retained payload — and it is left out of the model,
+    /// until it is reported again. Never waits.
+    pub fn remove(&self, target: &str) {
+        self.reports.remove(target);
+    }
+
+    /// Retract one property of a target: left out of its `State` from now on, until reported
+    /// again. Never waits.
+    pub fn remove_property(&self, target: &str, property: &str) {
+        self.reports.remove_property(target, property);
+    }
+
     /// Something that happened, for the `Event` lane: a JSON object with a string `kind` (and a
     /// `target` where it concerns one). Never waits; anything else is a driver bug, logged as an
     /// ERROR (`driver_contract_violation`) and dropped.

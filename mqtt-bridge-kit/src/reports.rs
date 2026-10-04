@@ -6,6 +6,9 @@
 //! on MQTT: with the broker stalled the queue filled, and the worker took no command — catch-up
 //! included — until the broker recovered.
 //!
+//! - **Retractions:** a target removed (gone from the device) is published as an empty retained
+//!   `State`, clearing it at the broker, and again after every CONNACK until it is reported again;
+//!   a property removed leaves the target's `State` without it.
 //! - **The retained model** — `Status`, and each target's latest `State` — is folded in at once,
 //!   before anything waits, so what is published is always the latest, and a publish cut short
 //!   (its session ended) loses nothing: the next session publishes the whole model again after its
@@ -130,6 +133,9 @@ struct State {
     broker_lost: Option<(Instant, BTreeMap<String, PropertyMap>)>,
     /// The names a driver reported that cannot stand as a topic segment, each said once.
     refused_names: std::collections::BTreeSet<String>,
+    /// Targets removed and not reported since: their `State` is retracted, an empty retained
+    /// payload, after every CONNACK too.
+    removed: std::collections::BTreeSet<String>,
 }
 
 /// See the module documentation.
@@ -145,7 +151,7 @@ pub struct Reports {
 #[derive(Debug, Default, PartialEq)]
 pub struct Changes {
     pub status: Option<LinkStatus>,
-    /// Each changed target's `State` document.
+    /// Each changed target's `State` document; an empty one retracts it.
     pub states: Vec<(String, Vec<u8>)>,
     pub errors: Vec<ErrorReport>,
     pub events: Vec<Outbound>,
@@ -173,6 +179,7 @@ impl Reports {
                     readback: BTreeMap::new(),
                     broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
+                    removed: std::collections::BTreeSet::new(),
                 },
             ),
             ready: Notify::new(),
@@ -235,9 +242,64 @@ impl Reports {
         }
     }
 
+    /// Retract a target gone from the device: removed from the model, its retained `State` cleared
+    /// (an empty retained payload), after every CONNACK too, until it is reported again. Never
+    /// waits.
+    pub fn remove(&self, target: &str) {
+        if !self.names_stand(target, None) {
+            return;
+        }
+        {
+            let mut state = self.locked();
+            state.targets.remove(target);
+            state.removed.insert(target.to_owned());
+            if !state.changed.iter().any(|t| t == target) {
+                state.changed.push(target.to_owned());
+            }
+        }
+        self.ready.notify_one();
+    }
+
+    /// Retract one property of a target: removed from the model, and the target's `State`
+    /// published without it. Never waits.
+    pub fn remove_property(&self, target: &str, property: &str) {
+        if !self.names_stand(target, Some(property)) {
+            return;
+        }
+        let changed = {
+            let mut state = self.locked();
+            let removed = state.targets.get_mut(target).is_some_and(|m| m.values.remove(property).is_some());
+            if removed && !state.changed.iter().any(|t| t == target) {
+                state.changed.push(target.to_owned());
+            }
+            removed
+        };
+        if changed {
+            self.ready.notify_one();
+        }
+    }
+
+    /// Whether a target (and property) name can stand as a topic segment; one that cannot is a
+    /// driver bug, said once per name.
+    fn names_stand(&self, target: &str, property: Option<&str>) -> bool {
+        let bad = if !valid_segment(target) {
+            Some(format!("target `{target}`"))
+        } else {
+            property.filter(|p| !valid_segment(p)).map(|p| format!("property `{p}` of `{target}`"))
+        };
+        let Some(name) = bad else {
+            return true;
+        };
+        if self.locked().refused_names.insert(name.clone()) {
+            error!(kind = "driver_contract_violation", name = %name, "A reported name cannot stand as a topic segment; dropped");
+        }
+        false
+    }
+
     /// Merge a validated report into the model; whether anything changed.
     fn merge(state: &mut State, target: &str, values: PropertyMap, assumed: bool) -> bool {
         {
+            state.removed.remove(target);
             let new = !state.targets.contains_key(target);
             let model = state.targets.entry(target.to_owned()).or_default();
             model.reports += 1;
@@ -281,7 +343,12 @@ impl Reports {
             let status = if std::mem::take(&mut state.status_changed) { state.status } else { None };
             let states = std::mem::take(&mut state.changed)
                 .into_iter()
-                .filter_map(|target| state.targets.get(&target).map(|m| (target.clone(), encode_state(&m.values, m.assumed))))
+                .filter_map(|target| match state.targets.get(&target) {
+                    Some(m) => Some((target.clone(), encode_state(&m.values, m.assumed))),
+                    // A retraction: an empty retained payload.
+                    None if state.removed.contains(&target) => Some((target, Vec::new())),
+                    None => None,
+                })
                 .collect();
             let errors = state.errors.items.drain(..).collect();
             let events = state.events.items.drain(..).collect();
@@ -312,7 +379,10 @@ impl Reports {
         let mut state = self.locked();
         state.status_changed = false;
         state.changed.clear();
-        Model { status: state.status, states: state.targets.iter().map(|(t, m)| (t.clone(), encode_state(&m.values, m.assumed))).collect() }
+        let mut states: Vec<(String, Vec<u8>)> =
+            state.targets.iter().map(|(t, m)| (t.clone(), encode_state(&m.values, m.assumed))).collect();
+        states.extend(state.removed.iter().map(|t| (t.clone(), Vec::new())));
+        Model { status: state.status, states }
     }
 
     /// Wait for a report. Cancellation-safe: a report made meanwhile leaves a permit, and `take` is

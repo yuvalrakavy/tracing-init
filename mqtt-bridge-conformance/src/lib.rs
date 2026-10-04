@@ -264,6 +264,10 @@ impl Harness {
             };
             assert_eq!(r.qos, QoS::AtLeastOnce, "{topic} was not published at QoS 1");
             assert_eq!(r.retain, retained, "{topic}: retained is {}, its lane says {retained}", r.retain);
+            if lane == "state" && r.payload.is_empty() {
+                // A retraction: an empty retained payload clears the topic.
+                continue;
+            }
             let instance = schema::instance(lane, &r.payload).unwrap_or_else(|e| panic!("{topic}: {e}"));
             if let Err(e) = schema::check(lane, &instance) {
                 panic!("{topic} does not conform to its lane's schema: {e}; the payload: {instance}");

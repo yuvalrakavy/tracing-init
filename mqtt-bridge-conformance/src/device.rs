@@ -226,6 +226,19 @@ impl Device {
         }
     }
 
+    /// Retract a target — gone from the device — through the current link's reporter. `false` with
+    /// no link.
+    pub fn remove(&self, target: &str) -> bool {
+        let link = self.locked().link.clone();
+        link.map(|link| link.report().remove(target)).is_some()
+    }
+
+    /// Retract one property of a target through the current link's reporter. `false` with no link.
+    pub fn remove_property(&self, target: &str, property: &str) -> bool {
+        let link = self.locked().link.clone();
+        link.map(|link| link.report().remove_property(target, property)).is_some()
+    }
+
     /// Report a target's state through the current link's reporter, as a helper does.
     pub fn report(&self, target: &str, values: PropertyMap) -> bool {
         let link = self.locked().link.clone();

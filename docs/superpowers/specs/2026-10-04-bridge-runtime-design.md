@@ -77,6 +77,9 @@ lost link, never a hang.
 
 - `ctx.report.state(target, values, assumed?)`: observed or assumed state, from an operation or a
   helper.
+- `ctx.report.remove(target)` and `ctx.report.remove_property(target, property)`: a target gone
+  from the device (its retained `State` cleared with an empty retained payload, after every CONNACK
+  too, until it is reported again), or one property of it.
 - `ctx.report.event(event)`: something that happened.
 - `ctx.spawn(task)`: a helper the runtime owns (an unsolicited-input reader), for the life of the link:
   cancelled when the link drops, and watched — a helper that ends, by returning or panicking, is the
