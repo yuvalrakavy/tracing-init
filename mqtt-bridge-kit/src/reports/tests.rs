@@ -148,3 +148,29 @@ fn an_acknowledged_write_is_known_to_the_snapshots_and_never_published() {
     reports.remove("u2");
     assert!(!reports.snapshot().contains_key("u2"), "a removed target kept its written values");
 }
+
+/// What the runtime assumes from an unacknowledged write is published, but left out of what the
+/// conflict rule reads — the current values and the snapshots — until a probe or read proves the
+/// write; then it stands (the R1 re-gate's R3).
+#[test]
+fn an_unproven_assumption_is_left_out_until_proven() {
+    let reports = Reports::new();
+    reports.state("u1", values(&[("level", json!(0))]), true);
+    reports.assume_unproven("u1", values(&[("level", json!(40))]));
+    reports.assume_unproven("u1", values(&[("level", json!(50))]));
+    let published: Value = serde_json::from_slice(&reports.take().states[0].1).unwrap();
+    assert_eq!(published, json!({"level": 50, "assumed": true}), "the assumption was not published");
+    assert_eq!(reports.values_of("u1").unwrap()["level"], json!(0), "an unproven assumption counted as the device's value");
+    assert_eq!(reports.snapshot()["u1"]["level"], json!(0), "a snapshot counted an unproven assumption");
+    let written = crate::mailbox::StateValue {
+        target: "u1".into(),
+        property: "level".into(),
+        value: json!(50),
+        deadline: None,
+        conflict: crate::wire::Conflict::DeviceWins,
+        check: Default::default(),
+    };
+    reports.assumptions_proven(&[written]);
+    assert_eq!(reports.values_of("u1").unwrap()["level"], json!(50), "a proven assumption was left out");
+    assert_eq!(reports.snapshot()["u1"]["level"], json!(50));
+}

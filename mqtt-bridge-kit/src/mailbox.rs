@@ -819,8 +819,8 @@ impl Mailbox {
     }
 
     /// A probe or read succeeded after every unproven write: they are proven.
-    pub fn proven(&self) {
-        self.locked().unproven.clear();
+    pub fn proven(&self) -> Vec<StateValue> {
+        std::mem::take(&mut self.locked().unproven).into_iter().map(|(value, _)| value).collect()
     }
 
     /// When the oldest unproven write was made, if one is unproven.

@@ -189,6 +189,12 @@ commands are refused, and reads are dropped.
     when a link whose catch-up was done is lost, so a link lost during its catch-up keeps the
     pre-outage values. The check applies to each value on its own: a live value taken with a
     checked one is applied as it is.
+  - **Unproven assumptions:** for a target with assumed feedback, what the runtime assumes from
+    an unacknowledged write is published as assumed `State` at once, but the conflict rule's
+    current values and snapshots leave it out — they keep the value before it — until a probe or
+    read proves that write (a report of the key settles it too). An unproven write held again
+    when the link dies is then not satisfied by, nor superseded by, its own assumption, under
+    either conflict policy (re-gate R3).
   - **What the snapshots hold:** the reported model, and over it what an acknowledged `apply`
     (`Writes::Acknowledged`) wrote since — for a `Partial`, only the values it did not name. A
     report of the key replaces a written value, and a key the driver reported during the `apply`

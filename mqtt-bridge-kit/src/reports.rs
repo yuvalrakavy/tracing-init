@@ -86,6 +86,25 @@ struct TargetModel {
     /// For each property, the count of `reports` at its last report: a property reported during
     /// an `apply` is the device's word, newer than the write.
     seen: BTreeMap<String, u64>,
+    /// Assumptions not yet proven: for each property the runtime assumed from an unacknowledged
+    /// write that no probe or read has proven, the value before it (`None`: none). The conflict
+    /// rule's current and "before" values use these, so an unproven write is no proof of itself
+    /// (re-gate R3); the published `State` keeps the assumption.
+    unproven: BTreeMap<String, Option<Value>>,
+}
+
+impl TargetModel {
+    /// The values as proven: every unproven assumption replaced by the value before it.
+    fn proven_values(&self) -> PropertyMap {
+        let mut values = self.values.clone();
+        for (property, before) in &self.unproven {
+            match before {
+                Some(value) => values.insert(property.clone(), value.clone()),
+                None => values.remove(property),
+            };
+        }
+        values
+    }
 }
 
 /// A capped queue of events, and its episode of displacement.
@@ -176,7 +195,7 @@ pub struct Model {
 /// What the bridge knows of every target, for the conflict rule: the reported values, and over them
 /// what acknowledged writes left since.
 fn known(state: &State) -> BTreeMap<String, PropertyMap> {
-    let mut known: BTreeMap<String, PropertyMap> = state.targets.iter().map(|(t, m)| (t.clone(), m.values.clone())).collect();
+    let mut known: BTreeMap<String, PropertyMap> = state.targets.iter().map(|(t, m)| (t.clone(), m.proven_values())).collect();
     for (target, values) in &state.written {
         let entry = known.entry(target.clone()).or_default();
         for (property, value) in values {
@@ -335,8 +354,10 @@ impl Reports {
             let mut changed = new || model.assumed != assumed;
             model.assumed = assumed;
             for (property, value) in values {
-                // A report replaces what a write left of the key.
+                // A report replaces what a write left of the key, and settles an unproven
+                // assumption of it.
                 model.seen.insert(property.clone(), model.reports);
+                model.unproven.remove(&property);
                 if let Some(written) = state.written.get_mut(target) {
                     written.remove(&property);
                 }
@@ -449,9 +470,43 @@ impl Reports {
     }
 
     /// A target's values as the bridge knows them now — for a target with assumed feedback, what it
-    /// believes the device holds.
+    /// believes the device holds, unproven assumptions left out (re-gate R3).
     pub fn values_of(&self, target: &str) -> Option<PropertyMap> {
-        self.locked().targets.get(target).map(|m| m.values.clone())
+        self.locked().targets.get(target).map(TargetModel::proven_values)
+    }
+
+    /// The runtime assumes `values` of `target` from an unacknowledged write no probe has proven
+    /// yet: published as assumed `State`, but kept apart for the conflict rule until
+    /// [`assumptions_proven`](Self::assumptions_proven) — an unproven write held again must not
+    /// meet itself as the device's value (re-gate R3). Never waits.
+    pub fn assume_unproven(&self, target: &str, values: PropertyMap) {
+        let before: Vec<(String, Option<Value>)> = {
+            let state = self.locked();
+            let model = state.targets.get(target);
+            values
+                .keys()
+                .map(|property| {
+                    let earlier = model.and_then(|m| m.unproven.get(property).cloned());
+                    let before = earlier.unwrap_or_else(|| model.and_then(|m| m.values.get(property).cloned()));
+                    (property.clone(), before)
+                })
+                .collect()
+        };
+        self.state(target, values, true);
+        let mut state = self.locked();
+        if let Some(model) = state.targets.get_mut(target) {
+            model.unproven.extend(before);
+        }
+    }
+
+    /// These writes were proven (a probe or read after them): their assumptions stand. Never waits.
+    pub fn assumptions_proven(&self, values: &[crate::mailbox::StateValue]) {
+        let mut state = self.locked();
+        for value in values {
+            if let Some(model) = state.targets.get_mut(&value.target) {
+                model.unproven.remove(&value.property);
+            }
+        }
     }
 
     /// How many reports `target` has had.

@@ -427,10 +427,12 @@ guard       = "in_flight_held_again"
 [[control]]
 name        = "a_probe_proves_nothing"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''    pub fn proven(&self) {
-        self.locked().unproven.clear();
+anchor      = '''    pub fn proven(&self) -> Vec<StateValue> {
+        std::mem::take(&mut self.locked().unproven).into_iter().map(|(value, _)| value).collect()
     }'''
-replacement = '''    pub fn proven(&self) {}'''
+replacement = '''    pub fn proven(&self) -> Vec<StateValue> {
+        Vec::new()
+    }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::unproven_writes_are_held_again_unless_a_newer_value_waits", "--exact"]
 expect_text = '''a proven write was held again'''
@@ -692,7 +694,7 @@ guard       = "probe_unproven"
 [[control]]
 name        = "assumed_feedback_publishes_nothing"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''                    self.reports.state(target, map, true);
+anchor      = '''                    self.assume(target, map);
 '''
 replacement = ''''''
 target      = "command"
@@ -1147,7 +1149,7 @@ anchor      = '''                Step::Poll => {
                     let polled = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::All)).await {
                         Ok(states) => {
                             last_heard = Instant::now();
-                            self.mailbox.proven();
+                            self.proven();
                             self.fold(&states);
                             Ok(())
                         }
@@ -1167,7 +1169,7 @@ replacement = '''                Step::Poll => {
                     let polled = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::All)).await {
                         Ok(states) => {
                             last_heard = Instant::now();
-                            self.mailbox.proven();
+                            self.proven();
                             self.fold(&states);
                             Ok(())
                         }
@@ -1418,12 +1420,12 @@ name        = "the_catch_up_reads_no_missing_target"
 file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''self.driver.read_state(Scope::Target(target.to_owned()))).await {
                 Ok(states) => {
-                    self.mailbox.proven();
+                    self.proven();
                     self.fold(&states);
                     let mut current: Option<PropertyMap> = None;'''
 replacement = '''self.driver.read_state(Scope::Target(target.to_owned()))).await.and(Err::<Vec<TargetState>, _>(OpError::Unsupported("control".into()))) {
                 Ok(states) => {
-                    self.mailbox.proven();
+                    self.proven();
                     self.fold(&states);
                     let mut current: Option<PropertyMap> = None;'''
 target      = "command"
@@ -1590,12 +1592,12 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''                if let Err(OpError::Unsupported(message)) = other {
                     self.unsupported_probe(&message);
                 }
-                self.mailbox.proven();'''
+                self.proven();'''
 replacement = '''                if let Err(OpError::Unsupported(message)) = other {
                     self.unsupported_probe(&message);
                     return Ok(());
                 }
-                self.mailbox.proven();'''
+                self.proven();'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violation", "--exact"]
 expect_text = '''a probe loop'''
@@ -2078,3 +2080,38 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_transient_helper_that_returns_keeps_the_link", "--exact"]
 expect_text = '''a transient helper that returned lost the link'''
 guard       = "transient_helpers"
+
+# Re-gate R3: an unproven assumption is no current value of itself.
+[[control]]
+name        = "an_unproven_assumption_is_the_current_value"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''        self.locked().targets.get(target).map(TargetModel::proven_values)'''
+replacement = '''        self.locked().targets.get(target).map(|m| m.values.clone())'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unproven_write_to_a_one_way_target_is_applied_again_after_the_link_dies", "--exact"]
+expect_text = '''the unproven write the device never took was not applied again'''
+guard       = "unproven_assumptions"
+
+# Re-gate R3: an unproven assumption is no "before" value either.
+[[control]]
+name        = "a_snapshot_counts_unproven_assumptions"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''    let mut known: BTreeMap<String, PropertyMap> = state.targets.iter().map(|(t, m)| (t.clone(), m.proven_values())).collect();'''
+replacement = '''    let mut known: BTreeMap<String, PropertyMap> = state.targets.iter().map(|(t, m)| (t.clone(), m.values.clone())).collect();'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unproven_write_to_an_assumed_target_under_device_wins_is_applied_again", "--exact"]
+expect_text = '''the bridge's own unproven write was not applied again'''
+guard       = "unproven_snapshots"
+
+# Re-gate R3: a proven write's assumption stands.
+[[control]]
+name        = "a_proven_assumption_stays_unproven"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''            if let Some(model) = state.targets.get_mut(&value.target) {
+                model.unproven.remove(&value.property);
+            }'''
+replacement = '''            let _ = value;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::an_unproven_assumption_is_left_out_until_proven", "--exact"]
+expect_text = '''a proven assumption was left out'''
+guard       = "assumptions_proven"

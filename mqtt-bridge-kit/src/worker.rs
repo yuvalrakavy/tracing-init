@@ -324,6 +324,21 @@ impl<D: DeviceDriver> Worker<D> {
         }
     }
 
+    /// The runtime assumes what it wrote to a target with assumed feedback: proven at once for an
+    /// acknowledged write, unproven until a probe for an unacknowledged one (re-gate R3).
+    fn assume(&self, target: &str, values: PropertyMap) {
+        match self.info.writes {
+            Writes::Acknowledged => self.reports.state(target, values, true),
+            Writes::Unacknowledged => self.reports.assume_unproven(target, values),
+        }
+    }
+
+    /// A probe or read proved every write made before it: the unproven ones, and their assumptions.
+    fn proven(&self) {
+        let proven = self.mailbox.proven();
+        self.reports.assumptions_proven(&proven);
+    }
+
     /// The clock the watchdog on the MQTT side reads.
     pub(crate) fn clock(&self) -> Arc<OpClock> {
         self.clock.clone()
@@ -382,7 +397,7 @@ impl<D: DeviceDriver> Worker<D> {
         // WAIT: device-op
         match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::All)).await {
             Ok(states) => {
-                self.mailbox.proven();
+                self.proven();
                 self.fold(&states);
                 Ok(Some(states))
             }
@@ -530,7 +545,7 @@ impl<D: DeviceDriver> Worker<D> {
                     self.reports.written(target, &map, reported_before);
                 }
                 if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before {
-                    self.reports.state(target, map, true);
+                    self.assume(target, map);
                 }
                 Ok(values.len())
             }
@@ -550,7 +565,7 @@ impl<D: DeviceDriver> Worker<D> {
                     self.reports.written(target, &applied, reported_before);
                 }
                 if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before && !applied.is_empty() {
-                    self.reports.state(target, applied, true);
+                    self.assume(target, applied);
                 }
                 for failure in &failures {
                     let reason = match failure.class {
@@ -631,7 +646,7 @@ impl<D: DeviceDriver> Worker<D> {
                 if let Err(OpError::Unsupported(message)) = other {
                     self.unsupported_probe(&message);
                 }
-                self.mailbox.proven();
+                self.proven();
                 Ok(())
             }
         }
@@ -694,7 +709,7 @@ impl<D: DeviceDriver> Worker<D> {
                     let polled = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::All)).await {
                         Ok(states) => {
                             last_heard = Instant::now();
-                            self.mailbox.proven();
+                            self.proven();
                             self.fold(&states);
                             Ok(())
                         }
@@ -757,7 +772,7 @@ impl<D: DeviceDriver> Worker<D> {
                 let scope = target.clone().map_or(Scope::All, Scope::Target);
                 // WAIT: device-op
                 let result = op(handle, timing.operation, "read_state", self.driver.read_state(scope)).await.map(|states| {
-                    self.mailbox.proven();
+                    self.proven();
                     self.fold(&states);
                     None
                 });
@@ -799,7 +814,7 @@ impl<D: DeviceDriver> Worker<D> {
             // WAIT: device-op
             let current = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::Target(target.to_owned()))).await {
                 Ok(states) => {
-                    self.mailbox.proven();
+                    self.proven();
                     self.fold(&states);
                     let mut current: Option<PropertyMap> = None;
                     for state in states.into_iter().filter(|s| s.target == target) {

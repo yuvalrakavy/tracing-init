@@ -490,3 +490,51 @@ async fn a_disconnect_that_blocks_the_worker_thread_is_a_dead_worker_past_its_bo
     assert!(lost_at.elapsed() < Duration::from_secs(10), "seen only once the disconnect let go: {:?}", lost_at.elapsed());
     assert!(h.stop().await);
 }
+
+/// An unproven write to a one-way target that cannot be read, held again when the link dies before
+/// a probe, is applied again on the next link — its own assumed `State` is no proof that the device
+/// took it (the R1 re-gate's R3, its RG3b: the re-held write met the model, which already assumed
+/// it, and was dropped as satisfied while the device stayed dark).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unproven_write_to_a_one_way_target_is_applied_again_after_the_link_dies() {
+    let h = Harness::start_with("unproven-oneway", info(Writes::Unacknowledged, Feedback::Assumed), quick_timing(), |_, _, device| {
+        device.answer(Op::Read, None, Answer::Unsupported);
+    })
+    .await;
+    assert!(connected(&h).await);
+    h.settle(Duration::from_millis(300)).await;
+    let probes = h.device.calls_of(Op::Probe).len();
+    h.device.set_deaf(true);
+    assert!(h.desire("dim", "level", json!(40), Req { expiry: Some(3600), conflict: Some("RequestWins") }));
+    assert!(h.eventually(BOUND, |h| h.device.calls_of(Op::Probe).len() > probes && !h.device.applies().is_empty()).await, "never probed");
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Disconnect).is_empty()).await, "the link never dropped");
+    h.device.set_deaf(false);
+    assert!(
+        h.eventually(Duration::from_secs(4), |h| h.device.get("dim", "level") == Some(json!(40))).await,
+        "the unproven write the device never took was not applied again; State claims {:?}",
+        h.state("dim")
+    );
+    assert!(h.stop().await);
+}
+
+/// The same for an assumed target under DeviceWins: the bridge's own unproven write, held again,
+/// is not taken for a change at the device — the "before" snapshot does not count an unproven
+/// assumption (the R1 re-gate's R3, its RG3c: superseded by itself).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unproven_write_to_an_assumed_target_under_device_wins_is_applied_again() {
+    let h = Harness::start_with("unproven-assumed", info(Writes::Unacknowledged, Feedback::Assumed), quick_timing(), |_, _, device| {
+        device.set("dim", "level", json!(0));
+    })
+    .await;
+    assert!(connected(&h).await);
+    h.device.set_deaf(true);
+    assert!(h.desire("dim", "level", json!(40), Req { expiry: Some(3600), conflict: Some("DeviceWins") }));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Probe).is_empty()).await, "never probed");
+    h.device.set_deaf(false);
+    assert!(
+        h.eventually(Duration::from_secs(4), |h| h.device.get("dim", "level") == Some(json!(40))).await,
+        "the bridge's own unproven write was not applied again: {:?}",
+        h.errors()
+    );
+    assert!(h.stop().await);
+}
