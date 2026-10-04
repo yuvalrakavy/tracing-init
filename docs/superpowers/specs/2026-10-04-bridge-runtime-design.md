@@ -159,7 +159,8 @@ commands are refused, and reads are dropped.
   - `configure` is called only while connected. Configs are held while down and applied first in the
     catch-up.
   - A momentary command still waiting at its message expiry is dropped.
-- **Timing:** the busy-probe interval is a 2 s constant (from mqtt_lutron). `Timing.poll` is an
+- **Timing:** the busy-probe interval is a 2 s constant (from mqtt_lutron), counted from the oldest
+  write still unproven — a newer value of a key keeps its older one's time. `Timing.poll` is an
   `Option`.
 - **Kinds:**
   - `event_report_dropped` (WARN) and `event_report_drop_ended` (INFO);

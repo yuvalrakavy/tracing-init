@@ -221,8 +221,9 @@ struct Inner {
     /// State values the worker took and has not finished.
     in_flight: Vec<StateValue>,
     in_flight_config: Option<(String, Option<Value>)>,
-    /// Values applied to a `Writes::Unacknowledged` device and not proven yet, oldest first, with
-    /// when each was written.
+    /// Values applied to a `Writes::Unacknowledged` device and not proven yet, in the order last
+    /// written, each with when its key's oldest unproven write was made: a newer value of a key
+    /// replaces its older one, and keeps the older one's proof deadline.
     unproven: Vec<(StateValue, Instant)>,
     /// The property copies a target-level write expects: the value, and until when.
     copies: HashMap<(String, String), (Value, Instant)>,
@@ -651,7 +652,9 @@ impl Mailbox {
     }
 
     /// The values in flight were applied. To a `Writes::Unacknowledged` device they stay unproven
-    /// (replacing an older unproven value of the same key) until [`proven`](Self::proven).
+    /// until [`proven`](Self::proven), each replacing an older unproven value of its key — and
+    /// keeping that one's time: the oldest outstanding proof deadline stands, so a stream of writes
+    /// to one property cannot postpone the busy probe for good (review C5).
     pub fn applied(&self, unacknowledged: bool) {
         let now = Instant::now();
         let mut inner = self.locked();
@@ -659,8 +662,11 @@ impl Mailbox {
         inner.in_flight_config = None;
         if unacknowledged {
             for value in applied {
-                inner.unproven.retain(|(v, _)| !v.same_key(&value));
-                inner.unproven.push((value, now));
+                let at = match inner.unproven.iter().position(|(v, _)| v.same_key(&value)) {
+                    Some(i) => inner.unproven.remove(i).1,
+                    None => now,
+                };
+                inner.unproven.push((value, at));
             }
         }
     }
@@ -679,7 +685,7 @@ impl Mailbox {
 
     /// When the oldest unproven write was made, if one is unproven.
     pub fn unproven_since(&self) -> Option<Instant> {
-        self.locked().unproven.first().map(|(_, at)| *at)
+        self.locked().unproven.iter().map(|(_, at)| *at).min()
     }
 
     /// Whether any work waits.

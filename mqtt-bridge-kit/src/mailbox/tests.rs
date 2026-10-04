@@ -252,6 +252,25 @@ fn unproven_writes_are_held_again_unless_a_newer_value_waits() {
     assert!(held_values(&mailbox).is_empty(), "a proven write was held again");
 }
 
+/// Replacing an unproven value keeps the oldest outstanding proof deadline: a stream of writes to
+/// one property, each replacing the last before it was proven, must not postpone the busy probe
+/// for good (review C5).
+#[test]
+fn replacing_an_unproven_value_keeps_the_oldest_proof_deadline() {
+    let mailbox = up();
+    mailbox.post_state(value("a", "level", json!(1)), false);
+    assert!(mailbox.try_take().is_some());
+    mailbox.applied(true);
+    let first = mailbox.unproven_since().expect("the write is unproven");
+    std::thread::sleep(Duration::from_millis(20));
+    mailbox.post_state(value("a", "level", json!(2)), false);
+    assert!(mailbox.try_take().is_some());
+    mailbox.applied(true);
+    assert_eq!(mailbox.unproven_since(), Some(first), "a newer write of the same key reset the proof deadline");
+    mailbox.proven();
+    assert_eq!(mailbox.unproven_since(), None);
+}
+
 /// A value the worker took and could not apply, the link lost, is held again for the next link.
 #[test]
 fn a_value_in_flight_when_the_link_dies_is_held_again() {

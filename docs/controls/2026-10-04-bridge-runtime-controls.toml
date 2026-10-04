@@ -1089,3 +1089,17 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_poll_slower_than_its_interval_does_not_starve_writes", "--exact"]
 expect_text = '''with polls slower than their interval, a write never ran'''
 guard       = "poll_from_completion"
+
+# C5: a newer unproven write of a key keeps the oldest proof deadline.
+[[control]]
+name        = "a_replaced_unproven_write_resets_its_proof_deadline"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                    Some(i) => inner.unproven.remove(i).1,'''
+replacement = '''                    Some(i) => {
+                        inner.unproven.remove(i);
+                        now
+                    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::replacing_an_unproven_value_keeps_the_oldest_proof_deadline", "--exact"]
+expect_text = '''a newer write of the same key reset the proof deadline'''
+guard       = "proof_deadline_oldest"
