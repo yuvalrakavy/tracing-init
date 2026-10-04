@@ -159,6 +159,9 @@ commands are refused, and reads are dropped.
   - `configure` is called only while connected. Configs are held while down and applied first in the
     catch-up.
   - A momentary command still waiting at its message expiry is dropped.
+- **Command line:** a zero `--retry` or `--probe-interval`, a `--mqtt-keep-alive` under 5 s
+  (rumqttc's floor) and a duration too long to count are usage errors (exit 2); the same timings
+  set in code fail the start. `--poll 0`, in any unit, and `--poll off` turn polling off.
 - **Timing:** the busy-probe interval is a 2 s constant (from mqtt_lutron), counted from the oldest
   write still unproven — a newer value of a key keeps its older one's time. `Timing.poll` is an
   `Option`.

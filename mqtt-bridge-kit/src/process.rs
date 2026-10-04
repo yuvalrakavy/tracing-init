@@ -312,6 +312,7 @@ impl Bridge {
         let span = tracing::info_span!("bridge", root = %topics.root(), instance = %instance);
         let info: DriverInfo = driver.info();
         let info = DriverInfo { timing: self.settings.timing.apply(info.timing), ..info };
+        config::check_timing(&info.timing, &self.settings.mqtt)?;
         let mailbox = Mailbox::new();
         let reports = Reports::new();
         let shared = Arc::new(session::Shared {

@@ -85,9 +85,28 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
     match unit {
         "ms" => Ok(Duration::from_millis(n)),
         "s" => Ok(Duration::from_secs(n)),
-        "m" => Ok(Duration::from_secs(n * 60)),
+        "m" => n.checked_mul(60).map(Duration::from_secs).ok_or_else(|| format!("`{text}` is too long a duration")),
         _ => Err(bad()),
     }
+}
+
+/// The smallest MQTT keep-alive rumqttc takes (it asserts it).
+pub const MIN_KEEP_ALIVE: Duration = Duration::from_secs(5);
+
+/// Timings that cannot run: a zero retry (an unpaced reconnect loop), a zero probe interval (a
+/// probe loop), a keep-alive under rumqttc's floor (its assertion would end the MQTT task). Checked
+/// at parse time and again for the timings set in code ([`crate::Bridge::start`]).
+pub fn check_timing(timing: &Timing, mqtt: &MqttTiming) -> Result<(), String> {
+    if timing.retry.is_zero() {
+        return Err("the device retry interval is zero: an unpaced reconnect loop".into());
+    }
+    if timing.probe_interval.is_zero() {
+        return Err("the probe interval is zero: a probe loop".into());
+    }
+    if mqtt.keep_alive < MIN_KEEP_ALIVE {
+        return Err(format!("the MQTT keep-alive is under {} s, rumqttc's floor", MIN_KEEP_ALIVE.as_secs()));
+    }
+    Ok(())
 }
 
 /// `host` or `host:port`, the port defaulting to 1883.
@@ -117,10 +136,10 @@ pub fn usage(program: &str, family: &str, options: &[(String, String)]) -> Strin
          \x20 --operation-timeout <d>      the bound on every other device operation\n\
          \x20 --retry <d>                  at most one device connect per this\n\
          \x20 --outage-warn <d>            a device outage this long is one WARN\n\
-         \x20 --poll <d|off>               read the device this often\n\
+         \x20 --poll <d|off>               read the device this often (0 or off: never)\n\
          \x20 --probe-interval <d>         probe a silent unacknowledged device this often\n\
          \x20 --probe-deadline <d>         the bound on a probe\n\
-         \x20 --mqtt-keep-alive <d>        MQTT keep-alive\n\
+         \x20 --mqtt-keep-alive <d>        MQTT keep-alive (at least 5s)\n\
          \x20 --mqtt-retry <d>             between MQTT sessions\n\
          \x20 --mqtt-warn <d>              a broker outage this long is one WARN\n\
          \x20 --mqtt-stable <d>            a connection that lasts this long ends a broker outage\n"
@@ -152,6 +171,10 @@ pub fn parse(args: impl IntoIterator<Item = String>, settings: &mut Settings, op
             None => return Err(Problem::Usage(format!("`--{name}` needs a value"))),
         };
         let duration = || parse_duration(&value).map_err(Problem::Usage);
+        let nonzero = || match duration()? {
+            d if d.is_zero() => Err(Problem::Usage(format!("`--{name}` cannot be zero"))),
+            d => Ok(d),
+        };
         match name.as_str() {
             "root" => settings.root = value,
             "instance" => settings.instance = Some(value),
@@ -159,13 +182,18 @@ pub fn parse(args: impl IntoIterator<Item = String>, settings: &mut Settings, op
             "log-config" => settings.log_config = Some(PathBuf::from(value)),
             "connect-timeout" => settings.timing.connect = Some(duration()?),
             "operation-timeout" => settings.timing.operation = Some(duration()?),
-            "retry" => settings.timing.retry = Some(duration()?),
+            "retry" => settings.timing.retry = Some(nonzero()?),
             "outage-warn" => settings.timing.outage_warn = Some(duration()?),
-            "poll" if value == "off" || value == "0" => settings.timing.poll = Some(None),
-            "poll" => settings.timing.poll = Some(Some(duration()?)),
-            "probe-interval" => settings.timing.probe_interval = Some(duration()?),
+            "poll" if value == "off" => settings.timing.poll = Some(None),
+            "poll" => settings.timing.poll = Some(Some(duration()?).filter(|d| !d.is_zero())),
+            "probe-interval" => settings.timing.probe_interval = Some(nonzero()?),
             "probe-deadline" => settings.timing.probe_deadline = Some(duration()?),
-            "mqtt-keep-alive" => settings.mqtt.keep_alive = duration()?,
+            "mqtt-keep-alive" => match duration()? {
+                d if d < MIN_KEEP_ALIVE => {
+                    return Err(Problem::Usage(format!("`--mqtt-keep-alive` is at least {} s (rumqttc's floor)", MIN_KEEP_ALIVE.as_secs())))
+                }
+                d => settings.mqtt.keep_alive = d,
+            },
             "mqtt-retry" => settings.mqtt.retry = duration()?,
             "mqtt-warn" => settings.mqtt.warn_after = duration()?,
             "mqtt-stable" => settings.mqtt.stable_after = duration()?,
@@ -237,6 +265,34 @@ mod tests {
         );
         assert!(matches!(parse(args("--instance a/b --broker x"), &mut Settings::new("A"), &[]), Err(Problem::Usage(_))));
         assert!(matches!(parse(args("--instance i --broker x:port"), &mut Settings::new("A"), &[]), Err(Problem::Usage(_))));
+    }
+
+    /// Durations that would make a hot loop, trip rumqttc's assertion or overflow are usage errors
+    /// at parse time, exit 2; a zero poll in any unit is off (review MINOR 2).
+    #[test]
+    fn durations_out_of_range_are_usage_errors() {
+        let usage = |line: &str| matches!(parse(args(line), &mut Settings::new("A"), &[]), Err(Problem::Usage(_)));
+        for bad in [
+            "--retry 0",
+            "--retry 0ms",
+            "--probe-interval 0",
+            "--mqtt-keep-alive 4s",
+            "--mqtt-keep-alive 4999ms",
+            "--connect-timeout 18446744073709551615m",
+        ] {
+            assert!(usage(&format!("--instance i --broker x {bad}")), "`{bad}` was accepted");
+        }
+        assert!(parse_duration("18446744073709551615m").is_err(), "a minute count that overflows was accepted");
+        let mut s = Settings::new("A");
+        parse(args("--instance i --broker x --poll 0ms --mqtt-keep-alive 5s --retry 1ms"), &mut s, &[]).unwrap();
+        assert_eq!(s.timing.poll, Some(None), "`--poll 0ms` did not turn polling off");
+        assert_eq!(s.mqtt.keep_alive, Duration::from_secs(5));
+        // Set in code, the same timings are refused when the bridge starts.
+        let zero_retry = Timing { retry: Duration::ZERO, ..Timing::default() };
+        assert!(check_timing(&zero_retry, &MqttTiming::default()).is_err());
+        let short = MqttTiming { keep_alive: Duration::from_secs(1), ..MqttTiming::default() };
+        assert!(check_timing(&Timing::default(), &short).is_err());
+        assert_eq!(check_timing(&Timing::default(), &MqttTiming::default()), Ok(()));
     }
 
     #[test]

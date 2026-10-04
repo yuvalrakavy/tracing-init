@@ -1131,3 +1131,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "without_its_stop_signals_the_bridge_ends_within_a_bound_whatever_its_logging_start_does", "--exact"]
 expect_text = '''without its stop signals the bridge did not end with a failure within its bound'''
 guard       = "no_signals_bounded"
+
+# MINOR 2: a zero retry is a usage error (an unpaced reconnect loop).
+[[control]]
+name        = "a_zero_retry_is_accepted"
+file        = "mqtt-bridge-kit/src/config.rs"
+anchor      = '''            "retry" => settings.timing.retry = Some(nonzero()?),'''
+replacement = '''            "retry" => settings.timing.retry = Some(duration()?),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "config::tests::durations_out_of_range_are_usage_errors", "--exact"]
+expect_text = '''`--retry 0` was accepted'''
+guard       = "cli_ranges"
