@@ -210,6 +210,42 @@ async fn sigterm_while_the_drivers_info_has_not_returned_stops_the_bridge_within
     assert_eq!(broker.connections(), 0, "the bridge reached its service, so info() did not hold it and this test proves nothing");
 }
 
+/// SIGTERM answers what waits: a momentary command queued behind a hanging write is refused, on
+/// `Error` and on its response topic, before `Active=false` and the DISCONNECT (the R1 re-gate's
+/// R15: the flush sent only those two, and the waiting command was never answered).
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_answers_the_commands_waiting_for_the_device() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(20);
+    let dir = workdir("stop_answers");
+    let mut child =
+        bridge(&dir, &broker, &["--device", "hang-apply"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("start the bridge");
+    let status_topic = format!("Proc/Status/{INSTANCE}");
+    assert!(
+        broker.wait_until(BOUND, |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connected")).await,
+        "the device never connected"
+    );
+    // A write that hangs, and a command waiting behind it.
+    assert!(broker.publish(&format!("Proc/Desired/{INSTANCE}/t1/power"), "false", &SendOptions::default().expiry(60)));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let replies = "Store/replies/stop";
+    let options = SendOptions::default().expiry(30).response_topic(replies).correlation_data(b"s-1".to_vec());
+    assert!(broker.publish(&format!("Proc/Command/{INSTANCE}"), r#"{"target":"t1","command":"pulse"}"#, &options));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    signal(&child, "-TERM");
+    let status = exit_within(&mut child, Duration::from_secs(15)).await;
+    assert!(status.is_some_and(|s| s.success()), "the bridge did not stop cleanly: {status:?}");
+    let answered = broker.received_on(replies);
+    assert!(!answered.is_empty(), "the command waiting at SIGTERM was not answered; the log:\n{}", logged(&dir));
+    let error_topic = format!("Proc/Error/{INSTANCE}");
+    assert!(
+        broker.received_on(&error_topic).iter().any(|r| String::from_utf8_lossy(&r.payload).contains("pulse")),
+        "the command waiting at SIGTERM was not refused on Error"
+    );
+    let active = format!("Proc/Active/{INSTANCE}");
+    assert_eq!(broker.received_on(&active).last().map(|r| r.payload.clone()).as_deref(), Some(&b"false"[..]));
+}
+
 /// The threads `pid` runs now.
 fn threads(pid: u32) -> usize {
     let listed = std::process::Command::new("ps").args(["-M", "-p", &pid.to_string()]).output().expect("ps");

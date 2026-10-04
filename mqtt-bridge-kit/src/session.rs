@@ -396,6 +396,9 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) {
         return;
     }
     let flushed = async {
+        // What is pending first — Status, Errors, the replies to the commands the stop refused —
+        // then the last words (re-gate R15).
+        publish_changes(shared, client, shared.reports.take()).await;
         emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
         // WAIT: mqtt-request
         client.disconnect().await?;

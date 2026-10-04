@@ -2257,3 +2257,26 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_unproven_restore_is_applied_again_when_the_link_dies_before_proof", "--exact"]
 expect_text = '''the failed probe never lost the link'''
 guard       = "restore_unproven"
+
+# Re-gate R15: the stop refuses what still waits, and publishes it before its last words.
+[[control]]
+name        = "the_stop_answers_nothing_waiting"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''            worker::report_refused(&self.reports, self.mailbox.disconnected(), STOPPED_BEFORE);'''
+replacement = '''            let _ = STOPPED_BEFORE;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_answers_the_commands_waiting_for_the_device", "--exact"]
+expect_text = '''the command waiting at SIGTERM was not answered'''
+guard       = "stop_refuses_waiting"
+
+# Re-gate R15: the flush publishes what is pending before Active=false.
+[[control]]
+name        = "the_flush_drops_what_is_pending"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        publish_changes(shared, client, shared.reports.take()).await;
+        emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
+replacement = '''        emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_answers_the_commands_waiting_for_the_device", "--exact"]
+expect_text = '''the command waiting at SIGTERM was not answered'''
+guard       = "flush_publishes_pending"

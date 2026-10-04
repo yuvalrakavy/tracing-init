@@ -304,6 +304,10 @@ commands are refused, and reads are dropped.
   dead-part path — the bounded shutdown (which does not wait for the blocked worker) and a failure
   exit, so the supervisor restarts the process. A thread cannot be cancelled; the restart is the
   recovery (re-gate R1, R13).
+- **What a stop answers:** the bounded shutdown first stops the worker taking work, refuses every
+  command still waiting for the device — on `Error` and on its response topic — then publishes what
+  is pending (`Status`, `Error`, replies; a watchdog's verdict included), then `Active=false` and
+  the DISCONNECT, all within the flush's bound (re-gate R15).
 - **Panics:** `Bridge::run` installs a process-global panic hook (`install_panic_hook`, also for
   in-process users of `Bridge::start`): ERROR `panic` through tracing (lossy), and the report for
   stderr handed to the process's one reporter thread through a bounded, lossy queue (16; full, the
