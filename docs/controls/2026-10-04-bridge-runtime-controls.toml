@@ -36,14 +36,14 @@ name        = "the_pump_waits_on_the_session"
 file        = "mqtt-bridge-kit/src/pump.rs"
 anchor      = '''                Event::Incoming(Packet::Publish(publish)) => {
                     backlog.pushed();
-                    PumpEvent::Publish(publish)
+                    PumpEvent::Publish(publish, Instant::now())
                 }'''
 replacement = '''                Event::Incoming(Packet::Publish(publish)) => {
                     backlog.pushed();
                     while backlog.depth.load(Ordering::SeqCst) > 10 {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
-                    PumpEvent::Publish(publish)
+                    PumpEvent::Publish(publish, Instant::now())
                 }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
@@ -1505,3 +1505,15 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_targets_config_is_configured_before_its_replayed_values_for_a_device_already_up", "--exact"]
 expect_text = '''the replayed value reached apply before the target's config'''
 guard       = "config_subscribed_first"
+
+# C7: a request's expiry counts from its arrival at the pump.
+[[control]]
+name        = "the_expiry_counts_from_the_session"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    span.in_scope(|| route(shared, &topic, publish, received));'''
+replacement = '''    let _ = received;
+    span.in_scope(|| route(shared, &topic, publish, Instant::now()));'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_reads_it", "--exact"]
+expect_text = '''a command executed past its expiry, counted from when the session read it'''
+guard       = "expiry_from_arrival"

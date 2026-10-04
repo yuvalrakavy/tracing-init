@@ -109,3 +109,26 @@ async fn a_broker_that_stops_reading_is_left_for_a_fresh_session() {
     );
     assert!(h.stop().await);
 }
+
+/// A request's expiry counts from its arrival at the bridge, not from when the session got to it: a
+/// command that waited past its expiry behind a stalled broker — the session parked on a full
+/// request channel — is never executed (review C7: decoding granted it its whole expiry again).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_reads_it() {
+    let h = Harness::start_with("expiry-arrival", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    h.broker.hold_acks();
+    for i in 0..1000 {
+        assert!(h.send_raw(&h.topics.command(), format!("not json {i}").as_bytes()));
+    }
+    assert!(h.eventually(BOUND, |h| h.broker.held_acks() >= 10).await, "the path is not saturated");
+    h.settle(Duration::from_millis(300)).await;
+    // One second to live, arriving while the session is parked.
+    let command = json!({"target": "t1", "command": "pulse"}).to_string();
+    assert!(h.broker.publish(&h.topics.command(), command, &SendOptions::default().expiry(1)));
+    h.settle(Duration::from_millis(2000)).await;
+    h.broker.release_acks();
+    h.settle(Duration::from_millis(1500)).await;
+    assert!(h.device.calls_of(Op::Execute).is_empty(), "a command executed past its expiry, counted from when the session read it");
+    assert!(h.stop().await);
+}

@@ -50,7 +50,7 @@ fn requests_left_unread_when_the_session_ends_are_reported() {
     for _ in 0..HIGH_WATER {
         backlog.pushed();
         let publish = Publish::new("t", QoS::AtLeastOnce, "x", None);
-        assert!(tx.send(PumpEvent::Publish(publish)).is_ok());
+        assert!(tx.send(PumpEvent::Publish(publish, std::time::Instant::now())).is_ok());
     }
     drop(Incoming { rx, backlog });
     let discarded = log.of_kind("mqtt_commands_discarded");

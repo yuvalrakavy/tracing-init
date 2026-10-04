@@ -40,8 +40,9 @@ impl Conflict {
 /// A request's metadata, from its MQTT v5 properties.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestMeta {
-    /// When it expires: its message expiry, counted from its arrival. A held request is dropped
-    /// then (Store kit spec Q6); one without an expiry never expires.
+    /// When it expires: its message expiry, counted from its arrival at the bridge — when the pump
+    /// received it, not when the session got to it. A held request is dropped then (Store kit spec
+    /// Q6); one without an expiry never expires.
     pub deadline: Option<Instant>,
     pub conflict: Conflict,
 }

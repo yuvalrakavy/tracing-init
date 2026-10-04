@@ -125,7 +125,7 @@ capped queue whose overflow is counted and logged once per episode.
 | Pump | polls only; unbounded forward with a backlog episode; one connection per client: the first failed poll ends the session, and the next connection gets a fresh client (rumqttc's in-loop reconnect would send what the session queued meanwhile ahead of the next CONNACK's subscriptions, and carries the 0.25 packet-id collision across connections); progress bounded at twice the keep-alive (§5.2) |
 | Every CONNACK | subscribe, then `Active=true`, then republish the retained model; `Version` |
 | Start-up read-back | reads its own retained `State`, for the conflict rule's "before" values after a restart; the requests are subscribed only once its SUBACK has come (at most 5 s), so its retained messages are queued ahead of every retained request |
-| Requests | decodes both `Desired` forms; the deadline from the MQTT message expiry; `conflict` from the user property; retractions; malformed payloads answered with `Error` |
+| Requests | decodes both `Desired` forms; the deadline from the MQTT message expiry, counted from the request's arrival (the pump stamps it); `conflict` from the user property; retractions; malformed payloads answered with `Error` |
 | Mailbox | latest per (target, property), moved to the back; momentary FIFO (cap 64) refused while down; reads coalesced; held values dropped at their deadline; unproven writes held again |
 | Worker | connect with pacing; proof of life before declaring recovery; catch-up (read, resolve conflicts, apply held state); poll; probes |
 | Reports | a never-waiting model for `State` and `Status`; capped queues for `Event` and `Error` |

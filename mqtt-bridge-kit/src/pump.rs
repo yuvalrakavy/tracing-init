@@ -50,13 +50,17 @@ pub fn stall_bound(keep_alive: Duration) -> Duration {
     keep_alive * 2
 }
 
-/// What the pump hands the session.
+/// What the pump hands the session. A value lives on the forward queue only until the session
+/// reads it; boxing the publish would cost an allocation for each.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum PumpEvent {
     /// The broker accepted the connection. The broker keeps no session, so the session subscribes
     /// and announces itself.
     Connected,
-    Publish(Publish),
+    /// A publish, and when the pump received it: a request's expiry counts from then, not from
+    /// when the session gets to it (review C7).
+    Publish(Publish, Instant),
     /// The broker acknowledged a subscription (the session waits for the read-back's).
     SubAck,
     /// The DISCONNECT the session asked for was written: the session's end.
@@ -268,7 +272,7 @@ impl Incoming {
     pub async fn recv(&mut self) -> Option<PumpEvent> {
         // WAIT: mqtt-pump-queue
         let event = self.rx.recv().await;
-        if matches!(event, Some(PumpEvent::Publish(_))) {
+        if matches!(event, Some(PumpEvent::Publish(..))) {
             self.backlog.popped();
         }
         event
@@ -366,7 +370,7 @@ impl Pump {
                 }
                 Event::Incoming(Packet::Publish(publish)) => {
                     backlog.pushed();
-                    PumpEvent::Publish(publish)
+                    PumpEvent::Publish(publish, Instant::now())
                 }
                 Event::Incoming(Packet::SubAck(_)) => PumpEvent::SubAck,
                 Event::Outgoing(Outgoing::Disconnect) => PumpEvent::Disconnected,

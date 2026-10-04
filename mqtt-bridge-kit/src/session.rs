@@ -201,8 +201,8 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                         Some(SessionEnd::Ended { connected: false })
                     }
                 }),
-                Step::Event(Some(PumpEvent::Publish(publish))) => {
-                    handle(shared, &publish);
+                Step::Event(Some(PumpEvent::Publish(publish, received))) => {
+                    handle(shared, &publish, received);
                     Ok(None)
                 }
                 Step::Event(Some(PumpEvent::Disconnected | PumpEvent::SubAck)) => Ok(None),
@@ -289,7 +289,7 @@ async fn read_back_acknowledged(shared: &Shared, incoming: &mut Incoming) -> Opt
         match tokio::time::timeout_at(deadline.into(), incoming.recv()).await {
             Err(_) => return Some(false),
             Ok(Some(PumpEvent::SubAck)) => return Some(true),
-            Ok(Some(PumpEvent::Publish(publish))) => handle(shared, &publish),
+            Ok(Some(PumpEvent::Publish(publish, received))) => handle(shared, &publish, received),
             Ok(Some(PumpEvent::Connected | PumpEvent::Disconnected)) => {}
             Ok(Some(PumpEvent::Ended(_)) | None) => return None,
         }
@@ -356,9 +356,9 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) {
     }
 }
 
-/// An incoming publish, handled without waiting: requests go to the mailbox, what must be answered
-/// to the reports.
-fn handle(shared: &Shared, publish: &Publish) {
+/// An incoming publish, received at `received`, handled without waiting: requests go to the
+/// mailbox, what must be answered to the reports.
+fn handle(shared: &Shared, publish: &Publish, received: Instant) {
     let topic = String::from_utf8_lossy(&publish.topic).into_owned();
     panic_for_test(&topic);
     let traceparent =
@@ -367,11 +367,11 @@ fn handle(shared: &Shared, publish: &Publish) {
     if let Some(tp) = &traceparent {
         tracing_init::traceparent::set_remote_parent(&span, tp);
     }
-    span.in_scope(|| route(shared, &topic, publish));
+    span.in_scope(|| route(shared, &topic, publish, received));
 }
 
-fn route(shared: &Shared, topic: &str, publish: &Publish) {
-    let now = Instant::now();
+/// `now` is when the publish arrived: every deadline counts from it.
+fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
     let properties = publish.properties.as_ref();
     let payload = &publish.payload[..];
     let malformed = |error: String, report: ErrorReport| {
