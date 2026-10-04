@@ -154,7 +154,7 @@ async fn op<T>(
     // WAIT: device-op
     let result = tokio::select! {
         biased;
-        done = tokio::time::timeout_at(deadline.into(), operation) => match done {
+        done = tokio::time::timeout_at(deadline.into(), crate::link::under_deadline(deadline, operation)) => match done {
             Ok(result) => result,
             Err(_) => Err(OpError::Link(LinkError::new(format!("{what} missed its deadline ({} ms)", bound.as_millis())))),
         },
@@ -879,10 +879,12 @@ impl<D: DeviceDriver> Worker<D> {
         if std::mem::take(&mut self.recovered) {
             self.before = Some((Instant::now(), self.reports.snapshot()));
         }
-        // Watched like an operation: a disconnect that blocks the thread is a dead worker too.
-        self.clock.set(Some(Instant::now() + self.info.timing.operation));
-        // WAIT: device-disconnect
-        let _ = tokio::time::timeout(self.info.timing.operation, self.driver.disconnect()).await;
+        // Watched like an operation: a disconnect that blocks the thread is a dead worker too. Its
+        // blocking calls are held to its bound, as an operation's.
+        let deadline = Instant::now() + self.info.timing.operation;
+        self.clock.set(Some(deadline));
+        // WAIT: device-disconnect, device-disconnect
+        let _ = tokio::time::timeout_at(deadline.into(), crate::link::under_deadline(deadline, self.driver.disconnect())).await;
         self.clock.set(None);
         let unanswered = self.mailbox.disconnected();
         report_refused(&self.reports, unanswered, LINK_LOST_BEFORE);

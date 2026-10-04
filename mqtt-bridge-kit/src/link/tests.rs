@@ -32,14 +32,16 @@ async fn a_lost_link_is_said_once_with_its_first_reason() {
 async fn a_blocking_call_past_its_deadline_is_abandoned_and_the_link_lost() {
     let ctx = context(1);
     let handle = ctx.handle();
-    handle.set_deadline(Some(Instant::now() + Duration::from_millis(100)));
     let (release, held) = std::sync::mpsc::channel::<()>();
     let started = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        ctx.blocking(move || {
-            let _ = held.recv();
-        }),
+        under_deadline(
+            Instant::now() + Duration::from_millis(100),
+            ctx.blocking(move || {
+                let _ = held.recv();
+            }),
+        ),
     )
     .await
     .expect("the blocking call was not bounded by its deadline");
@@ -57,20 +59,19 @@ async fn abandoned_blocking_calls_are_capped() {
     let mut releases = Vec::new();
     for generation in 0..ABANDONED_CAP as u64 {
         let ctx = LinkContext::new(generation, "i", Reports::new(), abandoned.clone(), Arc::new(OpClock::new()));
-        ctx.handle().set_deadline(Some(Instant::now() + Duration::from_millis(20)));
         let (release, held) = std::sync::mpsc::channel::<()>();
         releases.push(release);
-        assert!(ctx
-            .blocking(move || {
-                let _ = held.recv();
-            })
-            .await
-            .is_err());
+        let call = ctx.blocking(move || {
+            let _ = held.recv();
+        });
+        assert!(under_deadline(Instant::now() + Duration::from_millis(20), call).await.is_err());
     }
     let ctx = LinkContext::new(99, "i", Reports::new(), abandoned.clone(), Arc::new(OpClock::new()));
-    ctx.handle().set_deadline(Some(Instant::now() + Duration::from_secs(5)));
     let started = Instant::now();
-    assert!(ctx.blocking(|| 1).await.is_err(), "a blocking call past the cap was run");
+    assert!(
+        under_deadline(Instant::now() + Duration::from_secs(5), ctx.blocking(|| 1)).await.is_err(),
+        "a blocking call past the cap was run"
+    );
     assert!(started.elapsed() < Duration::from_secs(1), "the refusal waited");
     drop(releases.pop());
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -79,8 +80,7 @@ async fn abandoned_blocking_calls_are_capped() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let ctx = LinkContext::new(100, "i", Reports::new(), abandoned, Arc::new(OpClock::new()));
-    ctx.handle().set_deadline(Some(Instant::now() + Duration::from_secs(5)));
-    assert_eq!(ctx.blocking(|| 7).await, Ok(7));
+    assert_eq!(under_deadline(Instant::now() + Duration::from_secs(5), ctx.blocking(|| 7)).await, Ok(7));
 }
 
 /// A blocking call whose future is dropped — the operation that awaited it cancelled, by its link's

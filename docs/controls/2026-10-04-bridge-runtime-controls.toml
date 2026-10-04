@@ -482,8 +482,8 @@ guard       = "no_logging_under_mailbox_lock"
 [[control]]
 name        = "a_driver_call_is_not_bounded"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''        done = tokio::time::timeout_at(deadline.into(), operation) => match done {'''
-replacement = '''        done = async { Ok::<_, ()>(operation.await) } => match done {'''
+anchor      = '''        done = tokio::time::timeout_at(deadline.into(), crate::link::under_deadline(deadline, operation)) => match done {'''
+replacement = '''        done = async { Ok::<_, ()>(crate::link::under_deadline(deadline, operation).await) } => match done {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_call_that_never_returns_is_a_lost_link_within_its_deadline", "--exact"]
 expect_text = '''the hanging call never lost the link'''
@@ -1126,7 +1126,7 @@ replacement = '''                    polled'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_poll_slower_than_its_interval_does_not_starve_writes", "--exact"]
 expect_text = '''with polls slower than their interval, a write never ran'''
-guard       = "poll_from_completion"
+guard       = "poll_starvation"
 
 # C4 / re-gate R16: the next poll is due an interval after the last ended — alone.
 [[control]]
@@ -1948,3 +1948,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "config::tests::timings_too_long_or_unpaced_are_refused", "--exact"]
 expect_text = '''a connect bound that overflows an Instant was accepted'''
 guard       = "timing_ranges"
+
+# Re-gate R14: the blocking calls' deadline is the operation's task's, so a helper's call has none.
+[[control]]
+name        = "a_helpers_blocking_call_takes_the_operations_deadline"
+file        = "mqtt-bridge-kit/src/link.rs"
+anchor      = '''        let outcome = match OP_DEADLINE.try_with(|deadline| *deadline).ok() {'''
+replacement = '''        let outcome = match self.shared.clock.deadline() {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::a_helpers_blocking_call_is_not_held_to_an_operation_it_overlapped", "--exact"]
+expect_text = '''a helper's read was held to the deadline of an operation it overlapped'''
+guard       = "blocking_deadline_task_scoped"

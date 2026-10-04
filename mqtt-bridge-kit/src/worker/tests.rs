@@ -111,6 +111,44 @@ async fn an_operation_that_completed_wins_over_a_link_lost_at_the_same_moment() 
     }
 }
 
+/// A helper's blocking call has no deadline, even when it starts while an operation runs; the
+/// operation's own blocking calls are held to its deadline (spec §4.2; the R1 re-gate's R14: the
+/// deadline was the link's, so a reader's quiet read that overlapped a probe "overran" and lost
+/// the link).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_helpers_blocking_call_is_not_held_to_an_operation_it_overlapped() {
+    let ctx = link_context();
+    let handle = ctx.handle();
+    let reader = handle.clone();
+    let mut read = None;
+    let probed = op(&handle, Duration::from_millis(100), "probe", async {
+        read = Some(tokio::spawn(async move {
+            reader
+                .blocking(|| {
+                    std::thread::sleep(Duration::from_millis(400));
+                    "line"
+                })
+                .await
+        }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok::<(), OpError>(())
+    })
+    .await;
+    assert_eq!(probed, Ok(()));
+    let read = read.expect("the helper started").await.expect("the helper ran");
+    assert_eq!(read, Ok("line"), "a helper's read was held to the deadline of an operation it overlapped");
+    assert!(!handle.is_lost(), "a helper's read lost the link");
+    // The operation's own blocking call is held to its deadline.
+    let ctx = link_context();
+    let handle = ctx.handle();
+    let inner = handle.clone();
+    let slow = op(&handle, Duration::from_millis(100), "apply", async move {
+        inner.blocking(|| std::thread::sleep(Duration::from_millis(400))).await.map_err(OpError::Link)
+    })
+    .await;
+    assert!(matches!(slow, Err(OpError::Link(_))), "an operation's blocking call was not held to its deadline: {slow:?}");
+}
+
 /// An operation is not started on a link already lost: it is refused at once with the loss, and
 /// the driver is not called (the R1 re-gate's R6: the biased wrapper ran every new operation on a
 /// lost link, and catch-up or restore writes went on after the loss).

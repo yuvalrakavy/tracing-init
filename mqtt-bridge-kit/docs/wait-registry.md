@@ -93,6 +93,7 @@ bridge-end src/process.rs serve
 bridge-parts src/process.rs Running::ended
 device-disconnect src/worker.rs Worker::down
 device-disconnect src/worker.rs spawn
+device-op src/link.rs under_deadline
 device-op src/worker.rs Worker::configure
 device-op src/worker.rs Worker::decide
 device-op src/worker.rs Worker::link

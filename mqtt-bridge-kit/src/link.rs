@@ -26,6 +26,20 @@ use tracing::{error, Instrument};
 use crate::driver::{LinkError, PropertyMap};
 use crate::reports::{Outbound, Reports};
 
+tokio::task_local! {
+    /// The deadline of the driver operation running in this task: set by the worker around each
+    /// operation ([`under_deadline`]), so a blocking call made from the operation is held to it,
+    /// and one made from a helper — a task of its own — has none (spec §4.2; the R1 re-gate's R14:
+    /// the deadline was the link's, and a helper's call that overlapped an operation inherited it).
+    static OP_DEADLINE: Instant;
+}
+
+/// Run `operation` with `deadline` as its blocking calls' deadline.
+pub(crate) async fn under_deadline<F: Future>(deadline: Instant, operation: F) -> F::Output {
+    // WAIT: device-op
+    OP_DEADLINE.scope(deadline, operation).await
+}
+
 /// Blocking calls whose threads may run at once — in use, or abandoned (past their deadline, or
 /// their caller cancelled) and still running; past it, `blocking` refuses with a lost link until
 /// one of them ends.
@@ -139,9 +153,6 @@ struct LinkShared {
     lost: AtomicBool,
     reason: OnceLock<String>,
     lost_notify: Notify,
-    /// The current operation's deadline, in milliseconds since `epoch` plus one; 0 when none.
-    deadline: AtomicU64,
-    epoch: Instant,
     abandoned: Arc<Abandoned>,
     /// The worker's operation clock, which the watchdog reads.
     clock: Arc<OpClock>,
@@ -239,23 +250,15 @@ impl LinkHandle {
         }
     }
 
-    /// Set the deadline of the operation about to run (`None` between operations), for its
-    /// blocking calls and for the watchdog.
+    /// Set the deadline of the operation about to run (`None` between operations), for the
+    /// watchdog. Its blocking calls take it from their task ([`under_deadline`]).
     pub(crate) fn set_deadline(&self, deadline: Option<Instant>) {
-        let stamp = deadline.map_or(0, |d| d.saturating_duration_since(self.shared.epoch).as_millis() as u64 + 1);
-        self.shared.deadline.store(stamp, Ordering::SeqCst);
         self.shared.clock.set(deadline);
     }
 
-    fn deadline(&self) -> Option<Instant> {
-        match self.shared.deadline.load(Ordering::SeqCst) {
-            0 => None,
-            stamp => Some(self.shared.epoch + Duration::from_millis(stamp - 1)),
-        }
-    }
-
-    /// Run a synchronous library call on a thread of its own, under the current operation's
-    /// deadline. A call that overruns it is abandoned — a thread cannot be cancelled — the link is
+    /// Run a synchronous library call on a thread of its own — called from a driver operation,
+    /// under that operation's deadline; from a helper, with none. A call that overruns it is
+    /// abandoned — a thread cannot be cancelled — the link is
     /// reported lost, and the error is a `LinkError`. Every call's thread counts, from before it
     /// starts until it ends, against [`ABANDONED_CAP`] — in use or abandoned, a helper's (no
     /// deadline) too, and one whose caller was cancelled; past the cap the call is refused with a
@@ -278,7 +281,7 @@ impl LinkHandle {
         if let Err(e) = spawned {
             return Err(LinkError::new(format!("a blocking call's thread could not start: {e}")));
         }
-        let outcome = match self.deadline() {
+        let outcome = match OP_DEADLINE.try_with(|deadline| *deadline).ok() {
             // WAIT: blocking-call
             Some(deadline) => tokio::time::timeout_at(deadline.into(), &mut rx).await,
             // WAIT: blocking-call
@@ -367,8 +370,6 @@ impl LinkContext {
             lost: AtomicBool::new(false),
             reason: OnceLock::new(),
             lost_notify: Notify::new(),
-            deadline: AtomicU64::new(0),
-            epoch: Instant::now(),
             abandoned,
             clock,
             instance: instance.to_owned(),

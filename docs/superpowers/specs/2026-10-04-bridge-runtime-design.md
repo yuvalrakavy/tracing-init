@@ -88,7 +88,9 @@ lost link, never a hang.
   single-threaded runtime, as the driver does, so they need not be `Send`; `LinkHandle::spawn`
   starts one from a later operation or another helper (only on the worker's thread).
 - `ctx.link_lost(reason)`: a helper noticed the link died.
-- `ctx.blocking(fn)`: a synchronous library call on a worker thread, under the current deadline. An
+- `ctx.blocking(fn)`: a synchronous library call on a worker thread — called from an operation,
+  under that operation's deadline (a task-local, set around each operation and the disconnect);
+  called from a helper, a task of its own, with none, even while an operation runs (re-gate R14). An
   overrun abandons the thread and counts as a lost link. Every call's thread is counted from before
   it starts until it ends — in use or abandoned, a helper's or a cancelled caller's too — and at
   most four run at once; past that a call is refused as a lost link.

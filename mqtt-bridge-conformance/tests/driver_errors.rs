@@ -409,8 +409,12 @@ async fn a_partial_applys_written_values_are_held_again_when_the_link_dies_befor
     h.device.answer_times(Op::Apply, None, Answer::RefuseProperty("temp"), 1);
     let req = Req { expiry: Some(3600), conflict: Some("RequestWins") };
     assert!(h.desire_many("t1", json!({"power": true, "temp": 22}), req));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Probe).is_empty()).await, "the write was never probed: {:?}", h.device.calls());
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty()).await, "the write never reached the device");
+    h.settle(Duration::from_millis(100)).await;
+    // The link dies before anything proves the write (if the probe has not lost it already).
+    h.device.set_up(false);
     h.device.set_deaf(false);
+    h.device.set_up(true);
     assert!(
         h.eventually(BOUND, |h| h.device.get("t1", "power") == Some(json!(true))).await,
         "the value a partial apply wrote was not held again when the link died before proof: {:?}",
