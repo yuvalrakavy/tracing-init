@@ -767,8 +767,8 @@ guard       = "blocking_bounded"
 [[control]]
 name        = "abandoned_blocking_calls_are_not_capped"
 file        = "mqtt-bridge-kit/src/link.rs"
-anchor      = '''        if abandoned.running.load(Ordering::SeqCst) >= ABANDONED_CAP {'''
-replacement = '''        if false {'''
+anchor      = '''(running < ABANDONED_CAP).then_some(running + 1)'''
+replacement = '''Some(running + 1)'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::abandoned_blocking_calls_are_capped", "--exact"]
 expect_text = '''a blocking call past the cap was run'''
@@ -1050,3 +1050,27 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::an_operation_that_completed_wins_over_a_link_lost_at_the_same_moment", "--exact"]
 expect_text = '''a completed operation was turned into a lost link'''
 guard       = "op_result_wins"
+
+# C3: a blocking call's thread is counted until it ends, whatever becomes of its future.
+[[control]]
+name        = "a_blocking_thread_is_uncounted_when_its_future_is_dropped"
+file        = "mqtt-bridge-kit/src/link.rs"
+anchor      = '''            let _slot = slot;
+            let value = f();'''
+replacement = '''            drop(slot);
+            let value = f();'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_blocking_call_whose_future_is_dropped_stays_counted_until_its_thread_ends", "--exact"]
+expect_text = '''a dropped call whose thread still runs was not counted'''
+guard       = "blocking_slot_raii"
+
+# MINOR 11 / C3: the cap is reserved before the thread starts, for every call.
+[[control]]
+name        = "the_blocking_cap_is_not_reserved"
+file        = "mqtt-bridge-kit/src/link.rs"
+anchor      = '''(running < ABANDONED_CAP).then_some(running + 1)'''
+replacement = '''Some(running + 1)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_helpers_blocking_calls_count_towards_the_cap", "--exact"]
+expect_text = '''a blocking call past the cap was run'''
+guard       = "blocking_cap_reserved"

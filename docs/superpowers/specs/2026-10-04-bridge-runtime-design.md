@@ -83,7 +83,9 @@ lost link, never a hang.
   link lost (a panic is also ERROR `driver_contract_violation`).
 - `ctx.link_lost(reason)`: a helper noticed the link died.
 - `ctx.blocking(fn)`: a synchronous library call on a worker thread, under the current deadline. An
-  overrun abandons the thread (capped in number) and counts as a lost link.
+  overrun abandons the thread and counts as a lost link. Every call's thread is counted from before
+  it starts until it ends — in use or abandoned, a helper's or a cancelled caller's too — and at
+  most four run at once; past that a call is refused as a lost link.
 - `ctx.handle()`: a cloneable `LinkHandle` (`report()`, `link_lost()`, `is_lost()`, `blocking()`) to
   keep for later calls, since the context itself is only handed to `connect`. `ctx.report` is a
   cloneable `Reporter`.

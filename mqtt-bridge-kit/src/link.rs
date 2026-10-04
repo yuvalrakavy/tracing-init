@@ -13,7 +13,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -25,13 +25,10 @@ use tracing::{error, Instrument};
 use crate::driver::{LinkError, PropertyMap};
 use crate::reports::{Outbound, Reports};
 
-/// Blocking calls past their deadline that may still be running; past it, `blocking` refuses with
-/// a lost link until one of them ends.
+/// Blocking calls whose threads may run at once — in use, or abandoned (past their deadline, or
+/// their caller cancelled) and still running; past it, `blocking` refuses with a lost link until
+/// one of them ends.
 pub const ABANDONED_CAP: usize = 4;
-
-const RUNNING: u8 = 0;
-const FINISHED: u8 = 1;
-const ABANDONED: u8 = 2;
 
 /// Reports from a driver or its helpers, handed over without waiting.
 #[derive(Debug, Clone)]
@@ -63,10 +60,32 @@ impl Reporter {
     }
 }
 
-/// The blocking calls abandoned past their deadline and still running, across links.
+/// The blocking calls whose threads are running, across links: in use, or abandoned.
 #[derive(Debug, Default)]
 pub(crate) struct Abandoned {
     running: AtomicUsize,
+}
+
+/// One blocking call's place under [`ABANDONED_CAP`]: reserved before its thread starts, and held
+/// by the thread until it ends — whatever becomes of the future that started it, so a call whose
+/// caller was cancelled stays counted while its thread runs (review C3). Released on the thread's
+/// end, its panic included, and at once if the thread never starts.
+struct Slot(Arc<Abandoned>);
+
+impl Slot {
+    fn reserve(abandoned: &Arc<Abandoned>) -> Option<Slot> {
+        abandoned
+            .running
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| (running < ABANDONED_CAP).then_some(running + 1))
+            .ok()
+            .map(|_| Slot(abandoned.clone()))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The deadline of the operation the device worker is running, for the watchdog on the MQTT side
@@ -183,30 +202,24 @@ impl LinkHandle {
 
     /// Run a synchronous library call on a thread of its own, under the current operation's
     /// deadline. A call that overruns it is abandoned — a thread cannot be cancelled — the link is
-    /// reported lost, and the error is a `LinkError`. At most [`ABANDONED_CAP`] abandoned calls may
-    /// still be running; past it, the call is refused with a `LinkError` at once.
+    /// reported lost, and the error is a `LinkError`. Every call's thread counts, from before it
+    /// starts until it ends, against [`ABANDONED_CAP`] — in use or abandoned, a helper's (no
+    /// deadline) too, and one whose caller was cancelled; past the cap the call is refused with a
+    /// `LinkError` at once, and the link reported lost.
     pub async fn blocking<T, F>(&self, f: F) -> Result<T, LinkError>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let abandoned = self.shared.abandoned.clone();
-        if abandoned.running.load(Ordering::SeqCst) >= ABANDONED_CAP {
-            self.link_lost("too many blocking calls overran their deadline and are still running");
-            return Err(LinkError::new(format!("{ABANDONED_CAP} blocking calls past their deadline are still running")));
-        }
+        let Some(slot) = Slot::reserve(&self.shared.abandoned) else {
+            self.link_lost("too many blocking calls are still running");
+            return Err(LinkError::new(format!("{ABANDONED_CAP} blocking calls are still running")));
+        };
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        // RUNNING, then FINISHED (by the thread) or ABANDONED (by the deadline), whichever is
-        // first; an abandoned call is counted until its thread ends.
-        let state = Arc::new(AtomicU8::new(RUNNING));
-        let thread_state = state.clone();
-        let thread_abandoned = abandoned.clone();
         let spawned = std::thread::Builder::new().name("bridge-blocking".into()).spawn(move || {
+            let _slot = slot;
             let value = f();
             let _ = tx.send(value);
-            if thread_state.compare_exchange(RUNNING, FINISHED, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-                thread_abandoned.running.fetch_sub(1, Ordering::SeqCst);
-            }
         });
         if let Err(e) = spawned {
             return Err(LinkError::new(format!("a blocking call's thread could not start: {e}")));
@@ -221,14 +234,9 @@ impl LinkHandle {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(_)) => Err(LinkError::new("a blocking call panicked")),
             Err(_) => {
-                // Counted before the race is decided, so the thread's decrement never comes first.
-                abandoned.running.fetch_add(1, Ordering::SeqCst);
-                if state.compare_exchange(RUNNING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-                    // It finished as the deadline passed: not abandoned after all.
-                    abandoned.running.fetch_sub(1, Ordering::SeqCst);
-                    if let Ok(value) = rx.try_recv() {
-                        return Ok(value);
-                    }
+                // It may have finished as the deadline passed.
+                if let Ok(value) = rx.try_recv() {
+                    return Ok(value);
                 }
                 self.link_lost("a blocking call overran its deadline");
                 Err(LinkError::new("a blocking call overran its deadline and was abandoned"))
