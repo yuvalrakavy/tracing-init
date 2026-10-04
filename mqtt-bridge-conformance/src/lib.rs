@@ -100,6 +100,19 @@ impl Harness {
         timing: TimingOverrides,
         prepare: impl FnOnce(&FakeBroker, &Topics, &Device),
     ) -> Harness {
+        let harness = Harness::start_unwaited(name, info, timing, prepare).await;
+        let command = harness.topics.command();
+        assert!(harness.broker.wait_for_subscription(&command, BOUND).await, "the bridge never subscribed to {command}");
+        harness
+    }
+
+    /// The same, without waiting for the bridge to subscribe (a broker that holds its SUBACKs).
+    pub async fn start_unwaited(
+        name: &str,
+        info: DriverInfo,
+        timing: TimingOverrides,
+        prepare: impl FnOnce(&FakeBroker, &Topics, &Device),
+    ) -> Harness {
         let broker = FakeBroker::start().await;
         broker.cap_connections(50);
         let instance = instance_name(name);
@@ -116,10 +129,7 @@ impl Harness {
             .version("conformance")
             .start(driver)
             .expect("the bridge starts");
-        let harness = Harness { broker, device, topics, log, running: Some(running) };
-        let command = harness.topics.command();
-        assert!(harness.broker.wait_for_subscription(&command, BOUND).await, "the bridge never subscribed to {command}");
-        harness
+        Harness { broker, device, topics, log, running: Some(running) }
     }
 
     pub fn instance(&self) -> &str {

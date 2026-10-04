@@ -102,3 +102,21 @@ async fn a_report_wakes_the_session_and_never_waits() {
         .expect("a report made before the wait left no permit");
     assert!(reports.untaken());
 }
+
+/// A target or property name that cannot stand as one topic segment is dropped where it is
+/// reported, with one ERROR `driver_contract_violation` per name, however often it is reported
+/// (review B2).
+#[test]
+fn a_name_that_is_no_topic_segment_is_dropped_where_it_is_reported() {
+    let log = Capture::start();
+    let reports = Reports::new();
+    for _ in 0..3 {
+        reports.state("a#b", values(&[("x", json!(1))]), false);
+        reports.state("t2", values(&[("a/b", json!(1)), ("ok", json!(2))]), false);
+    }
+    let model = reports.model();
+    assert!(model.states.iter().all(|(t, _)| t != "a#b"), "a target that is no topic segment reached the model: {model:?}");
+    let t2: Value = serde_json::from_slice(&model.states.iter().find(|(t, _)| t == "t2").expect("t2").1).unwrap();
+    assert_eq!(t2, json!({"ok": 2}), "a property that is no topic segment reached the model");
+    assert_eq!(log.of_kind("driver_contract_violation").len(), 2, "not one ERROR per bad name: {:#?}", log.records());
+}

@@ -44,6 +44,8 @@
 //!   A new connection reads again.
 //! - **A broker that is down:** [`FakeBroker::refuse_connections`] closes every new connection
 //!   at once, unanswered, until it is turned off.
+//! - **A slow SUBACK:** [`FakeBroker::hold_subacks`] keeps each SUBACK — and the retained messages
+//!   its subscription replays after it — until [`FakeBroker::release_subacks`], in order.
 //! - **The client's maximum packet size** (v5): a packet larger than its CONNECT says it takes is
 //!   discarded, never sent — as MQTT v5 has a broker do.
 //! - **The last will** (v5): a connection that ends without a DISCONNECT leaves its CONNECT's will
@@ -235,6 +237,9 @@ struct Shared {
     will: Mutex<Option<(usize, String, Bytes, bool)>>,
     /// The current connection's maximum packet size (v5 CONNECT), by connection number.
     max_packet: Mutex<Option<(usize, u32)>>,
+    /// Whether SUBACKs (and their replays) are held, and those held, in order.
+    holding_subacks: AtomicBool,
+    held_subacks: Mutex<Vec<BytesMut>>,
     /// Arrivals at the `held` lock (see `lock_held`).
     #[cfg(test)]
     held_lock_reached: AtomicUsize,
@@ -281,6 +286,8 @@ impl FakeBroker {
             refusing: AtomicBool::new(false),
             will: Mutex::new(None),
             max_packet: Mutex::new(None),
+            holding_subacks: AtomicBool::new(false),
+            held_subacks: Mutex::new(Vec::new()),
             #[cfg(test)]
             held_lock_reached: AtomicUsize::new(0),
         });
@@ -420,6 +427,26 @@ impl FakeBroker {
         if let Some(tx) = &*self.shared.to_client.lock().unwrap() {
             for pkid in held {
                 let _ = tx.send(puback(self.shared.protocol, pkid));
+            }
+        }
+    }
+
+    /// Hold every SUBACK from now on, and the retained messages its subscription replays after it
+    /// (the subscription itself is made): a broker slow to acknowledge a subscription.
+    pub fn hold_subacks(&self) {
+        self.shared.holding_subacks.store(true, Ordering::SeqCst);
+    }
+
+    /// Send the SUBACKs held, and their replays, in order, and hold none from now on.
+    pub fn release_subacks(&self) {
+        let held = {
+            let mut held = self.shared.held_subacks.lock().unwrap();
+            self.shared.holding_subacks.store(false, Ordering::SeqCst);
+            std::mem::take(&mut *held)
+        };
+        if let Some(tx) = &*self.shared.to_client.lock().unwrap() {
+            for packet in held {
+                let _ = tx.send(packet);
             }
         }
     }
@@ -673,13 +700,14 @@ fn route(
 
 /// After a SUBACK: the retained messages matching `filter`, at QoS 1, flagged retained, each with
 /// what is left of its expiry (an expired one is dropped).
-fn replay(shared: &Shared, tx: &mpsc::UnboundedSender<BytesMut>, filter: &str) {
+fn replay(shared: &Shared, filter: &str) -> Vec<BytesMut> {
     let mut retained = shared.retained.lock().unwrap();
     retained.retain(|_, r| r.remaining().is_some());
+    let mut packets = Vec::new();
     for (topic, r) in retained.iter() {
         if rumqttc::v5::mqttbytes::matches(topic, filter) {
             let expiry = r.remaining().flatten();
-            let _ = tx.send(encode_publish(
+            packets.push(encode_publish(
                 shared.protocol,
                 topic,
                 r.payload.clone(),
@@ -689,6 +717,7 @@ fn replay(shared: &Shared, tx: &mpsc::UnboundedSender<BytesMut>, filter: &str) {
             ));
         }
     }
+    packets
 }
 
 /// A publish to the client: QoS 1 with `pkid`, or QoS 0 without one.
@@ -824,9 +853,17 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             for f in &s.filters {
                 event(shared, BrokerEvent::Subscribed(f.path.clone()));
             }
-            let _ = tx.send(encode_v5(v5::Packet::SubAck(v5::SubAck { pkid: s.pkid, return_codes: codes, properties: None })));
+            let mut packets = vec![encode_v5(v5::Packet::SubAck(v5::SubAck { pkid: s.pkid, return_codes: codes, properties: None }))];
             for f in &s.filters {
-                replay(shared, tx, &f.path);
+                packets.extend(replay(shared, &f.path));
+            }
+            let mut held = shared.held_subacks.lock().unwrap();
+            if shared.holding_subacks.load(Ordering::SeqCst) {
+                held.extend(packets);
+            } else {
+                for packet in packets {
+                    let _ = tx.send(packet);
+                }
             }
         }
         v5::Packet::Unsubscribe(u) => {
@@ -895,7 +932,9 @@ fn read_v4(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             }
             let _ = tx.send(encode_v4(v4::Packet::SubAck(v4::SubAck::new(s.pkid, codes))));
             for f in &s.filters {
-                replay(shared, tx, &f.path);
+                for packet in replay(shared, &f.path) {
+                    let _ = tx.send(packet);
+                }
             }
         }
         v4::Packet::Unsubscribe(u) => {

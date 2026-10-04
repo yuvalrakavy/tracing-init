@@ -85,6 +85,8 @@ struct State {
     link: Option<LinkHandle>,
     connect_cap: Option<usize>,
     helper: Option<Helper>,
+    /// How a read of every target (`Scope::All`) answers, in place of the device's own answer.
+    read_all: Option<Answer>,
 }
 
 impl State {
@@ -172,6 +174,12 @@ impl Device {
     /// Answer as the device does again.
     pub fn answer_normally(&self) {
         self.locked().rules.clear();
+    }
+
+    /// Answer every read of all targets (`Scope::All`) so — a device read one address at a time,
+    /// as the HWI is, answers `Unsupported` — while a read of one target answers as the device does.
+    pub fn answer_read_all(&self, answer: Answer) {
+        self.locked().read_all = Some(answer);
     }
 
     /// Start `helper` at the next connect (once).
@@ -322,6 +330,7 @@ impl DeviceDriver for FakeDevice {
             _ => None,
         };
         let answer = self.log(Op::Read, target.as_deref(), None, None);
+        let answer = if target.is_none() { self.locked().read_all.or(answer) } else { answer };
         FakeDevice::play(answer).await?;
         self.reachable()?;
         let state = self.locked();

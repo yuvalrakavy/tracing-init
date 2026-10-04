@@ -80,11 +80,9 @@ guard       = "connack_every_time"
 [[control]]
 name        = "active_is_announced_before_the_subscriptions"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    for filter in [topics.desired_filter(), topics.command(), topics.config_filter()] {
-'''
-replacement = '''    emit(client, topics.active(), true, b"true".to_vec(), properties()).await?;
-    for filter in [topics.desired_filter(), topics.command(), topics.config_filter()] {
-'''
+anchor      = '''    for (filter, retain_as_published) in ['''
+replacement = '''    emit(client, topics.active(), true, b"true".to_vec(), properties()).await;
+    for (filter, retain_as_published) in ['''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the bridge published before it had subscribed'''
@@ -94,7 +92,7 @@ guard       = "connack_order"
 [[control]]
 name        = "the_version_is_not_published"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    emit(client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await?;
+anchor      = '''    emit(client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
 '''
 replacement = ''''''
 target      = "command"
@@ -106,10 +104,9 @@ guard       = "connack_version"
 [[control]]
 name        = "the_model_is_not_republished_at_connack"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    republish(shared, client, shared.reports.model()).await
-}'''
-replacement = '''    Ok(())
-}'''
+anchor      = '''    republish(shared, client, shared.reports.model()).await;
+'''
+replacement = ''''''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_broker_restarted_without_persistence_gets_the_retained_model_again", "--exact"]
 expect_text = '''the retained model was not restored'''
@@ -778,8 +775,8 @@ guard       = "blocking_cap"
 [[control]]
 name        = "helpers_outlive_their_link"
 file        = "mqtt-bridge-kit/src/link.rs"
-anchor      = '''        self.helpers.spawn(task.in_current_span());'''
-replacement = '''        tokio::spawn(task.in_current_span());'''
+anchor      = '''        self.helpers.spawn(Watched { task: Box::pin(task), handle: self.handle.clone() }.in_current_span());'''
+replacement = '''        tokio::spawn(Watched { task: Box::pin(task), handle: self.handle.clone() }.in_current_span());'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::dropping_the_context_cancels_its_helpers", "--exact"]
 expect_text = '''the helper outlived its link'''
@@ -805,8 +802,13 @@ anchor      = '''        let mut signals = StopSignals::register();
                 }
             }
             Err(_) => {
+                // The bridge will not start; the wait is only to say why, so it is bounded.
                 // WAIT: logging-start
-                starting.await
+                match tokio::time::timeout(SHUTDOWN_GRACE, starting).await {
+                    Ok(started) => started,
+                    // No log to say it in: the status says it.
+                    Err(_) => return ExitCode::FAILURE,
+                }
             }
         };'''
 replacement = '''        let app = self.app();
@@ -894,12 +896,9 @@ guard       = "worker_died"
 name        = "the_fake_broker_replays_nothing"
 file        = "mqtt-test-broker/src/lib.rs"
 anchor      = '''            for f in &s.filters {
-                replay(shared, tx, &f.path);
-            }
-        }
-        v5::Packet::Unsubscribe(u) => {'''
-replacement = '''        }
-        v5::Packet::Unsubscribe(u) => {'''
+                packets.extend(replay(shared, &f.path));
+            }'''
+replacement = ''''''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "tests::retained_messages_are_replayed_on_subscription_with_their_remaining_expiry", "--exact"]
 expect_text = '''a publish within the bound'''
@@ -1178,8 +1177,8 @@ anchor      = '''            if !valid_segment(target) {
             }'''
 replacement = '''            (Self::merge(&mut state, target, values, assumed), newly_refused)'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_reported_name_that_is_no_topic_segment_is_dropped_and_the_session_goes_on", "--exact"]
-expect_text = '''the target beside the bad name was not published'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::a_name_that_is_no_topic_segment_is_dropped_where_it_is_reported", "--exact"]
+expect_text = '''a target that is no topic segment reached the model'''
 guard       = "reported_names_validated"
 
 # B2: a refused publish is one message dropped, not the CONNACK duties.
@@ -1204,8 +1203,8 @@ guard       = "refused_publish_dropped_alone"
 [[control]]
 name        = "the_maximum_packet_size_is_not_advertised"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        .set_max_packet_size(Some(MAX_PACKET_SIZE));'''
-replacement = ''';'''
+anchor      = '''.set_last_will(will).set_max_packet_size(Some(MAX_PACKET_SIZE));'''
+replacement = '''.set_last_will(will);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_large_retained_config_is_taken_and_one_past_the_limit_is_left_at_the_broker", "--exact"]
 expect_text = '''the 20 KiB config never reached configure'''
@@ -1226,8 +1225,12 @@ guard       = "fake_broker_max_packet"
 [[control]]
 name        = "commands_are_subscribed_without_retain_as_published"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''(topics.desired_target_filter(), true), (topics.desired_property_filter(), false), (topics.command(), true)'''
-replacement = '''(topics.desired_target_filter(), false), (topics.desired_property_filter(), false), (topics.command(), false)'''
+anchor      = '''        (topics.desired_target_filter(), true),
+        (topics.desired_property_filter(), false),
+        (topics.command(), true),'''
+replacement = '''        (topics.desired_target_filter(), false),
+        (topics.desired_property_filter(), false),
+        (topics.command(), false),'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken", "--exact"]
 expect_text = '''a live retained command or target-level write was not refused'''
