@@ -1053,7 +1053,9 @@ guard       = "panic_hook_installed"
 name        = "a_helpers_end_goes_unseen"
 file        = "mqtt-bridge-kit/src/link.rs"
 anchor      = '''            Ok(Poll::Ready(())) => {
-                this.handle.link_lost("a helper of the link ended");
+                if this.critical {
+                    this.handle.link_lost("a helper of the link ended");
+                }
                 Poll::Ready(())
             }'''
 replacement = '''            Ok(Poll::Ready(())) => Poll::Ready(()),'''
@@ -2063,3 +2065,16 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_response_topic_on_the_bridges_own_request_lanes_is_refused", "--exact"]
 expect_text = '''a response topic on the bridge's own lanes was not refused'''
 guard       = "reply_lanes_reserved"
+
+# Re-gate R17: a transient helper's return is not a lost link.
+[[control]]
+name        = "a_transient_helpers_return_loses_the_link"
+file        = "mqtt-bridge-kit/src/link.rs"
+anchor      = '''                if this.critical {
+                    this.handle.link_lost("a helper of the link ended");
+                }'''
+replacement = '''                this.handle.link_lost("a helper of the link ended");'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_transient_helper_that_returns_keeps_the_link", "--exact"]
+expect_text = '''a transient helper that returned lost the link'''
+guard       = "transient_helpers"

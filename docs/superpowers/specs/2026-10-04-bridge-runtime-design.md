@@ -87,6 +87,9 @@ lost link, never a hang.
   link lost (a panic is also ERROR `driver_contract_violation`). Helpers run on the worker's own
   single-threaded runtime, as the driver does, so they need not be `Send`; `LinkHandle::spawn`
   starts one from a later operation or another helper (only on the worker's thread).
+- `ctx.spawn_transient(task)` (and `LinkHandle::spawn_transient`): a helper that may end — a
+  delayed re-query, a debounce timer. Cancelled with the link like any helper; its return is not a
+  lost link; a panic still is, and ERROR `driver_contract_violation` (re-gate R17).
 - `ctx.link_lost(reason)`: a helper noticed the link died.
 - `ctx.blocking(fn)`: a synchronous library call on a worker thread — called from an operation,
   under that operation's deadline (a task-local, set around each operation and the disconnect);
@@ -113,10 +116,13 @@ capped queue whose overflow is counted and logged once per episode.
 
 ### 4.4 Capabilities (`DriverInfo`)
 
-- **`writes`:** `acknowledged` (a successful `apply` means the device confirmed it; CoolMaster), or
-  `unacknowledged` (it only means "sent"; the HWI, YNCA). With `unacknowledged`, each applied value
-  stays unproven until a later successful `probe` or read, and is held again if the link dies first,
-  unless a newer value waits.
+- **`writes`:** `acknowledged` (a successful `apply` is final: the device confirmed it, CoolMaster,
+  or nothing more can ever be learned of it — a one-way transport with nothing to probe, DMX or DALI
+  behind a write-only interface, declares this honestly and needs no `probe`), or `unacknowledged`
+  (it only means "sent", and a later answer can prove it; the HWI, YNCA). With `unacknowledged`,
+  each applied value stays unproven until a later successful `probe` or read, and is held again if
+  the link dies first, unless a newer value waits; such a driver must probe, and a `probe`
+  answering `Unsupported` is a contract violation (re-gate R17).
 - **`feedback`:** `observed`, or `assumed` for one-way devices. This is the driver's default; a target's
   `Config` may override it. With `assumed`, the runtime publishes applied values as `State` marked
   `"assumed": true` unless the driver reports otherwise.

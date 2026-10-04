@@ -247,3 +247,27 @@ fn racing_calls_never_reserve_past_the_cap() {
         assert_eq!(abandoned.running.load(Ordering::SeqCst), 0, "a released place stayed counted");
     }
 }
+
+/// A transient helper — a delayed re-query, a debounce timer — may end: its return is not a lost
+/// link, as a link-critical helper's is; its panic is still a driver bug and loses the link (the R1
+/// re-gate's R17: every helper that returned lost the link).
+#[tokio::test]
+async fn a_transient_helper_that_returns_keeps_the_link() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut ctx = context(1);
+            let handle = ctx.handle();
+            ctx.spawn_transient(async {});
+            handle.spawn_transient(async {});
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!handle.is_lost(), "a transient helper that returned lost the link");
+            handle.spawn_transient(async { panic!("a transient helper's bug") });
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(handle.is_lost(), "a transient helper's panic kept the link");
+        })
+        .await;
+}

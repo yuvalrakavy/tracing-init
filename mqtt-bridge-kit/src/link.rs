@@ -210,8 +210,9 @@ struct LinkShared {
     thread: std::thread::ThreadId,
 }
 
-/// Start a helper for `handle`'s link (see [`LinkContext::spawn`]).
-fn spawn_helper<F>(handle: &LinkHandle, task: F)
+/// Start a helper for `handle`'s link (see [`LinkContext::spawn`]); `critical`, its return is the
+/// link lost (see [`LinkContext::spawn_transient`] for one that may end).
+fn spawn_helper<F>(handle: &LinkHandle, task: F, critical: bool)
 where
     F: Future<Output = ()> + 'static,
 {
@@ -219,7 +220,7 @@ where
         error!(kind = "driver_contract_violation", "A helper was started off the device worker's thread; it is not started");
         return;
     }
-    let watched = Watched { task: Box::pin(task), handle: handle.clone() }.in_current_span();
+    let watched = Watched { task: Box::pin(task), handle: handle.clone(), critical }.in_current_span();
     // WAIT: link-helpers
     let mut helpers = handle.shared.helpers.lock().unwrap_or_else(|p| p.into_inner());
     // A link already dropped starts no helper.
@@ -274,7 +275,15 @@ impl LinkHandle {
     where
         F: Future<Output = ()> + 'static,
     {
-        spawn_helper(self, task);
+        spawn_helper(self, task, true);
+    }
+
+    /// Start a transient helper for this link, as [`LinkContext::spawn_transient`] does.
+    pub fn spawn_transient<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        spawn_helper(self, task, false);
     }
 
     /// The link's loss, if it was reported lost.
@@ -355,6 +364,8 @@ impl LinkHandle {
 struct Watched<F> {
     task: Pin<Box<F>>,
     handle: LinkHandle,
+    /// The link cannot run without it: its return is the link lost.
+    critical: bool,
 }
 
 impl<F: Future<Output = ()>> Future for Watched<F> {
@@ -365,7 +376,9 @@ impl<F: Future<Output = ()>> Future for Watched<F> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| this.task.as_mut().poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(())) => {
-                this.handle.link_lost("a helper of the link ended");
+                if this.critical {
+                    this.handle.link_lost("a helper of the link ended");
+                }
                 Poll::Ready(())
             }
             Err(panic) => {
@@ -435,7 +448,17 @@ impl LinkContext {
     where
         F: Future<Output = ()> + 'static,
     {
-        spawn_helper(&self.handle, task);
+        spawn_helper(&self.handle, task, true);
+    }
+
+    /// Start a transient helper — a delayed re-query, a debounce timer — for the life of the link at
+    /// most: cancelled when the link drops, like any helper, but free to end; its return is not a
+    /// lost link. A panic still is: a driver bug, ERROR `driver_contract_violation` (re-gate R17).
+    pub fn spawn_transient<F>(&mut self, task: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        spawn_helper(&self.handle, task, false);
     }
 
     /// The link died, as the driver noticed outside an operation.

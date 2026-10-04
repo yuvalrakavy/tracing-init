@@ -145,11 +145,14 @@ impl std::error::Error for OpError {}
 /// What a successful `apply` means (spec §4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Writes {
-    /// The device confirmed it (CoolMaster).
+    /// A successful `apply` is final: the device confirmed it (CoolMaster), or nothing more can
+    /// ever be learned of it — a one-way transport with nothing to probe (DMX, DALI behind a
+    /// write-only interface). Such a driver declares this honestly, and needs no `probe`.
     Acknowledged,
-    /// It was only sent (the HWI, YNCA): each applied value stays unproven until a later
-    /// successful `probe` or read, and is held again if the link dies first, unless a newer value
-    /// waits.
+    /// It was only sent, and a later answer can prove it (the HWI, YNCA): each applied value stays
+    /// unproven until a later successful `probe` or read, and is held again if the link dies
+    /// first, unless a newer value waits. Such a driver must be able to probe: a `probe` answering
+    /// `Unsupported` is a contract violation.
     Unacknowledged,
 }
 
