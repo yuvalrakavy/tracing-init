@@ -305,6 +305,17 @@ commands are refused, and reads are dropped.
   dead-part path — the bounded shutdown (which does not wait for the blocked worker) and a failure
   exit, so the supervisor restarts the process. A thread cannot be cancelled; the restart is the
   recovery (re-gate R1, R13).
+
+  The deadline stays on the clock while `op()` drops an operation's future that ran out its
+  bound, so a driver whose future's synchronous `Drop` takes longer than the 2 s grace — or a
+  bounded synchronous call longer than a lowered `--operation-timeout` plus 2 s — ends the process
+  instead of losing the link. That is deliberate: such a call blocks the worker's thread either
+  way, and only the restart frees it (Claude's re-gate minor 13).
+- **Several workers per session (mqtt_ynca's receivers): not built.** What would have to become
+  per worker: `Shared`'s mailbox, reports and commands (a router from target to worker); the
+  `Status` lane (one per receiver: there is no per-receiver availability lane yet); `Running`'s
+  worker, clock and watchdog; and `Bridge::start`, which takes one driver. The read-back and the
+  broker snapshot can stay shared; the panic hook is process-global already.
 - **Test seams:** the environment variables `MQTT_BRIDGE_TEST_*` (a held logging start, refused
   stop signals, a panicking session) are compiled in only with the kit's `test-seams` cargo
   feature, which the conformance suite enables — never in a deployed bridge, debug build or not
