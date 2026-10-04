@@ -990,3 +990,35 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline", "--exact"]
 expect_text = '''a driver blocking its thread went unseen'''
 guard       = "blocked_worker_watchdog"
+
+# M2: the panic hook writes nothing on the panicking thread.
+[[control]]
+name        = "the_panic_report_is_written_on_the_panicking_thread"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''    let reporter = std::thread::Builder::new().name("panic-report".into()).spawn(move || {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(report.as_bytes());
+        let _ = written.send(());
+    });'''
+replacement = '''    let reporter: std::io::Result<()> = {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(report.as_bytes());
+        let _ = written.send(());
+        Ok(())
+    };'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_driver_panic_with_a_stderr_nobody_reads_ends_the_bridge_with_a_failure", "--exact"]
+expect_text = '''a driver panic with a stderr nobody reads did not end the bridge with a failure'''
+guard       = "panic_hook_off_thread"
+
+# M2: `run` installs the hook (the session's panic, with the pipes full).
+[[control]]
+name        = "run_installs_no_panic_hook"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        install_panic_hook();
+        // No runtime, no bridge'''
+replacement = '''        // No runtime, no bridge'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_connection", "--exact"]
+expect_text = '''a session panic with a stderr nobody reads did not end the bridge with a failure'''
+guard       = "panic_hook_installed"

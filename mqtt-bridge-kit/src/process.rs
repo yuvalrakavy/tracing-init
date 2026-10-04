@@ -11,6 +11,11 @@
 //! - **No blocking prints:** nothing on a lifecycle path writes to stdout or stderr itself — a pipe
 //!   nobody drains would hold the writer outside every bound. The command line's own output
 //!   (`--help`, a usage error) is the exemption, before anything has started.
+//! - **Panics:** the process's panic hook ([`install_panic_hook`]) logs ERROR `panic` through
+//!   tracing, which is lossy, and hands the report for stderr to a thread of its own, abandoned
+//!   after [`PANIC_REPORT_BOUND`]: nothing is written on the panicking thread, so a panic with a
+//!   stderr nobody drains still reaches the `catch_unwind` or task end that turns it into a dead
+//!   worker. The default hook wrote it there, and with the pipe full the death was never seen.
 //! - **A bounded end:** the stop publishes `Active=false` and DISCONNECT and stops the device
 //!   worker, within [`SHUTDOWN_GRACE`] (past it, WARN `shutdown_timeout`); the runtime, built
 //!   explicitly, is shut down within [`RUNTIME_GRACE`] — dropped, it would wait without limit for a
@@ -54,6 +59,43 @@ pub const RUNTIME_GRACE: Duration = Duration::from_secs(1);
 pub const BLOCKED_GRACE: Duration = Duration::from_secs(2);
 /// How often the watchdog reads the operation's deadline.
 const WATCH_TICK: Duration = Duration::from_millis(100);
+/// How long a panicking thread waits for its report to reach stderr before it goes on without.
+pub const PANIC_REPORT_BOUND: Duration = Duration::from_millis(200);
+
+/// Install the process's panic hook, once; later calls do nothing. [`Bridge::run`] installs it; a
+/// process that runs bridges in-process ([`Bridge::start`]) installs it itself. Process-global, as
+/// a panic hook is: one process may host several bridges.
+///
+/// The hook logs ERROR `panic` (the thread, where, and the payload) through tracing — lossy, so it
+/// never waits — and writes the report to stderr on a thread of its own, waiting for it at most
+/// [`PANIC_REPORT_BOUND`]: a stderr nobody drains holds that thread, never the panicking one.
+pub fn install_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    // A closure, so the hook's argument type is whichever this toolchain names it.
+    INSTALLED.call_once(|| std::panic::set_hook(Box::new(|info| panic_hook(info.location(), info.payload()))));
+}
+
+fn panic_hook(location: Option<&std::panic::Location<'_>>, payload: &(dyn std::any::Any + Send)) {
+    let thread = std::thread::current().name().unwrap_or("unnamed").to_owned();
+    let location = location.map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
+    let payload = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".to_owned());
+    error!(kind = "panic", thread = %thread, location = %location, payload = %payload, "A thread panicked");
+    let report = format!("thread '{thread}' panicked at {location}:\n{payload}\n");
+    let (written, wait) = std::sync::mpsc::channel::<()>();
+    let reporter = std::thread::Builder::new().name("panic-report".into()).spawn(move || {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(report.as_bytes());
+        let _ = written.send(());
+    });
+    if reporter.is_ok() {
+        // WAIT: panic-report
+        let _ = wait.recv_timeout(PANIC_REPORT_BOUND);
+    }
+}
 
 /// A bridge: its family, its command line, and its driver's options. See the crate documentation.
 #[derive(Debug, Clone)]
@@ -182,6 +224,7 @@ impl Bridge {
             }
             None => {}
         }
+        install_panic_hook();
         // No runtime, no bridge: said by the status alone (there is no log yet).
         let Ok(runtime) = tokio::runtime::Builder::new_multi_thread().enable_all().build() else {
             return ExitCode::FAILURE;
@@ -245,8 +288,10 @@ impl Bridge {
     }
 
     /// Start the bridge on the current tokio runtime, in-process: the MQTT side as tasks, the
-    /// device worker on a thread of its own. No logging start and no signals — [`run`](Self::run)
-    /// adds those; the conformance suite uses this directly.
+    /// device worker on a thread of its own. No logging start, no signals and no panic hook —
+    /// [`run`](Self::run) adds those; a process that runs bridges this way calls
+    /// [`install_panic_hook`] itself (the conformance suite uses this directly, and keeps the test
+    /// harness's own hook).
     pub fn start<D: DeviceDriver>(self, driver: D) -> Result<Running, String> {
         if let Some(problem) = &self.problem {
             return Err(match problem {

@@ -162,7 +162,8 @@ commands are refused, and reads are dropped.
   - `event_report_dropped` (WARN) and `event_report_drop_ended` (INFO);
   - `driver_contract_violation` (ERROR);
   - `device_recovered` gains `expired`;
-  - the runtime also emits `startup_failed` and `bridge_shutdown_cut`.
+  - the runtime also emits `startup_failed` and `bridge_shutdown_cut`;
+  - `panic` (ERROR), from the panic hook: `thread`, `location`, `payload`.
 
 ### 5.2 Bounds and repairs from the R1 gate (2026-10-04)
 
@@ -180,6 +181,12 @@ commands are refused, and reads are dropped.
   dead-part path — the bounded shutdown and a failure exit, so the supervisor restarts the
   process. A thread cannot be cancelled; the restart is the recovery. (A helper that blocks the
   thread while no operation runs has no deadline to pass; it is not seen.)
+- **Panics:** `Bridge::run` installs a process-global panic hook (`install_panic_hook`, also for
+  in-process users of `Bridge::start`): ERROR `panic` through tracing (lossy), and the report for
+  stderr written by a thread of its own, abandoned after 200 ms. Nothing is written on the
+  panicking thread, so a panic with a stderr nobody drains still becomes a dead part — the device
+  worker's `catch_unwind`, or the MQTT task's end, whose connection then closes and whose last
+  will says `Active=false`.
 
 **Out of scope:** airzoned (a media daemon) keeps its own structure. mqtt_mdns adopts only the pump,
 reports and process pieces, since it has no device link.

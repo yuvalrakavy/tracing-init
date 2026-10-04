@@ -39,6 +39,8 @@
 //!   A new connection reads again.
 //! - **A broker that is down:** [`FakeBroker::refuse_connections`] closes every new connection
 //!   at once, unanswered, until it is turned off.
+//! - **The last will** (v5): a connection that ends without a DISCONNECT leaves its CONNECT's will
+//!   retained, if the will is retained — as a broker publishes it.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -218,6 +220,9 @@ struct Shared {
     current: AtomicUsize,
     /// Close every new connection at once (`refuse_connections`).
     refusing: AtomicBool,
+    /// The current connection's last will (v5), by connection number: its topic, payload and
+    /// retain flag. A DISCONNECT clears it.
+    will: Mutex<Option<(usize, String, Bytes, bool)>>,
     /// Arrivals at the `held` lock (see `lock_held`).
     #[cfg(test)]
     held_lock_reached: AtomicUsize,
@@ -261,6 +266,7 @@ impl FakeBroker {
             wedged: watch::Sender::new(None),
             current: AtomicUsize::new(0),
             refusing: AtomicBool::new(false),
+            will: Mutex::new(None),
             #[cfg(test)]
             held_lock_reached: AtomicUsize::new(0),
         });
@@ -325,6 +331,8 @@ impl FakeBroker {
     /// Close the current connection and forget every retained message and subscription, as a
     /// broker restarted without persistence would. The client may reconnect.
     pub fn restart_without_persistence(&self) {
+        // A restarted broker forgets the connection's will with everything else.
+        *self.shared.will.lock().unwrap() = None;
         self.shared.retained.lock().unwrap().clear();
         self.shared.active.lock().unwrap().clear();
         self.drop_connection();
@@ -500,7 +508,7 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
         }
         loop {
             let read = match shared.protocol {
-                Protocol::V5 => read_v5(&mut buf, &tx, &shared),
+                Protocol::V5 => read_v5(&mut buf, &tx, &shared, number),
                 Protocol::V4 => read_v4(&mut buf, &tx, &shared),
             };
             match read {
@@ -520,7 +528,33 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
             _ = kick.changed() => break,
         }
     }
+    publish_will(&shared, number);
     shared.changed.notify_waiters();
+}
+
+/// A clean DISCONNECT: the connection's will is not published.
+fn clear_will(shared: &Shared, number: usize) {
+    let mut will = shared.will.lock().unwrap();
+    if will.as_ref().is_some_and(|(n, ..)| *n == number) {
+        *will = None;
+    }
+}
+
+/// The connection ended: its will, if it has one still (no DISCONNECT came), is published — kept
+/// when retained.
+fn publish_will(shared: &Shared, number: usize) {
+    let will = {
+        let mut will = shared.will.lock().unwrap();
+        match will.as_ref() {
+            Some((n, ..)) if *n == number => will.take(),
+            _ => None,
+        }
+    };
+    if let Some((_, topic, payload, retain)) = will {
+        if retain {
+            store_retained(shared, &topic, payload, SendOptions { retain: true, ..SendOptions::default() });
+        }
+    }
 }
 
 fn record(shared: &Shared, received: Received) {
@@ -654,11 +688,12 @@ fn from_v4_qos(q: rumqttc::mqttbytes::QoS) -> QoS {
 }
 
 /// Read and answer one v5 packet; `None` on a malformed stream.
-fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Shared) -> Option<Read> {
+fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Shared, number: usize) -> Option<Read> {
     // A DISCONNECT with reason 0 and no properties has a remaining length of 0 (MQTT v5 §3.14.2.1),
     // as rumqttc's own client writes it — and rumqttc 0.25's reader refuses it (`PayloadRequired`).
     if buf.starts_with(&[0xE0, 0x00]) {
         let _ = buf.split_to(2);
+        clear_will(shared, number);
         event(shared, BrokerEvent::Disconnected);
         return Some(Read::Closed);
     }
@@ -668,7 +703,9 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
         Err(_) => return None,
     };
     match packet {
-        v5::Packet::Connect(..) => {
+        v5::Packet::Connect(_, will, _) => {
+            *shared.will.lock().unwrap() =
+                will.map(|w| (number, String::from_utf8_lossy(&w.topic).into_owned(), w.message.clone(), w.retain));
             shared.connections.fetch_add(1, Ordering::SeqCst);
             event(shared, BrokerEvent::Connected);
             let properties = v5::ConnAckProperties {
@@ -740,6 +777,7 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             let _ = tx.send(encode_v5(v5::Packet::PingResp(v5::PingResp)));
         }
         v5::Packet::Disconnect(_) => {
+            clear_will(shared, number);
             event(shared, BrokerEvent::Disconnected);
             return Some(Read::Closed);
         }

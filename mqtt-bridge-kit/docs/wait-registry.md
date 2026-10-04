@@ -65,6 +65,7 @@ side.
 | `shutdown` | bounded | the bridge's parts stopping (`Running::stop`, `stop_within`) | `SHUTDOWN_GRACE`, 5 s: the MQTT side's flush (itself bounded at 2 s) and the worker's disconnect (2 s). On expiry one WARN `shutdown_timeout`, the MQTT tasks aborted, the worker thread abandoned; `run` then shuts the runtime down within its own bound (`runtime`). |
 | `runtime` | bounded | `serve`, on the runtime (`Runtime::block_on`); then the runtime's threads (`Runtime::shutdown_timeout`) | `serve` ends with a stop signal or a death and the bounded shutdown (`bridge-end`, `shutdown`), or at once on a stop during the logging start (`logging-start`). Then `RUNTIME_GRACE`, 1 s; on expiry the threads still in a synchronous call — a DNS lookup of the broker's name, tracing-init's start — are abandoned and the process exits (the fleet's F1). |
 | `logging-start` | bounded | tracing-init's start, on a blocking thread | It reads its configuration, opens today's log file and resolves the GELF host, synchronously; tracing-init bounds the open and the lookup at 5 s each; on expiry it starts without that destination (WARN `log_destination_skipped`) and abandons the thread stuck in it. Raced against the stop signals: a stop ends the wait at once, and the thread is abandoned within `runtime`'s grace (F1, F3). Without the signals (they could not be taken, and the bridge will not start) it waits on the start alone, within tracing-init's bounds. In debug builds only, the start first reads the file `MQTT_BRIDGE_TEST_LOGGING_GATE` names, if set — the test seam that holds the start for as long as a test likes. |
+| `panic-report` | bounded | the panic hook's report reaching stderr, written on a thread of its own (`std::sync::mpsc` `recv_timeout`) | `PANIC_REPORT_BOUND`, 200 ms, on the panicking thread. On expiry the writer thread is abandoned — a stderr nobody drains holds it, never the panicking thread — and the panic goes on to its `catch_unwind` or task end. The ERROR `panic` before it goes through tracing, which is lossy and never waits. |
 | `stop-signal` | acyclic | the operating system's SIGINT or SIGTERM | Nothing in this process is waited on. Both are registered first thing in `serve`, before the logging starts (F3). |
 
 ## Settings
@@ -106,6 +107,7 @@ mqtt-pump-queue src/session.rs flush
 mqtt-request src/session.rs connected
 mqtt-request src/session.rs emit
 mqtt-request src/session.rs flush
+panic-report src/process.rs panic_hook
 reports-lock src/reports.rs Reports::locked
 reports-ready src/reports.rs Reports::reported
 runtime src/process.rs Bridge::run

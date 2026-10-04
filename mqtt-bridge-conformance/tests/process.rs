@@ -223,6 +223,72 @@ async fn a_stdout_and_stderr_nobody_reads_hold_neither_the_start_nor_the_stop() 
     );
 }
 
+/// A driver's panic with a stdout and stderr nobody drains still ends the bridge with a failure
+/// status (review M2). The default panic hook writes its report on the panicking thread: with the
+/// pipe full that write never returns, the worker never reaches its `catch_unwind`, and nobody
+/// sees the death.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_driver_panic_with_a_stderr_nobody_reads_ends_the_bridge_with_a_failure() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(20);
+    let dir = workdir("panic_apply");
+    let (full, unread) = full_stream();
+    let stdout = OwnedFd::from(full.try_clone().expect("a second handle on the full socket"));
+    let mut child = bridge(&dir, &broker, &["--device", "panic-apply"])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(OwnedFd::from(full)))
+        .spawn()
+        .expect("start the bridge");
+    let status_topic = format!("Proc/Status/{INSTANCE}");
+    let up = broker.wait_until(BOUND, |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connected")).await;
+    assert!(broker.send_with(&format!("Proc/Desired/{INSTANCE}/t1/power"), "false", &SendOptions::default()) || up);
+    let status = exit_within(&mut child, Duration::from_secs(10)).await;
+    drop(unread);
+    assert!(up, "the device never connected");
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "a driver panic with a stderr nobody reads did not end the bridge with a failure: {status:?}; the log:\n{}",
+        logged(&dir)
+    );
+}
+
+/// A panic in the MQTT session's task, with a stdout and stderr nobody drains, ends the bridge
+/// with a failure status, and its connection with it — the last will says `Active=false`. Left
+/// alive, the pump would go on answering pings, and `Active=true` would stand for a bridge that
+/// reads nothing (review M2). The panic comes from the debug build's seam
+/// (`MQTT_BRIDGE_TEST_PANIC_TOPIC`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_connection() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(20);
+    let dir = workdir("panic_session");
+    let (full, unread) = full_stream();
+    let stdout = OwnedFd::from(full.try_clone().expect("a second handle on the full socket"));
+    let poison = format!("Proc/Config/{INSTANCE}/panic");
+    let mut child = bridge(&dir, &broker, &[])
+        .env(mqtt_bridge_kit::session::TEST_PANIC_TOPIC, &poison)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(OwnedFd::from(full)))
+        .spawn()
+        .expect("start the bridge");
+    let active = format!("Proc/Active/{INSTANCE}");
+    let up = broker.wait_until(BOUND, |b| b.received_on(&active).iter().any(|r| &r.payload[..] == b"true")).await;
+    assert!(broker.send(&poison, "{}") || up);
+    let status = exit_within(&mut child, Duration::from_secs(10)).await;
+    drop(unread);
+    assert!(up, "the bridge never announced itself");
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "a session panic with a stderr nobody reads did not end the bridge with a failure: {status:?}; the log:\n{}",
+        logged(&dir)
+    );
+    assert!(
+        broker.wait_until(BOUND, |b| b.retained_on(&active).as_deref() == Some(&b"false"[..])).await,
+        "Active=true stood after the session died: {:?}",
+        broker.retained_on(&active)
+    );
+}
+
 /// A usage error is said on stderr — the command line's own output, before anything has started —
 /// with exit status 2.
 #[tokio::test(flavor = "multi_thread")]

@@ -58,6 +58,6 @@ pub use driver::{
     Timing, Value, Writes,
 };
 pub use link::{LinkContext, LinkHandle, Reporter};
-pub use process::{Bridge, Died, Running};
+pub use process::{install_panic_hook, Bridge, Died, Running};
 pub use session::MqttTiming;
 pub use wire::Conflict;

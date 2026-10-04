@@ -44,6 +44,9 @@ use crate::wire::{self, ErrorReport, Reason};
 /// The bound on the shutdown's flush: `Active=false` and DISCONNECT, written.
 pub const FLUSH_BOUND: Duration = Duration::from_secs(2);
 
+/// The test seam's environment variable (debug builds only): see [`panic_for_test`].
+pub const TEST_PANIC_TOPIC: &str = "MQTT_BRIDGE_TEST_PANIC_TOPIC";
+
 /// The MQTT side's timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MqttTiming {
@@ -288,6 +291,7 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) {
 /// to the reports.
 fn handle(shared: &Shared, publish: &Publish) {
     let topic = String::from_utf8_lossy(&publish.topic).into_owned();
+    panic_for_test(&topic);
     let traceparent =
         publish.properties.as_ref().and_then(|p| p.user_properties.iter().find(|(k, _)| k == "traceparent").map(|(_, v)| v.clone()));
     let span = tracing::debug_span!("mqtt_request", topic = %topic);
@@ -430,6 +434,20 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
         },
     }
 }
+
+/// The test seam for a panicking session task (debug builds only; a release build has none): when
+/// `MQTT_BRIDGE_TEST_PANIC_TOPIC` names a topic, a publish on it panics the session. Unset, it does
+/// nothing.
+#[cfg(debug_assertions)]
+fn panic_for_test(topic: &str) {
+    static SEAM: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if SEAM.get_or_init(|| std::env::var(TEST_PANIC_TOPIC).ok()).as_deref() == Some(topic) {
+        panic!("the test seam's panic, on a publish on {topic}");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn panic_for_test(_: &str) {}
 
 /// Spawn the MQTT side on the current runtime.
 pub(crate) fn spawn(shared: Arc<Shared>, shutdown: watch::Receiver<bool>, set: &mut tokio::task::JoinSet<()>) {
