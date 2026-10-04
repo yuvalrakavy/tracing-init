@@ -163,6 +163,13 @@ commands are refused, and reads are dropped.
     when a link whose catch-up was done is lost, so a link lost during its catch-up keeps the
     pre-outage values. The check applies to each value on its own: a live value taken with a
     checked one is applied as it is.
+  - **Current values:** for a target with assumed feedback, the model's (what the bridge
+    believes); otherwise the proving read's, and a target it did not give (a device read one
+    address at a time answers a read of all `Unsupported`) is read on its own. A current value
+    still unknown is not a reason to revert a person's change: under `DeviceWins` the request is
+    not applied but reported `superseded`, its `error` saying the current value is unknown;
+    `RequestWins` applies it. After the conflict read's wait, a value retracted, replaced or past
+    its deadline meanwhile is dropped.
   - A retained target-level `Desired`, or a retained `Command`, is refused as `malformed` — replayed
     or live: both are subscribed retain-as-published, so the broker keeps the flag on a live
     delivery. Property writes are subscribed without it, so a live retained one (every Store write)

@@ -12,16 +12,22 @@ fn request(value: Value, conflict: Conflict) -> StateValue {
 /// The outage conflict rule (Store kit spec §4.5), every row: unchanged → applied; changed and
 /// `DeviceWins` → superseded; changed and `RequestWins` → applied; no "before" value → applied;
 /// the device already at the requested value → nothing to write; the device's value unknown →
-/// applied.
+/// applied under `RequestWins`, and under `DeviceWins` not applied on a guess (review M6).
 #[test]
 fn the_outage_conflict_rule() {
     let (b, c) = (json!(20), json!(18));
     for conflict in [Conflict::DeviceWins, Conflict::RequestWins] {
         assert_eq!(resolve(&request(json!(22), conflict), Some(&b), Some(&b)), Resolution::Apply, "unchanged, {conflict:?}");
         assert_eq!(resolve(&request(json!(22), conflict), Some(&c), None), Resolution::Apply, "no before value, {conflict:?}");
-        assert_eq!(resolve(&request(json!(22), conflict), None, Some(&b)), Resolution::Apply, "current unknown, {conflict:?}");
         assert_eq!(resolve(&request(json!(18), conflict), Some(&c), Some(&b)), Resolution::Satisfied, "already there, {conflict:?}");
     }
+    assert_eq!(resolve(&request(json!(22), Conflict::RequestWins), None, Some(&b)), Resolution::Apply, "current unknown, RequestWins");
+    assert_eq!(resolve(&request(json!(22), Conflict::DeviceWins), None, Some(&b)), Resolution::Unknown, "current unknown, DeviceWins");
+    assert_eq!(
+        resolve(&request(json!(22), Conflict::DeviceWins), None, None),
+        Resolution::Unknown,
+        "current unknown, no before, DeviceWins"
+    );
     assert_eq!(resolve(&request(json!(22), Conflict::DeviceWins), Some(&c), Some(&b)), Resolution::Superseded);
     assert_eq!(resolve(&request(json!(22), Conflict::RequestWins), Some(&c), Some(&b)), Resolution::Apply);
 }

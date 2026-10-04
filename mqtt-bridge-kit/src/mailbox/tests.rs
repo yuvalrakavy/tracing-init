@@ -51,7 +51,7 @@ fn applied(work: &[Work]) -> Vec<(String, String, Value)> {
 
 fn held_values(mailbox: &Mailbox) -> Vec<HeldValues> {
     let mut held = Vec::new();
-    while let Some(h) = mailbox.take_held(|_| Resolution::Apply) {
+    while let Some(h) = mailbox.take_held() {
         if let Held::Values(v) = h {
             mailbox.applied(false);
             held.push(v);
@@ -83,7 +83,7 @@ fn held_state_keeps_the_latest_value_per_key_in_the_order_last_set() {
     mailbox.connected();
     let held = held_values(&mailbox);
     let groups: Vec<(String, Vec<(String, Value)>)> =
-        held.iter().map(|h| (h.target.clone(), h.apply.iter().map(|v| (v.property.clone(), v.value.clone())).collect())).collect();
+        held.iter().map(|h| (h.target.clone(), h.values.iter().map(|v| (v.property.clone(), v.value.clone())).collect())).collect();
     assert_eq!(
         groups,
         vec![
@@ -119,7 +119,7 @@ fn a_held_value_past_its_deadline_is_dropped() {
     mailbox.connected();
     let held = held_values(&mailbox);
     assert_eq!(held.len(), 1);
-    assert_eq!(held[0].apply.iter().map(|v| v.property.as_str()).collect::<Vec<_>>(), ["power"], "a value past its deadline was applied");
+    assert_eq!(held[0].values.iter().map(|v| v.property.as_str()).collect::<Vec<_>>(), ["power"], "a value past its deadline was applied");
     assert_eq!(mailbox.take_expired(), 1, "the expired value was not counted");
 }
 
@@ -245,7 +245,7 @@ fn unproven_writes_are_held_again_unless_a_newer_value_waits() {
     mailbox.disconnected();
     mailbox.connected();
     let held = held_values(&mailbox);
-    let order: Vec<(String, Value)> = held.iter().flat_map(|h| h.apply.iter().map(|v| (v.target.clone(), v.value.clone()))).collect();
+    let order: Vec<(String, Value)> = held.iter().flat_map(|h| h.values.iter().map(|v| (v.target.clone(), v.value.clone()))).collect();
     assert_eq!(order, vec![("a".into(), json!(10)), ("b".into(), json!(25)), ("c".into(), json!(30))], "the held-again order is wrong");
 
     // Proven: nothing is held again.
@@ -315,8 +315,8 @@ fn a_replayed_value_is_checked_on_its_own() {
     let mailbox = Mailbox::new();
     mailbox.post_state(value("a", "level", json!(1)), false);
     mailbox.connected();
-    let Some(Held::Values(held)) = mailbox.take_held(|_| Resolution::Apply) else { panic!("nothing held") };
-    assert_eq!(held.apply[0].check, Check { replayed: false, held: true });
+    let Some(Held::Values(held)) = mailbox.take_held() else { panic!("nothing held") };
+    assert_eq!(held.values[0].check, Check { replayed: false, held: true });
 }
 
 /// A config is the latest per target, held while the device is down; one naming a feedback mode
@@ -329,7 +329,7 @@ fn configs_are_the_latest_per_target_and_may_set_the_feedback() {
     assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Assumed);
     mailbox.connected();
     let mut configs = Vec::new();
-    while let Some(held) = mailbox.take_held(|_| Resolution::Apply) {
+    while let Some(held) = mailbox.take_held() {
         mailbox.applied(false);
         configs.push(held);
     }
@@ -338,25 +338,24 @@ fn configs_are_the_latest_per_target_and_may_set_the_feedback() {
     assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Observed, "a retracted config kept its feedback override");
 }
 
-/// The conflict rule's decisions reach the catch-up: superseded and satisfied values are not
-/// applied.
+/// A value retracted, replaced or past its deadline while the worker read the device is not
+/// applied when the read returns; one still as it was is (review C8).
 #[test]
-fn the_catch_up_applies_only_what_the_conflict_rule_lets_through() {
-    let mailbox = Mailbox::new();
-    mailbox.post_state(value("u1", "a", json!(1)), false);
-    mailbox.post_state(value("u1", "b", json!(2)), false);
-    mailbox.post_state(value("u1", "c", json!(3)), false);
-    mailbox.connected();
-    let Some(Held::Values(held)) = mailbox.take_held(|v| match v.property.as_str() {
-        "a" => Resolution::Superseded,
-        "b" => Resolution::Satisfied,
-        _ => Resolution::Apply,
-    }) else {
-        panic!("nothing held");
-    };
-    assert_eq!(held.apply.iter().map(|v| v.property.as_str()).collect::<Vec<_>>(), ["c"]);
-    assert_eq!(held.superseded.iter().map(|v| v.property.as_str()).collect::<Vec<_>>(), ["a"]);
-    assert_eq!(held.satisfied, 1);
+fn a_value_retracted_replaced_or_expired_during_a_read_is_dropped() {
+    let mailbox = up();
+    let mut late = value("u1", "c", json!(3));
+    late.deadline = Some(Instant::now() + Duration::from_millis(30));
+    for v in [value("u1", "a", json!(1)), value("u1", "b", json!(2)), late, value("u1", "d", json!(4))] {
+        mailbox.post_state(v, true);
+    }
+    let Some(Work::Apply { values, .. }) = mailbox.try_take() else { panic!("nothing taken") };
+    // Meanwhile: a retracted, b replaced, c past its deadline.
+    mailbox.retract("u1", "a");
+    mailbox.post_state(value("u1", "b", json!(20)), false);
+    std::thread::sleep(Duration::from_millis(40));
+    let kept = mailbox.revalidate(values);
+    assert_eq!(kept.iter().map(|v| v.property.as_str()).collect::<Vec<_>>(), ["d"], "a value changed during the read was kept");
+    assert_eq!(mailbox.take_expired(), 1, "the value past its deadline was not counted");
 }
 
 /// Nothing is logged while the mailbox's lock is held.
@@ -389,7 +388,7 @@ fn nothing_is_logged_under_the_mailbox_lock() {
     mailbox.disconnected();
     mailbox.post_state(late, false);
     mailbox.connected();
-    let _ = mailbox.take_held(|_| Resolution::Apply);
+    let _ = mailbox.take_held();
     assert!(events.get() >= 5, "the mailbox logged nothing, so this test proves nothing");
     assert_eq!(under_lock.get(), 0, "the mailbox logged while holding its lock");
 }

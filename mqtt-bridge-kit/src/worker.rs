@@ -130,10 +130,15 @@ async fn sleep_until(at: Option<Instant>) {
 
 /// How the outage conflict rule decides a checked value (Store kit spec §4.5): against the
 /// device's current value (`None`: the device did not say) and the last value the bridge saw
-/// before the outage (`None`: none, a first install).
+/// before the outage (`None`: none, a first install). A current value still unknown is no reason
+/// to revert a person's change: under `DeviceWins` the request is not applied on a guess (review
+/// M6).
 pub(crate) fn resolve(value: &StateValue, current: Option<&Value>, before: Option<&Value>) -> Resolution {
     let Some(current) = current else {
-        return Resolution::Apply;
+        return match value.conflict {
+            Conflict::DeviceWins => Resolution::Unknown,
+            Conflict::RequestWins => Resolution::Apply,
+        };
     };
     if *current == value.value {
         return Resolution::Satisfied;
@@ -176,16 +181,6 @@ impl Befores {
         sources.sort_by_key(|(at, _)| *at);
         sources.into_iter().find_map(|(_, values)| values.get(&key))
     }
-}
-
-fn index(states: &[TargetState]) -> Values {
-    let mut values = HashMap::new();
-    for state in states {
-        for (property, value) in &state.values {
-            values.insert((state.target.clone(), property.clone()), value.clone());
-        }
-    }
-    values
 }
 
 fn index_map(map: &BTreeMap<String, PropertyMap>, into: &mut Values) {
@@ -325,26 +320,22 @@ impl<D: DeviceDriver> Worker<D> {
     }
 
     /// Entering `Up`: what was held while the device was down, decided by the conflict rule
-    /// against the proving read, then applied a target at a time; then, for an unacknowledged
-    /// device, a probe proves it taken. Returns how many values were written.
+    /// against the proving read — a target it did not give is read on its own — then applied a
+    /// target at a time; then, for an unacknowledged device, a probe proves it taken. Returns how
+    /// many values were written.
     async fn catch_up(&mut self, handle: &LinkHandle, read: Option<Vec<TargetState>>) -> Result<usize, LinkError> {
-        let current = read.as_deref().map(index).unwrap_or_default();
-        let befores = self.befores();
+        let mut proving: BTreeMap<String, PropertyMap> = BTreeMap::new();
+        for state in read.into_iter().flatten() {
+            proving.entry(state.target).or_default().extend(state.values);
+        }
         let mut applied = 0;
         loop {
-            let held = self.mailbox.take_held(|v| {
-                let key = (v.target.clone(), v.property.clone());
-                resolve(v, current.get(&key), befores.of(v))
-            });
-            match held {
+            match self.mailbox.take_held() {
                 None => break,
                 Some(Held::Config { target, config }) => self.configure(handle, &target, config).await?,
                 Some(Held::Values(held)) => {
-                    self.superseded(&held.superseded);
-                    if held.satisfied > 0 {
-                        debug!(target = %held.target, satisfied = held.satisfied, "Held requests the device already has");
-                    }
-                    applied += self.write_values(handle, &held.target, held.apply).await?;
+                    let apply = self.decide(handle, &held.target, held.values, &proving).await?;
+                    applied += self.write_values(handle, &held.target, apply).await?;
                 }
             }
         }
@@ -354,15 +345,17 @@ impl<D: DeviceDriver> Worker<D> {
         Ok(applied)
     }
 
-    /// Requests a change at the device won: dropped, each reported on `Error`.
-    fn superseded(&self, values: &[StateValue]) {
+    /// Requests a change at the device won (`unknown`: whose current value is unknown, under
+    /// `DeviceWins`): dropped, each reported on `Error`.
+    fn superseded(&self, values: &[StateValue], unknown: bool) {
+        let message = if unknown {
+            "the device's current value is unknown; under DeviceWins a request is not applied on a guess"
+        } else {
+            "the device was changed during the outage; the change at the device wins"
+        };
         for value in values {
-            info!(target = %value.target, property = %value.property, "A held request was superseded by a change at the device");
-            self.reports.error(
-                ErrorReport::new(Reason::Superseded, "the device was changed during the outage; the change at the device wins")
-                    .target(Some(&value.target))
-                    .property(&value.property),
-            );
+            info!(target = %value.target, property = %value.property, unknown, "A held request was superseded by a change at the device");
+            self.reports.error(ErrorReport::new(Reason::Superseded, message).target(Some(&value.target)).property(&value.property));
         }
     }
 
@@ -521,7 +514,7 @@ impl<D: DeviceDriver> Worker<D> {
         let timing = self.info.timing;
         match work {
             Work::Apply { target, values } => {
-                let values = if values.iter().any(|v| v.check.any()) { self.check(handle, &target, values).await? } else { values };
+                let values = self.decide(handle, &target, values, &BTreeMap::new()).await?;
                 self.write_values(handle, &target, values).await.map(drop)
             }
             Work::Configure { target, config } => self.configure(handle, &target, config).await,
@@ -547,38 +540,69 @@ impl<D: DeviceDriver> Worker<D> {
         }
     }
 
-    /// A checked value taken while the device is up (the broker replayed it as retained): read the
-    /// target first, and let the conflict rule decide. Returns what to apply.
-    async fn check(&mut self, handle: &LinkHandle, target: &str, values: Vec<StateValue>) -> Result<Vec<StateValue>, LinkError> {
+    /// The outage conflict rule over a target's values (Store kit spec §4.5); returns what to
+    /// apply, the rest out of the in-flight set and reported. A value not checked is applied as it
+    /// is. The current values: for a target with assumed feedback, what the bridge believes — the
+    /// model (review MINOR 7: a device that cannot be read gave nothing, and a replay was sent
+    /// again); otherwise the proving read's, or — a target it did not give — a read of the target
+    /// on its own (review M6). After that read's wait, what was retracted, replaced or expired
+    /// meanwhile is dropped (review C8).
+    async fn decide(
+        &mut self,
+        handle: &LinkHandle,
+        target: &str,
+        values: Vec<StateValue>,
+        proving: &BTreeMap<String, PropertyMap>,
+    ) -> Result<Vec<StateValue>, LinkError> {
+        if !values.iter().any(|v| v.check.any()) {
+            return Ok(values);
+        }
         let timing = self.info.timing;
-        // WAIT: device-op
-        let current = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::Target(target.to_owned()))).await {
-            Ok(states) => {
-                self.mailbox.proven();
-                self.fold(&states);
-                index(&states)
-            }
-            Err(OpError::Link(e)) => return Err(e),
-            Err(_) => HashMap::new(),
+        let (current, values) = if self.mailbox.feedback(target, self.info.feedback) == Feedback::Assumed {
+            (self.reports.values_of(target), values)
+        } else if let Some(read) = proving.get(target) {
+            (Some(read.clone()), values)
+        } else {
+            // WAIT: device-op
+            let current = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::Target(target.to_owned()))).await {
+                Ok(states) => {
+                    self.mailbox.proven();
+                    self.fold(&states);
+                    let mut current: Option<PropertyMap> = None;
+                    for state in states.into_iter().filter(|s| s.target == target) {
+                        current.get_or_insert_with(PropertyMap::new).extend(state.values);
+                    }
+                    current
+                }
+                Err(OpError::Link(e)) => return Err(e),
+                Err(other) => {
+                    debug!(target, error = %other, "The device's answer to the conflict read was unusable; its values are unknown");
+                    None
+                }
+            };
+            (current, self.mailbox.revalidate(values))
         };
         let befores = self.befores();
-        let mut apply = Vec::new();
-        let mut superseded = Vec::new();
+        let (mut apply, mut superseded, mut unknown, mut satisfied) = (Vec::new(), Vec::new(), Vec::new(), 0);
         for value in values {
-            let key = (value.target.clone(), value.property.clone());
             if !value.check.any() {
                 // A live value, taken with a checked one: applied as it is (review MINOR 3).
                 apply.push(value);
                 continue;
             }
-            match resolve(&value, current.get(&key), befores.of(&value)) {
+            match resolve(&value, current.as_ref().and_then(|c| c.get(&value.property)), befores.of(&value)) {
                 Resolution::Apply => apply.push(value),
-                Resolution::Satisfied => {}
+                Resolution::Satisfied => satisfied += 1,
                 Resolution::Superseded => superseded.push(value),
+                Resolution::Unknown => unknown.push(value),
             }
         }
+        if satisfied > 0 {
+            debug!(target, satisfied, "Checked requests the device already has");
+        }
         self.mailbox.retain_in_flight(|v| apply.iter().any(|a| a.target == v.target && a.property == v.property));
-        self.superseded(&superseded);
+        self.superseded(&superseded, false);
+        self.superseded(&unknown, true);
         Ok(apply)
     }
 

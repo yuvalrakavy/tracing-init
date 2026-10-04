@@ -174,3 +174,27 @@ async fn a_response_topic_on_the_bridges_own_request_lanes_is_refused() {
     );
     assert!(h.stop().await);
 }
+
+/// For a target with assumed feedback the current value is the assumed model value: a request
+/// replayed after a broker blip, already applied, is satisfied — never sent again, which would
+/// toggle an IR device (review MINOR 7: the conflict read found nothing on a device that cannot be
+/// read, and the request was applied again after every blip).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_request_an_assumed_target_already_has_is_not_applied_again() {
+    let h = Harness::start_with("assumed-replay", info(Writes::Acknowledged, Feedback::Assumed), quick_timing(), |_, _, device| {
+        // A one-way device: nothing can be read back.
+        device.answer(Op::Read, None, Answer::Unsupported);
+    })
+    .await;
+    assert!(connected(&h).await);
+    // RequestWins, as an IR device's requests are: an unknown current value would be applied.
+    assert!(h.desire("tv", "power", json!(true), Req { expiry: Some(3600), conflict: Some("RequestWins") }));
+    assert!(h.eventually(BOUND, |h| h.state("tv") == Some(json!({"power": true, "assumed": true}))).await, "the write was not assumed");
+    // A broker blip: the request, not retracted yet, comes back as a replay.
+    let connects = h.broker.connections();
+    h.broker.drop_connection();
+    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects).await);
+    h.settle(Duration::from_millis(800)).await;
+    assert_eq!(h.device.calls_of(Op::Apply).len(), 1, "a replayed request the assumed target already had was sent again");
+    assert!(h.stop().await);
+}

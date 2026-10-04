@@ -566,8 +566,10 @@ guard       = "conflict_device_wins"
 [[control]]
 name        = "request_wins_is_superseded"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''            Conflict::RequestWins => Resolution::Apply,'''
-replacement = '''            Conflict::RequestWins => Resolution::Superseded,'''
+anchor      = '''            Conflict::DeviceWins => Resolution::Superseded,
+            Conflict::RequestWins => Resolution::Apply,'''
+replacement = '''            Conflict::DeviceWins => Resolution::Superseded,
+            Conflict::RequestWins => Resolution::Superseded,'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_request_wins", "--exact"]
 expect_text = '''the request did not win'''
@@ -1314,3 +1316,55 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_read_back_decides_replays_for_a_device_already_up", "--exact"]
 expect_text = '''the replayed request was not decided against the read-back'''
 guard       = "replay_checked"
+
+# M6: the catch-up reads a target the proving read did not give.
+[[control]]
+name        = "the_catch_up_reads_no_missing_target"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''self.driver.read_state(Scope::Target(target.to_owned()))).await {
+                Ok(states) => {
+                    self.mailbox.proven();
+                    self.fold(&states);
+                    let mut current: Option<PropertyMap> = None;'''
+replacement = '''self.driver.read_state(Scope::Target(target.to_owned()))).await.and(Err::<Vec<TargetState>, _>(OpError::Unsupported("control".into()))) {
+                Ok(states) => {
+                    self.mailbox.proven();
+                    self.fold(&states);
+                    let mut current: Option<PropertyMap> = None;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_catch_up_reads_a_target_the_proving_read_did_not_give", "--exact"]
+expect_text = '''DeviceWins reverted a change at the wall on a device read target by target'''
+guard       = "catch_up_reads_target"
+
+# M6: under DeviceWins an unknown current value is not applied on a guess.
+[[control]]
+name        = "device_wins_applies_on_a_guess"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            Conflict::DeviceWins => Resolution::Unknown,'''
+replacement = '''            Conflict::DeviceWins => Resolution::Apply,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "device_wins_does_not_apply_a_held_request_whose_current_value_is_unknown", "--exact"]
+expect_text = '''the DeviceWins request on an unknown value was not reported superseded'''
+guard       = "unknown_current_device_wins"
+
+# MINOR 7: an assumed target's current value is the model's.
+[[control]]
+name        = "an_assumed_targets_current_value_is_read"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        let (current, values) = if self.mailbox.feedback(target, self.info.feedback) == Feedback::Assumed {'''
+replacement = '''        let (current, values) = if self.mailbox.feedback(target, self.info.feedback) == Feedback::Assumed && false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_replayed_request_an_assumed_target_already_has_is_not_applied_again", "--exact"]
+expect_text = '''a replayed request the assumed target already had was sent again'''
+guard       = "assumed_current"
+
+# C8: after the conflict read, a value retracted, replaced or expired meanwhile is dropped.
+[[control]]
+name        = "the_conflict_read_is_not_revalidated"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            (current, self.mailbox.revalidate(values))'''
+replacement = '''            (current, values)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_retracted_during_its_conflict_read_is_not_applied", "--exact"]
+expect_text = '''a request retracted during its conflict read was applied'''
+guard       = "revalidate_after_read"

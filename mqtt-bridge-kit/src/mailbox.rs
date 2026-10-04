@@ -176,16 +176,17 @@ pub enum Resolution {
     Satisfied,
     /// A change at the device won.
     Superseded,
+    /// The device's current value is unknown, and the change at the device wins
+    /// (`DeviceWins`): not applied on a guess — reported superseded, saying why (review M6).
+    Unknown,
 }
 
-/// A held target's values, decided.
+/// A held target's values, in flight until [`Mailbox::applied`] or [`Mailbox::failed`]; the
+/// worker decides them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeldValues {
     pub target: String,
-    /// To apply, together (now in flight).
-    pub apply: Vec<StateValue>,
-    pub superseded: Vec<StateValue>,
-    pub satisfied: usize,
+    pub values: Vec<StateValue>,
 }
 
 /// What the worker takes during the catch-up.
@@ -563,11 +564,11 @@ impl Mailbox {
         unanswered
     }
 
-    /// The next of what was held while the device was down — a target's values, decided by
-    /// `resolve`, or a config — or `None` when nothing held is left. The values to apply are in
-    /// flight until [`applied`](Self::applied) or [`failed`](Self::failed). `resolve` runs under the
-    /// mailbox's lock: it must take no lock and wait on nothing. Never waits.
-    pub fn take_held(&self, mut resolve: impl FnMut(&StateValue) -> Resolution) -> Option<Held> {
+    /// The next of what was held while the device was down — a target's values, or a config — or
+    /// `None` when nothing held is left. The values are in flight until [`applied`](Self::applied)
+    /// or [`failed`](Self::failed); the worker decides them by the conflict rule first, and keeps
+    /// in flight only what it applies ([`retain_in_flight`](Self::retain_in_flight)). Never waits.
+    pub fn take_held(&self) -> Option<Held> {
         let now = Instant::now();
         let (held, expired) = {
             let mut inner = self.locked();
@@ -588,16 +589,8 @@ impl Mailbox {
                 if values.is_empty() {
                     continue;
                 }
-                let mut decided = HeldValues { target, apply: Vec::new(), superseded: Vec::new(), satisfied: 0 };
-                for value in values {
-                    match resolve(&value) {
-                        Resolution::Apply => decided.apply.push(value),
-                        Resolution::Satisfied => decided.satisfied += 1,
-                        Resolution::Superseded => decided.superseded.push(value),
-                    }
-                }
-                inner.in_flight = decided.apply.clone();
-                break Some(Held::Values(decided));
+                inner.in_flight = values.clone();
+                break Some(Held::Values(HeldValues { target, values }));
             };
             (held, expired)
         };
@@ -672,6 +665,37 @@ impl Mailbox {
             // WAIT: mailbox-posted
             self.posted.notified().await;
         }
+    }
+
+    /// The values the worker took, still as they were taken: each one still in flight — not
+    /// retracted meanwhile — with no newer value of its key waiting, and before its deadline. The
+    /// worker asks after a wait between taking values and applying them (a conflict read); what is
+    /// dropped leaves the in-flight set, and one past its deadline is counted (review C8: the
+    /// worker applied its private copy of a request retracted meanwhile). Never waits.
+    pub fn revalidate(&self, values: Vec<StateValue>) -> Vec<StateValue> {
+        let now = Instant::now();
+        let (kept, dropped) = {
+            let mut inner = self.locked();
+            let mut kept = Vec::new();
+            let mut dropped = 0;
+            for value in values {
+                let in_flight = inner.in_flight.contains(&value);
+                if in_flight && !inner.waits_for(&value) && !value.expired(now) {
+                    kept.push(value);
+                } else {
+                    if in_flight && value.expired(now) {
+                        inner.expired += 1;
+                    }
+                    dropped += 1;
+                }
+            }
+            inner.in_flight.retain(|v| kept.contains(v));
+            (kept, dropped)
+        };
+        if dropped > 0 {
+            debug!(dropped, "Requests retracted, replaced or expired while the device was read; not applied");
+        }
+        kept
     }
 
     /// Keep in flight only the values `keep` says (the rest were decided by the conflict rule).

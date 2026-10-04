@@ -392,3 +392,82 @@ async fn the_read_back_decides_replays_held_for_a_device_down() {
     assert_eq!(h.device.get("t1", "temp"), Some(json!(18)));
     assert!(h.stop().await);
 }
+
+/// A device read one address at a time (the HWI answers a read of every target `Unsupported`) is
+/// read target by target in the catch-up, so DeviceWins still sees a change made at the wall
+/// (review M6: the catch-up knew only the proving read, and applied everything).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_catch_up_reads_a_target_the_proving_read_did_not_give() {
+    let h = Harness::start_with("onebyone", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+    })
+    .await;
+    // Seen at 20 before the outage, through a read of t1 alone.
+    assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
+    h.device.answer_read_all(Answer::Unsupported);
+    h.device.set_up(false);
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    h.device.set("t1", "temp", json!(18));
+    assert!(h.desire("t1", "temp", json!(22), DEVICE_WINS));
+    h.settle(Duration::from_millis(200)).await;
+    h.device.set_up(true);
+    assert!(
+        h.eventually(BOUND, |h| !h.errors_for("superseded").is_empty() || h.device.get("t1", "temp") == Some(json!(22))).await,
+        "nothing became of the held request"
+    );
+    assert_eq!(h.device.get("t1", "temp"), Some(json!(18)), "DeviceWins reverted a change at the wall on a device read target by target");
+    assert!(
+        h.device.calls_of(Op::Read).iter().any(|c| c.target.as_deref() == Some("t1")),
+        "the catch-up did not read the target: {:?}",
+        h.device.calls()
+    );
+    assert!(h.stop().await);
+}
+
+/// When the device's current value stays unknown — it does not report that property — DeviceWins
+/// does not apply a held request on a guess: it is reported superseded, saying why; RequestWins
+/// applies it (review M6).
+#[tokio::test(flavor = "multi_thread")]
+async fn device_wins_does_not_apply_a_held_request_whose_current_value_is_unknown() {
+    let h = Harness::start_with("unknown", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.set_up(false);
+    })
+    .await;
+    assert!(h.desire("t1", "fan", json!("high"), DEVICE_WINS));
+    assert!(h.desire("t1", "mode", json!("cool"), Req { expiry: Some(3600), conflict: Some("RequestWins") }));
+    h.settle(Duration::from_millis(300)).await;
+    h.device.set_up(true);
+    assert!(h.eventually(BOUND, |h| h.device.get("t1", "mode") == Some(json!("cool"))).await, "the RequestWins request was not applied");
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("superseded").iter().any(|e| e["property"] == "fan")).await,
+        "the DeviceWins request on an unknown value was not reported superseded: {:?}",
+        h.errors()
+    );
+    let fan = h.errors_for("superseded").into_iter().find(|e| e["property"] == "fan").unwrap();
+    assert!(fan["error"].as_str().is_some_and(|e| e.contains("unknown")), "the Error does not say the value is unknown: {fan}");
+    assert_eq!(h.device.get("t1", "fan"), None, "a DeviceWins request was applied on a guess");
+    assert!(h.stop().await);
+}
+
+/// A request retracted while its conflict read is under way is not applied when the read returns
+/// (review C8: the worker applied its private copy).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_retracted_during_its_conflict_read_is_not_applied() {
+    let h = Harness::start_with("retracted-read", acknowledged(), quick_timing(), |broker, topics, device| {
+        device.set("t1", "temp", json!(20));
+        // The conflict check's read of t1 is slow — within its 500 ms bound.
+        device.answer(Op::Read, Some("t1"), Answer::Delay(Duration::from_millis(400)));
+        broker.retain(&topics.desired("t1", "temp"), "22", &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"));
+    })
+    .await;
+    assert!(
+        h.eventually(BOUND, |h| h.device.calls_of(Op::Read).iter().any(|c| c.target.as_deref() == Some("t1"))).await,
+        "the replayed request was never checked"
+    );
+    assert!(h.retract("t1", "temp"));
+    h.settle(Duration::from_millis(1200)).await;
+    assert!(h.device.applies().is_empty(), "a request retracted during its conflict read was applied: {:?}", h.device.applies());
+    assert_eq!(h.device.calls_of(Op::Connect).len(), 1, "the link was lost, so this test proves nothing");
+    assert!(h.stop().await);
+}

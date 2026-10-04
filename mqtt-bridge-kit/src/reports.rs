@@ -327,6 +327,12 @@ impl Reports {
         self.locked().targets.iter().map(|(t, m)| (t.clone(), m.values.clone())).collect()
     }
 
+    /// A target's values as the bridge knows them now — for a target with assumed feedback, what it
+    /// believes the device holds.
+    pub fn values_of(&self, target: &str) -> Option<PropertyMap> {
+        self.locked().targets.get(target).map(|m| m.values.clone())
+    }
+
     /// How many reports `target` has had.
     pub fn reports_for(&self, target: &str) -> u64 {
         self.locked().targets.get(target).map_or(0, |m| m.reports)
