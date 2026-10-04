@@ -1,0 +1,8 @@
+{
+  "$id": "https://github.com/yuvalrakavy/tracing-init/schemas/version.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Version/{instance}",
+  "description": "Retained: the bridge's version, as plain text (validated here as that text, a JSON string).",
+  "type": "string",
+  "minLength": 1
+}

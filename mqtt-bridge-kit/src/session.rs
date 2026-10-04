@@ -139,13 +139,18 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
     let (client, events) = client(shared);
     // Polling first, so every request below has an event loop draining it.
     let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), shared.timing.poll_retry);
+    // Nothing is published before the first CONNACK's duties are done: the subscriptions come
+    // first, and a state published ahead of the read-back's subscription would overwrite the
+    // retained state it is there to read.
+    let mut announced = false;
     loop {
         // WAIT: session-events
         let step = tokio::select! {
             event = incoming.recv() => Step::Event(event),
-            () = shared.reports.reported() => Step::Reported,
+            () = shared.reports.reported(), if announced => Step::Reported,
             _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
         };
+        let connack = matches!(step, Step::Event(Some(PumpEvent::Connected)));
         let work = async {
             match step {
                 Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client).await.map(|()| None),
@@ -166,7 +171,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
             _ = shutdown.wait_for(|stop| *stop) => Ok(Some(SessionEnd::Shutdown)),
         };
         match done {
-            Ok(None) => {}
+            Ok(None) => announced |= connack,
             Ok(Some(SessionEnd::Ended)) => return SessionEnd::Ended,
             Ok(Some(SessionEnd::Shutdown)) => {
                 flush(shared, &client, &mut incoming).await;

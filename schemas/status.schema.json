@@ -1,0 +1,13 @@
+{
+  "$id": "https://github.com/yuvalrakavy/tracing-init/schemas/status.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Status/{instance}",
+  "description": "Retained: the device link. Published as plain text (validated here as that text, a JSON string).",
+  "type": "string",
+  "enum": [
+    "connected",
+    "connecting",
+    "unreachable",
+    "disabled"
+  ]
+}

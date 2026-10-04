@@ -1,0 +1,16 @@
+{
+  "$id": "https://github.com/yuvalrakavy/tracing-init/schemas/state.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "State/{instance}/{target}",
+  "description": "Retained: a target's observed state, property by property, with \"assumed\": true when it was not read back. Never an echo of a request.",
+  "type": "object",
+  "properties": {
+    "assumed": {
+      "const": true
+    }
+  },
+  "propertyNames": {
+    "pattern": "^[^/+#]+$"
+  },
+  "additionalProperties": true
+}

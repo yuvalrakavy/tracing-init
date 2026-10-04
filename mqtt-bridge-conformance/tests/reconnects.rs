@@ -1,0 +1,98 @@
+//! Reconnects (Bridge Runtime spec §9): every CONNACK subscribes, then announces `Active=true`,
+//! then republishes the retained model from the bridge's own state — also to a broker that
+//! restarted without its retained messages.
+
+use mqtt_bridge_conformance::*;
+use serde_json::json;
+
+/// What the broker saw from the `n`-th connection on (1-based), as short labels.
+fn from_connection(broker: &FakeBroker, n: usize) -> Vec<String> {
+    let mut connections = 0;
+    let mut labels = Vec::new();
+    for event in broker.events() {
+        if let BrokerEvent::Connected = event {
+            connections += 1;
+        }
+        if connections < n {
+            continue;
+        }
+        labels.push(match event {
+            BrokerEvent::Connected => "connect".to_owned(),
+            BrokerEvent::Subscribed(f) => format!("sub {f}"),
+            BrokerEvent::Unsubscribed(f) => format!("unsub {f}"),
+            BrokerEvent::Published(r) => format!("pub {} {}", r.topic, String::from_utf8_lossy(&r.payload)),
+            BrokerEvent::Disconnected => "disconnect".to_owned(),
+        });
+    }
+    labels
+}
+
+fn position(labels: &[String], prefix: &str) -> Option<usize> {
+    labels.iter().position(|l| l.starts_with(prefix))
+}
+
+/// The first CONNACK subscribes to the bridge's own retained `State` (the read-back) before its
+/// lanes; every CONNACK subscribes to `Desired`, `Command` and `Config` before `Active=true`, then
+/// publishes the version, the status and every target's state again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connack_subscribes_before_active_then_republishes_the_model() {
+    let h = Harness::start_with("connack", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "power", json!(true))).await;
+    let t = h.topics.clone();
+    assert!(
+        h.eventually(BOUND, |h| h.state("t1").is_some() && h.status().as_deref() == Some("connected")).await,
+        "the device's state never reached the broker"
+    );
+    let first = from_connection(&h.broker, 1);
+    let read_back = position(&first, &format!("sub {}", t.state_filter())).expect("the first CONNACK made no read-back subscription");
+    let desired = position(&first, &format!("sub {}", t.desired_filter())).expect("no Desired subscription");
+    assert!(read_back < desired, "the read-back's subscription did not come first: {first:#?}");
+    // Nothing is published before the subscriptions, the first publish is Active=true: a state
+    // published sooner would overwrite the retained state the read-back is there to read.
+    let first_publish = position(&first, "pub ").expect("nothing was published");
+    let last_sub = first.iter().rposition(|l| l.starts_with("sub ")).expect("no subscription");
+    assert!(last_sub < first_publish, "the bridge published before it had subscribed: {first:#?}");
+    assert!(first[first_publish].starts_with(&format!("pub {} true", t.active())), "the first publish was not Active=true: {first:#?}");
+
+    h.broker.drop_connection();
+    assert!(
+        h.eventually(BOUND, |h| {
+            let again = from_connection(&h.broker, 2);
+            position(&again, &format!("pub {} ", t.state("t1"))).is_some()
+        })
+        .await,
+        "the state was not published again after the reconnect: {:#?}",
+        from_connection(&h.broker, 2)
+    );
+    let again = from_connection(&h.broker, 2);
+    let active = position(&again, &format!("pub {} true", t.active())).expect("no Active=true after the reconnect");
+    for filter in [t.desired_filter(), t.command(), t.config_filter()] {
+        let sub = position(&again, &format!("sub {filter}")).unwrap_or_else(|| panic!("{filter} was not subscribed again: {again:#?}"));
+        assert!(sub < active, "{filter} was subscribed after Active=true: {again:#?}");
+    }
+    assert!(position(&again, &format!("sub {}", t.state_filter())).is_none(), "the read-back was subscribed again: {again:#?}");
+    for model in [format!("pub {} ", t.version()), format!("pub {} connected", t.status()), format!("pub {} ", t.state("t1"))] {
+        let at = position(&again, &model).unwrap_or_else(|| panic!("`{model}` was not published again: {again:#?}"));
+        assert!(at > active, "`{model}` came before Active=true: {again:#?}");
+    }
+    assert!(h.stop().await);
+}
+
+/// A broker restarted without persistence lost every retained message: the next CONNACK restores
+/// the bridge's whole retained model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broker_restarted_without_persistence_gets_the_retained_model_again() {
+    let h = Harness::start_with("restart", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "power", json!(true))).await;
+    let t = h.topics.clone();
+    assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some() && h.status().as_deref() == Some("connected")).await);
+    h.broker.restart_without_persistence();
+    assert!(h.broker.retained().is_empty());
+    let restored = h
+        .eventually(BOUND, |h| {
+            [t.active(), t.status(), t.version(), t.state("t1")].iter().all(|topic| h.broker.retained_on(topic).is_some())
+        })
+        .await;
+    assert!(restored, "the retained model was not restored after a broker restart; retained: {:?}", h.broker.retained());
+    assert_eq!(h.broker.retained_on(&t.active()).as_deref(), Some(&b"true"[..]));
+    assert_eq!(h.broker.retained_on(&t.status()).as_deref(), Some(&b"connected"[..]));
+    assert!(h.stop().await);
+}

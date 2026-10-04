@@ -1,0 +1,3 @@
+# The tooling crates are written wide, like the Store code they lint (CI checks it).
+max_width = 140
+use_small_heuristics = "Max"

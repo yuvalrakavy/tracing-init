@@ -1,0 +1,13 @@
+{
+  "$id": "https://github.com/yuvalrakavy/tracing-init/schemas/desired-property.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Desired/{instance}/{target}/{property}",
+  "description": "Retained (an empty payload retracts): the requested value, a JSON scalar. The request's expiry is its MQTT v5 message expiry; its outage conflict rule the user property conflict (DeviceWins or RequestWins).",
+  "type": [
+    "string",
+    "number",
+    "integer",
+    "boolean",
+    "null"
+  ]
+}

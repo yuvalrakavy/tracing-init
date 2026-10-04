@@ -1,0 +1,20 @@
+{
+  "$id": "https://github.com/yuvalrakavy/tracing-init/schemas/event.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Event/{instance}",
+  "description": "Never retained: something that happened, not a state.",
+  "type": "object",
+  "required": [
+    "kind"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target": {
+      "type": "string",
+      "pattern": "^[^/+#]+$"
+    }
+  }
+}

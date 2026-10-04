@@ -1,0 +1,11 @@
+{
+  "$id": "https://github.com/yuvalrakavy/tracing-init/schemas/active.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Active/{instance}",
+  "description": "Retained; the last will says \"false\". Published as the plain text true or false (validated here as that text, a JSON string).",
+  "type": "string",
+  "enum": [
+    "true",
+    "false"
+  ]
+}

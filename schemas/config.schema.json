@@ -1,0 +1,14 @@
+{
+  "$id": "https://github.com/yuvalrakavy/tracing-init/schemas/config.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Config/{instance}/{target}",
+  "description": "Retained (an empty payload retracts): the setup a target needs. A string \"feedback\" (observed or assumed) overrides the driver's feedback mode for the target.",
+  "properties": {
+    "feedback": {
+      "enum": [
+        "observed",
+        "assumed"
+      ]
+    }
+  }
+}

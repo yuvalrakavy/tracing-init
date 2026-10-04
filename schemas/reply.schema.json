@@ -1,0 +1,53 @@
+{
+  "$id": "https://github.com/yuvalrakavy/tracing-init/schemas/reply.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "A reply, on a command's response topic",
+  "description": "Never retained; carries the command's correlation data. Shaped as an Event: kind reply, the command, its target, and the driver's answer as value \u2014 or, for a failure, error and reason.",
+  "type": "object",
+  "required": [
+    "kind",
+    "command"
+  ],
+  "properties": {
+    "kind": {
+      "const": "reply"
+    },
+    "command": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target": {
+      "type": "string"
+    },
+    "value": true,
+    "error": {
+      "type": "string"
+    },
+    "reason": {
+      "enum": [
+        "malformed",
+        "refused",
+        "rejected",
+        "unusable",
+        "unsupported",
+        "superseded",
+        "link_lost"
+      ]
+    }
+  },
+  "dependentRequired": {
+    "error": [
+      "reason"
+    ],
+    "reason": [
+      "error"
+    ]
+  },
+  "not": {
+    "required": [
+      "value",
+      "error"
+    ]
+  },
+  "additionalProperties": false
+}

@@ -613,6 +613,13 @@ fn from_v4_qos(q: rumqttc::mqttbytes::QoS) -> QoS {
 
 /// Read and answer one v5 packet; `None` on a malformed stream.
 fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Shared) -> Option<Read> {
+    // A DISCONNECT with reason 0 and no properties has a remaining length of 0 (MQTT v5 §3.14.2.1),
+    // as rumqttc's own client writes it — and rumqttc 0.25's reader refuses it (`PayloadRequired`).
+    if buf.starts_with(&[0xE0, 0x00]) {
+        let _ = buf.split_to(2);
+        event(shared, BrokerEvent::Disconnected);
+        return Some(Read::Closed);
+    }
     let packet = match v5::Packet::read(buf, None) {
         Ok(p) => p,
         Err(rumqttc::v5::mqttbytes::Error::InsufficientBytes(_)) => return Some(Read::NeedMore),

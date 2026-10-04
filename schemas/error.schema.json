@@ -1,0 +1,37 @@
+{
+  "$id": "https://github.com/yuvalrakavy/tracing-init/schemas/error.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Error/{instance}",
+  "description": "Never retained: a request refused or failed. reason superseded when a change at the device won an outage conflict.",
+  "type": "object",
+  "required": [
+    "error",
+    "reason"
+  ],
+  "properties": {
+    "error": {
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    },
+    "property": {
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "reason": {
+      "enum": [
+        "malformed",
+        "refused",
+        "rejected",
+        "unusable",
+        "unsupported",
+        "superseded",
+        "link_lost"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

@@ -376,3 +376,20 @@ async fn the_broker_stops_listening_past_its_cap() {
     let n = tokio::time::timeout(BOUND, first.read(&mut buf)).await.expect("the open connection still delivers").unwrap();
     assert!(n > 0);
 }
+
+/// A client's DISCONNECT is recorded — the short form rumqttc writes, with no reason code, which
+/// rumqttc's own reader refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clients_disconnect_is_recorded() {
+    let broker = FakeBroker::start().await;
+    let (client, events) = client(&broker, 10);
+    let (task, _incoming) = pump_publishes(events);
+    assert!(broker.wait_until(BOUND, |b| b.connections() == 1).await);
+    client.disconnect().await.unwrap();
+    assert!(
+        broker.wait_until(BOUND, |b| b.events().iter().any(|e| matches!(e, BrokerEvent::Disconnected))).await,
+        "the client's DISCONNECT was not recorded: {:?}",
+        broker.events()
+    );
+    task.abort();
+}

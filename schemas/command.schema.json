@@ -1,0 +1,20 @@
+{
+  "$id": "https://github.com/yuvalrakavy/tracing-init/schemas/command.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Command/{instance}",
+  "description": "Never retained; 30 s message expiry. A momentary action: its name, its target, and any other field as a parameter. The standard commands are refresh (a read) and assume (the values to assume, as parameters). A command wanting an answer carries an MQTT v5 response topic and correlation data.",
+  "type": "object",
+  "required": [
+    "command"
+  ],
+  "properties": {
+    "command": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target": {
+      "type": "string",
+      "pattern": "^[^/+#]+$"
+    }
+  }
+}
