@@ -1093,15 +1093,26 @@ argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.
 expect_text = '''a dropped call whose thread still runs was not counted'''
 guard       = "blocking_slot_raii"
 
-# MINOR 11 / C3: the cap is reserved before the thread starts, for every call.
+# MINOR 11 / C3: the cap is reserved atomically, before the thread starts, for every call. (Re-gate
+# R16: the row removed the cap, as `abandoned_blocking_calls_are_not_capped` does; it now replaces
+# the atomic reservation with a check-then-add, against calls racing for the last places.)
 [[control]]
 name        = "the_blocking_cap_is_not_reserved"
 file        = "mqtt-bridge-kit/src/link.rs"
-anchor      = '''(running < ABANDONED_CAP).then_some(running + 1)'''
-replacement = '''Some(running + 1)'''
+anchor      = '''        abandoned
+            .running
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| (running < ABANDONED_CAP).then_some(running + 1))
+            .ok()
+            .map(|_| Slot(abandoned.clone()))'''
+replacement = '''        if abandoned.running.load(Ordering::SeqCst) >= ABANDONED_CAP {
+            return None;
+        }
+        std::thread::yield_now();
+        abandoned.running.fetch_add(1, Ordering::SeqCst);
+        Some(Slot(abandoned.clone()))'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_helpers_blocking_calls_count_towards_the_cap", "--exact"]
-expect_text = '''a blocking call past the cap was run'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::racing_calls_never_reserve_past_the_cap", "--exact"]
+expect_text = '''racing calls reserved past the cap'''
 guard       = "blocking_cap_reserved"
 
 # C4: the next poll is due an interval after the last one ended; the mailbox is served between polls.

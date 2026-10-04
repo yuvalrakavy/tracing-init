@@ -222,3 +222,28 @@ fn an_event_without_a_kind_is_dropped() {
     assert_eq!(reports.take().events.len(), 1);
     assert_eq!(log.of_kind("driver_contract_violation").len(), 1);
 }
+
+/// The cap is reserved atomically: of many calls racing for its places, exactly the cap get one —
+/// never more (the R1 re-gate: no control saw a check-then-add, which lets a burst past the cap).
+#[test]
+fn racing_calls_never_reserve_past_the_cap() {
+    for _ in 0..50 {
+        let abandoned = Arc::new(Abandoned::default());
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let racers: Vec<_> = (0..16)
+            .map(|_| {
+                let abandoned = abandoned.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Slot::reserve(&abandoned)
+                })
+            })
+            .collect();
+        let slots: Vec<Slot> = racers.into_iter().filter_map(|r| r.join().expect("a racer panicked")).collect();
+        assert!(slots.len() <= ABANDONED_CAP, "{} racing calls reserved past the cap of {ABANDONED_CAP}", slots.len());
+        assert_eq!(slots.len(), ABANDONED_CAP, "racing calls left the cap's places unused");
+        drop(slots);
+        assert_eq!(abandoned.running.load(Ordering::SeqCst), 0, "a released place stayed counted");
+    }
+}
