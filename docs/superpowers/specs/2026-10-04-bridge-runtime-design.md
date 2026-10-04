@@ -304,6 +304,10 @@ commands are refused, and reads are dropped.
   dead-part path — the bounded shutdown (which does not wait for the blocked worker) and a failure
   exit, so the supervisor restarts the process. A thread cannot be cancelled; the restart is the
   recovery (re-gate R1, R13).
+- **Test seams:** the environment variables `MQTT_BRIDGE_TEST_*` (a held logging start, refused
+  stop signals, a panicking session) are compiled in only with the kit's `test-seams` cargo
+  feature, which the conformance suite enables — never in a deployed bridge, debug build or not
+  (Claude's re-gate minor 4).
 - **What a stop answers:** the bounded shutdown first stops the worker taking work, refuses every
   command still waiting for the device — on `Error` and on its response topic — then publishes what
   is pending (`Status`, `Error`, replies; a watchdog's verdict included), then `Active=false` and

@@ -2291,3 +2291,16 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_assume_with_a_bad_property_name_is_malformed", "--exact"]
 expect_text = '''a bad assume was not refused as malformed'''
 guard       = "assume_validated"
+
+# Claude's re-gate minor 4: the test seams are behind a cargo feature, not debug_assertions.
+[[control]]
+name        = "the_test_seams_follow_debug_assertions"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        #[cfg(feature = "test-seams")]
+        if std::env::var_os(TEST_NO_SIGNALS).is_some() {'''
+replacement = '''        #[cfg(debug_assertions)]
+        if std::env::var_os(TEST_NO_SIGNALS).is_some() {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "process::tests::the_test_seams_are_off_without_their_feature", "--exact"]
+expect_text = '''the no-signals seam is on in a build without the test-seams feature'''
+guard       = "test_seams_feature"

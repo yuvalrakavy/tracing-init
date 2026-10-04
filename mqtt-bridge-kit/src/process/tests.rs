@@ -35,3 +35,15 @@ fn a_drivers_required_option_and_its_own_usage_errors_exit_2_without_a_driver() 
     assert_eq!(refused.usage_exit(), Some(ExitCode::from(2)), "the driver's own usage error did not exit 2");
     assert_eq!(Bridge::new("A").args(args("--help")).usage_exit(), Some(ExitCode::SUCCESS));
 }
+
+/// The test seams are off in a build without the `test-seams` feature — a debug build deployed
+/// included, which used to honour them (Claude's re-gate minor 4: gated on `debug_assertions`).
+#[cfg(unix)]
+#[cfg(not(feature = "test-seams"))]
+#[tokio::test]
+async fn the_test_seams_are_off_without_their_feature() {
+    std::env::set_var(TEST_NO_SIGNALS, "1");
+    let registered = StopSignals::register();
+    std::env::remove_var(TEST_NO_SIGNALS);
+    assert!(registered.is_ok(), "the no-signals seam is on in a build without the test-seams feature");
+}

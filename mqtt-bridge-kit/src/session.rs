@@ -59,7 +59,7 @@ pub const READ_BACK_WAIT: Duration = Duration::from_secs(5);
 /// matches the stdio plugin protocol's line cap (spec §7), and bounds what one message can cost.
 pub const MAX_PACKET_SIZE: u32 = 1024 * 1024;
 
-/// The test seam's environment variable (debug builds only): see [`panic_for_test`].
+/// The test seam's environment variable (with the `test-seams` feature only): see [`panic_for_test`].
 pub const TEST_PANIC_TOPIC: &str = "MQTT_BRIDGE_TEST_PANIC_TOPIC";
 
 /// The MQTT side's timing.
@@ -613,10 +613,10 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
     }
 }
 
-/// The test seam for a panicking session task (debug builds only; a release build has none): when
+/// The test seam for a panicking session task (with the `test-seams` feature only; a build without it has none): when
 /// `MQTT_BRIDGE_TEST_PANIC_TOPIC` names a topic, a publish on it panics the session. Unset, it does
 /// nothing.
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-seams")]
 fn panic_for_test(topic: &str) {
     static SEAM: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     if SEAM.get_or_init(|| std::env::var(TEST_PANIC_TOPIC).ok()).as_deref() == Some(topic) {
@@ -624,7 +624,7 @@ fn panic_for_test(topic: &str) {
     }
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(feature = "test-seams"))]
 fn panic_for_test(_: &str) {}
 
 /// Spawn the MQTT side on the current runtime.

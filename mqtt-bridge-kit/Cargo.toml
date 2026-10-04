@@ -8,6 +8,11 @@ license = "MIT"
 repository = "https://github.com/yuvalrakavy/tracing-init"
 publish = false
 
+[features]
+# The test seams (the environment variables `MQTT_BRIDGE_TEST_*`) — for the conformance suite only,
+# never in a deployed bridge, debug build or not.
+test-seams = []
+
 [dependencies]
 bytes = "1"
 lock-order = { path = "../lock-order" }

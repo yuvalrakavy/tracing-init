@@ -673,7 +673,7 @@ pub(crate) async fn serve(mut running: Running, stop: impl Future<Output = &'sta
     ending
 }
 
-/// The test seam's environment variable (debug builds only): set, the stop signals cannot be
+/// The test seam's environment variable (with the `test-seams` feature only): set, the stop signals cannot be
 /// taken (`StopSignals::register` fails), as when the process may not install handlers.
 pub const TEST_NO_SIGNALS: &str = "MQTT_BRIDGE_TEST_NO_SIGNALS";
 
@@ -689,7 +689,7 @@ impl StopSignals {
     #[cfg(unix)]
     fn register() -> std::io::Result<StopSignals> {
         use tokio::signal::unix::{signal, SignalKind};
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "test-seams")]
         if std::env::var_os(TEST_NO_SIGNALS).is_some() {
             return Err(std::io::Error::other("the test seam refused the stop signals"));
         }

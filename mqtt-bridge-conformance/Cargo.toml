@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 bytes = "1"
 jsonschema = { version = "0.33", default-features = false }
-mqtt-bridge-kit = { path = "../mqtt-bridge-kit" }
+mqtt-bridge-kit = { path = "../mqtt-bridge-kit", features = ["test-seams"] }
 mqtt-test-broker = { path = "../mqtt-test-broker" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }

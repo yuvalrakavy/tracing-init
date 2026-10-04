@@ -13,7 +13,7 @@ use std::path::Path;
 use tracing_init::types::OnDestinationError;
 use tracing_init::TracingGuard;
 
-/// The test seam's environment variable (debug builds only): see [`hold_for_test`].
+/// The test seam's environment variable (with the `test-seams` feature only): see [`hold_for_test`].
 pub const TEST_LOGGING_GATE: &str = "MQTT_BRIDGE_TEST_LOGGING_GATE";
 
 /// tracing-init's start, synchronous, on the raced start's thread.
@@ -51,12 +51,12 @@ fn say_on_stderr(line: String) {
     });
 }
 
-/// The test seam for a logging start that does not end, or fails (debug builds only; a release
-/// build has none): when `MQTT_BRIDGE_TEST_LOGGING_GATE` names a file, the start reads it first. A
+/// The test seam for a logging start that does not end, or fails (with the `test-seams` feature
+/// only; a build without it has none): when `MQTT_BRIDGE_TEST_LOGGING_GATE` names a file, the start reads it first. A
 /// test points it at a FIFO whose write end it holds open and never writes, so the read — and the
 /// start — never returns until the test lets go, as on a stalled file system; or at a file that
 /// says `fail`, and the start fails. Unset, it does nothing. Returns whether to fail.
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-seams")]
 fn hold_for_test() -> bool {
     match std::env::var_os(TEST_LOGGING_GATE) {
         Some(gate) => std::fs::read(gate).is_ok_and(|text| text.starts_with(b"fail")),
@@ -64,7 +64,7 @@ fn hold_for_test() -> bool {
     }
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(feature = "test-seams"))]
 fn hold_for_test() -> bool {
     false
 }
