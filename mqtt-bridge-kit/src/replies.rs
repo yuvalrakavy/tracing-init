@@ -29,8 +29,8 @@ impl ReplyTo {
         if topic.is_empty() || topic.contains(['+', '#', '\0']) {
             return Err(format!("the response topic `{topic}` is not a topic one can publish to"));
         }
-        if topics.is_request_lane(&topic) {
-            return Err(format!("the response topic `{topic}` is one of the bridge's own request lanes"));
+        if topics.is_reserved_for_replies(&topic) {
+            return Err(format!("the response topic `{topic}` is a lane of this bridge, or a request lane under its root"));
         }
         Ok(Some(ReplyTo { topic, correlation: properties.and_then(|p| p.correlation_data.clone()) }))
     }

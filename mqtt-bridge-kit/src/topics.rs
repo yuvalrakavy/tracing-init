@@ -111,9 +111,24 @@ impl Topics {
     }
 
     /// Whether `topic` is on one of the bridge's request lanes — `Desired`, `Command` or `Config` —
-    /// which the Store owns and the bridge reads: no reply may go there.
+    /// which the Store owns and the bridge reads.
     pub fn is_request_lane(&self, topic: &str) -> bool {
-        ["Desired", "Command", "Config"].iter().any(|lane| {
+        self.on_own_lane(topic, &["Desired", "Command", "Config"])
+    }
+
+    /// Whether no reply may go to `topic`: one of the bridge's own lanes — those it reads (a reply
+    /// there is read back as a request) and those it publishes but `Event` (`State`, `Error`,
+    /// `Status`, `Active`, `Version`: a reply there passes for the bridge's own report) — or any
+    /// instance's request lane under the same root, where another bridge would take it for a
+    /// request (re-gate R17). The `Event` lane stays open: replies are Event-shaped, and the kit
+    /// spec has them arrive there.
+    pub fn is_reserved_for_replies(&self, topic: &str) -> bool {
+        let any_instance = ["Desired", "Command", "Config"].iter().any(|lane| topic.starts_with(&format!("{}/{lane}/", self.root)));
+        any_instance || self.on_own_lane(topic, &["Desired", "Command", "Config", "State", "Error", "Status", "Active", "Version"])
+    }
+
+    fn on_own_lane(&self, topic: &str, lanes: &[&str]) -> bool {
+        lanes.iter().any(|lane| {
             let lane = self.lane(lane);
             topic == lane || topic.strip_prefix(lane.as_str()).is_some_and(|rest| rest.starts_with('/'))
         })
@@ -185,6 +200,13 @@ mod tests {
         assert!(t.is_request_lane("Aircondition/Desired/ctrl/u1/power"));
         assert!(!t.is_request_lane("Aircondition/Event/ctrl") && !t.is_request_lane("Aircondition/Commandx/ctrl"));
         assert!(!t.is_request_lane("Aircondition/Command/ctrlx"));
+        for reserved in
+            ["Aircondition/State/ctrl/u1", "Aircondition/Status/ctrl", "Aircondition/Command/other", "Aircondition/Desired/x/u/p"]
+        {
+            assert!(t.is_reserved_for_replies(reserved), "{reserved}");
+        }
+        assert!(!t.is_reserved_for_replies("Aircondition/Replies/ctrl") && !t.is_reserved_for_replies("Store/replies/1"));
+        assert!(!t.is_reserved_for_replies("Aircondition/Event/ctrl"), "the Event lane, where replies arrive, was reserved");
         assert_eq!(t.command(), "Aircondition/Command/ctrl");
         assert_eq!(t.config_filter(), "Aircondition/Config/ctrl/#");
         assert_eq!(t.event(), "Aircondition/Event/ctrl");

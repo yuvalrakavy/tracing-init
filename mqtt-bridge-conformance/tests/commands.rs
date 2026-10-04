@@ -159,11 +159,28 @@ async fn a_response_topic_on_the_bridges_own_request_lanes_is_refused() {
     let h = Harness::start_with("ownlanes", acknowledged(), quick_timing(), up_at_20).await;
     assert!(connected(&h).await);
     let t = h.topics.clone();
-    for own in [t.command(), t.desired("t1", "temp"), t.config("t1")] {
-        assert!(h.command(json!({"target": "t1", "command": "pulse"}), Some((&own, b"c"))));
+    // Its request lanes; its output lanes but Event (where replies arrive), where a reply would
+    // pass for the bridge's own report; and any instance's request lanes under the root, where it
+    // would be read as a request (the R1 re-gate's R17).
+    let other = |lane: &str| format!("{}/{lane}/another", t.root());
+    let reserved = [
+        t.command(),
+        t.desired("t1", "temp"),
+        t.config("t1"),
+        t.state("t1"),
+        t.error(),
+        t.status(),
+        t.active(),
+        t.version(),
+        other("Command"),
+        format!("{}/t9/x", other("Desired")),
+        format!("{}/t9", other("Config")),
+    ];
+    for own in &reserved {
+        assert!(h.command(json!({"target": "t1", "command": "pulse"}), Some((own, b"c"))));
     }
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("malformed").len() == 3).await,
+        h.eventually(BOUND, |h| h.errors_for("malformed").len() == reserved.len()).await,
         "a response topic on the bridge's own lanes was not refused: {:?}",
         h.errors()
     );

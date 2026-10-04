@@ -203,8 +203,12 @@ commands are refused, and reads are dropped.
     or live: both are subscribed retain-as-published, so the broker keeps the flag on a live
     delivery. Property writes are subscribed without it, so a live retained one (every Store write)
     is live, and only a replay arrives flagged.
-  - A response topic on the bridge's own request lanes (`Desired`, `Command`, `Config`) is refused
-    as `malformed`: the reply would be read back as a request.
+  - A response topic on the bridge's own lanes is refused as `malformed`: on those it reads
+    (`Desired`, `Command`, `Config`) the reply would be read back as a request; on those it
+    publishes but `Event` (`State`, `Error`, `Status`, `Active`, `Version`) it would pass for the
+    bridge's own report. So is one on any instance's request lane under the same root, where
+    another bridge would take it for a request (re-gate R17). The `Event` lane stays open: replies
+    are Event-shaped (`"kind":"reply"`), and the kit spec has them arrive there.
   - A target-level write's property copies are skipped for 60 s.
   - `configure` is called only while connected. Configs are held while down and applied first in the
     catch-up: every held config before any held value; while up, a target's waiting config before

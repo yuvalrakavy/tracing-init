@@ -1346,8 +1346,8 @@ guard       = "property_writes_live"
 [[control]]
 name        = "a_reply_to_the_bridges_own_lanes_is_taken"
 file        = "mqtt-bridge-kit/src/replies.rs"
-anchor      = '''        if topics.is_request_lane(&topic) {'''
-replacement = '''        if topics.is_request_lane(&topic) && false {'''
+anchor      = '''        if topics.is_reserved_for_replies(&topic) {'''
+replacement = '''        if topics.is_reserved_for_replies(&topic) && false {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_response_topic_on_the_bridges_own_request_lanes_is_refused", "--exact"]
 expect_text = '''a response topic on the bridge's own lanes was not refused'''
@@ -2052,3 +2052,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_read_command_that_expires_while_queued_is_refused_not_executed", "--exact"]
 expect_text = '''a read-class command past its expiry was executed'''
 guard       = "read_expiry"
+
+# Re-gate R17: replies may not go to the bridge's output lanes or another instance's request lanes.
+[[control]]
+name        = "replies_go_to_output_lanes"
+file        = "mqtt-bridge-kit/src/replies.rs"
+anchor      = '''        if topics.is_reserved_for_replies(&topic) {'''
+replacement = '''        if topics.is_request_lane(&topic) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_response_topic_on_the_bridges_own_request_lanes_is_refused", "--exact"]
+expect_text = '''a response topic on the bridge's own lanes was not refused'''
+guard       = "reply_lanes_reserved"
