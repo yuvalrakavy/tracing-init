@@ -83,6 +83,9 @@ lost link, never a hang.
 - `ctx.link_lost(reason)`: a helper noticed the link died.
 - `ctx.blocking(fn)`: a synchronous library call on a worker thread, under the current deadline. An
   overrun abandons the thread (capped in number) and counts as a lost link.
+- `ctx.handle()`: a cloneable `LinkHandle` (`report()`, `link_lost()`, `is_lost()`, `blocking()`) to
+  keep for later calls, since the context itself is only handed to `connect`. `ctx.report` is a
+  cloneable `Reporter`.
 
 Every reporter call returns at once and never waits on MQTT. State coalesces per topic; events go to a
 capped queue whose overflow is counted and logged once per episode.
@@ -133,6 +136,34 @@ or `Down` on `LinkError`, a missed deadline or `link_lost`. `Down` retries after
 Catch-up runs on entering `Up`. While `Down`, state requests are held to their deadline, momentary
 commands are refused, and reads are dropped.
 
+### 5.1 Wire details fixed while building R1 (2026-10-04)
+
+- **Plain text, not JSON:** `Active`, `Status` and `Version` payloads (`true`, `connected`,
+  `mqtt_ac 2.0.0`). Every other lane is JSON.
+- **`Error` always carries `reason`:** one of `malformed`, `refused`, `rejected`, `unusable`,
+  `unsupported`, `superseded`, `link_lost`. It may also carry `target`, `property`, `command` and an
+  `error` text.
+- **Replies are Event-shaped** (`"kind":"reply"`), sent to the response topic of any command that
+  names one, with its correlation data. Failures also go to `Error`.
+- **Request rules:**
+  - A missing `conflict` user property means `DeviceWins`, the conservative choice: a manual change is
+    never reverted on a guess.
+  - A held value the device already has is satisfied: it is dropped, with no `Error`.
+  - A `Desired` replayed as retained gets the conflict check even while the device is up (the
+    bridge-restart case).
+  - A retained target-level `Desired`, or a retained `Command`, is refused as `malformed`.
+  - A target-level write's property copies are skipped for 60 s.
+  - `configure` is called only while connected. Configs are held while down and applied first in the
+    catch-up.
+  - A momentary command still waiting at its message expiry is dropped.
+- **Timing:** the busy-probe interval is a 2 s constant (from mqtt_lutron). `Timing.poll` is an
+  `Option`.
+- **Kinds:**
+  - `event_report_dropped` (WARN) and `event_report_drop_ended` (INFO);
+  - `driver_contract_violation` (ERROR);
+  - `device_recovered` gains `expired`;
+  - the runtime also emits `startup_failed` and `bridge_shutdown_cut`.
+
 **Out of scope:** airzoned (a media daemon) keeps its own structure. mqtt_mdns adopts only the pump,
 reports and process pieces, since it has no device link.
 
@@ -157,7 +188,12 @@ fn main() -> ExitCode {
 }
 ```
 
-- Native `async fn` in traits (Rust 1.75+) works because the runtime is generic over the driver type.
+- Native `async fn` in the trait needs `#[allow(async_fn_in_trait)]`, and its futures are not `Send`,
+  so the runtime cannot `tokio::spawn` them. The driver therefore runs on a thread of its own with a
+  single-threaded runtime (as built in R1). A driver that blocks its thread holds up neither the MQTT
+  side nor the stop.
+- `Bridge` also has `option(name, help)` / `value(name)` for driver-specific options (mqtt_ac v2's
+  CoolMaster address), and `start(driver) -> Running` to run a bridge in-process (used by the suite).
 - The stdio binding is itself a `DeviceDriver` (`PluginDriver`) that forwards each call to the plugin
   process.
 
@@ -259,3 +295,7 @@ schemas/                  JSON Schemas for each lane's payload
 - **Blocking libraries.** A synchronous call can only be abandoned, not cancelled. `ctx.blocking` bounds
   it and caps the number abandoned.
 - **A plugin is a second process to deploy.** The host supervises it.
+- **The read-back can miss.** If the broker connection drops after the read-back subscribe is queued
+  but before it is written, rumqttc's clean start loses it. That run then has no "before" values, so
+  replayed requests are applied. For a broker-only outage, replayed requests are checked against the
+  last device outage's snapshot, or the read-back.
