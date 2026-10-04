@@ -2198,8 +2198,8 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        if complete {
             self.restore_due = false;
         } else if'''
-replacement = '''        if true {
-            self.restore_due = false;
+replacement = '''        self.restore_due = false;
+        if complete {
         } else if'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_on_an_incomplete_read_back_is_done_again_when_it_completes", "--exact"]
@@ -2227,8 +2227,8 @@ anchor      = '''        while let Some((target, config)) = self.mailbox.take_co
         let complete = self.reports.read_back_is_complete();'''
 replacement = '''        let complete = self.reports.read_back_is_complete();'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_follows_the_targets_config_and_yields_to_a_newer_request", "--exact"]
-expect_text = '''the target was written before its config'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_in_the_catch_up_configures_a_config_that_came_meanwhile", "--exact"]
+expect_text = '''the restore wrote before a config that came while it waited'''
 guard       = "restore_configs_first"
 
 # Re-gate R7: a restore's refusal is said in the log, not on Error (no request was made).

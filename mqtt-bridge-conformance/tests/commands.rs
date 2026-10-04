@@ -570,3 +570,26 @@ async fn an_unproven_restore_is_applied_again_when_the_link_dies_before_proof() 
     );
     assert!(h.stop().await);
 }
+
+/// A restore in the catch-up configures first a config that came while it waited for the replays
+/// to go quiet — one that came after the device was proven waits as not held, and nothing else
+/// takes it while the catch-up runs (the R1 re-gate's R5).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_in_the_catch_up_configures_a_config_that_came_meanwhile() {
+    let h = Harness::start_with("restore-catchup-config", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        device.answer(Op::Read, None, Answer::Unsupported);
+        device.set_up(false);
+    })
+    .await;
+    // The read-back is in long before the device comes up.
+    h.settle(Duration::from_millis(500)).await;
+    let probes = h.device.calls_of(Op::Probe).len();
+    h.device.set_up(true);
+    assert!(h.eventually(BOUND, |h| h.device.calls_of(Op::Probe).len() > probes).await, "the device was never proven");
+    assert!(h.broker.publish(&h.topics.config("dimmer"), json!({"channel": 7}).to_string(), &SendOptions::default().retained()));
+    assert!(h.eventually(BOUND, |h| h.device.get("dimmer", "level") == Some(json!(40))).await, "the target was never restored");
+    let ops: Vec<Op> = h.device.calls().iter().filter(|c| c.target.as_deref() == Some("dimmer")).map(|c| c.op).collect();
+    assert_eq!(ops.first(), Some(&Op::Configure), "the restore wrote before a config that came while it waited: {ops:?}");
+    assert!(h.stop().await);
+}
