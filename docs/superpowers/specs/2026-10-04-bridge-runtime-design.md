@@ -181,7 +181,9 @@ commands are refused, and reads are dropped.
   - `configure` is called only while connected. Configs are held while down and applied first in the
     catch-up: every held config before any held value; while up, a target's waiting config before
     its values; `Config` is subscribed before `Desired`. A config's `feedback` override takes effect
-    once `configure` has taken it.
+    once `configure` has taken it. A config identical to the one `configure` last took on the
+    current link is not handed over again (every reconnect replays the retained configs); a lost
+    link forgets what was taken.
   - A momentary command still waiting at its message expiry is dropped.
 - **Command line:** a zero `--retry` or `--probe-interval`, a `--mqtt-keep-alive` under 5 s
   (rumqttc's floor) and a duration too long to count are usage errors (exit 2); the same timings

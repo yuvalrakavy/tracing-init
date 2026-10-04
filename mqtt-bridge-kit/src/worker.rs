@@ -228,6 +228,10 @@ pub(crate) struct Worker<D: DeviceDriver> {
     before: Option<(Instant, BTreeMap<String, PropertyMap>)>,
     /// Whether the current link has recovered: proven, and its catch-up done.
     recovered: bool,
+    /// The config `configure` last took for each target on this link: one identical is not handed
+    /// over again while the link stays up (every reconnect replays the retained configs; review
+    /// MINOR 5). Forgotten when the link is lost — the device may have lost its setup with it.
+    configured: HashMap<String, Option<Value>>,
 }
 
 impl<D: DeviceDriver> Worker<D> {
@@ -245,6 +249,7 @@ impl<D: DeviceDriver> Worker<D> {
             last_attempt: None,
             before: None,
             recovered: false,
+            configured: HashMap::new(),
         }
     }
 
@@ -416,13 +421,19 @@ impl<D: DeviceDriver> Worker<D> {
         }
     }
 
-    /// Hand a target its setup.
+    /// Hand a target its setup — unless `configure` took the same one on this link already.
     async fn configure(&mut self, handle: &LinkHandle, target: &str, config: Option<Value>) -> Result<(), LinkError> {
+        if self.configured.get(target) == Some(&config) {
+            debug!(target, "A config identical to the one this link has already taken; not handed over again");
+            self.mailbox.configured(target, config.as_ref());
+            return Ok(());
+        }
         let timing = self.info.timing;
         // WAIT: device-op
         match op(handle, timing.operation, "configure", self.driver.configure(target, config.as_ref())).await {
             Ok(()) => {
                 self.mailbox.configured(target, config.as_ref());
+                self.configured.insert(target.to_owned(), config);
                 Ok(())
             }
             Err(OpError::Link(e)) => Err(e),
@@ -663,6 +674,7 @@ impl<D: DeviceDriver> Worker<D> {
     /// have taken held again, the momentary commands waiting refused, the outage episode advanced.
     async fn down(&mut self, ctx: LinkContext, error: LinkError) {
         drop(ctx);
+        self.configured.clear();
         if std::mem::take(&mut self.recovered) {
             self.before = Some((Instant::now(), self.reports.snapshot()));
         }

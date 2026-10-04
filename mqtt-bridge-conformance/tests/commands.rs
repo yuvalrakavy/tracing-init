@@ -198,3 +198,39 @@ async fn a_replayed_request_an_assumed_target_already_has_is_not_applied_again()
     assert_eq!(h.device.calls_of(Op::Apply).len(), 1, "a replayed request the assumed target already had was sent again");
     assert!(h.stop().await);
 }
+
+/// A config identical to the one `configure` last took on this link is not handed to the driver
+/// again — every reconnect replays the retained configs; a changed one is, and so is any after the
+/// link was lost, when the device may have lost its setup (review MINOR 5).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unchanged_config_is_not_configured_again_while_the_link_stays_up() {
+    let h = Harness::start_with("cfgdedupe", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    let configures = |h: &Harness| h.device.calls_of(Op::Configure).len();
+    assert!(h.config("ir", json!({"code_set": "lg"})));
+    assert!(h.eventually(BOUND, |h| configures(h) == 1).await, "the config never reached the driver");
+    let reconnect = |h: &Harness| {
+        let connects = h.broker.connections();
+        h.broker.drop_connection();
+        connects
+    };
+    let connects = reconnect(&h);
+    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await);
+    h.settle(Duration::from_millis(500)).await;
+    assert_eq!(configures(&h), 1, "an unchanged config replayed on a reconnect was configured again");
+    assert!(h.config("ir", json!({"code_set": "sony"})));
+    assert!(h.eventually(BOUND, |h| configures(h) == 2).await, "a changed config was not configured");
+    // The link lost and back: the same config, replayed, is the device's setup again.
+    h.device.set_up(false);
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    h.device.set_up(true);
+    assert!(connected(&h).await);
+    let connects = reconnect(&h);
+    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await);
+    assert!(
+        h.eventually(BOUND, |h| configures(h) == 3).await,
+        "a config replayed after the link was lost was not configured: {}",
+        configures(&h)
+    );
+    assert!(h.stop().await);
+}

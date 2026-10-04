@@ -1455,3 +1455,25 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_configs_feedback_override_is_committed_when_configure_takes_it", "--exact"]
 expect_text = '''the override took effect before configure took it'''
 guard       = "feedback_on_configure"
+
+# MINOR 5: a config identical to the one this link took is not configured again.
+[[control]]
+name        = "an_unchanged_config_is_configured_again"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        if self.configured.get(target) == Some(&config) {'''
+replacement = '''        if self.configured.get(target) == Some(&config) && false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_unchanged_config_is_not_configured_again_while_the_link_stays_up", "--exact"]
+expect_text = '''an unchanged config replayed on a reconnect was configured again'''
+guard       = "config_dedupe"
+
+# MINOR 5: a lost link forgets the configs it took.
+[[control]]
+name        = "a_lost_link_remembers_its_configs"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        self.configured.clear();'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_unchanged_config_is_not_configured_again_while_the_link_stays_up", "--exact"]
+expect_text = '''a config replayed after the link was lost was not configured'''
+guard       = "config_dedupe_per_link"
