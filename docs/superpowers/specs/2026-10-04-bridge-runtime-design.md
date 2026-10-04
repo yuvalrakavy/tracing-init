@@ -281,7 +281,8 @@ commands are refused, and reads are dropped.
   withholds its acknowledgements fills rumqttc's in-flight window, and rumqttc then takes no
   request while its pings succeed; a broker that stops reading holds rumqttc in its flush,
   inside the poll, where its keep-alive cannot fire. Reconnects are paced by `poll_retry`, and by
-  `retry` after every fifth failed connect in a row.
+  `retry` after every fifth failed connect in a row — a connection dropped before `stable_after`
+  (two bridges sharing a client id) counting as a failed one (Claude's re-gate minor 12).
 - **No operation on a lost link:** an operation is refused at once, the driver not called, on a
   link already reported lost; one admitted while the link was live and completed keeps its result
   over a loss noticed at the same moment (re-gate R6).

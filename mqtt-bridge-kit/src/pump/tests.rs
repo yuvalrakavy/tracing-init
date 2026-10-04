@@ -114,6 +114,38 @@ async fn a_broker_outage_is_one_episode_recovered_only_on_a_connection_that_hold
     let _ = tokio::time::timeout(Duration::from_secs(5), mqtt).await;
 }
 
+/// A broker that takes each connection and drops it at once — two bridges sharing a client id — is
+/// paced as one that refuses: a session shorter than `stable_after` counts as one more failure, so
+/// the `retry` pause comes after five in a row (Claude's re-gate minor 12: every accepted
+/// connection reset the count, and the bridge reconnected at `poll_retry` for good).
+#[tokio::test]
+async fn connections_dropped_at_once_are_paced_as_failures() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(80);
+    let relay = Relay::start(broker.address()).await;
+    let timing = MqttTiming {
+        keep_alive: Duration::from_secs(5),
+        retry: Duration::from_secs(3),
+        poll_retry: Duration::from_millis(50),
+        warn_after: Duration::from_secs(30),
+        stable_after: Duration::from_millis(400),
+    };
+    let shared = shared_through(&relay, timing);
+    let command = shared.topics.command();
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let mqtt = tokio::spawn(crate::session::run(shared, stopped));
+    assert!(broker.wait_for_subscription(&command, Duration::from_secs(5)).await, "the MQTT side never subscribed");
+    relay.drop_connections_after(Some(Duration::from_millis(100)));
+    let before = relay.accepted();
+    relay.cut();
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let made = relay.accepted() - before;
+    assert!(made >= 3, "the broker was not reconnected to: {made} connections");
+    assert!(made <= 6, "{made} connections in 2 s to a broker that dropped each at once: the retry pause never came");
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), mqtt).await;
+}
+
 /// The MQTT side's shared state, for a broker reached through `relay`.
 fn shared_through(relay: &Relay, timing: MqttTiming) -> Arc<crate::session::Shared> {
     let (host, port) = relay.address.rsplit_once(':').expect("the relay's host and port");

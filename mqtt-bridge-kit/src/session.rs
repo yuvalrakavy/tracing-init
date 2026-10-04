@@ -128,12 +128,15 @@ enum SessionEnd {
 pub(crate) async fn run(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     let mut failed: u32 = 0;
     loop {
+        let started = Instant::now();
         let connected = match session(&shared, &mut shutdown).await {
             SessionEnd::Shutdown => return,
             SessionEnd::Ended { connected } => connected,
         };
-        // A connection lost is the first failure of what follows; a connect refused, one more.
-        failed = if connected { 1 } else { failed + 1 };
+        // A connection lost after it held is the first failure of what follows; a connect refused,
+        // or a connection dropped before `stable_after` (two bridges sharing a client id), one more
+        // (Claude's re-gate minor 12: every accepted connection reset the count).
+        failed = if connected && started.elapsed() >= shared.timing.stable_after { 1 } else { failed + 1 };
         let pause = if failed % MAX_CONSECUTIVE_ERRORS == 0 { shared.timing.retry } else { shared.timing.poll_retry };
         debug!(pause_ms = pause.as_millis() as u64, failed, "MQTT session ended; starting a new one");
         // WAIT: session-retry
@@ -228,7 +231,15 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                     Ok(None)
                 }
                 Step::Event(Some(PumpEvent::Disconnected | PumpEvent::SubAck { .. } | PumpEvent::Subscribing(_))) => Ok(None),
-                Step::Event(Some(PumpEvent::Ended(_)) | None) => Ok(Some(SessionEnd::Ended { connected: false })),
+                Step::Event(Some(PumpEvent::Ended(_))) => Ok(Some(SessionEnd::Ended { connected: false })),
+                // The pump went without a word — it panicked — so it never said the connection was
+                // lost: the broker snapshot is taken here (Claude's re-gate minor 14).
+                Step::Event(None) => {
+                    if accepted {
+                        shared.reports.broker_lost();
+                    }
+                    Ok(Some(SessionEnd::Ended { connected: false }))
+                }
                 Step::Reported => {
                     publish_changes(shared, &client, shared.reports.take()).await;
                     Ok(None)

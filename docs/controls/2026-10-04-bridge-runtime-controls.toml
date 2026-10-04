@@ -2304,3 +2304,15 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "process::tests::the_test_seams_are_off_without_their_feature", "--exact"]
 expect_text = '''the no-signals seam is on in a build without the test-seams feature'''
 guard       = "test_seams_feature"
+
+# Claude's re-gate minor 12: a connection dropped at once counts as a failure for the pacing.
+[[control]]
+name        = "an_accepted_connection_resets_the_pacing"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        failed = if connected && started.elapsed() >= shared.timing.stable_after { 1 } else { failed + 1 };'''
+replacement = '''        failed = if connected { 1 } else { failed + 1 };
+        let _ = started;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "pump::tests::connections_dropped_at_once_are_paced_as_failures", "--exact"]
+expect_text = '''the retry pause never came'''
+guard       = "pacing_quick_drops"
