@@ -62,9 +62,11 @@ enum Origin {
 /// [`RESTORE_QUIET_CAP`] after the read-back). Cancellation-safe.
 async fn restore_ready(reports: &Reports, mailbox: &Mailbox, complete: bool) {
     reports.read_back_reached(complete).await;
-    let cap = Instant::now() + RESTORE_QUIET_CAP;
+    let done = Instant::now();
+    let cap = done + RESTORE_QUIET_CAP;
     loop {
-        let quiet = mailbox.quiet_for().unwrap_or(Duration::MAX);
+        // Quiet since the read-back was done at the least: the replays come behind it.
+        let quiet = mailbox.quiet_for().unwrap_or(Duration::MAX).min(done.elapsed());
         let now = Instant::now();
         if quiet >= RESTORE_QUIET || now >= cap {
             return;

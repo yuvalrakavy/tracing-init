@@ -1699,9 +1699,9 @@ guard       = "restore"
 name        = "restore_does_not_wait_for_the_read_back"
 file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''    reports.read_back_reached(complete).await;
-    let cap = Instant::now() + RESTORE_QUIET_CAP;'''
+    let done = Instant::now();'''
 replacement = '''    let _ = (reports, complete);
-    let cap = Instant::now() + RESTORE_QUIET_CAP;'''
+    let done = Instant::now();'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_waits_for_a_broker_that_comes_up_after_the_device", "--exact"]
 expect_text = '''a restore ran before its read-back was done'''
