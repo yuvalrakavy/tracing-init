@@ -97,6 +97,28 @@ async fn a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_epis
     assert!(h.stop().await);
 }
 
+/// `Status` says `connected` only once the device has proved itself alive: a device that takes the
+/// connection and then answers nothing stays `unreachable` (the link goes `Connecting` →
+/// `Proving` → `Up`, and `Proving` is not up).
+#[tokio::test(flavor = "multi_thread")]
+async fn status_says_connected_only_once_the_device_proved_alive() {
+    let h = Harness::start_with("proving", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    let connected_said = |h: &Harness| h.published(&h.topics.status()).iter().filter(|r| &r.payload[..] == b"connected").count();
+    let before = connected_said(&h);
+    // Every connect succeeds, and every read on it goes unanswered until its deadline.
+    h.device.answer(Op::Read, None, Answer::Hang);
+    h.device.set_up(false);
+    h.device.set_up(true);
+    h.settle(Duration::from_millis(1500)).await;
+    assert!(h.device.calls_of(Op::Connect).len() >= 3, "the device was not reconnected to");
+    assert_eq!(connected_said(&h), before, "Status said connected for a device that never proved itself alive");
+    assert_eq!(h.status().as_deref(), Some("unreachable"));
+    h.device.answer_normally();
+    assert!(connected(&h).await, "Status never said connected once the device answered");
+    assert!(h.stop().await);
+}
+
 /// `Writes::Unacknowledged`: an applied value stays unproven until a later probe or read; a device
 /// that took the write without acting on it, and leaves the probe unanswered, loses the link — and
 /// the value is held again and applied on the next link (mqtt_lutron; the fleet's F5).

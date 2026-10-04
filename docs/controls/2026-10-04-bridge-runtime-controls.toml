@@ -1,0 +1,929 @@
+# Negative controls for the Bridge Runtime, R1 (tracing-init `mqtt-bridge-kit`, its conformance suite
+# and the fake broker's additions; Bridge Runtime spec §5, §9). Each row undoes one guard and names
+# the test that must fail, by its failure text. Run from Store with
+#     CARGO_TARGET_DIR=<a scratch dir> python3 scripts/negative-control.py \
+#         --root ../tracing-init docs/controls/2026-10-04-bridge-runtime-controls.toml
+# (the root is the repository: a row's guard is in mqtt-bridge-kit, its test often in
+# mqtt-bridge-conformance). Every row must come back RED.
+
+# rumqttc 0.25's packet-id collision survives a failed poll unless the pump moves it into `pending`.
+[[control]]
+name        = "the_pump_leaves_a_collision_standing"
+file        = "mqtt-bridge-kit/src/pump.rs"
+anchor      = '''                    if let Some(publish) = events.state.collision.take() {
+                        events.pending.push_back(Request::Publish(publish));
+                    }
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "pump::tests::a_collision_standing_when_the_connection_drops_does_not_stop_the_event_loop_for_good", "--exact"]
+expect_text = '''nothing was sent after the reconnect'''
+guard       = "pump_collision_fix"
+
+# The forward queue's high-water WARN (`mqtt_backlog_high`).
+[[control]]
+name        = "the_backlog_never_flags_high_water"
+file        = "mqtt-bridge-kit/src/pump.rs"
+anchor      = '''if depth >= HIGH_WATER && self.high_since'''
+replacement = '''if depth >= usize::MAX && self.high_since'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "pump::tests::a_backlog_past_high_water_is_flagged_once_and_cleared_when_it_drains", "--exact"]
+expect_text = '''not flagged at the high-water mark'''
+guard       = "pump_backlog_episode"
+
+# A bounded forward: the pump waits on a session parked on the request channel only the pump drains.
+[[control]]
+name        = "the_pump_waits_on_the_session"
+file        = "mqtt-bridge-kit/src/pump.rs"
+anchor      = '''                Event::Incoming(Packet::Publish(publish)) => {
+                    backlog.pushed();
+                    PumpEvent::Publish(publish)
+                }'''
+replacement = '''                Event::Incoming(Packet::Publish(publish)) => {
+                    backlog.pushed();
+                    while backlog.depth.load(Ordering::SeqCst) > 10 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    PumpEvent::Publish(publish)
+                }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
+expect_text = '''the bridge did not recover with the broker'''
+guard       = "pump_never_waits"
+
+# Recovery declared at the CONNACK: a broker that accepts and drops is an INFO pair per connection.
+[[control]]
+name        = "the_broker_outage_ends_at_connack"
+file        = "mqtt-bridge-kit/src/pump.rs"
+anchor      = '''        self.connected_at.store(self.stamp(), Ordering::SeqCst);
+'''
+replacement = '''        self.connected_at.store(1, Ordering::SeqCst);
+        self.alive();
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "pump::tests::a_broker_outage_is_one_episode_recovered_only_on_a_connection_that_holds", "--exact"]
+expect_text = '''the outage began more than once'''
+guard       = "broker_outage_proof_of_life"
+
+# rumqttc reconnects inside one event loop and the broker keeps no session: every CONNACK subscribes again.
+[[control]]
+name        = "the_connack_duties_are_done_once_per_session"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client).await.map(|()| None),'''
+replacement = '''                Step::Event(Some(PumpEvent::Connected)) if announced => Ok(None),
+                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client).await.map(|()| None),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
+expect_text = '''the state was not published again after the reconnect'''
+guard       = "connack_every_time"
+
+# Active=true before the subscriptions.
+[[control]]
+name        = "active_is_announced_before_the_subscriptions"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    for filter in [topics.desired_filter(), topics.command(), topics.config_filter()] {
+'''
+replacement = '''    emit(client, topics.active(), true, b"true".to_vec(), properties()).await?;
+    for filter in [topics.desired_filter(), topics.command(), topics.config_filter()] {
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
+expect_text = '''the bridge published before it had subscribed'''
+guard       = "connack_order"
+
+# Every CONNACK publishes the version.
+[[control]]
+name        = "the_version_is_not_published"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    emit(client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await?;
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
+expect_text = '''was not published again'''
+guard       = "connack_version"
+
+# The fleet's F4: every CONNACK republishes the retained model from the bridge's own state.
+[[control]]
+name        = "the_model_is_not_republished_at_connack"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    republish(shared, client, shared.reports.model()).await
+}'''
+replacement = '''    Ok(())
+}'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_broker_restarted_without_persistence_gets_the_retained_model_again", "--exact"]
+expect_text = '''the retained model was not restored'''
+guard       = "connack_republish"
+
+# Found by the read-back scenario: a state published before the first CONNACK's subscriptions overwrote the retained state the read-back reads.
+[[control]]
+name        = "reports_are_published_before_the_connack"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''() = shared.reports.reported(), if announced => Step::Reported,'''
+replacement = '''() = shared.reports.reported() => Step::Reported,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
+expect_text = '''no Error said the request was superseded'''
+guard       = "nothing_before_connack"
+
+# The start-up read-back of the bridge's own retained State: the conflict rule's before values after a restart.
+[[control]]
+name        = "the_read_back_is_never_subscribed"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    if !shared.read_back_requested.load(Ordering::SeqCst) {
+        // WAIT: mqtt-request
+        client.subscribe(topics.state_filter(), QoS::AtLeastOnce).await?;
+        shared.read_back_requested.store(true, Ordering::SeqCst);
+    }
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
+expect_text = '''no Error said the request was superseded'''
+guard       = "read_back"
+
+# Only retained deliveries are the read-back: the bridge's own publishes come back unflagged.
+[[control]]
+name        = "the_bridges_own_state_is_read_back"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        Inbound::State { target } => {
+            if publish.retain {'''
+replacement = '''        Inbound::State { target } => {
+            if true {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
+expect_text = '''no Error said the request was superseded'''
+guard       = "read_back_retained_only"
+
+# A malformed payload is answered on Error.
+[[control]]
+name        = "malformed_payloads_are_not_answered"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        shared.reports.error(ErrorReport { error, ..report });
+'''
+replacement = '''        let _ = (error, report);
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "malformed_desired_and_command_payloads_are_answered_on_error", "--exact"]
+expect_text = '''not every malformed payload was answered on Error'''
+guard       = "malformed_answered"
+
+# A retained target-level Desired is refused: replayed at every restart, it would act again.
+[[control]]
+name        = "a_retained_target_write_is_taken"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''            if publish.retain {
+                return malformed("a target-level Desired is never retained".into(), report);
+            }
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "malformed_desired_and_command_payloads_are_answered_on_error", "--exact"]
+expect_text = '''not every malformed payload was answered on Error'''
+guard       = "target_write_never_retained"
+
+# A reply carries the command's correlation data.
+[[control]]
+name        = "a_reply_loses_its_correlation_data"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        props.correlation_data = event.correlation;
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
+expect_text = '''the reply lost the correlation data'''
+guard       = "reply_correlation"
+
+# A reply goes to the command's response topic.
+[[control]]
+name        = "a_reply_goes_to_the_event_lane"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''event.topic.unwrap_or_else(|| topics.event())'''
+replacement = '''topics.event()'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
+expect_text = '''no reply on the response topic'''
+guard       = "reply_response_topic"
+
+# The standard `refresh` command reads the device.
+[[control]]
+name        = "refresh_is_unknown"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        "refresh" => {'''
+replacement = '''        "refresh-disabled" => {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "refresh_reads_the_device_and_assume_sets_the_assumed_state_without_it", "--exact"]
+expect_text = '''refresh did not publish what it read'''
+guard       = "refresh"
+
+# The standard `assume` command sets the assumed state.
+[[control]]
+name        = "assume_is_not_assumed"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''shared.reports.state(t, call.params.clone(), true);'''
+replacement = '''shared.reports.state(t, call.params.clone(), false);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "refresh_reads_the_device_and_assume_sets_the_assumed_state_without_it", "--exact"]
+expect_text = '''assume did not set the assumed state'''
+guard       = "assume"
+
+# The bounded shutdown says Active=false (a clean DISCONNECT fires no last will) and DISCONNECTs.
+[[control]]
+name        = "no_active_false_at_shutdown"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    if shared.outage.down() {
+'''
+replacement = '''    if true {
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_stops_the_bridge_cleanly", "--exact"]
+expect_text = '''the bridge did not say Active=false on its way out'''
+guard       = "shutdown_flush"
+
+# A request's deadline is its MQTT v5 message expiry.
+[[control]]
+name        = "the_expiry_is_not_read"
+file        = "mqtt-bridge-kit/src/wire.rs"
+anchor      = '''    let deadline = properties.and_then(|p| p.message_expiry_interval).map(|s| now + Duration::from_secs(u64::from(s)));
+'''
+replacement = '''    let deadline: Option<Instant> = None;
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_held_past_its_expiry_is_never_applied", "--exact"]
+expect_text = '''a request was applied after its expiry'''
+guard       = "deadline_from_expiry"
+
+# The conflict rule comes from the user property `conflict`.
+[[control]]
+name        = "the_conflict_property_is_not_read"
+file        = "mqtt-bridge-kit/src/wire.rs"
+anchor      = '''    let conflict = match properties.and_then(|p| p.user_properties.iter().find(|(k, _)| k == "conflict")) {'''
+replacement = '''    let conflict = match None::<&(String, String)> {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_request_wins", "--exact"]
+expect_text = '''the request did not win'''
+guard       = "conflict_user_property"
+
+# Every payload is checked against its lane's JSON Schema.
+[[control]]
+name        = "an_error_breaks_its_schema"
+file        = "mqtt-bridge-kit/src/wire.rs"
+anchor      = '''let mut document = json!({ "error": self.error, "reason": self.reason.as_str() });'''
+replacement = '''let mut document = json!({ "error": self.error, "reason": self.reason.as_str(), "extra": 1 });'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_momentary_command_while_the_device_is_down_is_refused_and_never_executed", "--exact"]
+expect_text = '''does not conform to its lane's schema'''
+guard       = "lane_schemas"
+
+# A held value is dropped at its deadline.
+[[control]]
+name        = "held_values_are_kept_past_their_deadline"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''        values.retain(|v| !v.expired(now));
+'''
+replacement = '''        values.retain(|_| true);
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_held_past_its_expiry_is_never_applied", "--exact"]
+expect_text = '''a request was applied after its expiry'''
+guard       = "held_dropped_at_deadline"
+
+# The owner's device-down policy: state requests are held for the device's return.
+[[control]]
+name        = "state_is_not_held_while_down"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                _ => {
+                    let held = !inner.connected;
+                    inner.replace_state(value, held, held || replay);'''
+replacement = '''                _ if !inner.connected => Posted::Dropped,
+                _ => {
+                    let held = !inner.connected;
+                    inner.replace_state(value, held, held || replay);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_while_the_device_is_down_is_applied_on_recovery_within_its_expiry", "--exact"]
+expect_text = '''the held request was never applied'''
+guard       = "state_held_while_down"
+
+# The property copies of a target-level write are skipped.
+[[control]]
+name        = "property_copies_are_applied_again"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''Some((copy, until)) if copy == value.value && now < until => Posted::Skipped,'''
+replacement = '''Some((copy, until)) if false && copy == value.value && now < until => Posted::Skipped,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_level_write_reaches_apply_once_with_all_values", "--exact"]
+expect_text = '''the target write did not reach apply once with all its values'''
+guard       = "target_write_copies"
+
+# A target's waiting values are applied together.
+[[control]]
+name        = "a_targets_values_are_applied_one_by_one"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''Entry::State { value, held: h, .. } if value.target == target && *h == held => indices.push(i),'''
+replacement = '''Entry::State { value, held: h, .. } if i == first && value.target == target && *h == held => indices.push(i),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_level_write_reaches_apply_once_with_all_values", "--exact"]
+expect_text = '''the target write did not reach apply once with all its values'''
+guard       = "target_values_together"
+
+# A retraction removes the held request.
+[[control]]
+name        = "a_retraction_is_ignored"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''        inner.pending.retain(|e| !matches!(e, Entry::State { value, .. } if value.is_key(target, property)));
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_retraction_before_the_device_returns_is_never_applied", "--exact"]
+expect_text = '''a retracted request was applied'''
+guard       = "retraction"
+
+# A momentary command is refused while the device is down.
+[[control]]
+name        = "momentary_commands_wait_for_a_down_device"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''            let why = if !inner.connected {
+                Some(Refusal::DeviceDown)'''
+replacement = '''            let why = if false {
+                Some(Refusal::DeviceDown)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_momentary_command_while_the_device_is_down_is_refused_and_never_executed", "--exact"]
+expect_text = '''the command was not refused at once'''
+guard       = "momentary_refused_while_down"
+
+# Momentary commands waiting when the device goes down are refused (mqtt_ynca's purge).
+[[control]]
+name        = "waiting_momentary_commands_survive_a_disconnect"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                    Entry::Momentary { target, call, reply, .. } => {
+                        unanswered.push(Unanswered { target, command: call.command, momentary: true, replies: reply.into_iter().collect() })
+                    }'''
+replacement = '''                    Entry::Momentary { target, call, reply, deadline } => inner.pending.push_back(Entry::Momentary { target, call, reply, deadline }),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::momentary_commands_and_reads", "--exact"]
+expect_text = '''the waiting momentary commands were not refused'''
+guard       = "momentary_purged_at_disconnect"
+
+# The momentary FIFO's cap, 64.
+[[control]]
+name        = "no_momentary_cap"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''            } else if inner.momentary >= MOMENTARY_CAP {'''
+replacement = '''            } else if inner.momentary >= usize::MAX {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::momentary_commands_and_reads", "--exact"]
+expect_text = '''a momentary command past the cap was queued'''
+guard       = "momentary_cap"
+
+# Reads are dropped while the device is down.
+[[control]]
+name        = "reads_are_queued_while_down"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''            if !inner.connected {
+                Posted::Dropped
+            } else {'''
+replacement = '''            if false {
+                Posted::Dropped
+            } else {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_read_command_is_answered_while_up_and_dropped_while_down", "--exact"]
+expect_text = '''the read was not dropped at once'''
+guard       = "reads_dropped_while_down"
+
+# mqtt_lutron's F5: a write not proven by a later probe or read is held again when the link dies.
+[[control]]
+name        = "unproven_writes_are_not_held_again"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''            let mut again: Vec<StateValue> = inner.unproven.drain(..).map(|(v, _)| v).collect();
+'''
+replacement = '''            inner.unproven.clear();
+            let mut again: Vec<StateValue> = Vec::new();
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "unacknowledged_writes_are_held_again_when_the_link_dies_before_a_probe", "--exact"]
+expect_text = '''the unproven write was not held again'''
+guard       = "unproven_held_again"
+
+# A value in flight when the link dies is held again.
+[[control]]
+name        = "the_value_in_flight_is_lost_with_the_link"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''            again.append(&mut inner.in_flight);
+'''
+replacement = '''            inner.in_flight.clear();
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_call_that_never_returns_is_a_lost_link_within_its_deadline", "--exact"]
+expect_text = '''the request in the hanging call was lost'''
+guard       = "in_flight_held_again"
+
+# A successful probe or read proves every unproven write.
+[[control]]
+name        = "a_probe_proves_nothing"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''    pub fn proven(&self) {
+        self.locked().unproven.clear();
+    }'''
+replacement = '''    pub fn proven(&self) {}'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::unproven_writes_are_held_again_unless_a_newer_value_waits", "--exact"]
+expect_text = '''a proven write was held again'''
+guard       = "proof_clears_unproven"
+
+# A target's Config may override the feedback mode.
+[[control]]
+name        = "a_configs_feedback_is_ignored"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                Some(feedback) => inner.feedback.insert(target.to_owned(), feedback),'''
+replacement = '''                Some(_) => None,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_targets_config_is_configured_and_may_override_the_feedback", "--exact"]
+expect_text = '''the config's feedback did not apply'''
+guard       = "config_feedback_override"
+
+# A momentary command waiting past its message expiry is dropped.
+[[control]]
+name        = "a_momentary_command_past_its_deadline_runs"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                        if deadline.is_some_and(|d| now >= d) {'''
+replacement = '''                        if deadline.is_some_and(|_| false) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_momentary_command_past_its_deadline_is_dropped", "--exact"]
+expect_text = '''a momentary command past its deadline was run'''
+guard       = "momentary_deadline"
+
+# Nothing is logged under the mailbox's lock.
+[[control]]
+name        = "a_refusal_is_logged_under_the_mailbox_lock"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                Some(why) => (Posted::Refused(why), Some((why, inner.refuse(why)))),'''
+replacement = '''                Some(why) => {
+                    log_refusal(&call.command, target.as_deref(), why, true);
+                    (Posted::Refused(why), Some((why, inner.refuse(why))))
+                }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::nothing_is_logged_under_the_mailbox_lock", "--exact"]
+expect_text = '''the mailbox logged while holding its lock'''
+guard       = "no_logging_under_mailbox_lock"
+
+# Every driver call carries a deadline the runtime enforces: an overrun is a lost link, never a hang.
+[[control]]
+name        = "a_driver_call_is_not_bounded"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        done = tokio::time::timeout_at(deadline.into(), operation) => match done {'''
+replacement = '''        done = async { Ok::<_, ()>(operation.await) } => match done {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_call_that_never_returns_is_a_lost_link_within_its_deadline", "--exact"]
+expect_text = '''the hanging call never lost the link'''
+guard       = "op_deadline"
+
+# A helper's link_lost drops the link.
+[[control]]
+name        = "a_helpers_lost_link_goes_unseen"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                lost = handle.lost() => return lost,
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+expect_text = '''the outage was never seen'''
+guard       = "link_lost"
+
+# At most one connect per retry interval, after a lost link as after a failed connect.
+[[control]]
+name        = "reconnects_are_not_paced"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            if let Some(at) = self.last_attempt {
+                tokio::time::sleep_until((at + self.info.timing.retry).into()).await;
+            }
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_episode", "--exact"]
+expect_text = '''reconnects are not paced at the retry interval'''
+guard       = "paced_reconnects"
+
+# The fleet's F2: recovery on the device's first good answer, never on a bare connect.
+[[control]]
+name        = "recovery_is_declared_at_connect"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        let read = match self.prove(handle).await {
+'''
+replacement = '''        self.outage.recovered(0, 0, 0);
+        let read = match self.prove(handle).await {
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_episode", "--exact"]
+expect_text = '''the outage began more than once'''
+guard       = "device_proof_of_life"
+
+# Proving is not Up: Status says connected only once the device answered.
+[[control]]
+name        = "status_says_connected_before_proof"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        let read = match self.prove(handle).await {
+'''
+replacement = '''        self.reports.status(LinkStatus::Connected);
+        let read = match self.prove(handle).await {
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "status_says_connected_only_once_the_device_proved_alive", "--exact"]
+expect_text = '''Status said connected for a device that never proved itself alive'''
+guard       = "status_after_proof"
+
+# A device outage is one episode: one WARN `device_unreachable` past the threshold.
+[[control]]
+name        = "the_device_outage_warns_every_attempt"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        if !episode.warned && episode.since.elapsed() >= self.warn_after {'''
+replacement = '''        if episode.since.elapsed() >= self.warn_after {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_episode", "--exact"]
+expect_text = '''the outage past its threshold was not one WARN'''
+guard       = "device_outage_episode"
+
+# Status says unreachable when the link is lost.
+[[control]]
+name        = "the_outage_is_not_on_status"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        self.reports.status(LinkStatus::Unreachable);
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+expect_text = '''the outage was never seen'''
+guard       = "status_unreachable"
+
+# The outage conflict, DeviceWins.
+[[control]]
+name        = "device_wins_never_supersedes"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            Conflict::DeviceWins => Resolution::Superseded,'''
+replacement = '''            Conflict::DeviceWins => Resolution::Apply,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+expect_text = '''no Error said the request was superseded'''
+guard       = "conflict_device_wins"
+
+# The outage conflict, RequestWins.
+[[control]]
+name        = "request_wins_is_superseded"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            Conflict::RequestWins => Resolution::Apply,'''
+replacement = '''            Conflict::RequestWins => Resolution::Superseded,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_request_wins", "--exact"]
+expect_text = '''the request did not win'''
+guard       = "conflict_request_wins"
+
+# An unchanged property takes the request.
+[[control]]
+name        = "an_unchanged_value_counts_as_changed"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        Some(before) if before != current => match value.conflict {'''
+replacement = '''        Some(_) => match value.conflict {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+expect_text = '''the unchanged property's request was not applied'''
+guard       = "conflict_unchanged"
+
+# A device outage's before values are what the bridge knew when the link was lost.
+[[control]]
+name        = "no_before_values_after_a_device_outage"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            self.before = Some(self.reports.snapshot());
+'''
+replacement = '''            let _ = self.reports.snapshot();
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+expect_text = '''no Error said the request was superseded'''
+guard       = "conflict_before_in_memory"
+
+# Rejected: an Error naming the target and property; the link stays up.
+[[control]]
+name        = "a_rejection_drops_the_link"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            Err(OpError::Link(e)) => Err(e),
+            Err(failure) => {
+                self.mailbox.failed();
+                let properties'''
+replacement = '''            Err(OpError::Link(e)) => Err(e),
+            Err(OpError::Rejected(m)) => Err(LinkError::new(m)),
+            Err(failure) => {
+                self.mailbox.failed();
+                let properties'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_is_reported_and_the_link_stays_up", "--exact"]
+expect_text = '''the rejection got no Error'''
+guard       = "rejected"
+
+# Unusable: an Error once, passed over, never a reconnect for it (no-hang 3b's hot loop).
+[[control]]
+name        = "an_unusable_answer_drops_the_link"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            Err(OpError::Link(e)) => Err(e),
+            Err(failure) => {
+                self.mailbox.failed();
+                let properties'''
+replacement = '''            Err(OpError::Link(e)) => Err(e),
+            Err(OpError::Unusable(m)) => Err(LinkError::new(m)),
+            Err(failure) => {
+                self.mailbox.failed();
+                let properties'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unusable_answer_is_reported_once_and_passed_over", "--exact"]
+expect_text = '''the unusable answer got no Error'''
+guard       = "unusable"
+
+# A rejection is one WARN `command_rejected`.
+[[control]]
+name        = "a_rejection_is_no_warn"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''warn!(kind = "command_rejected", target, ?properties, error = message, "The device rejected a request")'''
+replacement = '''info!(kind = "command_rejected", target, ?properties, error = message, "The device rejected a request")'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_is_reported_and_the_link_stays_up", "--exact"]
+expect_text = '''not one WARN `command_rejected`'''
+guard       = "rejected_warn"
+
+# An unacknowledged write is probed once nothing else waits, or every 2 s while busy.
+[[control]]
+name        = "unproven_writes_are_not_probed"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            Some(_) if !self.mailbox.waiting() => Instant::now(),
+            Some(since) => since + BUSY_PROBE.min(self.info.timing.probe_interval),
+'''
+replacement = '''            Some(_) => last_heard + self.info.timing.probe_interval,
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "unacknowledged_writes_are_held_again_when_the_link_dies_before_a_probe", "--exact"]
+expect_text = '''the write was never probed'''
+guard       = "probe_unproven"
+
+# Assumed feedback publishes applied values as State marked assumed.
+[[control]]
+name        = "assumed_feedback_publishes_nothing"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                    self.reports.state(target, map, true);
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "assumed_feedback_publishes_applied_values_as_assumed_state", "--exact"]
+expect_text = '''the applied value was not published as assumed state'''
+guard       = "assumed_feedback"
+
+# A Config intent reaches configure.
+[[control]]
+name        = "a_config_never_reaches_the_driver"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            Work::Configure { target, config } => self.configure(handle, &target, config).await,'''
+replacement = '''            Work::Configure { .. } => Ok(()),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_targets_config_is_configured_and_may_override_the_feedback", "--exact"]
+expect_text = '''the config never reached the driver'''
+guard       = "configure"
+
+# mqtt_ac re-review C1: the device side never waits on MQTT.
+[[control]]
+name        = "reports_wait_for_the_session"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''        if changed {
+            self.ready.notify_one();
+        }
+    }
+
+    /// A target's observed (or assumed) values, merged into its state. Never waits.'''
+replacement = '''        if changed {
+            self.ready.notify_one();
+            while self.locked().status_changed {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// A target's observed (or assumed) values, merged into its state. Never waits.'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
+expect_text = '''with the broker stalled the device worker did not apply the held request'''
+guard       = "reports_never_wait"
+
+# Error and Event are capped queues (64), the oldest displaced, one WARN per episode.
+[[control]]
+name        = "error_reports_are_not_capped"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''        self.items.pop_front();
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::messages_past_the_cap_displace_the_oldest_said_once_per_episode", "--exact"]
+expect_text = '''right: 64'''
+guard       = "error_queue_capped"
+
+# Nothing is logged under the reports' lock.
+[[control]]
+name        = "a_displacement_is_logged_under_the_reports_lock"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''        let began = self.locked().errors.push(report);
+'''
+replacement = '''        let began = {
+            let mut state = self.locked();
+            let began = state.errors.push(report);
+            if began {
+                warn!(kind = "error_report_dropped", "under the lock");
+            }
+            began
+        };
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::nothing_is_logged_under_the_reports_lock", "--exact"]
+expect_text = '''the reports logged while holding their lock'''
+guard       = "no_logging_under_reports_lock"
+
+# A driver's event reaches the Event lane.
+[[control]]
+name        = "events_are_dropped"
+file        = "mqtt-bridge-kit/src/link.rs"
+anchor      = '''        self.reports.event(Outbound { topic: None, payload: event.to_string().into_bytes(), correlation: None });
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_drivers_event_reaches_the_event_lane", "--exact"]
+expect_text = '''the event never reached the Event lane'''
+guard       = "event_lane"
+
+# ctx.blocking runs under the current deadline; an overrun abandons the thread and loses the link.
+[[control]]
+name        = "a_blocking_call_is_not_bounded"
+file        = "mqtt-bridge-kit/src/link.rs"
+anchor      = '''            Some(deadline) => tokio::time::timeout_at(deadline.into(), &mut rx).await,'''
+replacement = '''            Some(_) => Ok::<_, tokio::time::error::Elapsed>((&mut rx).await),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_blocking_call_past_its_deadline_is_abandoned_and_the_link_lost", "--exact"]
+expect_text = '''the blocking call was not bounded by its deadline'''
+guard       = "blocking_bounded"
+
+# Abandoned blocking threads are capped in number.
+[[control]]
+name        = "abandoned_blocking_calls_are_not_capped"
+file        = "mqtt-bridge-kit/src/link.rs"
+anchor      = '''        if abandoned.running.load(Ordering::SeqCst) >= ABANDONED_CAP {'''
+replacement = '''        if false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::abandoned_blocking_calls_are_capped", "--exact"]
+expect_text = '''a blocking call past the cap was run'''
+guard       = "blocking_cap"
+
+# ctx.spawn's helpers are cancelled when the link drops.
+[[control]]
+name        = "helpers_outlive_their_link"
+file        = "mqtt-bridge-kit/src/link.rs"
+anchor      = '''        self.helpers.spawn(task.in_current_span());'''
+replacement = '''        tokio::spawn(task.in_current_span());'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::dropping_the_context_cancels_its_helpers", "--exact"]
+expect_text = '''the helper outlived its link'''
+guard       = "helpers_cancelled"
+
+# The fleet's F3: SIGINT and SIGTERM are taken first thing.
+[[control]]
+name        = "the_signals_are_taken_after_the_logging_start"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        let mut signals = StopSignals::register();
+        let app = self.app();
+        let log_config = self.settings.log_config.clone();
+        let starting = tokio::task::spawn_blocking(move || crate::logging::start(&app, log_config.as_deref()));
+        let logging = match &mut signals {
+            Ok(signals) => {
+                // WAIT: logging-start
+                tokio::select! {
+                    started = starting => started,
+                    _ = signals.next() => {
+                        // Stopped before there is a log to say so in.
+                        return ExitCode::SUCCESS;
+                    }
+                }
+            }
+            Err(_) => {
+                // WAIT: logging-start
+                starting.await
+            }
+        };'''
+replacement = '''        let app = self.app();
+        let log_config = self.settings.log_config.clone();
+        let starting = tokio::task::spawn_blocking(move || crate::logging::start(&app, log_config.as_deref()));
+        let logging = starting.await;
+        let signals = StopSignals::register();'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
+expect_text = '''did not stop cleanly within its bound on SIGTERM while its logging start was held'''
+guard       = "signals_first"
+
+# The logging start, on a blocking thread, is raced against the stop.
+[[control]]
+name        = "the_logging_start_is_not_raced"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''                tokio::select! {
+                    started = starting => started,
+                    _ = signals.next() => {
+                        // Stopped before there is a log to say so in.
+                        return ExitCode::SUCCESS;
+                    }
+                }'''
+replacement = '''                starting.await'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
+expect_text = '''did not stop cleanly within its bound on SIGTERM while its logging start was held'''
+guard       = "logging_start_raced"
+
+# The fleet's F1: the explicit runtime ends with shutdown_timeout; dropped, it waits for the held thread.
+[[control]]
+name        = "the_runtime_is_dropped"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        runtime.shutdown_timeout(RUNTIME_GRACE);
+'''
+replacement = '''        drop(runtime);
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
+expect_text = '''did not stop cleanly within its bound on SIGTERM while its logging start was held'''
+guard       = "runtime_shutdown_timeout"
+
+# No blocking prints on a lifecycle path (no-hang 3b round 3).
+[[control]]
+name        = "a_blocking_print_on_the_start"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        if let Some(guard) = &_logging {
+            info!(logging = %guard, "Logging started");
+        }'''
+replacement = '''        if let Some(guard) = &_logging {
+            info!(logging = %guard, "Logging started");
+        }
+        println!("{}", "x".repeat(1 << 20));'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_stdout_and_stderr_nobody_reads_hold_neither_the_start_nor_the_stop", "--exact"]
+expect_text = '''the bridge never announced itself: its start waited on a stdout or stderr nobody reads'''
+guard       = "no_blocking_prints"
+
+# A shutdown past its bound is cut short with one WARN `shutdown_timeout`.
+[[control]]
+name        = "a_slow_shutdown_is_no_warn"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        warn!(
+            kind = "shutdown_timeout",'''
+replacement = '''        tracing::info!(
+            kind = "shutdown_timeout",'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "process::tests::a_shutdown_past_its_bound_is_cut_short_with_one_warn", "--exact"]
+expect_text = '''the cut-short shutdown was not one WARN'''
+guard       = "shutdown_timeout"
+
+# A part of the bridge that ends is seen (ERROR `worker_died`, a failure status).
+[[control]]
+name        = "a_dead_device_worker_goes_unseen"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''                    Some(worker) => worker.await,'''
+replacement = '''                    Some(_) => std::future::pending::<Result<WorkerEnd, oneshot::error::RecvError>>().await,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_panic_ends_the_device_worker", "--exact"]
+expect_text = '''the driver's panic went unseen'''
+guard       = "worker_died"
+
+# FakeBroker replays retained messages on a matching subscription.
+[[control]]
+name        = "the_fake_broker_replays_nothing"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''            for f in &s.filters {
+                replay(shared, tx, &f.path);
+            }
+        }
+        v5::Packet::Unsubscribe(u) => {'''
+replacement = '''        }
+        v5::Packet::Unsubscribe(u) => {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "tests::retained_messages_are_replayed_on_subscription_with_their_remaining_expiry", "--exact"]
+expect_text = '''a publish within the bound'''
+guard       = "fake_broker_replay"
+
+# FakeBroker stops listening past its cap.
+[[control]]
+name        = "the_fake_broker_listens_past_its_cap"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''        if accepted > shared.cap.load(Ordering::SeqCst) {'''
+replacement = '''        if accepted > usize::MAX - 1 {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "tests::the_broker_stops_listening_past_its_cap", "--exact"]
+expect_text = '''the extra connection is closed'''
+guard       = "fake_broker_cap"
+
+# FakeBroker records rumqttc's short DISCONNECT.
+[[control]]
+name        = "the_fake_broker_misses_a_short_disconnect"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''    if buf.starts_with(&[0xE0, 0x00]) {'''
+replacement = '''    if buf.starts_with(&[0xFF, 0xFF]) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "tests::a_clients_disconnect_is_recorded", "--exact"]
+expect_text = '''the client's DISCONNECT was not recorded'''
+guard       = "fake_broker_disconnect"

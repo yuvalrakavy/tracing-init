@@ -195,9 +195,10 @@ enum Step {
 /// `Active=true`, the version, and the whole retained model.
 async fn connected(shared: &Shared, client: &AsyncClient) -> Result<(), Failed> {
     let topics = &shared.topics;
-    if !shared.read_back_requested.swap(true, Ordering::SeqCst) {
+    if !shared.read_back_requested.load(Ordering::SeqCst) {
         // WAIT: mqtt-request
         client.subscribe(topics.state_filter(), QoS::AtLeastOnce).await?;
+        shared.read_back_requested.store(true, Ordering::SeqCst);
     }
     for filter in [topics.desired_filter(), topics.command(), topics.config_filter()] {
         // WAIT: mqtt-request

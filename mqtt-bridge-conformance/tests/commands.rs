@@ -85,7 +85,10 @@ async fn a_read_command_is_answered_while_up_and_dropped_while_down() {
     let executed = h.device.calls_of(Op::Execute).len();
     assert!(h.command(json!({"target": "t1", "command": "status"}), Some(("Store/r", b"2"))));
     assert!(h.eventually(BOUND, |h| h.published("Store/r").len() == 2).await, "the dropped read was not answered");
-    assert_eq!(json_of(&h.published("Store/r")[1])["reason"], "refused");
+    let dropped = json_of(&h.published("Store/r")[1]);
+    assert_eq!(dropped["reason"], "refused");
+    // Dropped as it came, not queued and dropped by the next failed connect.
+    assert_eq!(dropped["error"], "the device is not connected", "the read was not dropped at once: {dropped}");
     h.device.set_up(true);
     assert!(connected(&h).await);
     h.settle(Duration::from_millis(400)).await;

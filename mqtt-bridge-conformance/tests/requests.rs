@@ -71,6 +71,8 @@ async fn a_momentary_command_while_the_device_is_down_is_refused_and_never_execu
     assert!(h.eventually(BOUND, |h| !h.errors_for("refused").is_empty()).await, "the refused command got no Error: {:?}", h.errors());
     let refused = &h.errors_for("refused")[0];
     assert_eq!((refused["target"].as_str(), refused["command"].as_str()), (Some("t1"), Some("pulse")));
+    // Refused as it came, not queued and refused by the next failed connect.
+    assert_eq!(refused["error"], "the device is not connected", "the command was not refused at once: {refused}");
     assert_eq!(h.log.of_kind("command_refused").len(), 1);
     h.device.set_up(true);
     assert!(connected(&h).await);
@@ -155,6 +157,10 @@ async fn the_outage_conflict_after_a_bridge_restart_uses_the_read_back() {
         // Changed at the device while the bridge was away: temp only.
         device.set("t1", "temp", json!(18));
         device.set("t1", "power", json!(false));
+        // The conflict check's read of t1 is slow: by the time it decides, the bridge's own state
+        // (published after its CONNACK, temp 18) has come back from the broker, unflagged — and
+        // must not have been taken for the read-back.
+        device.answer(Op::Read, Some("t1"), Answer::Delay(Duration::from_millis(400)));
     })
     .await;
     assert!(
@@ -163,11 +169,9 @@ async fn the_outage_conflict_after_a_bridge_restart_uses_the_read_back() {
     );
     assert!(
         h.eventually(BOUND, |h| !h.errors_for("superseded").is_empty()).await,
-        "no Error said the request was superseded: {:?}; the calls: {:#?}; the log: {:#?}; the broker: {:#?}",
+        "no Error said the request was superseded: {:?}; the calls: {:?}",
         h.errors(),
-        h.device.calls(),
-        h.log.records(),
-        h.broker.events()
+        h.device.calls().iter().map(|c| format!("{:?} {:?} {:?}", c.op, c.target, c.values)).collect::<Vec<_>>()
     );
     assert_eq!(h.device.get("t1", "temp"), Some(json!(18)), "a change made while the bridge was away was reverted");
     assert!(h.stop().await);
@@ -182,7 +186,11 @@ async fn a_target_level_write_reaches_apply_once_with_all_values() {
     assert!(h.desire_many("t1", json!({"power": true, "temp": 22}), Req { expiry: Some(60), conflict: Some("DeviceWins") }));
     assert!(h.eventually(BOUND, |h| !h.device.applies().is_empty()).await, "the target write was never applied");
     h.settle(SETTLE).await;
-    assert_eq!(h.device.applies(), vec![("t1".to_owned(), values(&[("power", json!(true)), ("temp", json!(22))]))]);
+    assert_eq!(
+        h.device.applies(),
+        vec![("t1".to_owned(), values(&[("power", json!(true)), ("temp", json!(22))]))],
+        "the target write did not reach apply once with all its values"
+    );
     assert!(h.stop().await);
 }
 

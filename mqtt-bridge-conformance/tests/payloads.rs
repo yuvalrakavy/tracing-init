@@ -26,9 +26,13 @@ async fn malformed_desired_and_command_payloads_are_answered_on_error() {
     // A conflict rule that names neither side is malformed too.
     let bad_conflict = SendOptions::default().user_property("conflict", "Whoever");
     assert!(h.broker.send_with(&t.desired("t1", "temp"), "22", &bad_conflict));
+    // A target-level write or a command the broker replays as retained was left there by mistake:
+    // replayed at every restart, it would act again each time.
+    assert!(h.broker.send_with(&t.desired_target("t1"), r#"{"temp": 30}"#, &SendOptions::default().retained()));
+    assert!(h.broker.send_with(&t.command(), r#"{"target": "t1", "command": "pulse"}"#, &SendOptions::default().retained()));
     // An unknown command is unsupported.
     assert!(h.command(json!({"target": "t1", "command": "dance"}), None));
-    let expected = malformed.len() + 1;
+    let expected = malformed.len() + 3;
     assert!(
         h.eventually(BOUND, |h| h.errors_for("malformed").len() == expected).await,
         "not every malformed payload was answered on Error: {:#?}",
@@ -43,6 +47,7 @@ async fn malformed_desired_and_command_payloads_are_answered_on_error() {
     );
     assert_eq!(h.log.of_kind("validation_rejected").len(), expected, "{:#?}", h.log.records());
     assert!(h.device.applies().is_empty(), "a malformed request was applied");
+    assert!(h.device.calls_of(Op::Execute).is_empty(), "a malformed command was executed");
     // The bridge goes on.
     assert!(h.desire("t1", "temp", json!(22), Req::default()));
     assert!(

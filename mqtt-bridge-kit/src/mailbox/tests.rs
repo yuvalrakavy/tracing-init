@@ -186,7 +186,11 @@ fn momentary_commands_and_reads() {
     for _ in 0..MOMENTARY_CAP {
         assert_eq!(mailbox.post_command(None, call("pulse"), None, None), Posted::Queued);
     }
-    assert_eq!(mailbox.post_command(None, call("pulse"), None, None), Posted::Refused(Refusal::QueueFull));
+    assert_eq!(
+        mailbox.post_command(None, call("pulse"), None, None),
+        Posted::Refused(Refusal::QueueFull),
+        "a momentary command past the cap was queued"
+    );
     let reply = ReplyTo { topic: "R/Event/i".into(), correlation: None };
     assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, Some(reply.clone())), Posted::Queued);
     assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, Some(reply.clone())), Posted::Queued);
@@ -198,6 +202,22 @@ fn momentary_commands_and_reads() {
     assert!(mailbox.try_take().is_none(), "a momentary command or read survived the disconnect");
     assert_eq!(mailbox.post_command(None, call("pulse"), None, None), Posted::Refused(Refusal::DeviceDown));
     assert_eq!(mailbox.connected(), MOMENTARY_CAP as u32 + 1, "the refusals of the outage were not counted");
+}
+
+/// A momentary command still waiting at its deadline (its message expiry) is dropped, not run.
+#[test]
+fn a_momentary_command_past_its_deadline_is_dropped() {
+    let mailbox = up();
+    mailbox.post_command(None, call("late"), None, Some(Instant::now() - Duration::from_millis(1)));
+    mailbox.post_command(None, call("timely"), None, Some(Instant::now() + Duration::from_secs(60)));
+    let commands: Vec<String> = drain(&mailbox)
+        .into_iter()
+        .filter_map(|w| match w {
+            Work::Execute { call, .. } => Some(call.command),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(commands, ["timely"], "a momentary command past its deadline was run");
 }
 
 /// A write to an unacknowledged device stays unproven until a later probe or read; if the link
