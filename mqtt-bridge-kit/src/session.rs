@@ -204,12 +204,13 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                 // The next subscription's SUBACK, behind the read-back's replay.
                 shared.reports.read_back_complete();
             } else if shared.read_back_late.load(Ordering::SeqCst) == u32::from(*pkid) + 1 {
-                // The read-back's SUBACK, past its wait: its replay follows, and no SUBACK comes
-                // behind it; a restore waits for the replays to go quiet.
+                // The read-back's SUBACK, past its wait: its replay follows it, and the SUBACKs of
+                // the subscriptions made after it — sent after it, answered in order — come behind
+                // the replay; the next completes the read-back.
                 shared.read_back_late.store(0, Ordering::SeqCst);
                 if *granted {
-                    info!("The read-back's SUBACK came late; the read-back is complete");
-                    shared.reports.read_back_complete();
+                    info!("The read-back's SUBACK came late; the read-back completes behind its replay");
+                    shared.read_back_next.store(true, Ordering::SeqCst);
                 }
             }
         }

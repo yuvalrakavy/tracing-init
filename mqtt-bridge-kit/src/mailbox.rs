@@ -309,6 +309,9 @@ struct Inner {
     /// later snapshot that holds the change at the device (re-gate R12). Dropped when the Store
     /// retracts the key or writes it live, or a replay of another value replaces it.
     bases: HashMap<(String, String), (Value, Basis)>,
+    /// When a retained request last arrived — a config, or a replayed value: a restore waits for
+    /// them to go quiet.
+    last_retained: Option<Instant>,
 }
 
 impl Inner {
@@ -420,6 +423,7 @@ impl Mailbox {
                     let held = !inner.connected;
                     value.check = Check { replayed: replay, held };
                     if replay {
+                        inner.last_retained = Some(now);
                         match inner.bases.get(&key) {
                             Some((first, basis)) if *first == value.value => value.basis = Some(basis.clone()),
                             _ => {
@@ -481,6 +485,7 @@ impl Mailbox {
     pub fn post_config(&self, target: &str, config: Option<Value>) -> Posted {
         let posted = {
             let mut inner = self.locked();
+            inner.last_retained = Some(Instant::now());
             inner.pending.retain(|e| !matches!(e, Entry::Config { target: t, .. } if t == target));
             let held = !inner.connected;
             inner.pending.push_back(Entry::Config { target: target.to_owned(), config, held });
@@ -802,6 +807,30 @@ impl Mailbox {
             }
             _ => None,
         }
+    }
+
+    /// The next config waiting, held or not. Never waits.
+    pub fn take_config(&self) -> Option<(String, Option<Value>)> {
+        let mut inner = self.locked();
+        let i = inner.pending.iter().position(|e| matches!(e, Entry::Config { .. }))?;
+        match inner.pending.remove(i) {
+            Some(Entry::Config { target, config, .. }) => {
+                inner.in_flight_config = Some((target.clone(), config.clone()));
+                Some((target, config))
+            }
+            _ => None,
+        }
+    }
+
+    /// A restore's values go to the device: in flight, as a request's, so that their outcome and
+    /// proof are accounted the same way (re-gate R7). Never waits.
+    pub fn begin_restore(&self, values: Vec<StateValue>) {
+        self.locked().in_flight = values;
+    }
+
+    /// How long since a retained request last arrived; `None`, none has. Never waits.
+    pub fn quiet_for(&self) -> Option<Duration> {
+        self.locked().last_retained.map(|at| at.elapsed())
     }
 
     /// Whether a value for `target` and `property` waits — one past its deadline will be dropped,

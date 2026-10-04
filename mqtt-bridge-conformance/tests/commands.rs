@@ -433,3 +433,140 @@ async fn a_read_command_that_expires_while_queued_is_refused_not_executed() {
     assert!(h.errors_for("refused").iter().any(|e| e["command"] == "status"), "the expiry was not on Error: {:?}", h.errors());
     assert!(h.stop().await);
 }
+
+fn restoring(writes: Writes) -> mqtt_bridge_kit::DriverInfo {
+    mqtt_bridge_kit::DriverInfo { restore: true, ..info(writes, Feedback::Assumed) }
+}
+
+/// A restore waits for the read-back however late the broker comes — after a power cut the device's
+/// interface is up at once and the broker's host boots later — and is never given up silently (the
+/// R1 re-gate's R11, its RG2: past 10 s the restore ran on an empty read-back and was done for good).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_waits_for_a_broker_that_comes_up_after_the_device() {
+    let h = Harness::start_unwaited("restore-late", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.cap_connections(10_000);
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        broker.refuse_connections(true);
+        device.answer(Op::Read, None, Answer::Unsupported);
+    })
+    .await;
+    // The device is up at once; the broker, for 11 s, is not (past the old 10 s bound).
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    h.broker.refuse_connections(false);
+    assert!(h.broker.wait_for_subscription(&h.topics.command(), BOUND).await, "the bridge never subscribed");
+    assert!(
+        h.eventually(Duration::from_secs(5), |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
+        "the one-way target was never restored once the read-back came: {:?}",
+        h.device.applies()
+    );
+    assert_eq!(h.device.applies().len(), 1, "restored more than once: {:?}", h.device.applies());
+    assert!(
+        h.log.of_kind("restore_incomplete").is_empty(),
+        "a restore ran before its read-back was done: {:#?}",
+        h.log.of_kind("restore_incomplete")
+    );
+    assert!(h.stop().await);
+}
+
+/// A restore that had to run on an incomplete read-back — its SUBACK late past the 5 s wait — says
+/// so once, and is done again from the rest when the late SUBACK brings it (the R1 re-gate's R11:
+/// never given up silently, and due again when the read-back arrives later).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_on_an_incomplete_read_back_is_done_again_when_it_completes() {
+    let h = Harness::start_unwaited("restore-again", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        broker.hold_subacks();
+        device.answer(Op::Read, None, Answer::Unsupported);
+    })
+    .await;
+    assert!(
+        h.eventually(Duration::from_secs(8), |h| !h.log.of_kind("restore_incomplete").is_empty()).await,
+        "a restore on an incomplete read-back was not said: {:#?}",
+        h.log.records()
+    );
+    assert!(h.device.applies().is_empty(), "restored from a read-back that had not come: {:?}", h.device.applies());
+    h.broker.release_subacks();
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
+        "the restore was not done again when the read-back completed: {:?}",
+        h.device.calls()
+    );
+    assert_eq!(h.log.of_kind("restore_incomplete").len(), 1, "the incomplete restore was said more than once");
+    assert!(h.stop().await);
+}
+
+/// A restore follows the target's retained Config — configured first — and leaves a property a
+/// newer retained request waits for to that request: the restore waits for the replays to go quiet,
+/// not merely for a SUBACK (the R1 re-gate's R5 and Claude's minor 9).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_follows_the_targets_config_and_yields_to_a_newer_request() {
+    let h = Harness::start_with("restore-config", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "color": 3, "assumed": true}).to_string(), &SendOptions::default());
+        broker.retain(&topics.config("dimmer"), json!({"channel": 7}).to_string(), &SendOptions::default());
+        broker.retain(
+            &topics.desired("dimmer", "level"),
+            "70",
+            &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"),
+        );
+        device.answer(Op::Read, None, Answer::Unsupported);
+    })
+    .await;
+    assert!(connected(&h).await);
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("dimmer", "level") == Some(json!(70)) && h.device.get("dimmer", "color") == Some(json!(3)))
+            .await,
+        "the restore or the newer request did not reach the device: {:?}",
+        h.device.calls()
+    );
+    h.settle(Duration::from_millis(300)).await;
+    let ops: Vec<Op> = h.device.calls().iter().filter(|c| c.target.as_deref() == Some("dimmer")).map(|c| c.op).collect();
+    assert_eq!(ops.first(), Some(&Op::Configure), "the target was written before its config: {ops:?}");
+    let levels: Vec<Value> = h.device.applies().iter().filter_map(|(_, v)| v.get("level").cloned()).collect();
+    assert_eq!(levels, [json!(70)], "the restore wrote a level a newer request waited for: {:?}", h.device.applies());
+    assert!(h.stop().await);
+}
+
+/// A restore's apply that the device refuses in part keeps what it wrote — assumed, as any write's —
+/// and says the refused property, a WARN, not an `Error` for a request nobody made (the R1
+/// re-gate's R7: the whole target was taken for refused).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_refused_in_part_keeps_what_it_wrote() {
+    let h = Harness::start_with("restore-partial", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "color": 3, "assumed": true}).to_string(), &SendOptions::default());
+        device.answer(Op::Read, None, Answer::Unsupported);
+        device.answer_times(Op::Apply, None, Answer::RefuseProperty("color"), 1);
+    })
+    .await;
+    assert!(connected(&h).await);
+    assert!(h.eventually(BOUND, |h| h.device.get("dimmer", "level") == Some(json!(40))).await, "the restore did not write the level");
+    assert!(
+        h.eventually(BOUND, |h| h.log.of_kind("command_rejected").iter().any(|r| r.field("property") == Some("color"))).await,
+        "the refused property of the restore was not said: {:#?}",
+        h.log.records()
+    );
+    assert!(h.errors().is_empty(), "a restore's refusal went to Error, for a request nobody made: {:?}", h.errors());
+    assert!(h.stop().await);
+}
+
+/// A restore to a device with unacknowledged writes is held to proof like any write: when the link
+/// dies before a probe proves it, it is applied again on the next link (the R1 re-gate's R7: its
+/// writes were never unproven, and a lost link lost them).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unproven_restore_is_applied_again_when_the_link_dies_before_proof() {
+    let h = Harness::start_with("restore-unproven", restoring(Writes::Unacknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        device.set("dimmer", "level", json!(0));
+        // The restore's write is lost on the way, and the probe after it loses the link.
+        device.answer_times(Op::Apply, None, Answer::Unheard, 1);
+        device.answer_times(Op::Probe, None, Answer::Link, 1);
+    })
+    .await;
+    assert!(h.eventually(BOUND, |h| !h.device.applies().is_empty()).await, "the restore was never written");
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Disconnect).is_empty()).await, "the failed probe never lost the link");
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
+        "the restore the deaf device never took was not applied again: {:?}",
+        h.device.calls()
+    );
+    assert!(h.stop().await);
+}

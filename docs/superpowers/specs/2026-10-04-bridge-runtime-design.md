@@ -131,11 +131,19 @@ capped queue whose overflow is counted and logged once per episode.
   driver) are standard and handled by the runtime.
 - **`timing`:** defaults for connect, operation, retry pacing, the outage WARN threshold (30 s), the poll
   interval, and the probe interval and deadline. Each can be overridden on the command line.
-- **`restore`** (default off; `--restore on|off` overrides it, `Bridge::restore` in code): at the
-  process's first connect, each target with assumed feedback gets the read-back's values — what the
-  previous run said it had set — after the held configs, before any held value, once the read-back
-  is in (at most 10 s). For a one-way device that comes back dark (DMX). A property a newer request
-  waits for is left to that request.
+- **`restore`** (default off; `--restore on|off` overrides it, `Bridge::restore` in code): each
+  target with assumed feedback gets the read-back's values — what the previous run said it had set
+  — once the read-back is in, however late the broker comes (a power cut: the device's interface
+  is up at once, the broker's host boots later), and the retained replays have gone quiet for
+  300 ms (at most 3 s): a SUBACK is no proof the retained configs and requests were handled. Every
+  config waiting goes first, and a property a request wrote since the start, or still waits for,
+  is left to that request. At the first catch-up if the read-back is already in, before any held
+  value; else in the Up loop, when it is. Its writes are a request's — their outcome (`Partial`
+  included), their assumption, and their proof for unacknowledged writes — but a refusal is a WARN
+  `command_rejected`, never an `Error`: no request was made. On an incomplete read-back (no SUBACK
+  in time, or refused) it restores what came, says so once (WARN `restore_incomplete`), and is done
+  again from the rest if a late SUBACK brings it (re-gate R5, R7, R11). For a one-way device that
+  comes back dark (DMX).
 
 ## 5. What the runtime owns
 
@@ -260,7 +268,9 @@ commands are refused, and reads are dropped.
   - the runtime also emits `startup_failed` and `bridge_shutdown_cut`;
   - `panic` (ERROR), from the panic hook: `thread`, `location`, `payload`;
   - `read_back_incomplete` (WARN): the read-back's SUBACK did not come within 5 s, or refused the
-    subscription (an ACL; `refused`); the requests were subscribed without it.
+    subscription (an ACL; `refused`); the requests were subscribed without it;
+  - `restore_incomplete` (WARN): a restore ran on an incomplete read-back, once; it is done again
+    from the rest if the read-back completes.
 
 ### 5.2 Bounds and repairs from the R1 gate (2026-10-04)
 

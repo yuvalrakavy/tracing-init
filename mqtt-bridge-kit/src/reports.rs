@@ -583,6 +583,22 @@ impl Reports {
         }
     }
 
+    /// Wait until the read-back is done — or, with `complete`, complete. Cancellation-safe.
+    pub async fn read_back_reached(&self, complete: bool) {
+        let level = if complete { 2 } else { 1 };
+        loop {
+            // WAIT: read-back-ready
+            let notified = self.read_back_in.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.read_back_done.load(std::sync::atomic::Ordering::SeqCst) >= level {
+                return;
+            }
+            // WAIT: read-back-ready
+            notified.await;
+        }
+    }
+
     /// Whether the read-back is complete (not merely done).
     pub fn read_back_is_complete(&self) -> bool {
         self.read_back_done.load(std::sync::atomic::Ordering::SeqCst) >= 2

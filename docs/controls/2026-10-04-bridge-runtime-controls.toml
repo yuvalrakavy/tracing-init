@@ -1540,9 +1540,9 @@ guard       = "config_first_up"
 [[control]]
 name        = "a_configs_feedback_takes_effect_at_the_post"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''            let mut inner = self.locked();
+anchor      = '''            inner.last_retained = Some(Instant::now());
             inner.pending.retain(|e| !matches!(e, Entry::Config { target: t, .. } if t == target));'''
-replacement = '''            let mut inner = self.locked();
+replacement = '''            inner.last_retained = Some(Instant::now());
             if let Some(feedback) = config.as_ref().and_then(|c| c.get("feedback")).and_then(Value::as_str).and_then(Feedback::parse) {
                 inner.feedback.insert(target.to_owned(), feedback);
             }
@@ -1686,24 +1686,27 @@ guard       = "retraction_republished"
 [[control]]
 name        = "restore_does_nothing"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''        if self.restore_due {
-            applied += self.restore(handle).await?;'''
-replacement = '''        if self.restore_due && false {
-            applied += self.restore(handle).await?;'''
+anchor      = '''            applied += self.restore(handle).await?;
+        }'''
+replacement = '''            let _ = &mut applied;
+        }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_one_way_device_is_restored_from_the_read_back_when_restore_is_on", "--exact"]
 expect_text = '''the assumed target was not restored from the read-back'''
 guard       = "restore"
 
-# M8: the restore waits for the read-back.
+# M8: the restore waits for the read-back. (Re-gate R16 T6: it went RED by timing, the fake device
+# connecting before the read-back; now on the late broker, deterministically.)
 [[control]]
 name        = "restore_does_not_wait_for_the_read_back"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''        if !self.reports.read_back_completed(RESTORE_WAIT).await {'''
-replacement = '''        if !self.reports.read_back_completed(Duration::ZERO).await {'''
+anchor      = '''    reports.read_back_reached(complete).await;
+    let cap = Instant::now() + RESTORE_QUIET_CAP;'''
+replacement = '''    let _ = (reports, complete);
+    let cap = Instant::now() + RESTORE_QUIET_CAP;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_one_way_device_is_restored_from_the_read_back_when_restore_is_on", "--exact"]
-expect_text = '''the assumed target was not restored from the read-back'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_waits_for_a_broker_that_comes_up_after_the_device", "--exact"]
+expect_text = '''a restore ran before its read-back was done'''
 guard       = "restore_waits"
 
 # MINOR 13: a command with no target reaches execute with none.
@@ -2189,3 +2192,70 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_targets_config_goes_before_its_held_values_whatever_its_held_flag", "--exact"]
 expect_text = '''b's held value went before its config'''
 guard       = "catch_up_configs_first"
+
+# Re-gate R11: a restore on an incomplete read-back stays due for the rest.
+[[control]]
+name        = "an_incomplete_restore_is_done_for_good"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        if complete {
+            self.restore_due = false;
+        } else if'''
+replacement = '''        if true {
+            self.restore_due = false;
+        } else if'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_on_an_incomplete_read_back_is_done_again_when_it_completes", "--exact"]
+expect_text = '''the restore was not done again when the read-back completed'''
+guard       = "restore_stays_due"
+
+# Re-gate R5 / Claude minor 9: a restore waits for the retained replays to go quiet.
+[[control]]
+name        = "a_restore_runs_at_the_suback"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        if quiet >= RESTORE_QUIET || now >= cap {'''
+replacement = '''        if quiet >= Duration::ZERO || now >= cap {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_follows_the_targets_config_and_yields_to_a_newer_request", "--exact"]
+expect_text = '''the target was written before its config'''
+guard       = "restore_quiet"
+
+# Re-gate R5: a restore configures every waiting config first.
+[[control]]
+name        = "a_restore_goes_before_a_waiting_config"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        while let Some((target, config)) = self.mailbox.take_config() {
+            self.configure(handle, &target, config).await?;
+        }
+        let complete = self.reports.read_back_is_complete();'''
+replacement = '''        let complete = self.reports.read_back_is_complete();'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_follows_the_targets_config_and_yields_to_a_newer_request", "--exact"]
+expect_text = '''the target was written before its config'''
+guard       = "restore_configs_first"
+
+# Re-gate R7: a restore's refusal is said in the log, not on Error (no request was made).
+[[control]]
+name        = "a_restores_refusal_goes_to_error"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                    if origin == Origin::Restore {
+                        warn!(kind = "command_rejected", target, property = %failure.property, error = %failure.error, "The device refused a property of a restore from the read-back");
+                        continue;
+                    }'''
+replacement = '''                    if origin == Origin::Restore {
+                        warn!(kind = "command_rejected", target, property = %failure.property, error = %failure.error, "The device refused a property of a restore from the read-back");
+                    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_refused_in_part_keeps_what_it_wrote", "--exact"]
+expect_text = '''a restore's refusal went to Error'''
+guard       = "restore_outcome"
+
+# Re-gate R7: a restore's writes are accounted as a request's: unproven until a probe.
+[[control]]
+name        = "a_restore_is_never_unproven"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            self.mailbox.begin_restore(values.clone());'''
+replacement = '''            let _ = &values;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_unproven_restore_is_applied_again_when_the_link_dies_before_proof", "--exact"]
+expect_text = '''the failed probe never lost the link'''
+guard       = "restore_unproven"

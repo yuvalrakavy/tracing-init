@@ -56,6 +56,9 @@ pub enum Answer {
     /// An `apply` that writes every value but this property's, which the device refuses: a partial
     /// outcome (`OpError::Partial`).
     RefuseProperty(&'static str),
+    /// An `apply` that succeeds as far as the driver can tell, but the device never takes: an
+    /// unacknowledged write lost on the way.
+    Unheard,
 }
 
 /// A helper the fake driver starts through its link's context at its next connect, as a driver
@@ -307,7 +310,7 @@ impl FakeDevice {
                 Ok(())
             }
             // Only `apply` gives a partial outcome; anywhere else it is the device's own answer.
-            Some(Answer::RefuseProperty(_)) => Ok(()),
+            Some(Answer::RefuseProperty(_) | Answer::Unheard) => Ok(()),
         }
     }
 
@@ -419,7 +422,7 @@ impl DeviceDriver for FakeDevice {
             _ => None,
         };
         let mut state = self.locked();
-        if !state.deaf {
+        if !state.deaf && answer != Some(Answer::Unheard) {
             let entry = state.targets.entry(target.to_owned()).or_default();
             for (property, value) in values {
                 if Some(property.as_str()) != refused {
