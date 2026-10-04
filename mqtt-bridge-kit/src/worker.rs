@@ -96,7 +96,8 @@ impl DeviceOutage {
 }
 
 /// One driver operation, under `bound` and the link's `link_lost`: an overrun or a lost link is a
-/// `LinkError`.
+/// `LinkError`. An operation that has completed wins over a loss noticed at the same moment — its
+/// result is what the device did; the loss is seen at the worker's next step.
 async fn op<T>(
     handle: &LinkHandle,
     bound: Duration,
@@ -107,6 +108,7 @@ async fn op<T>(
     handle.set_deadline(Some(deadline));
     // WAIT: device-op
     let result = tokio::select! {
+        biased;
         done = tokio::time::timeout_at(deadline.into(), operation) => match done {
             Ok(result) => result,
             Err(_) => Err(OpError::Link(LinkError::new(format!("{what} missed its deadline ({} ms)", bound.as_millis())))),

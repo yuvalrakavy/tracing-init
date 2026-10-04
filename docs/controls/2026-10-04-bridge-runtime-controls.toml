@@ -1036,3 +1036,17 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_helper_that_ends_is_a_lost_link", "--exact"]
 expect_text = '''ReturnAfter(200ms): the helper's end went unseen'''
 guard       = "helpers_watched"
+
+# Item 34: a completed operation's result wins over a link loss noticed at the same moment.
+[[control]]
+name        = "a_completed_operation_loses_to_a_link_loss"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''    let result = tokio::select! {
+        biased;
+        done = tokio::time::timeout_at'''
+replacement = '''    let result = tokio::select! {
+        done = tokio::time::timeout_at'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::an_operation_that_completed_wins_over_a_link_lost_at_the_same_moment", "--exact"]
+expect_text = '''a completed operation was turned into a lost link'''
+guard       = "op_result_wins"

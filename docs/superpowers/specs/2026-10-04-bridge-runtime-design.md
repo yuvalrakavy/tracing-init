@@ -188,6 +188,8 @@ commands are refused, and reads are dropped.
   panicking thread, so a panic with a stderr nobody drains still becomes a dead part — the device
   worker's `catch_unwind`, or the MQTT task's end, whose connection then closes and whose last
   will says `Active=false`.
+- **Succeeded, then the link died:** an operation that has completed wins over a `link_lost`
+  noticed at the same moment; its result stands, and the loss is seen at the worker's next step.
 
 **Out of scope:** airzoned (a media daemon) keeps its own structure. mqtt_mdns adopts only the pump,
 reports and process pieces, since it has no device link.

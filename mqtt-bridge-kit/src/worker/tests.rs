@@ -56,3 +56,18 @@ fn a_device_outage_is_one_episode() {
         (Some("4"), Some("2"), Some("1"))
     );
 }
+
+/// An operation that has completed wins over a link loss noticed at the same moment: its result is
+/// what the device did, and the loss is seen at the worker's next step. Raced unbiased, a helper's
+/// `link_lost` turned a completed `Ok` into a `Link` error half the time (the mqtt_ac v2 build).
+#[tokio::test]
+async fn an_operation_that_completed_wins_over_a_link_lost_at_the_same_moment() {
+    let ctx = LinkContext::new(1, "i", Reports::new(), Arc::new(crate::link::Abandoned::default()), Arc::new(OpClock::new()));
+    let handle = ctx.handle();
+    handle.link_lost("lost meanwhile");
+    for _ in 0..64 {
+        let result = op(&handle, Duration::from_secs(5), "apply", async { Ok::<u32, OpError>(7) }).await;
+        assert_eq!(result, Ok(7), "a completed operation was turned into a lost link");
+    }
+    assert!(handle.is_lost(), "the loss itself was forgotten");
+}
