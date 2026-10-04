@@ -33,7 +33,7 @@ async fn the_device_side_works_while_the_broker_is_stalled() {
     // The barrier: a request sent now is read only by a session that is not parked on a full
     // request channel. A target-level write is never retained, so nothing brings it back later.
     let probe = SendOptions::default().expiry(60).user_property("conflict", "RequestWins");
-    assert!(h.broker.send_with(&h.topics.desired_target("t2"), r#"{"temp": 5}"#, &probe));
+    assert!(h.broker.publish(&h.topics.desired_target("t2"), r#"{"temp": 5}"#, &probe));
     h.settle(Duration::from_millis(300)).await;
 
     h.device.set_up(true);

@@ -1153,3 +1153,16 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "process::tests::a_drivers_required_option_and_its_own_usage_errors_exit_2_without_a_driver", "--exact"]
 expect_text = '''a missing required option was not a usage error'''
 guard       = "required_options"
+
+# Tests: another client's publish reaches the bridge only through a matching subscription.
+[[control]]
+name        = "the_fake_broker_delivers_past_the_subscriptions"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''        let Some(preserve_retain) = matching(&self.shared, topic) else {
+            return false;
+        };'''
+replacement = '''        let preserve_retain = matching(&self.shared, topic).unwrap_or(false);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "tests::another_clients_publish_goes_through_the_subscriptions_at_qos_1", "--exact"]
+expect_text = '''a publish nothing subscribed to was delivered'''
+guard       = "fake_broker_matching"

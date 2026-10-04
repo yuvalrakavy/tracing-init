@@ -25,7 +25,7 @@ async fn malformed_desired_and_command_payloads_are_answered_on_error() {
     }
     // A conflict rule that names neither side is malformed too.
     let bad_conflict = SendOptions::default().user_property("conflict", "Whoever");
-    assert!(h.broker.send_with(&t.desired("t1", "temp"), "22", &bad_conflict));
+    assert!(h.broker.publish(&t.desired("t1", "temp"), "22", &bad_conflict));
     // A target-level write or a command the broker replays as retained was left there by mistake:
     // replayed at every restart, it would act again each time.
     assert!(h.broker.send_with(&t.desired_target("t1"), r#"{"temp": 30}"#, &SendOptions::default().retained()));

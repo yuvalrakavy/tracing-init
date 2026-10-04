@@ -145,18 +145,16 @@ impl Harness {
         tokio::time::sleep(d).await;
     }
 
-    /// The Store's write of one property: published retained (kept at the broker) and delivered
-    /// live.
+    /// The Store's write of one property: published retained — kept at the broker, and delivered
+    /// live through the bridge's subscription, as another client's publish is (QoS 1).
     pub fn desire(&self, target: &str, property: &str, value: Value, req: Req) -> bool {
         let topic = self.topics.desired(target, property);
-        let payload = value.to_string();
-        self.broker.retain(&topic, payload.clone(), &req.options().retained());
-        self.broker.send_with(&topic, payload, &req.options())
+        self.broker.publish(&topic, value.to_string(), &req.options().retained())
     }
 
     /// The Store's `desire_many`: the target message, then each property topic, retained.
     pub fn desire_many(&self, target: &str, values: Value, req: Req) -> bool {
-        let sent = self.broker.send_with(&self.topics.desired_target(target), values.to_string(), &req.options());
+        let sent = self.broker.publish(&self.topics.desired_target(target), values.to_string(), &req.options());
         if let Value::Object(map) = &values {
             for (property, value) in map {
                 self.desire(target, property, value.clone(), req);
@@ -165,11 +163,10 @@ impl Harness {
         sent
     }
 
-    /// The Store's retraction of a property's request.
+    /// The Store's retraction of a property's request: an empty retained publish.
     pub fn retract(&self, target: &str, property: &str) -> bool {
         let topic = self.topics.desired(target, property);
-        self.broker.retain(&topic, "", &SendOptions::default());
-        self.broker.send_with(&topic, "", &SendOptions::default())
+        self.broker.publish(&topic, "", &SendOptions::default().retained())
     }
 
     /// A command, with a response topic and correlation data when `reply` is given.
@@ -178,19 +175,17 @@ impl Harness {
         if let Some((topic, correlation)) = reply {
             options = options.response_topic(topic).correlation_data(correlation.to_vec());
         }
-        self.broker.send_with(&self.topics.command(), payload.to_string(), &options)
+        self.broker.publish(&self.topics.command(), payload.to_string(), &options)
     }
 
-    /// A raw payload on `topic`, live.
+    /// A raw payload on `topic`, live, through the bridge's subscriptions.
     pub fn send_raw(&self, topic: &str, payload: &[u8]) -> bool {
-        self.broker.send_with(topic, payload.to_vec(), &SendOptions::default())
+        self.broker.publish(topic, payload.to_vec(), &SendOptions::default())
     }
 
-    /// A target's config, retained and live.
+    /// A target's config, retained (kept, and delivered live).
     pub fn config(&self, target: &str, config: Value) -> bool {
-        let topic = self.topics.config(target);
-        self.broker.retain(&topic, config.to_string(), &SendOptions::default());
-        self.broker.send_with(&topic, config.to_string(), &SendOptions::default())
+        self.broker.publish(&self.topics.config(target), config.to_string(), &SendOptions::default().retained())
     }
 
     /// Every `Error` the bridge published, as JSON.

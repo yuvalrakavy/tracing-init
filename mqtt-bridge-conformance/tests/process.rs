@@ -241,7 +241,7 @@ async fn a_driver_panic_with_a_stderr_nobody_reads_ends_the_bridge_with_a_failur
         .expect("start the bridge");
     let status_topic = format!("Proc/Status/{INSTANCE}");
     let up = broker.wait_until(BOUND, |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connected")).await;
-    assert!(broker.send_with(&format!("Proc/Desired/{INSTANCE}/t1/power"), "false", &SendOptions::default()) || up);
+    assert!(broker.publish(&format!("Proc/Desired/{INSTANCE}/t1/power"), "false", &SendOptions::default()) || up);
     let status = exit_within(&mut child, Duration::from_secs(10)).await;
     drop(unread);
     assert!(up, "the device never connected");
@@ -273,7 +273,7 @@ async fn a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_conn
         .expect("start the bridge");
     let active = format!("Proc/Active/{INSTANCE}");
     let up = broker.wait_until(BOUND, |b| b.received_on(&active).iter().any(|r| &r.payload[..] == b"true")).await;
-    assert!(broker.send(&poison, "{}") || up);
+    assert!(broker.publish(&poison, "{}", &SendOptions::default()) || up);
     let status = exit_within(&mut child, Duration::from_secs(10)).await;
     drop(unread);
     assert!(up, "the bridge never announced itself");

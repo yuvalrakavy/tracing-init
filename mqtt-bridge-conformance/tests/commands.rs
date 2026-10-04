@@ -56,20 +56,24 @@ async fn refresh_reads_the_device_and_assume_sets_the_assumed_state_without_it()
     let h = Harness::start_with("standard", acknowledged(), quick_timing(), up_at_20).await;
     assert!(connected(&h).await);
     h.device.set("t1", "temp", json!(25));
-    let reads = h.device.calls_of(Op::Read).len();
+    // The counts tell the calls apart rather than rely on nothing else calling the driver: a
+    // refresh of `t1` reads `t1` alone (a poll — off in `quick_timing` anyway — reads everything).
+    let reads_of_t1 = |h: &Harness| h.device.calls_of(Op::Read).iter().filter(|c| c.target.as_deref() == Some("t1")).count();
+    let reads = reads_of_t1(&h);
     assert!(h.command(json!({"target": "t1", "command": "refresh"}), Some(("Store/r", b"1"))));
     assert!(h.eventually(BOUND, |h| h.state("t1").is_some_and(|s| s["temp"] == 25)).await, "refresh did not publish what it read");
-    assert_eq!(h.device.calls_of(Op::Read).len(), reads + 1);
+    assert_eq!(reads_of_t1(&h), reads + 1, "refresh did not read its target once");
     assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "refresh was not answered");
 
-    let calls = h.device.calls().len();
+    let not_a_poll = |h: &Harness| h.device.calls().iter().filter(|c| !(c.op == Op::Read && c.target.is_none())).count();
+    let calls = not_a_poll(&h);
     assert!(h.command(json!({"target": "t1", "command": "assume", "power": true}), None));
     assert!(
         h.eventually(BOUND, |h| h.state("t1") == Some(json!({"temp": 25, "power": true, "assumed": true}))).await,
         "assume did not set the assumed state: {:?}",
         h.state("t1")
     );
-    assert_eq!(h.device.calls().len(), calls, "assume called the driver");
+    assert_eq!(not_a_poll(&h), calls, "assume called the driver");
     assert!(h.stop().await);
 }
 

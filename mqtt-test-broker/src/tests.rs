@@ -393,3 +393,26 @@ async fn a_clients_disconnect_is_recorded() {
     );
     task.abort();
 }
+
+/// Another client's publish reaches the connected client only through a matching subscription,
+/// at QoS 1, and keeps its retain flag only for a subscription made retain-as-published; a
+/// retained one is kept, for later subscriptions (review: injected requests bypassed matching).
+#[tokio::test(flavor = "multi_thread")]
+async fn another_clients_publish_goes_through_the_subscriptions_at_qos_1() {
+    use rumqttc::v5::mqttbytes::v5::Filter;
+    let broker = FakeBroker::start().await;
+    let (client, events) = client(&broker, 10);
+    let (task, mut incoming) = pump_publishes(events);
+    let preserving = Filter { preserve_retain: true, ..Filter::new("kept/+", QoS::AtLeastOnce) };
+    client.subscribe_many(vec![preserving, Filter::new("plain/#", QoS::AtLeastOnce)]).await.unwrap();
+    assert!(broker.wait_for_subscription("plain/#", BOUND).await);
+    assert!(broker.publish("kept/a", "1", &SendOptions::default().retained()), "a matching publish was not delivered");
+    let kept = next_publish(&mut incoming).await;
+    assert_eq!((kept.qos, kept.retain), (QoS::AtLeastOnce, true), "retain-as-published was not honoured: {kept:?}");
+    assert!(broker.publish("plain/b", "2", &SendOptions::default().retained()));
+    let plain = next_publish(&mut incoming).await;
+    assert_eq!((plain.qos, plain.retain), (QoS::AtLeastOnce, false), "a live publish was flagged retained: {plain:?}");
+    assert!(!broker.publish("other/c", "3", &SendOptions::default()), "a publish nothing subscribed to was delivered");
+    assert_eq!(broker.retained_on("kept/a").as_deref(), Some(&b"1"[..]), "a retained publish was not kept");
+    task.abort();
+}
