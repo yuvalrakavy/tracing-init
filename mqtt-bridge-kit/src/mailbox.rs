@@ -544,14 +544,14 @@ impl Mailbox {
                     Entry::Momentary { target, call, reply, .. } => {
                         unanswered.push(Unanswered { target, command: call.command, momentary: true, replies: reply.into_iter().collect() })
                     }
-                    Entry::Read { key, replies, .. } if !replies.is_empty() => {
+                    // Refused, on `Error` and on any response topic, whether or not it named one.
+                    Entry::Read { key, replies, .. } => {
                         let (target, command) = match key {
                             ReadKey::Refresh(target) => (target, "refresh".to_owned()),
                             ReadKey::Command { target, command } => (target, command),
                         };
                         unanswered.push(Unanswered { target, command, momentary: false, replies });
                     }
-                    Entry::Read { .. } => {}
                 }
             }
             inner.momentary = 0;

@@ -1832,3 +1832,17 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::an_expired_value_does_not_wait_for_its_key", "--exact"]
 expect_text = '''a value past its deadline still waits for its key'''
 guard       = "waits_for_key_live"
+
+# Re-gate minor: a read queued at a disconnect is refused even with no response topic.
+[[control]]
+name        = "a_read_with_no_reply_is_dropped_at_a_disconnect"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                    Entry::Read { key, replies, .. } => {
+                        let (target, command) = match key {'''
+replacement = '''                    Entry::Read { replies, .. } if replies.is_empty() => {}
+                    Entry::Read { key, replies, .. } => {
+                        let (target, command) = match key {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_read_with_no_response_topic_is_refused_at_a_disconnect", "--exact"]
+expect_text = '''a read with no response topic was dropped silently at a disconnect'''
+guard       = "reads_refused_at_disconnect"

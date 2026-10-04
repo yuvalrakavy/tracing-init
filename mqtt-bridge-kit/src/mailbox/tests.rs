@@ -487,3 +487,15 @@ fn an_expired_value_does_not_wait_for_its_key() {
     std::thread::sleep(Duration::from_millis(60));
     assert!(!mailbox.waits_for_key("u1", "level"), "a value past its deadline still waits for its key");
 }
+
+/// A read queued when the device goes down is refused — on `Error`, as every command's failure —
+/// whether or not it named a response topic (re-gate minor: one with no response topic was
+/// dropped silently).
+#[test]
+fn a_read_with_no_response_topic_is_refused_at_a_disconnect() {
+    let mailbox = up();
+    assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, None), Posted::Queued);
+    let unanswered = mailbox.disconnected();
+    assert_eq!(unanswered.len(), 1, "a read with no response topic was dropped silently at a disconnect");
+    assert_eq!((unanswered[0].command.as_str(), unanswered[0].replies.len()), ("refresh", 0));
+}
