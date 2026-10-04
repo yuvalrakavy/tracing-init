@@ -474,3 +474,16 @@ async fn take_waits_for_a_post_and_a_post_never_waits() {
     let work = tokio::time::timeout(Duration::from_secs(5), taker).await.expect("take did not wake").unwrap();
     assert!(matches!(work, Work::Apply { .. }));
 }
+
+/// A value past its deadline does not count as waiting: it will be dropped, not applied, so a
+/// restore must not skip its property for it (re-gate minor: `waits_for_key` counted it).
+#[test]
+fn an_expired_value_does_not_wait_for_its_key() {
+    let mailbox = Mailbox::new();
+    let mut held = value("u1", "level", json!(40));
+    held.deadline = Some(Instant::now() + Duration::from_millis(50));
+    let _ = mailbox.post_state(held, true);
+    assert!(mailbox.waits_for_key("u1", "level"), "a held value does not wait for its key");
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(!mailbox.waits_for_key("u1", "level"), "a value past its deadline still waits for its key");
+}

@@ -1821,3 +1821,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::json_numbers_compare_by_value", "--exact"]
 expect_text = '''two different integers compared as the same value'''
 guard       = "numbers_by_value"
+
+# Re-gate minor: a value past its deadline does not wait for its key.
+[[control]]
+name        = "an_expired_value_waits_for_its_key"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''if value.is_key(target, property) && !value.expired(now)))'''
+replacement = '''if value.is_key(target, property) && !value.expired(now - Duration::from_secs(3600))))'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::an_expired_value_does_not_wait_for_its_key", "--exact"]
+expect_text = '''a value past its deadline still waits for its key'''
+guard       = "waits_for_key_live"

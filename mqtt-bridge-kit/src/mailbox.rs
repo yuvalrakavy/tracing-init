@@ -724,9 +724,14 @@ impl Mailbox {
         }
     }
 
-    /// Whether a value for `target` and `property` waits. Never waits.
+    /// Whether a value for `target` and `property` waits — one past its deadline will be dropped,
+    /// not applied, so it does not. Never waits.
     pub fn waits_for_key(&self, target: &str, property: &str) -> bool {
-        self.locked().pending.iter().any(|e| matches!(e, Entry::State { value, .. } if value.is_key(target, property)))
+        let now = Instant::now();
+        self.locked()
+            .pending
+            .iter()
+            .any(|e| matches!(e, Entry::State { value, .. } if value.is_key(target, property) && !value.expired(now)))
     }
 
     /// Keep in flight only the values `keep` says (the rest were decided by the conflict rule).
