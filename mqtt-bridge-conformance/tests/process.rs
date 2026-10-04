@@ -210,6 +210,45 @@ async fn sigterm_while_the_drivers_info_has_not_returned_stops_the_bridge_within
     assert_eq!(broker.connections(), 0, "the bridge reached its service, so info() did not hold it and this test proves nothing");
 }
 
+/// The threads `pid` runs now.
+fn threads(pid: u32) -> usize {
+    let listed = std::process::Command::new("ps").args(["-M", "-p", &pid.to_string()]).output().expect("ps");
+    // A header line, then one line per thread.
+    String::from_utf8_lossy(&listed.stdout).lines().count().saturating_sub(1)
+}
+
+/// Helpers that panic on every link, with a stderr nobody drains, leak no thread per panic: the
+/// panic hook has one writer for stderr, behind a bounded, lossy queue (the R1 re-gate's R8: each
+/// panic started a writer thread, which a full stderr kept forever).
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_panics_with_a_stderr_nobody_reads_leak_no_threads() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(20);
+    let dir = workdir("panic_loop");
+    let (full, unread) = full_stream();
+    let stdout = OwnedFd::from(full.try_clone().expect("a second handle on the full socket"));
+    let mut child = bridge(&dir, &broker, &["--device", "panic-helper", "--retry", "200ms"])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(OwnedFd::from(full)))
+        .spawn()
+        .expect("start the bridge");
+    let pid = child.id().expect("the bridge's pid");
+    let active = format!("Proc/Active/{INSTANCE}");
+    assert!(
+        broker.wait_until(Duration::from_secs(10), |b| b.received_on(&active).iter().any(|r| &r.payload[..] == b"true")).await,
+        "the bridge never announced itself"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let early = threads(pid);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let late = threads(pid);
+    signal(&child, "-TERM");
+    let _ = exit_within(&mut child, Duration::from_secs(15)).await;
+    drop(unread);
+    assert!(early > 0, "no threads listed for the bridge");
+    assert!(late <= early + 2, "the bridge grew from {early} to {late} threads while its helpers panicked: a thread per panic");
+}
+
 /// A stream whose buffer is already full, as a supervisor's stdout that stopped draining. Returns
 /// the full end, for the bridge, and the other, to hold unread until the bridge has exited.
 fn full_stream() -> (UnixStream, UnixStream) {

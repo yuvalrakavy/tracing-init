@@ -1024,17 +1024,13 @@ guard       = "blocked_worker_watchdog"
 [[control]]
 name        = "the_panic_report_is_written_on_the_panicking_thread"
 file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''    let reporter = std::thread::Builder::new().name("panic-report".into()).spawn(move || {
+anchor      = '''    if let Some(reports) = PANIC_REPORTS.get_or_init(|| PanicReports::start(|| Box::new(std::io::stderr()))) {
+        reports.report(format!("thread '{thread}' panicked at {location}:\n{payload}\n"));
+    }'''
+replacement = '''    {
         use std::io::Write;
-        let _ = std::io::stderr().write_all(report.as_bytes());
-        let _ = written.send(());
-    });'''
-replacement = '''    let reporter: std::io::Result<()> = {
-        use std::io::Write;
-        let _ = std::io::stderr().write_all(report.as_bytes());
-        let _ = written.send(());
-        Ok(())
-    };'''
+        let _ = std::io::stderr().write_all(format!("thread '{thread}' panicked at {location}:\n{payload}\n").as_bytes());
+    }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_driver_panic_with_a_stderr_nobody_reads_ends_the_bridge_with_a_failure", "--exact"]
 expect_text = '''a driver panic with a stderr nobody reads did not end the bridge with a failure'''
@@ -2021,3 +2017,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_disconnect_that_blocks_the_worker_thread_is_a_dead_worker_past_its_bound", "--exact"]
 expect_text = '''the blocked disconnect was not seen past its bound'''
 guard       = "disconnect_watched"
+
+# Re-gate R8: one panic reporter thread for the process, not one per panic.
+[[control]]
+name        = "a_reporter_thread_per_panic"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''    if let Some(reports) = PANIC_REPORTS.get_or_init(|| PanicReports::start(|| Box::new(std::io::stderr()))) {'''
+replacement = '''    if let Some(reports) = &PanicReports::start(|| Box::new(std::io::stderr())) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "repeated_panics_with_a_stderr_nobody_reads_leak_no_threads", "--exact"]
+expect_text = '''while its helpers panicked: a thread per panic'''
+guard       = "one_panic_reporter"

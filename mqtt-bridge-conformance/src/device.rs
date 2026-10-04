@@ -95,6 +95,8 @@ struct State {
     link: Option<LinkHandle>,
     connect_cap: Option<usize>,
     helper: Option<Helper>,
+    /// A helper started on every link, after `helper`'s one.
+    every_link: Option<Helper>,
     /// How a read of every target (`Scope::All`) answers, in place of the device's own answer.
     read_all: Option<Answer>,
     /// `info()` writes this file, then blocks its thread this long: a driver breaking "info is pure".
@@ -203,6 +205,11 @@ impl Device {
     /// Start `helper` at the next connect (once).
     pub fn helper(&self, helper: Helper) {
         self.locked().helper = Some(helper);
+    }
+
+    /// Start `helper` on every link from now on (a reader that panics at each connect).
+    pub fn helper_every_link(&self, helper: Helper) {
+        self.locked().every_link = Some(helper);
     }
 
     /// Refuse every connect past `cap` connects in all: a bridge that reconnects in a loop is
@@ -341,7 +348,7 @@ impl DeviceDriver for FakeDevice {
         }
         state.connected = true;
         state.link = Some(ctx.handle());
-        if let Some(helper) = state.helper.take() {
+        if let Some(helper) = state.helper.take().or(state.every_link) {
             let handle = ctx.handle();
             ctx.spawn(async move {
                 match helper {

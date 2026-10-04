@@ -91,16 +91,52 @@ fn panic_hook(location: Option<&std::panic::Location<'_>>, payload: &(dyn std::a
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "a panic without a message".to_owned());
     error!(kind = "panic", thread = %thread, location = %location, payload = %payload, "A thread panicked");
-    let report = format!("thread '{thread}' panicked at {location}:\n{payload}\n");
-    let (written, wait) = std::sync::mpsc::channel::<()>();
-    let reporter = std::thread::Builder::new().name("panic-report".into()).spawn(move || {
-        use std::io::Write;
-        let _ = std::io::stderr().write_all(report.as_bytes());
-        let _ = written.send(());
-    });
-    if reporter.is_ok() {
-        // WAIT: panic-report
-        let _ = wait.recv_timeout(PANIC_REPORT_BOUND);
+    if let Some(reports) = PANIC_REPORTS.get_or_init(|| PanicReports::start(|| Box::new(std::io::stderr()))) {
+        reports.report(format!("thread '{thread}' panicked at {location}:\n{payload}\n"));
+    }
+}
+
+/// The panic reports a panicking thread hands over, waiting for none (re-gate R8).
+static PANIC_REPORTS: std::sync::OnceLock<Option<PanicReports>> = std::sync::OnceLock::new();
+
+/// How many panic reports may wait for stderr; past it a report is dropped.
+const PANIC_QUEUE: usize = 16;
+
+/// The process's one panic reporter: a thread of its own that writes each report to stderr, fed by
+/// a bounded queue. A stderr nobody drains holds that one thread, never a panicking one, and never
+/// more threads: each panic used to start a writer, which a full stderr kept for good, so repeated
+/// recoverable panics leaked a thread apiece.
+struct PanicReports {
+    queue: std::sync::mpsc::SyncSender<(String, std::sync::mpsc::SyncSender<()>)>,
+}
+
+impl PanicReports {
+    /// The writer thread, writing to what `writer` opens; `None` if it cannot start.
+    fn start(writer: impl FnOnce() -> Box<dyn std::io::Write + Send> + Send + 'static) -> Option<PanicReports> {
+        let (queue, reports) = std::sync::mpsc::sync_channel::<(String, std::sync::mpsc::SyncSender<()>)>(PANIC_QUEUE);
+        std::thread::Builder::new()
+            .name("panic-report".into())
+            .spawn(move || {
+                let mut out = writer();
+                // WAIT: panic-report
+                while let Ok((report, written)) = reports.recv() {
+                    let _ = out.write_all(report.as_bytes());
+                    let _ = out.flush();
+                    let _ = written.try_send(());
+                }
+            })
+            .ok()?;
+        Some(PanicReports { queue })
+    }
+
+    /// Hand `report` to the writer, and wait for it to be written at most [`PANIC_REPORT_BOUND`].
+    /// A full queue drops it: lossy, never a wait past the bound.
+    fn report(&self, report: String) {
+        let (written, wait) = std::sync::mpsc::sync_channel::<()>(1);
+        if self.queue.try_send((report, written)).is_ok() {
+            // WAIT: panic-report
+            let _ = wait.recv_timeout(PANIC_REPORT_BOUND);
+        }
     }
 }
 

@@ -269,7 +269,9 @@ commands are refused, and reads are dropped.
   recovery (re-gate R1, R13).
 - **Panics:** `Bridge::run` installs a process-global panic hook (`install_panic_hook`, also for
   in-process users of `Bridge::start`): ERROR `panic` through tracing (lossy), and the report for
-  stderr written by a thread of its own, abandoned after 200 ms. Nothing is written on the
+  stderr handed to the process's one reporter thread through a bounded, lossy queue (16; full, the
+  report is dropped), waited for at most 200 ms — so repeated panics with a stderr nobody drains
+  hold one thread, not one apiece (re-gate R8). Nothing is written on the
   panicking thread, so a panic with a stderr nobody drains still becomes a dead part — the device
   worker's `catch_unwind`, or the MQTT task's end, whose connection then closes and whose last
   will says `Active=false`.
