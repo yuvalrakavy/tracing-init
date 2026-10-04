@@ -44,7 +44,7 @@ async fn a_connack_subscribes_before_active_then_republishes_the_model() {
     );
     let first = from_connection(&h.broker, 1);
     let read_back = position(&first, &format!("sub {}", t.state_filter())).expect("the first CONNACK made no read-back subscription");
-    let desired = position(&first, &format!("sub {}", t.desired_filter())).expect("no Desired subscription");
+    let desired = position(&first, &format!("sub {}", t.desired_target_filter())).expect("no Desired subscription");
     assert!(read_back < desired, "the read-back's subscription did not come first: {first:#?}");
     // Nothing is published before the subscriptions, the first publish is Active=true: a state
     // published sooner would overwrite the retained state the read-back is there to read.
@@ -65,7 +65,7 @@ async fn a_connack_subscribes_before_active_then_republishes_the_model() {
     );
     let again = from_connection(&h.broker, 2);
     let active = position(&again, &format!("pub {} true", t.active())).expect("no Active=true after the reconnect");
-    for filter in [t.desired_filter(), t.command(), t.config_filter()] {
+    for filter in [t.desired_target_filter(), t.desired_property_filter(), t.command(), t.config_filter()] {
         let sub = position(&again, &format!("sub {filter}")).unwrap_or_else(|| panic!("{filter} was not subscribed again: {again:#?}"));
         assert!(sub < active, "{filter} was subscribed after Active=true: {again:#?}");
     }

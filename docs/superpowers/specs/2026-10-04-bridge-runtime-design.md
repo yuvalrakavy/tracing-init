@@ -121,7 +121,7 @@ capped queue whose overflow is counted and logged once per episode.
 
 | Area | Behaviour |
 |---|---|
-| Topics | the grammar from `--root` and `--instance`; subscriptions to `Desired`, `Command`, `Config` |
+| Topics | the grammar from `--root` and `--instance`; subscriptions to `Desired` (target-level `…/+` and `Command` retain-as-published; property-level `…/+/+` not), `Command`, `Config` |
 | Pump | polls only; unbounded forward with a backlog episode; one connection per client: the first failed poll ends the session, and the next connection gets a fresh client (rumqttc's in-loop reconnect would send what the session queued meanwhile ahead of the next CONNACK's subscriptions, and carries the 0.25 packet-id collision across connections); progress bounded at twice the keep-alive (§5.2) |
 | Every CONNACK | subscribe, then `Active=true`, then republish the retained model; `Version` |
 | Start-up read-back | reads its own retained `State`, for the conflict rule's "before" values after a restart |
@@ -154,7 +154,12 @@ commands are refused, and reads are dropped.
   - A held value the device already has is satisfied: it is dropped, with no `Error`.
   - A `Desired` replayed as retained gets the conflict check even while the device is up (the
     bridge-restart case).
-  - A retained target-level `Desired`, or a retained `Command`, is refused as `malformed`.
+  - A retained target-level `Desired`, or a retained `Command`, is refused as `malformed` — replayed
+    or live: both are subscribed retain-as-published, so the broker keeps the flag on a live
+    delivery. Property writes are subscribed without it, so a live retained one (every Store write)
+    is live, and only a replay arrives flagged.
+  - A response topic on the bridge's own request lanes (`Desired`, `Command`, `Config`) is refused
+    as `malformed`: the reply would be read back as a request.
   - A target-level write's property copies are skipped for 60 s.
   - `configure` is called only while connected. Configs are held while down and applied first in the
     catch-up.

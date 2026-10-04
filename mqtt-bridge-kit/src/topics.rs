@@ -91,9 +91,32 @@ impl Topics {
         self.lane("Command")
     }
 
-    /// `{Root}/Desired/{instance}/#`: both write forms.
+    /// `{Root}/Desired/{instance}/#`: both write forms. The bridge subscribes to them separately
+    /// ([`desired_target_filter`](Self::desired_target_filter),
+    /// [`desired_property_filter`](Self::desired_property_filter)).
     pub fn desired_filter(&self) -> String {
         format!("{}/#", self.lane("Desired"))
+    }
+
+    /// `{Root}/Desired/{instance}/+`: target-level writes, never retained — subscribed
+    /// retain-as-published, so a live retained one keeps its flag and is refused.
+    pub fn desired_target_filter(&self) -> String {
+        format!("{}/+", self.lane("Desired"))
+    }
+
+    /// `{Root}/Desired/{instance}/+/+`: property writes, retained by design — subscribed without
+    /// retain-as-published, so only a replay arrives flagged.
+    pub fn desired_property_filter(&self) -> String {
+        format!("{}/+/+", self.lane("Desired"))
+    }
+
+    /// Whether `topic` is on one of the bridge's request lanes — `Desired`, `Command` or `Config` —
+    /// which the Store owns and the bridge reads: no reply may go there.
+    pub fn is_request_lane(&self, topic: &str) -> bool {
+        ["Desired", "Command", "Config"].iter().any(|lane| {
+            let lane = self.lane(lane);
+            topic == lane || topic.strip_prefix(lane.as_str()).is_some_and(|rest| rest.starts_with('/'))
+        })
     }
 
     /// `{Root}/Config/{instance}/#`.
@@ -156,6 +179,12 @@ mod tests {
         assert_eq!(t.state("L1.001"), "Aircondition/State/ctrl/L1.001");
         assert_eq!(t.desired("L1.001", "power"), "Aircondition/Desired/ctrl/L1.001/power");
         assert_eq!(t.desired_filter(), "Aircondition/Desired/ctrl/#");
+        assert_eq!(t.desired_target_filter(), "Aircondition/Desired/ctrl/+");
+        assert_eq!(t.desired_property_filter(), "Aircondition/Desired/ctrl/+/+");
+        assert!(t.is_request_lane("Aircondition/Command/ctrl") && t.is_request_lane("Aircondition/Config/ctrl/u1"));
+        assert!(t.is_request_lane("Aircondition/Desired/ctrl/u1/power"));
+        assert!(!t.is_request_lane("Aircondition/Event/ctrl") && !t.is_request_lane("Aircondition/Commandx/ctrl"));
+        assert!(!t.is_request_lane("Aircondition/Command/ctrlx"));
         assert_eq!(t.command(), "Aircondition/Command/ctrl");
         assert_eq!(t.config_filter(), "Aircondition/Config/ctrl/#");
         assert_eq!(t.event(), "Aircondition/Event/ctrl");

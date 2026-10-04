@@ -20,7 +20,7 @@ async fn malformed_desired_and_command_payloads_are_answered_on_error() {
         (t.command(), b"not json"),
         (t.command(), br#"{"target": "t1"}"#),
         (t.command(), br#"{"command": "assume"}"#),
-        (format!("{}/Desired/{}", t.root(), t.instance()), b"1"),
+        (t.config("t1"), b"not json"),
     ];
     for (topic, payload) in &malformed {
         assert!(h.send_raw(topic, payload));
@@ -85,5 +85,40 @@ async fn a_large_retained_config_is_taken_and_one_past_the_limit_is_left_at_the_
     assert!(!configured(&h, "huge"), "a config past the advertised maximum packet size reached the driver");
     assert!(h.desire("t1", "temp", json!(22), Req::default()));
     assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await, "the bridge stopped working");
+    assert!(h.stop().await);
+}
+
+/// A retained `Command` or target-level `Desired` published while the bridge listens is refused
+/// as malformed, as a replayed one is: the bridge subscribes to them retain-as-published, so the
+/// broker keeps the flag on a live delivery. A live retained property write — every write the
+/// Store makes — is a request like any other: its own subscription clears the flag on a live
+/// delivery (review C10: every live retained publish arrived unflagged, and a retained `pulse`
+/// executed).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken() {
+    let h = Harness::start_with("liveretained", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    let t = h.topics.clone();
+    let retained = SendOptions::default().retained();
+    assert!(h.broker.publish(&t.command(), r#"{"target": "t1", "command": "pulse"}"#, &retained));
+    assert!(h.broker.publish(&t.desired_target("t1"), r#"{"temp": 30}"#, &retained));
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("malformed").len() == 2).await,
+        "a live retained command or target-level write was not refused: {:?}",
+        h.errors()
+    );
+    assert!(h.desire("t1", "temp", json!(22), Req { expiry: Some(60), conflict: Some("DeviceWins") }));
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await,
+        "a live retained property write was not taken: {:?}",
+        h.device.calls()
+    );
+    assert!(h.device.calls_of(Op::Execute).is_empty(), "a live retained command was executed");
+    assert!(h.device.applies().iter().all(|(_, v)| *v != json!({"temp": 30})), "a live retained target-level write was applied");
+    assert!(
+        h.device.calls_of(Op::Read).iter().all(|c| c.target.as_deref() != Some("t1")),
+        "a live property write was checked as a replay: {:?}",
+        h.device.calls()
+    );
     assert!(h.stop().await);
 }

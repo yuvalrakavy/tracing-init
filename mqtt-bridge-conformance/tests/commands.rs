@@ -149,3 +149,28 @@ async fn a_targets_config_is_configured_and_may_override_the_feedback() {
     );
     assert!(h.stop().await);
 }
+
+/// A command whose response topic is one of the bridge's own request lanes — `Desired`, `Command`
+/// or `Config` — is refused as malformed: its reply would be read back as a request, and a reply
+/// on `Command` carries `command`, so a momentary action ran twice (review MINOR 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_response_topic_on_the_bridges_own_request_lanes_is_refused() {
+    let h = Harness::start_with("ownlanes", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    let t = h.topics.clone();
+    for own in [t.command(), t.desired("t1", "temp"), t.config("t1")] {
+        assert!(h.command(json!({"target": "t1", "command": "pulse"}), Some((&own, b"c"))));
+    }
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("malformed").len() == 3).await,
+        "a response topic on the bridge's own lanes was not refused: {:?}",
+        h.errors()
+    );
+    h.settle(Duration::from_millis(600)).await;
+    assert!(
+        h.device.calls_of(Op::Execute).is_empty(),
+        "a command answering on the bridge's own lanes ran: {} times",
+        h.device.calls_of(Op::Execute).len()
+    );
+    assert!(h.stop().await);
+}

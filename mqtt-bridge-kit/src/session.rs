@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rumqttc::v5::mqttbytes::v5::{LastWill, Publish, PublishProperties};
+use rumqttc::v5::mqttbytes::v5::{Filter, LastWill, Publish, PublishProperties};
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, MqttOptions};
 use tokio::sync::watch;
@@ -233,9 +233,19 @@ async fn connected(shared: &Shared, client: &AsyncClient) -> Result<(), Failed> 
         client.subscribe(topics.state_filter(), QoS::AtLeastOnce).await?;
         shared.read_back_requested.store(true, Ordering::SeqCst);
     }
-    for filter in [topics.desired_filter(), topics.command(), topics.config_filter()] {
+    // Target-level writes and commands are never retained: subscribed retain-as-published, a
+    // live retained one keeps its flag and is refused like a replayed one. Property writes are
+    // retained by design: their subscription clears the flag on a live delivery, so only a replay
+    // arrives flagged (review C10).
+    for (filter, retain_as_published) in [
+        (topics.desired_target_filter(), true),
+        (topics.desired_property_filter(), false),
+        (topics.command(), true),
+        (topics.config_filter(), false),
+    ] {
+        let filter = Filter { preserve_retain: retain_as_published, ..Filter::new(filter, QoS::AtLeastOnce) };
         // WAIT: mqtt-request
-        client.subscribe(filter, QoS::AtLeastOnce).await?;
+        client.subscribe_many(vec![filter]).await?;
     }
     emit(client, topics.active(), true, b"true".to_vec(), properties()).await;
     emit(client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
@@ -375,8 +385,8 @@ fn route(shared: &Shared, topic: &str, publish: &Publish) {
             if publish.retain {
                 return malformed("a command is never retained".into(), blank());
             }
-            let decoded =
-                wire::decode_command(payload).and_then(|(target, call)| Ok((target, call, ReplyTo::from_properties(properties)?)));
+            let decoded = wire::decode_command(payload)
+                .and_then(|(target, call)| Ok((target, call, ReplyTo::from_properties(properties, &shared.topics)?)));
             let (target, call, reply) = match decoded {
                 Err(e) => return malformed(e, blank()),
                 Ok(decoded) => decoded,

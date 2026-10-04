@@ -1221,3 +1221,36 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "tests::a_packet_past_the_clients_maximum_is_discarded", "--exact"]
 expect_text = '''a publish within the bound'''
 guard       = "fake_broker_max_packet"
+
+# C10: commands and target-level writes are subscribed retain-as-published.
+[[control]]
+name        = "commands_are_subscribed_without_retain_as_published"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''(topics.desired_target_filter(), true), (topics.desired_property_filter(), false), (topics.command(), true)'''
+replacement = '''(topics.desired_target_filter(), false), (topics.desired_property_filter(), false), (topics.command(), false)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken", "--exact"]
+expect_text = '''a live retained command or target-level write was not refused'''
+guard       = "retain_as_published"
+
+# C10: property writes are not subscribed retain-as-published (a live retained one is live).
+[[control]]
+name        = "property_writes_are_subscribed_retain_as_published"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''(topics.desired_property_filter(), false)'''
+replacement = '''(topics.desired_property_filter(), true)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken", "--exact"]
+expect_text = '''a live property write was checked as a replay'''
+guard       = "property_writes_live"
+
+# MINOR 6: a response topic on the bridge's own request lanes is refused.
+[[control]]
+name        = "a_reply_to_the_bridges_own_lanes_is_taken"
+file        = "mqtt-bridge-kit/src/replies.rs"
+anchor      = '''        if topics.is_request_lane(&topic) {'''
+replacement = '''        if topics.is_request_lane(&topic) && false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_response_topic_on_the_bridges_own_request_lanes_is_refused", "--exact"]
+expect_text = '''a response topic on the bridge's own lanes was not refused'''
+guard       = "reply_not_on_request_lanes"

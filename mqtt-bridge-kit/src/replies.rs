@@ -6,6 +6,7 @@ use bytes::Bytes;
 use rumqttc::v5::mqttbytes::v5::PublishProperties;
 use serde_json::{json, Value};
 
+use crate::topics::Topics;
 use crate::wire::Reason;
 
 /// Where a command's answer goes.
@@ -17,13 +18,19 @@ pub struct ReplyTo {
 
 impl ReplyTo {
     /// The reply address a command's properties give, if any; an error for a response topic the
-    /// bridge could never publish to (empty, or holding a wildcard): rumqttc would refuse it.
-    pub fn from_properties(properties: Option<&PublishProperties>) -> Result<Option<ReplyTo>, String> {
+    /// bridge could never publish to (empty, or holding a wildcard: rumqttc would refuse it), and
+    /// for one on the bridge's own request lanes (`Desired`, `Command`, `Config`): the reply would
+    /// be read back as a request — on `Command` it carries `command`, and a momentary action ran
+    /// twice (review MINOR 6).
+    pub fn from_properties(properties: Option<&PublishProperties>, topics: &Topics) -> Result<Option<ReplyTo>, String> {
         let Some(topic) = properties.and_then(|p| p.response_topic.clone()) else {
             return Ok(None);
         };
         if topic.is_empty() || topic.contains(['+', '#', '\0']) {
             return Err(format!("the response topic `{topic}` is not a topic one can publish to"));
+        }
+        if topics.is_request_lane(&topic) {
+            return Err(format!("the response topic `{topic}` is one of the bridge's own request lanes"));
         }
         Ok(Some(ReplyTo { topic, correlation: properties.and_then(|p| p.correlation_data.clone()) }))
     }
@@ -67,11 +74,14 @@ mod tests {
             correlation_data: Some(Bytes::from_static(b"42")),
             ..PublishProperties::default()
         };
-        let to = ReplyTo::from_properties(Some(&props)).unwrap().unwrap();
+        let topics = Topics::new("IR", "living").unwrap();
+        let to = ReplyTo::from_properties(Some(&props), &topics).unwrap().unwrap();
         assert_eq!(to, ReplyTo { topic: "IR/Event/living".into(), correlation: Some(Bytes::from_static(b"42")) });
-        assert_eq!(ReplyTo::from_properties(None), Ok(None));
+        assert_eq!(ReplyTo::from_properties(None, &topics), Ok(None));
         let wild = PublishProperties { response_topic: Some("IR/+/x".into()), ..PublishProperties::default() };
-        assert!(ReplyTo::from_properties(Some(&wild)).is_err());
+        assert!(ReplyTo::from_properties(Some(&wild), &topics).is_err());
+        let own = PublishProperties { response_topic: Some("IR/Command/living".into()), ..PublishProperties::default() };
+        assert!(ReplyTo::from_properties(Some(&own), &topics).is_err(), "a reply to the bridge's own Command lane was taken");
     }
 
     #[test]
