@@ -178,3 +178,34 @@ async fn a_driver_panic_ends_the_device_worker() {
     assert!(died.cause.contains("scripted panic"), "{died:?}");
     assert!(h.stop().await);
 }
+
+/// A driver that blocks its thread — a synchronous call with no timeout — stops the worker's own
+/// timers, so its operation's deadline cannot fire there. The watchdog on the MQTT side reads that
+/// deadline: past it and a grace, the device is unreachable, the waiting momentary commands are
+/// refused, and the device worker is dead — the bounded shutdown and a failure status, for the
+/// service manager to restart the bridge (review M3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline() {
+    let mut h = Harness::start_with("blocked", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Apply, None, Answer::Block(Duration::from_secs(5)), 1);
+    assert!(h.desire("t1", "temp", json!(22), REQ));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty()).await, "the apply never began");
+    // Waiting behind the blocked apply.
+    assert!(h.command(json!({"target": "t1", "command": "pulse"}), Some(("Store/r", b"p1"))));
+    let blocked_at = h.device.calls_of(Op::Apply)[0].at;
+    // The 500 ms deadline, the grace, a margin: well short of the 5 s the driver blocks.
+    let died = tokio::time::timeout(Duration::from_millis(3500), h.running().ended()).await;
+    let died = died.unwrap_or_else(|_| panic!("a driver blocking its thread went unseen for 3.5 s; Status {:?}", h.status()));
+    assert_eq!(died.part, "device", "{died:?}");
+    assert!(died.cause.contains("blocked"), "{died:?}");
+    assert!(blocked_at.elapsed() < Duration::from_secs(4), "seen only once the driver let go: {:?}", blocked_at.elapsed());
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "Status still says {:?}", h.status());
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("refused").iter().any(|e| e["command"] == "pulse")).await,
+        "the momentary command waiting behind the blocked worker was not refused: {:?}",
+        h.errors()
+    );
+    assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the refused command was not answered");
+    assert!(h.stop().await);
+}

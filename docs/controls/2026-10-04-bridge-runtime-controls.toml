@@ -979,3 +979,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
 expect_text = '''the session was not parked on a full request channel'''
 guard       = "stalled_test_barrier"
+
+# M3: a driver that blocks its thread is a dead worker past its operation's deadline.
+[[control]]
+name        = "the_watchdog_never_fires"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''            if over > BLOCKED_GRACE {'''
+replacement = '''            if over > Duration::from_secs(3600) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline", "--exact"]
+expect_text = '''a driver blocking its thread went unseen'''
+guard       = "blocked_worker_watchdog"

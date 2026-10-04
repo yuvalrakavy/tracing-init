@@ -67,6 +67,34 @@ pub(crate) struct Abandoned {
     running: AtomicUsize,
 }
 
+/// The deadline of the operation the device worker is running, for the watchdog on the MQTT side
+/// ([`crate::process::Running::ended`]): a worker whose thread is blocked in a synchronous call
+/// cannot fire its own timers, so only another thread can see the deadline pass. Across links.
+#[derive(Debug)]
+pub(crate) struct OpClock {
+    epoch: Instant,
+    /// In milliseconds since `epoch` plus one; 0 between operations.
+    deadline: AtomicU64,
+}
+
+impl OpClock {
+    pub(crate) fn new() -> OpClock {
+        OpClock { epoch: Instant::now(), deadline: AtomicU64::new(0) }
+    }
+
+    pub(crate) fn set(&self, deadline: Option<Instant>) {
+        let stamp = deadline.map_or(0, |d| d.saturating_duration_since(self.epoch).as_millis() as u64 + 1);
+        self.deadline.store(stamp, Ordering::SeqCst);
+    }
+
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        match self.deadline.load(Ordering::SeqCst) {
+            0 => None,
+            stamp => Some(self.epoch + Duration::from_millis(stamp - 1)),
+        }
+    }
+}
+
 /// One link's shared state.
 #[derive(Debug)]
 struct LinkShared {
@@ -78,6 +106,8 @@ struct LinkShared {
     deadline: AtomicU64,
     epoch: Instant,
     abandoned: Arc<Abandoned>,
+    /// The worker's operation clock, which the watchdog reads.
+    clock: Arc<OpClock>,
     instance: String,
 }
 
@@ -134,10 +164,12 @@ impl LinkHandle {
         }
     }
 
-    /// Set the deadline of the operation about to run (`None` between operations).
+    /// Set the deadline of the operation about to run (`None` between operations), for its
+    /// blocking calls and for the watchdog.
     pub(crate) fn set_deadline(&self, deadline: Option<Instant>) {
         let stamp = deadline.map_or(0, |d| d.saturating_duration_since(self.shared.epoch).as_millis() as u64 + 1);
         self.shared.deadline.store(stamp, Ordering::SeqCst);
+        self.shared.clock.set(deadline);
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -213,7 +245,13 @@ pub struct LinkContext {
 }
 
 impl LinkContext {
-    pub(crate) fn new(generation: u64, instance: &str, reports: Arc<Reports>, abandoned: Arc<Abandoned>) -> LinkContext {
+    pub(crate) fn new(
+        generation: u64,
+        instance: &str,
+        reports: Arc<Reports>,
+        abandoned: Arc<Abandoned>,
+        clock: Arc<OpClock>,
+    ) -> LinkContext {
         let report = Reporter::new(reports);
         let shared = Arc::new(LinkShared {
             generation,
@@ -223,6 +261,7 @@ impl LinkContext {
             deadline: AtomicU64::new(0),
             epoch: Instant::now(),
             abandoned,
+            clock,
             instance: instance.to_owned(),
         });
         LinkContext { report: report.clone(), handle: LinkHandle { shared, report }, helpers: tokio::task::JoinSet::new() }

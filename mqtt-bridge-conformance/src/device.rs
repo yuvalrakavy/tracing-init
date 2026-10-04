@@ -1,7 +1,7 @@
 //! A scriptable fake device, as a [`DeviceDriver`]: up and down, values changed at the device,
 //! answers scripted per operation (a lost link, a refusal, an unusable reply, unsupported, a delay,
-//! a call that never returns, a gate the test opens), a deaf device that takes writes without
-//! acting on them, and a log of every call.
+//! a call that never returns, a panic, a call that blocks its thread), a deaf device that takes
+//! writes without acting on them, and a log of every call.
 //!
 //! [`fake_device`] returns the driver, for the bridge, and a [`Device`] handle, for the test.
 
@@ -50,6 +50,9 @@ pub enum Answer {
     Delay(Duration),
     /// The driver panics (a bug).
     Panic,
+    /// The driver blocks its thread this long — a synchronous call with no timeout — and then
+    /// answers as the device does (a bug the runtime's watchdog catches).
+    Block(Duration),
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +239,10 @@ impl FakeDevice {
                 Ok(())
             }
             Some(Answer::Panic) => panic!("the fake driver's scripted panic"),
+            Some(Answer::Block(d)) => {
+                std::thread::sleep(d);
+                Ok(())
+            }
         }
     }
 

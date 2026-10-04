@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::*;
 
 fn context(generation: u64) -> LinkContext {
-    LinkContext::new(generation, "i", Reports::new(), Arc::new(Abandoned::default()))
+    LinkContext::new(generation, "i", Reports::new(), Arc::new(Abandoned::default()), Arc::new(OpClock::new()))
 }
 
 /// A helper's `link_lost` ends the worker's wait on it, with the first reason given.
@@ -56,7 +56,7 @@ async fn abandoned_blocking_calls_are_capped() {
     let abandoned = Arc::new(Abandoned::default());
     let mut releases = Vec::new();
     for generation in 0..ABANDONED_CAP as u64 {
-        let ctx = LinkContext::new(generation, "i", Reports::new(), abandoned.clone());
+        let ctx = LinkContext::new(generation, "i", Reports::new(), abandoned.clone(), Arc::new(OpClock::new()));
         ctx.handle().set_deadline(Some(Instant::now() + Duration::from_millis(20)));
         let (release, held) = std::sync::mpsc::channel::<()>();
         releases.push(release);
@@ -67,7 +67,7 @@ async fn abandoned_blocking_calls_are_capped() {
             .await
             .is_err());
     }
-    let ctx = LinkContext::new(99, "i", Reports::new(), abandoned.clone());
+    let ctx = LinkContext::new(99, "i", Reports::new(), abandoned.clone(), Arc::new(OpClock::new()));
     ctx.handle().set_deadline(Some(Instant::now() + Duration::from_secs(5)));
     let started = Instant::now();
     assert!(ctx.blocking(|| 1).await.is_err(), "a blocking call past the cap was run");
@@ -78,7 +78,7 @@ async fn abandoned_blocking_calls_are_capped() {
         assert!(Instant::now() < deadline, "an abandoned call that ended was never uncounted");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let ctx = LinkContext::new(100, "i", Reports::new(), abandoned);
+    let ctx = LinkContext::new(100, "i", Reports::new(), abandoned, Arc::new(OpClock::new()));
     ctx.handle().set_deadline(Some(Instant::now() + Duration::from_secs(5)));
     assert_eq!(ctx.blocking(|| 7).await, Ok(7));
 }

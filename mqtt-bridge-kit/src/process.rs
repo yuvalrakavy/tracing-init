@@ -18,7 +18,11 @@
 //!   and never calls `process::exit`, which would skip every drop.
 //! - **Dead workers:** none of the bridge's parts ends on its own; one that does (a driver's
 //!   panic) is ERROR `worker_died`, the bounded shutdown, and a failure status, for the service
-//!   manager to restart the bridge.
+//!   manager to restart the bridge. So is a device worker whose thread is blocked — a synchronous
+//!   call with no timeout, where its own timers cannot fire: a watchdog here reads the running
+//!   operation's deadline, and past it and [`BLOCKED_GRACE`] says the device is unreachable,
+//!   refuses the momentary commands waiting, and ends the bridge. A thread cannot be cancelled;
+//!   the restart is the recovery.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -33,9 +37,10 @@ use tracing::{error, info, warn, Instrument, Span};
 
 use crate::config::{self, Problem, Settings, TimingOverrides};
 use crate::driver::{DeviceDriver, DriverInfo};
+use crate::link::OpClock;
 use crate::mailbox::Mailbox;
 use crate::pump::BrokerOutage;
-use crate::reports::Reports;
+use crate::reports::{LinkStatus, Reports};
 use crate::session::{self, MqttTiming};
 use crate::topics::Topics;
 use crate::worker::{self, Worker, WorkerEnd};
@@ -44,6 +49,11 @@ use crate::worker::{self, Worker, WorkerEnd};
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// How long the runtime's threads get, once the bridge has stopped, before the process exits.
 pub const RUNTIME_GRACE: Duration = Duration::from_secs(1);
+/// Past its operation's deadline by this much, a device worker is blocked: its thread is in a
+/// call its own timers cannot interrupt, and the watchdog declares it dead.
+pub const BLOCKED_GRACE: Duration = Duration::from_secs(2);
+/// How often the watchdog reads the operation's deadline.
+const WATCH_TICK: Duration = Duration::from_millis(100);
 
 /// A bridge: its family, its command line, and its driver's options. See the crate documentation.
 #[derive(Debug, Clone)]
@@ -266,13 +276,14 @@ impl Bridge {
         });
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (worker_stop, worker_stop_rx) = watch::channel(false);
-        let worker = Worker::new(driver, info, &instance, mailbox, reports);
+        let worker = Worker::new(driver, info, &instance, mailbox.clone(), reports.clone());
+        let clock = worker.clock();
         let worker = worker::spawn(worker, worker_stop_rx, span.clone()).map_err(|e| format!("the device worker's thread: {e}"))?;
         let mut tasks = JoinSet::new();
         let _entered = span.enter();
         session::spawn(shared, shutdown_rx, &mut tasks);
         drop(_entered);
-        Ok(Running { tasks, worker: Some(worker), shutdown, worker_stop, span })
+        Ok(Running { tasks, worker: Some(worker), shutdown, worker_stop, span, clock, watching: true, reports, mailbox })
     }
 }
 
@@ -283,6 +294,26 @@ pub struct Running {
     shutdown: watch::Sender<bool>,
     worker_stop: watch::Sender<bool>,
     span: Span,
+    /// The device worker's operation clock, and whether the watchdog still reads it (it fires
+    /// once).
+    clock: Arc<OpClock>,
+    watching: bool,
+    reports: Arc<Reports>,
+    mailbox: Arc<Mailbox>,
+}
+
+/// Until the device worker's running operation is past its deadline by [`BLOCKED_GRACE`]; by how
+/// much it is.
+async fn blocked(clock: &OpClock) -> Duration {
+    loop {
+        tokio::time::sleep(WATCH_TICK).await;
+        if let Some(deadline) = clock.deadline() {
+            let over = std::time::Instant::now().saturating_duration_since(deadline);
+            if over > BLOCKED_GRACE {
+                return over;
+            }
+        }
+    }
 }
 
 /// A part of the bridge that ended on its own.
@@ -294,10 +325,22 @@ pub struct Died {
 
 impl Running {
     /// The first part of the bridge to end — none ends on its own, so it is a death: the MQTT side
-    /// (`mqtt`) or the device worker (`device`). Cancellation-safe.
+    /// (`mqtt`) or the device worker (`device`), also a device worker blocked past its operation's
+    /// deadline (then the device is said unreachable and the momentary commands waiting are
+    /// refused first). Cancellation-safe.
     pub async fn ended(&mut self) -> Died {
+        let watching = self.watching && self.worker.is_some();
         // WAIT: bridge-parts
         tokio::select! {
+            over = blocked(&self.clock), if watching => {
+                self.watching = false;
+                self.reports.status(LinkStatus::Unreachable);
+                worker::report_refused(&self.reports, self.mailbox.disconnected());
+                Died {
+                    part: "device",
+                    cause: format!("the device worker blocked its thread {} ms past its operation's deadline", over.as_millis()),
+                }
+            }
             Some(joined) = self.tasks.join_next() => Died { part: "mqtt", cause: match joined {
                 Ok(()) => "returned".to_owned(),
                 Err(e) => e.to_string(),

@@ -28,7 +28,7 @@ use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, warn, Instrument, Span};
 
 use crate::driver::{DeviceDriver, DriverInfo, Feedback, LinkError, OpError, PropertyMap, Scope, TargetState, Writes};
-use crate::link::{Abandoned, LinkContext, LinkHandle};
+use crate::link::{Abandoned, LinkContext, LinkHandle, OpClock};
 use crate::mailbox::{Held, Mailbox, ReadKey, Resolution, StateValue, Unanswered, Work};
 use crate::replies::{reply_payload, Answer, ReplyTo};
 use crate::reports::{LinkStatus, Outbound, Reports};
@@ -181,6 +181,8 @@ pub(crate) struct Worker<D: DeviceDriver> {
     mailbox: Arc<Mailbox>,
     reports: Arc<Reports>,
     abandoned: Arc<Abandoned>,
+    /// The running operation's deadline, for the watchdog on the MQTT side.
+    clock: Arc<OpClock>,
     outage: DeviceOutage,
     generation: u64,
     /// When the last connect began: the next waits out `retry` from it.
@@ -201,11 +203,17 @@ impl<D: DeviceDriver> Worker<D> {
             mailbox,
             reports,
             abandoned: Arc::new(Abandoned::default()),
+            clock: Arc::new(OpClock::new()),
             generation: 0,
             last_attempt: None,
             before: None,
             up: false,
         }
+    }
+
+    /// The clock the watchdog on the MQTT side reads.
+    pub(crate) fn clock(&self) -> Arc<OpClock> {
+        self.clock.clone()
     }
 
     /// The worker's life: link after link. It never returns; the stop cancels it.
@@ -217,7 +225,8 @@ impl<D: DeviceDriver> Worker<D> {
             }
             self.last_attempt = Some(Instant::now());
             self.generation += 1;
-            let mut ctx = LinkContext::new(self.generation, &self.instance, self.reports.clone(), self.abandoned.clone());
+            let mut ctx =
+                LinkContext::new(self.generation, &self.instance, self.reports.clone(), self.abandoned.clone(), self.clock.clone());
             let handle = ctx.handle();
             let error = self.link(&mut ctx, &handle).await;
             self.down(ctx, error).await;
@@ -577,29 +586,32 @@ impl<D: DeviceDriver> Worker<D> {
         if std::mem::take(&mut self.up) {
             self.before = Some(self.reports.snapshot());
         }
+        // Watched like an operation: a disconnect that blocks the thread is a dead worker too.
+        self.clock.set(Some(Instant::now() + self.info.timing.operation));
         // WAIT: device-disconnect
         let _ = tokio::time::timeout(self.info.timing.operation, self.driver.disconnect()).await;
+        self.clock.set(None);
         let unanswered = self.mailbox.disconnected();
-        self.refused(unanswered);
+        report_refused(&self.reports, unanswered);
         self.reports.status(LinkStatus::Unreachable);
         self.outage.failed(&error);
     }
+}
 
-    /// What the disconnect refused: each momentary command on `Error`, and every reply waited for.
-    fn refused(&self, unanswered: Vec<Unanswered>) {
-        let message = "the device link was lost before it ran";
-        for u in unanswered {
-            if u.momentary {
-                self.reports.error(ErrorReport::new(Reason::Refused, message).target(u.target.as_deref()).command(&u.command));
-            }
-            let answer = Answer::Failed { reason: Reason::Refused, error: message.to_owned() };
-            for reply in u.replies {
-                self.reports.event(Outbound {
-                    topic: Some(reply.topic),
-                    payload: reply_payload(u.target.as_deref(), &u.command, &answer),
-                    correlation: reply.correlation,
-                });
-            }
+/// What a disconnect refused: each momentary command on `Error`, and every reply waited for.
+pub(crate) fn report_refused(reports: &Reports, unanswered: Vec<Unanswered>) {
+    let message = "the device link was lost before it ran";
+    for u in unanswered {
+        if u.momentary {
+            reports.error(ErrorReport::new(Reason::Refused, message).target(u.target.as_deref()).command(&u.command));
+        }
+        let answer = Answer::Failed { reason: Reason::Refused, error: message.to_owned() };
+        for reply in u.replies {
+            reports.event(Outbound {
+                topic: Some(reply.topic),
+                payload: reply_payload(u.target.as_deref(), &u.command, &answer),
+                correlation: reply.correlation,
+            });
         }
     }
 }

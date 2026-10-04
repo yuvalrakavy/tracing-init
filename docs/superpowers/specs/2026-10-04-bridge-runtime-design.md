@@ -174,6 +174,12 @@ commands are refused, and reads are dropped.
   request while its pings succeed; a broker that stops reading holds rumqttc in its flush,
   inside the poll, where its keep-alive cannot fire. Reconnects are paced by `poll_retry`, and by
   `retry` after every fifth failed connect in a row.
+- **A driver that blocks its thread:** its operation's deadline cannot fire on the worker's own
+  runtime, so a watchdog on the MQTT side reads it (an atomic). Past the deadline and a 2 s grace:
+  ERROR `worker_died`, `Status=unreachable`, the momentary commands waiting refused, and the
+  dead-part path — the bounded shutdown and a failure exit, so the supervisor restarts the
+  process. A thread cannot be cancelled; the restart is the recovery. (A helper that blocks the
+  thread while no operation runs has no deadline to pass; it is not seen.)
 
 **Out of scope:** airzoned (a media daemon) keeps its own structure. mqtt_mdns adopts only the pump,
 reports and process pieces, since it has no device link.
@@ -202,7 +208,7 @@ fn main() -> ExitCode {
 - Native `async fn` in the trait needs `#[allow(async_fn_in_trait)]`, and its futures are not `Send`,
   so the runtime cannot `tokio::spawn` them. The driver therefore runs on a thread of its own with a
   single-threaded runtime (as built in R1). A driver that blocks its thread holds up neither the MQTT
-  side nor the stop.
+  side nor the stop, and past its operation's deadline it is a dead worker (§5.2).
 - `Bridge` also has `option(name, help)` / `value(name)` for driver-specific options (mqtt_ac v2's
   CoolMaster address), and `start(driver) -> Running` to run a bridge in-process (used by the suite).
 - The stdio binding is itself a `DeviceDriver` (`PluginDriver`) that forwards each call to the plugin
