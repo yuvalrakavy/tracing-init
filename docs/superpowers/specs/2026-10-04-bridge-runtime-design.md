@@ -1,0 +1,261 @@
+# Bridge Runtime (`mqtt-bridge-kit`) — design
+
+**Status:** approved by the owner, 2026-10-04. Not yet built.
+**Companions (kept in sync, owner rule 2026-10-04):**
+- the SDL Bridge Support Kit spec (Store, `docs/superpowers/specs/2026-10-04-sdl-bridge-kit-design.md`),
+  which owns the wire contract;
+- the Bridge Kit Tutorial;
+- the `developing-mqtt-bridges` skill.
+
+A change to any of them updates the others in the same change. This spec is the source for the bridge
+side; the artifacts follow it:
+- runtime: https://claude.ai/artifact/VtZNayRupmyBtUdcaWbqY3
+- tutorial: https://claude.ai/artifact/23pVXtj2orqEXfGKL9D7zx
+
+## 1. Why
+
+Each of the seven device bridges carries its own copy of the same machinery, and no-hang 3b (Store spec
+§14.8–§14.10) spent three two-family review rounds finding bugs in those copies:
+
+- **The MQTT pump:** the rumqttc 0.25 collision fix, the clean-start republish, and the backlog
+  episode.
+- **Outages:** episodes with proof-of-life recovery and paced reconnects; two bridges had hot loops.
+- **The device mailbox:** state held latest-per-target, momentary commands refused, reads dropped.
+  Held state was lost in two bridges.
+- **Reporting:** the device side must never wait on MQTT.
+- **Start-up and shutdown:** signals first, the logging start raced against the stop, a bounded process
+  end, no blocking prints.
+
+The Bridge Kit adds the `Desired` lane, expiry, conflict resolution, `Event`, and replies to every bridge.
+Written once, the policy gets one review, one test suite and one fix; each bridge keeps only its device
+protocol.
+
+## 2. Decisions (2026-10-04)
+
+- **D1, shape:** one Rust runtime, with drivers in-process (a Rust trait) or as a plugin process speaking
+  a stdio protocol (any language). The policy is written and reviewed once. A native runtime in another
+  language stays possible later, from the same API and conformance suite.
+- **D2, home:** this workspace, next to `mqtt-test-broker`, `wait-lint` and `lock-order`.
+- **D3, order:** R1 lands with Bridge Kit S1/S2, with mqtt_ac v2 as its first user. The other Rust bridges
+  follow with their Bridge Kit S4 steps. The stdio binding and Python SDK (R3) come when the first Python
+  bridge is needed.
+- **Install base:** mqtt_ac, mqtt_dmx and mqtt_dali serve the old home system, so their runtime versions
+  are a new, incompatible v2 on `main`; v1 stays on a `v1` branch. Lutron, HDL and YNCA move in place.
+
+## 3. Layers
+
+1. **Wire contract:** the Bridge Kit grammar, plus JSON Schemas for each lane's payload, shared with the
+   Store kit's tests.
+2. **Driver API:** language-neutral. Every operation has a meaning, a deadline and an error class. It is
+   not code-generated.
+3. **Bindings:** the same API twice: a Rust trait (in-process) and a stdio protocol (a plugin process,
+   JSON lines).
+4. **Runtime:** everything that is policy, in Rust.
+5. **Conformance suite:** the executable contract, a black-box suite over MQTT that runs against either
+   binding with a scriptable fake device.
+
+## 4. The driver API
+
+A driver is one object, called by one runtime task at a time, so a device protocol that needs strict
+sequencing gets it for free. Every call carries a deadline the runtime enforces; an overrun counts as a
+lost link, never a hang.
+
+### 4.1 Operations the driver implements
+
+| Operation | Called when | Must | Returns |
+|---|---|---|---|
+| `info()` | once, at start | be pure | `DriverInfo` (§4.4) |
+| `connect(ctx)` | to open the device link (paced retries) | finish or fail within the connect timing; may start helpers via `ctx` | ok or `LinkError` |
+| `disconnect()` | after a lost link, at shutdown | be quick; best effort | nothing |
+| `read_state(scope)` | after connecting, on the poll interval, for `refresh`, and before resolving outage conflicts | read the device, not a cache | observed state per target |
+| `apply(target, values)` | for a request; several values arrive together for an atomic write | apply all values, in the order the device needs | ok or an error class |
+| `execute(target, command, params)` | for a momentary command | act once; never retry | ok with an optional reply, or an error class |
+| `configure(target, config)` | when a `Config` intent arrives or is retracted (`none`) | accept the setup | ok or an error class |
+| `probe()` | for drivers with `writes: unacknowledged`: idle and while busy | prove the device is alive (Lutron's `DLMON`) | ok or `LinkError`; defaults to a read |
+
+### 4.2 The link context
+
+- `ctx.report.state(target, values, assumed?)`: observed or assumed state, from an operation or a
+  helper.
+- `ctx.report.event(event)`: something that happened.
+- `ctx.spawn(task)`: a helper the runtime owns (an unsolicited-input reader), cancelled when the link
+  drops.
+- `ctx.link_lost(reason)`: a helper noticed the link died.
+- `ctx.blocking(fn)`: a synchronous library call on a worker thread, under the current deadline. An
+  overrun abandons the thread (capped in number) and counts as a lost link.
+
+Every reporter call returns at once and never waits on MQTT. State coalesces per topic; events go to a
+capped queue whose overflow is counted and logged once per episode.
+
+### 4.3 Errors
+
+| Class | Means | The runtime then |
+|---|---|---|
+| `Link` | the connection failed: I/O, timeout, closed | drops the link; starts or continues the outage episode; holds state requests, refuses momentary ones; reconnects at the paced rate |
+| `Rejected` | the device refused this request | publishes `Error` naming the target and property (the Store abandons it); WARN `command_rejected`; the link stays up |
+| `Unusable` | a reply the driver couldn't parse | publishes `Error` once and passes the request over; never reconnects for it (3b: that was a hot loop) |
+| `Unsupported` | no such command or property | publishes `Error`; no retry |
+
+### 4.4 Capabilities (`DriverInfo`)
+
+- **`writes`:** `acknowledged` (a successful `apply` means the device confirmed it; CoolMaster), or
+  `unacknowledged` (it only means "sent"; the HWI, YNCA). With `unacknowledged`, each applied value
+  stays unproven until a later successful `probe` or read, and is held again if the link dies first,
+  unless a newer value waits.
+- **`feedback`:** `observed`, or `assumed` for one-way devices. This is the driver's default; a target's
+  `Config` may override it. With `assumed`, the runtime publishes applied values as `State` marked
+  `"assumed": true` unless the driver reports otherwise.
+- **`commands`:** each with a class: `momentary`, `read` (coalesced; dropped while down), or
+  `with_reply`. `refresh` (a `read_state`) and `assume` (set the assumed state without calling the
+  driver) are standard and handled by the runtime.
+- **`timing`:** defaults for connect, operation, retry pacing, the outage WARN threshold (30 s), the poll
+  interval, and the probe interval and deadline. Each can be overridden on the command line.
+
+## 5. What the runtime owns
+
+| Area | Behaviour |
+|---|---|
+| Topics | the grammar from `--root` and `--instance`; subscriptions to `Desired`, `Command`, `Config` |
+| Pump | polls only; unbounded forward with a backlog episode; the 0.25 collision fix |
+| Every CONNACK | subscribe, then `Active=true`, then republish the retained model; `Version` |
+| Start-up read-back | reads its own retained `State`, for the conflict rule's "before" values after a restart |
+| Requests | decodes both `Desired` forms; the deadline from the MQTT message expiry; `conflict` from the user property; retractions; malformed payloads answered with `Error` |
+| Mailbox | latest per (target, property), moved to the back; momentary FIFO (cap 64) refused while down; reads coalesced; held values dropped at their deadline; unproven writes held again |
+| Worker | connect with pacing; proof of life before declaring recovery; catch-up (read, resolve conflicts, apply held state); poll; probes |
+| Reports | a never-waiting model for `State` and `Status`; capped queues for `Event` and `Error` |
+| Replies | a command's answer goes to its MQTT v5 response topic, carrying its correlation data |
+| Outages | broker and device episodes: INFO first failure, DEBUG retries, one WARN past 30 s, INFO recovery with `down_for_ms` and `attempts` |
+| Process | signals first; logging start raced against the stop; no blocking prints; `Active=false` and DISCONNECT; explicit runtime ended with `shutdown_timeout`; `ExitCode` |
+| Logging | tracing-init with lossy destinations; the fleet's kind names (Store `docs/guides/logging-policy.md`) |
+
+Device-link states: `Connecting` → `Proving` (connected, awaiting the first good read or probe) → `Up`,
+or `Down` on `LinkError`, a missed deadline or `link_lost`. `Down` retries after the pacing interval.
+Catch-up runs on entering `Up`. While `Down`, state requests are held to their deadline, momentary
+commands are refused, and reads are dropped.
+
+**Out of scope:** airzoned (a media daemon) keeps its own structure. mqtt_mdns adopts only the pump,
+reports and process pieces, since it has no device link.
+
+## 6. Rust binding
+
+```rust
+pub trait DeviceDriver: Send + 'static {
+    fn info(&self) -> DriverInfo;
+    async fn connect(&mut self, ctx: &mut LinkContext) -> Result<(), LinkError>;
+    async fn disconnect(&mut self);
+    async fn read_state(&mut self, scope: Scope) -> Result<Vec<TargetState>, OpError>;
+    async fn apply(&mut self, target: &str, values: &PropertyMap) -> Result<(), OpError>;
+    async fn execute(&mut self, target: &str, call: &CommandCall) -> Result<Option<Value>, OpError>;
+    async fn configure(&mut self, target: &str, config: Option<&Value>) -> Result<(), OpError>;
+    async fn probe(&mut self) -> Result<(), OpError> { self.read_state(Scope::Any).await.map(drop) }
+}
+
+pub enum OpError { Link(LinkError), Rejected(String), Unusable(String), Unsupported(String) }
+
+fn main() -> ExitCode {
+    mqtt_bridge_kit::Bridge::new("Aircondition").from_cli().run(Coolmaster::new())
+}
+```
+
+- Native `async fn` in traits (Rust 1.75+) works because the runtime is generic over the driver type.
+- The stdio binding is itself a `DeviceDriver` (`PluginDriver`) that forwards each call to the plugin
+  process.
+
+## 7. Stdio plugin protocol
+
+The host binary runs a plugin and talks to it over stdin/stdout, one JSON object per line:
+`mqtt-bridge-host --root IR --instance living --broker … --plugin "python3 -m broadlink_bridge"`.
+
+```text
+→ {"id":1,"op":"hello","api":1}
+← {"id":1,"ok":{"info":{...}}}
+→ {"id":2,"op":"connect","deadline_ms":10000}
+← {"id":2,"ok":null}
+→ {"id":3,"op":"apply","target":"tv","values":{"power":true},"deadline_ms":3000}
+← {"id":3,"ok":null}
+← {"note":"event","event":{"kind":"code","code":"…"}}
+→ {"id":4,"op":"execute","target":"tv","command":"learn","params":{"key":"Netflix"},"deadline_ms":30000}
+← {"id":4,"error":{"class":"rejected","message":"no IR heard within 30 s"}}
+```
+
+**The host enforces:**
+- **Draining:** stdout is read on a task of its own and always drained. stderr is drained to the log,
+  lossy.
+- **Deadlines:** writes to stdin are bounded. A plugin that stops reading, or misses a deadline, counts
+  as a lost link.
+- **Crashes:** a plugin that exits is an outage episode and is restarted at the paced rate. One that
+  ignores `disconnect` is killed with its process group.
+- **Message size:** lines are capped at 1 MiB. An oversized or malformed line is `Unusable`.
+- **One request at a time,** unless the plugin declares `"concurrent": true`.
+
+## 8. Python SDK
+
+The `mqtt_bridge_kit` package gives Python the same API shape:
+- a `DeviceDriver` base class with the eight operations as `async` methods;
+- the four error classes as exceptions;
+- a `LinkContext` with the same calls;
+- `run_plugin(driver)` to serve the protocol.
+
+The motivating case is an IR blaster driven by the `python-broadlink` library. The plugin has no MQTT
+client and no outage or shutdown logic; it inherits them from the host.
+
+## 9. Conformance suite
+
+One black-box suite plays the Store's side over MQTT (`FakeBroker`) and drives a scriptable fake device.
+The fake device is itself a driver, in-process for the Rust binding and a plugin for the stdio binding,
+so both bindings run the same suite.
+
+**Scenarios:**
+- **Reconnects:** a CONNACK (subscriptions before `Active`, then the model republished); a broker
+  restart without persistence.
+- **Requests:**
+  - a request while the device is down, applied on recovery within its expiry and never after it;
+  - a momentary command while down (`Error`; never applied later);
+  - the outage conflict both ways;
+  - a target-level write reaching `apply` once with all values;
+  - a retraction before the device returns.
+- **Driver errors:**
+  - `Rejected`, `Unusable` and `Link` with their behaviours, including paced reconnects (at most one per
+    retry interval);
+  - unacknowledged writes held again when the link dies before a probe;
+  - a driver call that never returns, which becomes a lost link within its deadline.
+- **Process:** SIGTERM, including during a stalled `connect`; malformed `Desired` and `Command`
+  payloads.
+- **Plugins:** a plugin that crashes, hangs or floods its stdout.
+
+Every guard also gets a negative-control row. The suite runs in this repo's CI.
+
+## 10. Repository layout
+
+```text
+mqtt-bridge-kit/          the runtime and the Rust trait binding (library)
+  src/  topics · wire · pump · session · mailbox · worker · reports · replies · process · plugin
+mqtt-bridge-host/         binary: runs a stdio plugin under the runtime
+mqtt-bridge-conformance/  the suite; the fake device as a driver and as a plugin
+python/mqtt_bridge_kit/   the Python SDK (stdio binding only)
+schemas/                  JSON Schemas for each lane's payload
+```
+
+## 11. Rollout
+
+- **R1** (with Bridge Kit S1/S2): the runtime, the trait and the suite, lifted from 3b's code:
+  - mqtt_ac's mailbox and reports;
+  - lutron's probe accounting;
+  - ynca's order-based proof;
+  - the shared pump and process pieces.
+
+  **mqtt_ac v2** is its first user: the CoolMaster protocol as a `DeviceDriver`.
+- **R2** (with Bridge Kit S4): Lutron, HDL and YNCA in place; DMX and DALI as v2.
+- **R3:** `mqtt-bridge-host`, the protocol, the plugin fake device, the Python SDK, and a Broadlink IR
+  plugin.
+
+## 12. Risks
+
+- **One runtime is one point of failure.** Mitigated by the conformance suite, negative controls,
+  two-family review, and staged migration, so a regression shows on one pair first.
+- **The API may not fit an odd device.** A device that streams, or needs concurrent operations, strains
+  the one-call-at-a-time model. The outlets are `ctx.spawn` and the plugin `concurrent` flag; R2's five
+  drivers test them.
+- **Blocking libraries.** A synchronous call can only be abandoned, not cancelled. `ctx.blocking` bounds
+  it and caps the number abandoned.
+- **A plugin is a second process to deploy.** The host supervises it.
