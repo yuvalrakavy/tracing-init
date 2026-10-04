@@ -213,7 +213,10 @@ commands are refused, and reads are dropped.
     current link is not handed over again (every reconnect replays the retained configs); a lost
     link forgets what was taken.
   - A momentary command still waiting at its message expiry is dropped — on `Error` (`refused`) and
-    answered.
+    answered. Any command past its expiry when the session reads it (it waited behind a stalled
+    broker) is refused the same way, `assume` and the reads included; a coalesced read keeps each
+    caller's deadline, refuses each caller past it on its own, and runs only for the rest (re-gate
+    R9).
 - **Command line:** a zero `--retry`, `--probe-interval` or `--mqtt-retry`, a `--mqtt-keep-alive`
   under 5 s (rumqttc's floor) or over 65535 s (MQTT's 16-bit field), and any duration over a week
   (near the type's limit it overflows an `Instant`) are usage errors (exit 2); the same timings

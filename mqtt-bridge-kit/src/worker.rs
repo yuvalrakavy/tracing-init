@@ -748,7 +748,12 @@ impl<D: DeviceDriver> Worker<D> {
                 let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref(), &call)).await;
                 self.answered(target.as_deref(), &call.command, result, reply.into_iter().collect(), true)
             }
-            Work::Read { key: ReadKey::Refresh(target), replies, .. } => {
+            Work::ReadExpired { expired } => {
+                report_refused(&self.reports, expired, READ_EXPIRED);
+                Ok(())
+            }
+            Work::Read { key: ReadKey::Refresh(target), replies, expired, .. } => {
+                report_refused(&self.reports, expired, READ_EXPIRED);
                 let scope = target.clone().map_or(Scope::All, Scope::Target);
                 // WAIT: device-op
                 let result = op(handle, timing.operation, "read_state", self.driver.read_state(scope)).await.map(|states| {
@@ -759,7 +764,8 @@ impl<D: DeviceDriver> Worker<D> {
                 // A failure goes to Error too, as every command's does (review C13).
                 self.answered(target.as_deref(), "refresh", result, replies, true)
             }
-            Work::Read { key: ReadKey::Command { target, command }, call, replies } => {
+            Work::Read { key: ReadKey::Command { target, command }, call, replies, expired } => {
+                report_refused(&self.reports, expired, READ_EXPIRED);
                 let call = call.unwrap_or_else(|| crate::driver::CommandCall { command: command.clone(), params: PropertyMap::new() });
                 let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref(), &call)).await;
                 self.answered(target.as_deref(), &command, result, replies, true)
@@ -901,6 +907,9 @@ impl<D: DeviceDriver> Worker<D> {
 
 /// What a disconnect refuses: a command the device never took.
 pub(crate) const LINK_LOST_BEFORE: &str = "the device link was lost before it ran";
+
+/// What a read's caller past its deadline is told.
+const READ_EXPIRED: &str = "the command reached its expiry while it waited for the device; not executed";
 
 /// What a disconnect refused, or what expired: each command on `Error`, and every reply waited for.
 pub(crate) fn report_refused(reports: &Reports, unanswered: Vec<Unanswered>, message: &str) {

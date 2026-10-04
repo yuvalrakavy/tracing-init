@@ -514,9 +514,15 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
         shared.reports.error(ErrorReport::new(reason, error).target(target.as_deref()).command(&call.command));
         answer(Answer::Failed { reason, error: error.to_owned() });
     };
+    // Past its expiry when the session reads it — it waited behind a stalled broker — a command
+    // is refused, whatever its class: `assume` and the reads included (review R9).
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        debug!(command = %call.command, "A command past its expiry when read; refused");
+        return refused(Reason::Refused, "the command reached its expiry before the bridge read it; not executed");
+    }
     match call.command.as_str() {
         "refresh" => {
-            let posted = shared.mailbox.post_read(ReadKey::Refresh(target.clone()), None, reply.clone());
+            let posted = shared.mailbox.post_read(ReadKey::Refresh(target.clone()), None, reply.clone(), deadline);
             if posted == Posted::Dropped {
                 refused(Reason::Refused, "the device is not connected");
             }
@@ -538,7 +544,7 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
             }
             Some(CommandClass::Read) => {
                 let key = ReadKey::Command { target: target.clone(), command: name.to_owned() };
-                if shared.mailbox.post_read(key, Some(call.clone()), reply.clone()) == Posted::Dropped {
+                if shared.mailbox.post_read(key, Some(call.clone()), reply.clone(), deadline) == Posted::Dropped {
                     refused(Reason::Refused, "the device is not connected");
                 }
             }

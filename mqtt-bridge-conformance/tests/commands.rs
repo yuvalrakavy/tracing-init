@@ -393,3 +393,26 @@ async fn a_command_queued_during_a_poll_that_loses_the_link_is_answered() {
     );
     assert!(h.stop().await);
 }
+
+/// A read-class command still waiting at its expiry is not executed: it is refused, on `Error` and
+/// on its response topic — every caller of a coalesced read with its own deadline (the R1
+/// re-gate's R9: reads stored no deadline, and ran whenever their turn came).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_command_that_expires_while_queued_is_refused_not_executed() {
+    let timing = mqtt_bridge_kit::TimingOverrides { operation: Some(Duration::from_secs(3)), ..quick_timing() };
+    let h = Harness::start_with("expired-read", acknowledged(), timing, up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(1500)), 1);
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), None));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await);
+    let replies = "Store/replies/expired-read";
+    let options = SendOptions::default().expiry(1).response_topic(replies).correlation_data(b"s-1".to_vec());
+    assert!(h.broker.publish(&h.topics.command(), json!({"target": "t1", "command": "status"}).to_string(), &options));
+    assert!(h.eventually(BOUND, |h| !h.published(replies).is_empty()).await, "the read was never answered");
+    h.settle(Duration::from_millis(300)).await;
+    let statuses = h.device.calls_of(Op::Execute).iter().filter(|c| c.command.as_deref() == Some("status")).count();
+    assert_eq!(statuses, 0, "a read-class command past its expiry was executed");
+    assert_eq!(json_of(&h.published(replies)[0])["reason"], "refused");
+    assert!(h.errors_for("refused").iter().any(|e| e["command"] == "status"), "the expiry was not on Error: {:?}", h.errors());
+    assert!(h.stop().await);
+}

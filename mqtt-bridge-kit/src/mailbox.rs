@@ -122,12 +122,29 @@ pub enum ReadKey {
     Command { target: Option<String>, command: String },
 }
 
+impl ReadKey {
+    /// The target and the command it reads for.
+    fn names(&self) -> (Option<String>, String) {
+        match self {
+            ReadKey::Refresh(target) => (target.clone(), "refresh".to_owned()),
+            ReadKey::Command { target, command } => (target.clone(), command.clone()),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Entry {
     State { value: StateValue, held: bool },
     Config { target: String, config: Option<Value>, held: bool },
     Momentary { target: Option<String>, call: CommandCall, reply: Option<ReplyTo>, deadline: Option<Instant> },
-    Read { key: ReadKey, call: Option<CommandCall>, replies: Vec<ReplyTo> },
+    Read { key: ReadKey, call: Option<CommandCall>, callers: Vec<Caller> },
+}
+
+/// One caller of a coalesced read: its response topic, if it named one, and its deadline.
+#[derive(Debug)]
+struct Caller {
+    reply: Option<ReplyTo>,
+    deadline: Option<Instant>,
 }
 
 impl Entry {
@@ -161,10 +178,16 @@ pub enum Work {
         call: CommandCall,
         reply: Option<ReplyTo>,
     },
+    /// A read for its callers still within their deadline; those past it, refused (review R9).
     Read {
         key: ReadKey,
         call: Option<CommandCall>,
         replies: Vec<ReplyTo>,
+        expired: Vec<Unanswered>,
+    },
+    /// A read whose every caller reached its expiry while it waited: not run, every caller refused.
+    ReadExpired {
+        expired: Vec<Unanswered>,
     },
     /// A momentary command that reached its expiry while it waited: not executed, but reported
     /// and answered (review MINOR 4, C13).
@@ -465,20 +488,20 @@ impl Mailbox {
 
     /// A read; coalesced with one waiting for the same key (the latest parameters, every reply).
     /// Never waits.
-    pub fn post_read(&self, key: ReadKey, call: Option<CommandCall>, reply: Option<ReplyTo>) -> Posted {
+    pub fn post_read(&self, key: ReadKey, call: Option<CommandCall>, reply: Option<ReplyTo>, deadline: Option<Instant>) -> Posted {
         let posted = {
             let mut inner = self.locked();
             if !inner.connected {
                 Posted::Dropped
             } else {
-                let mut replies = Vec::new();
+                let mut callers = Vec::new();
                 if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Read { key: k, .. } if *k == key)) {
-                    if let Some(Entry::Read { replies: earlier, .. }) = inner.pending.remove(i) {
-                        replies = earlier;
+                    if let Some(Entry::Read { callers: earlier, .. }) = inner.pending.remove(i) {
+                        callers = earlier;
                     }
                 }
-                replies.extend(reply);
-                inner.pending.push_back(Entry::Read { key, call, replies });
+                callers.push(Caller { reply, deadline });
+                inner.pending.push_back(Entry::Read { key, call, callers });
                 Posted::Queued
             }
         };
@@ -545,11 +568,9 @@ impl Mailbox {
                         unanswered.push(Unanswered { target, command: call.command, momentary: true, replies: reply.into_iter().collect() })
                     }
                     // Refused, on `Error` and on any response topic, whether or not it named one.
-                    Entry::Read { key, replies, .. } => {
-                        let (target, command) = match key {
-                            ReadKey::Refresh(target) => (target, "refresh".to_owned()),
-                            ReadKey::Command { target, command } => (target, command),
-                        };
+                    Entry::Read { key, callers, .. } => {
+                        let (target, command) = key.names();
+                        let replies = callers.into_iter().filter_map(|c| c.reply).collect();
                         unanswered.push(Unanswered { target, command, momentary: false, replies });
                     }
                 }
@@ -646,8 +667,26 @@ impl Mailbox {
                     }
                 }
                 Entry::Read { .. } => {
-                    if let Some(Entry::Read { key, call, replies }) = inner.pending.pop_front() {
-                        return Some(Work::Read { key, call, replies });
+                    if let Some(Entry::Read { key, call, callers }) = inner.pending.pop_front() {
+                        // Each caller past its deadline is refused on its own; the read runs for
+                        // the rest, if any remain (review R9).
+                        let (target, command) = key.names();
+                        let (late, live): (Vec<Caller>, Vec<Caller>) =
+                            callers.into_iter().partition(|c| c.deadline.is_some_and(|d| now >= d));
+                        let expired = late
+                            .into_iter()
+                            .map(|c| Unanswered {
+                                target: target.clone(),
+                                command: command.clone(),
+                                momentary: false,
+                                replies: c.reply.into_iter().collect(),
+                            })
+                            .collect();
+                        if live.is_empty() {
+                            return Some(Work::ReadExpired { expired });
+                        }
+                        let replies = live.into_iter().filter_map(|c| c.reply).collect();
+                        return Some(Work::Read { key, call, replies, expired });
                     }
                 }
             }

@@ -1926,11 +1926,11 @@ guard       = "waits_for_key_live"
 [[control]]
 name        = "a_read_with_no_reply_is_dropped_at_a_disconnect"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''                    Entry::Read { key, replies, .. } => {
-                        let (target, command) = match key {'''
-replacement = '''                    Entry::Read { replies, .. } if replies.is_empty() => {}
-                    Entry::Read { key, replies, .. } => {
-                        let (target, command) = match key {'''
+anchor      = '''                    Entry::Read { key, callers, .. } => {
+                        let (target, command) = key.names();'''
+replacement = '''                    Entry::Read { callers, .. } if callers.iter().all(|c| c.reply.is_none()) => {}
+                    Entry::Read { key, callers, .. } => {
+                        let (target, command) = key.names();'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_read_with_no_response_topic_is_refused_at_a_disconnect", "--exact"]
 expect_text = '''a read with no response topic was dropped silently at a disconnect'''
@@ -2028,3 +2028,27 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "repeated_panics_with_a_stderr_nobody_reads_leak_no_threads", "--exact"]
 expect_text = '''while its helpers panicked: a thread per panic'''
 guard       = "one_panic_reporter"
+
+# Re-gate R9: a command past its expiry when the session reads it is refused, whatever its class.
+[[control]]
+name        = "an_expired_command_is_taken_at_arrival"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    if deadline.is_some_and(|d| Instant::now() >= d) {
+        debug!(command = %call.command, "A command past its expiry when read; refused");'''
+replacement = '''    if false && deadline.is_some_and(|d| Instant::now() >= d) {
+        debug!(command = %call.command, "A command past its expiry when read; refused");'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "an_assume_past_its_expiry_is_refused_not_taken", "--exact"]
+expect_text = '''an assume past its expiry was not refused'''
+guard       = "command_expiry_at_arrival"
+
+# Re-gate R9: each caller of a queued read is refused past its own deadline.
+[[control]]
+name        = "a_read_runs_past_its_callers_expiry"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                            callers.into_iter().partition(|c| c.deadline.is_some_and(|d| now >= d));'''
+replacement = '''                            callers.into_iter().partition(|c| c.deadline.is_some_and(|d| now >= d) && false);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_read_command_that_expires_while_queued_is_refused_not_executed", "--exact"]
+expect_text = '''a read-class command past its expiry was executed'''
+guard       = "read_expiry"

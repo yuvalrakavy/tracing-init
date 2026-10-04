@@ -135,3 +135,31 @@ async fn a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_rea
     assert!(h.device.calls_of(Op::Execute).is_empty(), "a command executed past its expiry, counted from when the session read it");
     assert!(h.stop().await);
 }
+
+/// An `assume` read past its expiry — it waited behind a stalled broker — is refused, not taken: the
+/// model is not overwritten by a stale assumption (the R1 re-gate's R9: only momentary commands
+/// carried their deadline).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assume_past_its_expiry_is_refused_not_taken() {
+    let h = Harness::start_with("assume-expiry", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
+    h.broker.hold_acks();
+    for i in 0..1000 {
+        assert!(h.send_raw(&h.topics.command(), format!("not json {i}").as_bytes()));
+    }
+    assert!(h.eventually(BOUND, |h| h.broker.held_acks() >= 10).await, "the path is not saturated");
+    h.settle(Duration::from_millis(300)).await;
+    let assume = json!({"target": "t1", "command": "assume", "temp": 30}).to_string();
+    assert!(h.broker.publish(&h.topics.command(), assume, &SendOptions::default().expiry(1)));
+    h.settle(Duration::from_millis(2000)).await;
+    h.broker.release_acks();
+    assert!(
+        h.eventually(Duration::from_secs(5), |h| h.errors_for("refused").iter().any(|e| e["command"] == "assume")).await,
+        "an assume past its expiry was not refused: State {:?}, Errors {:?}",
+        h.state("t1"),
+        h.errors_for("refused")
+    );
+    assert_ne!(h.state("t1").map(|s| s["temp"].clone()), Some(json!(30)), "an assume past its expiry overwrote the model");
+    assert!(h.stop().await);
+}

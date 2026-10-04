@@ -67,7 +67,7 @@ fn a_new_mailbox_is_down_until_the_first_connect() {
     let mailbox = Mailbox::new();
     assert_eq!(mailbox.post_state(value("u1", "power", json!(true)), false), Posted::Held);
     assert_eq!(mailbox.post_command(Some("u1".into()), call("reset"), None, None), Posted::Refused(Refusal::DeviceDown));
-    assert_eq!(mailbox.post_read(ReadKey::Refresh(None), None, None), Posted::Dropped);
+    assert_eq!(mailbox.post_read(ReadKey::Refresh(None), None, None, None), Posted::Dropped);
     assert!(mailbox.try_take().is_some(), "the held value is in the mailbox");
 }
 
@@ -199,8 +199,8 @@ fn momentary_commands_and_reads() {
         "a momentary command past the cap was queued"
     );
     let reply = ReplyTo { topic: "R/Event/i".into(), correlation: None };
-    assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, Some(reply.clone())), Posted::Queued);
-    assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, Some(reply.clone())), Posted::Queued);
+    assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, Some(reply.clone()), None), Posted::Queued);
+    assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, Some(reply.clone()), None), Posted::Queued);
     let unanswered = mailbox.disconnected();
     assert_eq!(unanswered.iter().filter(|u| u.momentary).count(), MOMENTARY_CAP, "the waiting momentary commands were not refused");
     let reads: Vec<&Unanswered> = unanswered.iter().filter(|u| !u.momentary).collect();
@@ -494,7 +494,7 @@ fn an_expired_value_does_not_wait_for_its_key() {
 #[test]
 fn a_read_with_no_response_topic_is_refused_at_a_disconnect() {
     let mailbox = up();
-    assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, None), Posted::Queued);
+    assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, None, None), Posted::Queued);
     let unanswered = mailbox.disconnected();
     assert_eq!(unanswered.len(), 1, "a read with no response topic was dropped silently at a disconnect");
     assert_eq!((unanswered[0].command.as_str(), unanswered[0].replies.len()), ("refresh", 0));
