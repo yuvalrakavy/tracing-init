@@ -140,15 +140,24 @@ pub(crate) fn resolve(value: &StateValue, current: Option<&Value>, before: Optio
             Conflict::RequestWins => Resolution::Apply,
         };
     };
-    if *current == value.value {
+    if same_value(current, &value.value) {
         return Resolution::Satisfied;
     }
     match before {
-        Some(before) if before != current => match value.conflict {
+        Some(before) if !same_value(before, current) => match value.conflict {
             Conflict::DeviceWins => Resolution::Superseded,
             Conflict::RequestWins => Resolution::Apply,
         },
         _ => Resolution::Apply,
+    }
+}
+
+/// Whether two JSON values are the same value: numbers by value — `24` and `24.0` are one, as a
+/// device may report what was asked written another way — the rest as written.
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x == y || x.as_f64().zip(y.as_f64()).is_some_and(|(x, y)| x == y),
+        _ => a == b,
     }
 }
 

@@ -92,9 +92,12 @@ async fn outage_with_a_change_at_the_device(h: &Harness, conflict: &'static str)
     h.device.set_up(false);
     assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "the outage was never seen");
     h.device.set("t1", "temp", json!(18));
+    // Already at what is asked, a JSON number written another way: satisfied, never written.
+    h.device.set("t1", "level", json!(40.0));
     let req = Req { expiry: Some(60), conflict: Some(conflict) };
     assert!(h.desire("t1", "temp", json!(22), req));
     assert!(h.desire("t1", "power", json!(true), req));
+    assert!(h.desire("t1", "level", json!(40), req));
     h.settle(Duration::from_millis(200)).await;
     h.device.set_up(true);
 }

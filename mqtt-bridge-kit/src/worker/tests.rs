@@ -77,3 +77,20 @@ async fn an_operation_that_completed_wins_over_a_link_lost_at_the_same_moment() 
     }
     assert!(handle.is_lost(), "the loss itself was forgotten");
 }
+
+/// JSON numbers compare by value: `24` and `24.0` are the same value, so a held request the device
+/// already has is satisfied, and an unchanged "before" value is unchanged (the mqtt_ac v2 build).
+#[test]
+fn json_numbers_compare_by_value() {
+    let (int, float) = (json!(24), json!(24.0));
+    assert_eq!(
+        resolve(&request(json!(24), Conflict::DeviceWins), Some(&float), Some(&json!(20))),
+        Resolution::Satisfied,
+        "24 and 24.0 differ"
+    );
+    assert_eq!(
+        resolve(&request(json!(26), Conflict::DeviceWins), Some(&int), Some(&float)),
+        Resolution::Apply,
+        "an unchanged before value counted as a change"
+    );
+}

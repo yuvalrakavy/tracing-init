@@ -151,7 +151,8 @@ commands are refused, and reads are dropped.
 - **Request rules:**
   - A missing `conflict` user property means `DeviceWins`, the conservative choice: a manual change is
     never reverted on a guess.
-  - A held value the device already has is satisfied: it is dropped, with no `Error`.
+  - A held value the device already has is satisfied: it is dropped, with no `Error`. JSON numbers
+    compare by value (`24` and `24.0` are one), in the satisfied test and the "changed" test alike.
   - A `Desired` replayed as retained gets the conflict check even while the device is up (the
     bridge-restart case).
   - **"Before" values, per value, by where it came from** (kit spec §4.5, "the last value it saw

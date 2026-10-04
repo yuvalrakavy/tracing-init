@@ -1368,3 +1368,40 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_retracted_during_its_conflict_read_is_not_applied", "--exact"]
 expect_text = '''a request retracted during its conflict read was applied'''
 guard       = "revalidate_after_read"
+
+# Item 33: JSON numbers compare by value in the conflict rule.
+[[control]]
+name        = "json_numbers_compare_as_written"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        (Value::Number(x), Value::Number(y)) => x == y || x.as_f64().zip(y.as_f64()).is_some_and(|(x, y)| x == y),'''
+replacement = '''        (Value::Number(x), Value::Number(y)) => x == y,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::json_numbers_compare_by_value", "--exact"]
+expect_text = '''24 and 24.0 differ'''
+guard       = "numbers_by_value"
+
+# MINOR 15: a held value the device already has is satisfied, never written again.
+[[control]]
+name        = "a_satisfied_value_is_applied"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''    if same_value(current, &value.value) {
+        return Resolution::Satisfied;
+    }'''
+replacement = '''    if same_value(current, &value.value) {
+        return Resolution::Apply;
+    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+expect_text = '''a held value the device already had was written again'''
+guard       = "satisfied"
+
+# MINOR 15: a target-level write's property copies are skipped within the copy window.
+[[control]]
+name        = "the_copy_window_is_zero"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''pub const COPY_WINDOW: Duration = Duration::from_secs(60);'''
+replacement = '''pub const COPY_WINDOW: Duration = Duration::from_secs(0);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_level_write_reaches_apply_once_with_all_values", "--exact"]
+expect_text = '''the target write did not reach apply once with all its values'''
+guard       = "copy_window"
