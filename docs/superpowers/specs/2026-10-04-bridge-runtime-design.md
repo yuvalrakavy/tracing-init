@@ -389,12 +389,14 @@ schemas/                  JSON Schemas for each lane's payload
 - **Blocking libraries.** A synchronous call can only be abandoned, not cancelled. `ctx.blocking` bounds
   it and caps the number abandoned.
 - **A plugin is a second process to deploy.** The host supervises it.
-- **The read-back can miss.** If the broker connection drops after the read-back subscribe is queued
-  but before it is written, rumqttc's clean start loses it. That run then has no "before" values, so
-  replayed requests are applied. After a broker-only outage, replayed requests are checked against
-  the model as it stood when the connection was lost; the read-back serves only the process's first
-  session (and held values until the device's first outage snapshot). A change at the device the
-  bridge never saw — made while the bridge was away, between two reads — is still a change.
+- **The read-back can miss.** A connection lost before the read-back's SUBACK leaves it to the next
+  session, which subscribes again; but past 5 s without the SUBACK the requests are subscribed
+  without it (WARN `read_back_incomplete`), and a replay that meets no "before" values is applied
+  (under `DeviceWins`, only where the current value is known). After a broker-only outage, replayed
+  requests are checked against the model as it stood when the connection was lost; the read-back
+  serves only the process's first session (and held values until the device's first outage
+  snapshot). A change at the device the bridge never saw — made while the bridge was away, between
+  two reads — is still a change.
 - **The read-back's order rests on the broker.** The requests are subscribed once the read-back's
   SUBACK has come, so a broker that writes a subscription's retained messages right behind its
   SUBACK (Mosquitto does) queues the retained `State` ahead of every retained request. A broker
