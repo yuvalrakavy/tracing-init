@@ -1477,3 +1477,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_unchanged_config_is_not_configured_again_while_the_link_stays_up", "--exact"]
 expect_text = '''a config replayed after the link was lost was not configured'''
 guard       = "config_dedupe_per_link"
+
+# C11b: an Unsupported probe from an unacknowledged driver is a contract violation.
+[[control]]
+name        = "an_unsupported_probe_is_proof"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        if self.info.writes == Writes::Unacknowledged && !std::mem::replace(&mut self.unsupported_probe_said, true) {'''
+replacement = '''        if false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violation", "--exact"]
+expect_text = '''an unsupported probe of an unacknowledged driver was not one ERROR'''
+guard       = "unsupported_probe"

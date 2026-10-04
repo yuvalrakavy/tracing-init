@@ -71,7 +71,7 @@ lost link, never a hang.
 | `apply(target, values)` | for a request; several values arrive together for an atomic write | apply all values, in the order the device needs | ok or an error class |
 | `execute(target, command, params)` | for a momentary command | act once; never retry | ok with an optional reply, or an error class |
 | `configure(target, config)` | when a `Config` intent arrives or is retracted (`none`) | accept the setup | ok or an error class |
-| `probe()` | for drivers with `writes: unacknowledged`: idle and while busy | prove the device is alive (Lutron's `DLMON`) | ok or `LinkError`; defaults to a read |
+| `probe()` | for drivers with `writes: unacknowledged`: idle and while busy | prove the device is alive (Lutron's `DLMON`) | ok or `LinkError`; defaults to a read. `Unsupported` proves nothing: from an unacknowledged driver it is a contract violation (its writes are still taken as proven) |
 
 ### 4.2 The link context
 
@@ -195,7 +195,9 @@ commands are refused, and reads are dropped.
   - `event_report_dropped` (WARN) and `event_report_drop_ended` (INFO);
   - `driver_contract_violation` (ERROR): an event without a string `kind`; a helper's panic; a
     reported target or property name that cannot stand as one topic segment (dropped, said once
-    per name);
+    per name); a `probe` answering `Unsupported` from a driver with unacknowledged writes (once per
+    process: it proves nothing, yet its writes are taken as proven, so it cannot become a probe
+    hot loop);
   - `device_recovered` gains `expired`;
   - the runtime also emits `startup_failed` and `bridge_shutdown_cut`;
   - `panic` (ERROR), from the panic hook: `thread`, `location`, `payload`;

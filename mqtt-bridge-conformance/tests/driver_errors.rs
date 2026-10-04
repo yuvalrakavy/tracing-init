@@ -304,3 +304,32 @@ async fn a_reported_name_that_is_no_topic_segment_is_dropped_and_the_session_goe
     );
     assert!(h.stop().await);
 }
+
+/// A driver with unacknowledged writes whose probe answers `Unsupported` proves nothing — it sent
+/// nothing to the device — and breaks its contract: one ERROR `driver_contract_violation`, however
+/// many probes. Its writes are still taken as proven, so it cannot become a probe hot loop
+/// (review C11b).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violation() {
+    let h = Harness::start_with("noprobe", info(Writes::Unacknowledged, Feedback::Observed), quick_timing(), |_, _, device| {
+        device.set("t1", "level", json!(0));
+        device.answer(Op::Probe, None, Answer::Unsupported);
+    })
+    .await;
+    assert!(connected(&h).await);
+    for level in [40, 50] {
+        assert!(h.desire("t1", "level", json!(level), REQ));
+        assert!(h.eventually(BOUND, |h| h.device.get("t1", "level") == Some(json!(level))).await);
+        h.settle(Duration::from_millis(300)).await;
+    }
+    assert!(h.device.calls_of(Op::Probe).len() >= 2, "the writes were not probed: {:?}", h.device.calls());
+    assert!(h.device.calls_of(Op::Probe).len() < 10, "a probe loop: {} probes", h.device.calls_of(Op::Probe).len());
+    let violations = h.log.of_kind("driver_contract_violation");
+    assert!(
+        violations.len() == 1 && violations[0].level == tracing::Level::ERROR,
+        "an unsupported probe of an unacknowledged driver was not one ERROR: {:#?}",
+        h.log.records()
+    );
+    assert_eq!(h.device.calls_of(Op::Connect).len(), 1, "an unsupported probe lost the link");
+    assert!(h.stop().await);
+}

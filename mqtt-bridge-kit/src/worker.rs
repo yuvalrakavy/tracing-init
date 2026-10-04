@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::{oneshot, watch};
-use tracing::{debug, info, warn, Instrument, Span};
+use tracing::{debug, error, info, warn, Instrument, Span};
 
 use crate::driver::{DeviceDriver, DriverInfo, Feedback, LinkError, OpError, PropertyMap, Scope, TargetState, Writes};
 use crate::link::{Abandoned, LinkContext, LinkHandle, OpClock};
@@ -232,6 +232,8 @@ pub(crate) struct Worker<D: DeviceDriver> {
     /// over again while the link stays up (every reconnect replays the retained configs; review
     /// MINOR 5). Forgotten when the link is lost — the device may have lost its setup with it.
     configured: HashMap<String, Option<Value>>,
+    /// Whether the driver's `Unsupported` probe was said (once per process).
+    unsupported_probe_said: bool,
 }
 
 impl<D: DeviceDriver> Worker<D> {
@@ -250,6 +252,7 @@ impl<D: DeviceDriver> Worker<D> {
             before: None,
             recovered: false,
             configured: HashMap::new(),
+            unsupported_probe_said: false,
         }
     }
 
@@ -313,6 +316,10 @@ impl<D: DeviceDriver> Worker<D> {
             // WAIT: device-op
             Err(OpError::Unsupported(_)) => match op(handle, timing.probe_deadline, "probe", self.driver.probe()).await {
                 Err(OpError::Link(e)) => Err(e),
+                Err(OpError::Unsupported(message)) => {
+                    self.unsupported_probe(&message);
+                    Ok(None)
+                }
                 _ => Ok(None),
             },
             Err(other) => {
@@ -453,14 +460,32 @@ impl<D: DeviceDriver> Worker<D> {
     async fn probe(&mut self, handle: &LinkHandle) -> Result<(), LinkError> {
         let timing = self.info.timing;
         // WAIT: device-op
-        match op(handle, timing.probe_deadline, "probe", self.driver.probe()).await {
+        let probed = op(handle, timing.probe_deadline, "probe", self.driver.probe()).await;
+        match probed {
             Err(OpError::Link(e)) => Err(e),
-            // An answer, even an unusable one, was written after every unproven write; a driver
-            // that cannot probe leaves nothing better to wait for.
-            _ => {
+            // An answer, even an unusable one, was written after every unproven write. An
+            // `Unsupported` one sent nothing, so it proves nothing — but a driver that cannot probe
+            // leaves nothing better to wait for, and waiting would be a probe hot loop: its writes
+            // are taken as proven, and the contract violation said once (review C11b).
+            other => {
+                if let Err(OpError::Unsupported(message)) = other {
+                    self.unsupported_probe(&message);
+                }
                 self.mailbox.proven();
                 Ok(())
             }
+        }
+    }
+
+    /// A probe answered `Unsupported`: for a driver with unacknowledged writes, which must prove
+    /// them, a contract violation — ERROR `driver_contract_violation`, once per process.
+    fn unsupported_probe(&mut self, message: &str) {
+        if self.info.writes == Writes::Unacknowledged && !std::mem::replace(&mut self.unsupported_probe_said, true) {
+            error!(
+                kind = "driver_contract_violation",
+                error = message,
+                "A driver with unacknowledged writes cannot probe: its writes are taken as proven without proof"
+            );
         }
     }
 
