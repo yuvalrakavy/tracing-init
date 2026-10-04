@@ -4,7 +4,20 @@
 #     CARGO_TARGET_DIR=<a scratch dir> python3 scripts/negative-control.py \
 #         --root ../tracing-init docs/controls/2026-10-04-bridge-runtime-controls.toml
 # (the root is the repository: a row's guard is in mqtt-bridge-kit, its test often in
-# mqtt-bridge-conformance). Every row must come back RED.
+# mqtt-bridge-conformance; give the table's path as an absolute one, or relative to Store).
+# Every row must come back RED.
+#
+# Runs, on 2026-10-04: the first, 62 RED, 2 GREEN, 5 WRONG-REASON — the GREEN rows
+# (`momentary_commands_wait_for_a_down_device`, `reads_are_queued_while_down`) could not tell a
+# refusal at once from the next failed connect's purge, and now require the refusal's own message;
+# two WRONG-REASON rows did not compile, three failed at an earlier assertion of the same guard.
+# The second, after those fixes: all 69 RED (15 min).
+#
+# Failing first, beyond these rows: the read-back scenario
+# (`the_outage_conflict_after_a_bridge_restart_uses_the_read_back`) failed against the first
+# build — "no Error said the request was superseded: []" — because the session published the
+# device's state before its first CONNACK's subscriptions, overwriting the retained state the
+# read-back reads; the row `reports_are_published_before_the_connack` undoes that fix.
 
 # rumqttc 0.25's packet-id collision survives a failed poll unless the pump moves it into `pending`.
 [[control]]
