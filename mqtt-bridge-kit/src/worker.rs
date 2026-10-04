@@ -506,6 +506,10 @@ impl<D: DeviceDriver> Worker<D> {
         match op(handle, timing.operation, "apply", self.driver.apply(target, &map)).await {
             Ok(()) => {
                 self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
+                if self.info.writes == Writes::Acknowledged {
+                    // What the device acknowledged is what the bridge knows (the lead's F2).
+                    self.reports.written(target, &map, reported_before);
+                }
                 if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before {
                     self.reports.state(target, map, true);
                 }
@@ -517,9 +521,15 @@ impl<D: DeviceDriver> Worker<D> {
                 let failed = |v: &StateValue| failures.iter().any(|f| f.property == v.property);
                 self.mailbox.retain_in_flight(|v| !failed(v));
                 self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
-                let applied: PropertyMap =
-                    map.into_iter().filter(|(property, _)| !failures.iter().any(|f| f.property == *property)).collect();
+                let applied: PropertyMap = map
+                    .iter()
+                    .filter(|(property, _)| !failures.iter().any(|f| f.property == **property))
+                    .map(|(property, value)| (property.clone(), value.clone()))
+                    .collect();
                 let count = applied.len();
+                if self.info.writes == Writes::Acknowledged {
+                    self.reports.written(target, &applied, reported_before);
+                }
                 if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before && !applied.is_empty() {
                     self.reports.state(target, applied, true);
                 }

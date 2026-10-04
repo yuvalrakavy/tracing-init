@@ -120,3 +120,31 @@ fn a_name_that_is_no_topic_segment_is_dropped_where_it_is_reported() {
     assert_eq!(t2, json!({"ok": 2}), "a property that is no topic segment reached the model");
     assert_eq!(log.of_kind("driver_contract_violation").len(), 2, "not one ERROR per bad name: {:#?}", log.records());
 }
+
+/// What an acknowledged write left is what the bridge knows for the conflict rule's snapshots —
+/// the device snapshot and the broker-loss one — and never published; a report of the key replaces
+/// it, and a key the driver reported during the write keeps its report (the lead's F2).
+#[test]
+fn an_acknowledged_write_is_known_to_the_snapshots_and_never_published() {
+    let reports = Reports::new();
+    reports.state("u1", values(&[("temp", json!(20)), ("power", json!(false))]), false);
+    let _ = reports.take();
+    let before = reports.reports_for("u1");
+    // During the write, the driver reports power itself.
+    reports.state("u1", values(&[("power", json!(true))]), false);
+    let _ = reports.take();
+    reports.written("u1", &values(&[("temp", json!(23)), ("power", json!(false))]), before);
+    reports.written("u2", &values(&[("level", json!(40))]), 0);
+    assert!(reports.take().states.is_empty(), "a write was published as State");
+    assert_eq!(reports.model().states.len(), 1, "a written-only target was published");
+    let snapshot = reports.snapshot();
+    assert_eq!(snapshot["u1"], values(&[("temp", json!(23)), ("power", json!(true))]), "the snapshot is not what the bridge knows");
+    assert_eq!(snapshot["u2"], values(&[("level", json!(40))]));
+    reports.broker_lost();
+    assert_eq!(reports.broker_before().1["u1"]["temp"], json!(23), "the broker-loss snapshot missed the write");
+    // A later report replaces what the write left.
+    reports.state("u1", values(&[("temp", json!(22))]), false);
+    assert_eq!(reports.snapshot()["u1"]["temp"], json!(22), "a report did not replace the written value");
+    reports.remove("u2");
+    assert!(!reports.snapshot().contains_key("u2"), "a removed target kept its written values");
+}

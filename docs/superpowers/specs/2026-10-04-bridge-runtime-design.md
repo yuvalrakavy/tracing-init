@@ -180,6 +180,11 @@ commands are refused, and reads are dropped.
     when a link whose catch-up was done is lost, so a link lost during its catch-up keeps the
     pre-outage values. The check applies to each value on its own: a live value taken with a
     checked one is applied as it is.
+  - **What the snapshots hold:** the reported model, and over it what an acknowledged `apply`
+    (`Writes::Acknowledged`) wrote since — for a `Partial`, only the values it did not name. A
+    report of the key replaces a written value, and a key the driver reported during the `apply`
+    keeps its report. Written values are never published as `State`: the device may have clamped
+    them. A snapshot already taken is not changed by a later write.
   - **Current values:** for a target with assumed feedback, the model's (what the bridge
     believes); otherwise the proving read's, and a target it did not give (a device read one
     address at a time answers a read of all `Unsupported`) is read on its own. After the conflict

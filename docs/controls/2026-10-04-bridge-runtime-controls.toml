@@ -1688,3 +1688,68 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::the_conflict_rule_takes_its_rows_in_order", "--exact"]
 expect_text = '''row 2: a first install was not applied because the current value is unknown'''
 guard       = "conflict_rule_order"
+
+# F2: what an acknowledged apply wrote is what the bridge knows for the conflict rule's snapshots.
+[[control]]
+name        = "acknowledged_writes_are_not_known"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                    // What the device acknowledged is what the bridge knows (the lead's F2).
+                    self.reports.written(target, &map, reported_before);'''
+replacement = '''                    // What the device acknowledged is what the bridge knows (the lead's F2).'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_made_during_a_broker_outage_is_decided_against_what_the_bridge_last_knew", "--exact"]
+expect_text = '''a request made during a broker outage was superseded though nobody touched the device'''
+guard       = "written_known"
+
+# F2: the device snapshot holds the written values too.
+[[control]]
+name        = "the_device_snapshot_ignores_writes"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''    pub fn snapshot(&self) -> BTreeMap<String, PropertyMap> {
+        known(&self.locked())
+    }'''
+replacement = '''    pub fn snapshot(&self) -> BTreeMap<String, PropertyMap> {
+        self.locked().targets.iter().map(|(t, m)| (t.clone(), m.values.clone())).collect()
+    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "an_acknowledged_write_is_a_device_outages_before_value", "--exact"]
+expect_text = '''a held request was decided against the value before the bridge's own write'''
+guard       = "written_known"
+
+# F2: of a partial apply, only the values it wrote are known.
+[[control]]
+name        = "a_partial_applys_refused_values_are_known"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                    self.reports.written(target, &applied, reported_before);'''
+replacement = '''                    self.reports.written(target, &map, reported_before);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "only_the_values_a_partial_apply_wrote_become_what_the_bridge_knows", "--exact"]
+expect_text = '''a replay was decided against a value the partial apply did not leave'''
+guard       = "written_known"
+
+# F2: a key the driver reported during the write keeps its report.
+[[control]]
+name        = "a_write_overrides_a_report_made_during_it"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''            if seen.and_then(|s| s.get(property)).is_some_and(|at| *at > reported_before) {
+                continue;
+            }'''
+replacement = '''            let _ = (&seen, reported_before);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::an_acknowledged_write_is_known_to_the_snapshots_and_never_published", "--exact"]
+expect_text = '''the snapshot is not what the bridge knows'''
+guard       = "written_known"
+
+# F2: a report replaces what a write left of the key.
+[[control]]
+name        = "a_report_leaves_the_written_value"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''                if let Some(written) = state.written.get_mut(target) {
+                    written.remove(&property);
+                }
+                if model.values.get(&property) != Some(&value) {'''
+replacement = '''                if model.values.get(&property) != Some(&value) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::an_acknowledged_write_is_known_to_the_snapshots_and_never_published", "--exact"]
+expect_text = '''a report did not replace the written value'''
+guard       = "written_known"

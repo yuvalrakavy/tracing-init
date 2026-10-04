@@ -83,6 +83,9 @@ struct TargetModel {
     /// How many reports this target has had: the worker reads it around an `apply`, to tell
     /// whether the driver reported the target's state itself.
     reports: u64,
+    /// For each property, the count of `reports` at its last report: a property reported during
+    /// an `apply` is the device's word, newer than the write.
+    seen: BTreeMap<String, u64>,
 }
 
 /// A capped queue of events, and its episode of displacement.
@@ -136,6 +139,9 @@ struct State {
     /// Targets removed and not reported since: their `State` is retracted, an empty retained
     /// payload, after every CONNACK too.
     removed: std::collections::BTreeSet<String>,
+    /// What an acknowledged `apply` wrote, by target, until a report gives the key: what the bridge
+    /// knows for the conflict rule's snapshots, never published — the device may have clamped it.
+    written: BTreeMap<String, PropertyMap>,
 }
 
 /// See the module documentation.
@@ -167,6 +173,19 @@ pub struct Model {
     pub states: Vec<(String, Vec<u8>)>,
 }
 
+/// What the bridge knows of every target, for the conflict rule: the reported values, and over them
+/// what acknowledged writes left since.
+fn known(state: &State) -> BTreeMap<String, PropertyMap> {
+    let mut known: BTreeMap<String, PropertyMap> = state.targets.iter().map(|(t, m)| (t.clone(), m.values.clone())).collect();
+    for (target, values) in &state.written {
+        let entry = known.entry(target.clone()).or_default();
+        for (property, value) in values {
+            entry.insert(property.clone(), value.clone());
+        }
+    }
+    known
+}
+
 impl Reports {
     pub fn new() -> Arc<Reports> {
         Arc::new(Reports {
@@ -183,6 +202,7 @@ impl Reports {
                     broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
                     removed: std::collections::BTreeSet::new(),
+                    written: BTreeMap::new(),
                 },
             ),
             ready: Notify::new(),
@@ -257,6 +277,7 @@ impl Reports {
         {
             let mut state = self.locked();
             state.targets.remove(target);
+            state.written.remove(target);
             state.removed.insert(target.to_owned());
             if !state.changed.iter().any(|t| t == target) {
                 state.changed.push(target.to_owned());
@@ -273,6 +294,9 @@ impl Reports {
         }
         let changed = {
             let mut state = self.locked();
+            if let Some(written) = state.written.get_mut(target) {
+                written.remove(property);
+            }
             let removed = state.targets.get_mut(target).is_some_and(|m| m.values.remove(property).is_some());
             if removed && !state.changed.iter().any(|t| t == target) {
                 state.changed.push(target.to_owned());
@@ -311,6 +335,11 @@ impl Reports {
             let mut changed = new || model.assumed != assumed;
             model.assumed = assumed;
             for (property, value) in values {
+                // A report replaces what a write left of the key.
+                model.seen.insert(property.clone(), model.reports);
+                if let Some(written) = state.written.get_mut(target) {
+                    written.remove(&property);
+                }
                 if model.values.get(&property) != Some(&value) {
                     model.values.insert(property, value);
                     changed = true;
@@ -397,9 +426,26 @@ impl Reports {
         self.ready.notified().await;
     }
 
-    /// Every target's values as the bridge knows them now.
+    /// Every target's values as the bridge knows them now, for the conflict rule: what was reported,
+    /// and over it what an acknowledged `apply` wrote since.
     pub fn snapshot(&self) -> BTreeMap<String, PropertyMap> {
-        self.locked().targets.iter().map(|(t, m)| (t.clone(), m.values.clone())).collect()
+        known(&self.locked())
+    }
+
+    /// An acknowledged `apply` wrote `values` to `target`: what the bridge knows for the conflict
+    /// rule's later snapshots, until a report gives the key. Never published: the device may have
+    /// clamped the value. A property the driver reported during the write (since its report count
+    /// was `reported_before`) keeps the report. Never waits.
+    pub fn written(&self, target: &str, values: &PropertyMap, reported_before: u64) {
+        let mut state = self.locked();
+        let State { targets, written, .. } = &mut *state;
+        let seen = targets.get(target).map(|m| &m.seen);
+        for (property, value) in values {
+            if seen.and_then(|s| s.get(property)).is_some_and(|at| *at > reported_before) {
+                continue;
+            }
+            written.entry(target.to_owned()).or_default().insert(property.clone(), value.clone());
+        }
     }
 
     /// A target's values as the bridge knows them now — for a target with assumed feedback, what it
@@ -418,7 +464,7 @@ impl Reports {
     /// waits.
     pub fn broker_lost(&self) {
         let mut state = self.locked();
-        let values = state.targets.iter().map(|(t, m)| (t.clone(), m.values.clone())).collect();
+        let values = known(&state);
         state.broker_lost = Some((Instant::now(), values));
     }
 

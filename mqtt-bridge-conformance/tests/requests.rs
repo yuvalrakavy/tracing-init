@@ -218,7 +218,9 @@ const DEVICE_WINS: Req = Req { expiry: Some(3600), conflict: Some("DeviceWins") 
 /// A request made during a broker outage — kept at the broker, replayed on the next connection —
 /// is decided against what the bridge knew when it stopped listening, not the start-up read-back:
 /// a value the Store itself set since start-up is no change at the device (review B1: it was
-/// taken for one, and DeviceWins dropped every replay of a property changed since start-up).
+/// taken for one, and DeviceWins dropped every replay of a property changed since start-up). What
+/// the bridge knew includes what the device acknowledged writing, before any read reported it (the
+/// lead's F2: without a read since, the write was taken for a change at the device).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_made_during_a_broker_outage_is_decided_against_what_the_bridge_last_knew() {
     let h = Harness::start_with("blip", acknowledged(), quick_timing(), |broker, topics, device| {
@@ -230,8 +232,8 @@ async fn a_request_made_during_a_broker_outage_is_decided_against_what_the_bridg
     // The Store sets 23; the device takes it; its State says 23; the Store retracts.
     assert!(h.desire("t1", "temp", json!(23), DEVICE_WINS));
     assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(23))).await);
-    assert!(h.command(json!({"target": "t1", "command": "refresh"}), None));
-    assert!(h.eventually(BOUND, |h| h.state("t1") == Some(json!({"temp": 23}))).await, "the bridge never saw the device at 23");
+    // No read since: the published State still says 20 (the device may have clamped the write).
+    assert_eq!(h.state("t1"), Some(json!({"temp": 20})), "an acknowledged write was published as State");
     assert!(h.retract("t1", "temp"));
     h.settle(Duration::from_millis(300)).await;
     // The broker goes away; meanwhile the Store asks for 25, kept at the broker.
@@ -250,6 +252,74 @@ async fn a_request_made_during_a_broker_outage_is_decided_against_what_the_bridg
         h.errors()
     );
     assert_eq!(h.device.get("t1", "temp"), Some(json!(25)));
+    assert!(h.stop().await);
+}
+
+/// Of a partial apply, only the values the device wrote become what the bridge knows for the
+/// conflict rule (the lead's F2): a replayed request for the property it wrote, and for the one it
+/// refused, both meet the device as the bridge left it — no change at the device, so both applied.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_values_a_partial_apply_wrote_become_what_the_bridge_knows() {
+    let h = Harness::start_with("partial-basis", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.set("t1", "power", json!(false));
+    })
+    .await;
+    assert!(connected(&h).await);
+    assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
+    h.device.answer_times(Op::Apply, None, Answer::RefuseProperty("temp"), 1);
+    assert!(h.desire_many("t1", json!({"power": true, "temp": 22}), DEVICE_WINS));
+    assert!(h.eventually(BOUND, |h| !h.errors_for("rejected").is_empty()).await, "the refused property got no Error");
+    assert_eq!(h.device.get("t1", "power"), Some(json!(true)));
+    h.settle(Duration::from_millis(300)).await;
+    // The broker goes away; meanwhile the Store asks for power off and 25, kept at the broker.
+    h.broker.refuse_connections(true);
+    h.broker.drop_connection();
+    h.settle(Duration::from_millis(300)).await;
+    let replay = SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins");
+    h.broker.retain(&h.topics.desired("t1", "power"), "false", &replay);
+    h.broker.retain(&h.topics.desired("t1", "temp"), "25", &replay);
+    h.broker.refuse_connections(false);
+    assert!(
+        h.eventually(BOUND, |h| (h.device.get("t1", "power") == Some(json!(false)) && h.device.get("t1", "temp") == Some(json!(25)))
+            || !h.errors_for("superseded").is_empty())
+            .await,
+        "nothing became of the replayed requests"
+    );
+    assert!(
+        h.errors_for("superseded").is_empty(),
+        "a replay was decided against a value the partial apply did not leave: {:?}",
+        h.errors()
+    );
+    assert!(h.stop().await);
+}
+
+/// A device outage's "before" values include what the device acknowledged writing before it, with no
+/// read since (the lead's F2): a request held through the outage meets the device as the bridge left
+/// it — no change at the device, so it is applied.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledged_write_is_a_device_outages_before_value() {
+    let h = Harness::start_with("written-before", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
+    assert!(connected(&h).await);
+    assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
+    assert!(h.desire("t1", "temp", json!(23), DEVICE_WINS));
+    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(23))).await);
+    assert!(h.retract("t1", "temp"));
+    h.settle(Duration::from_millis(200)).await;
+    h.device.set_up(false);
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    assert!(h.desire("t1", "temp", json!(25), DEVICE_WINS));
+    h.settle(Duration::from_millis(200)).await;
+    h.device.set_up(true);
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(25)) || !h.errors_for("superseded").is_empty()).await,
+        "nothing became of the held request"
+    );
+    assert!(
+        h.errors_for("superseded").is_empty(),
+        "a held request was decided against the value before the bridge's own write: {:?}",
+        h.errors()
+    );
     assert!(h.stop().await);
 }
 
