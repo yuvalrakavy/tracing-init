@@ -53,6 +53,9 @@ pub enum Answer {
     /// The driver blocks its thread this long — a synchronous call with no timeout — and then
     /// answers as the device does (a bug the runtime's watchdog catches).
     Block(Duration),
+    /// An `apply` that writes every value but this property's, which the device refuses: a partial
+    /// outcome (`OpError::Partial`).
+    RefuseProperty(&'static str),
 }
 
 /// A helper the fake driver starts through its link's context at its next connect, as a driver
@@ -281,6 +284,8 @@ impl FakeDevice {
                 std::thread::sleep(d);
                 Ok(())
             }
+            // Only `apply` gives a partial outcome; anywhere else it is the device's own answer.
+            Some(Answer::RefuseProperty(_)) => Ok(()),
         }
     }
 
@@ -362,14 +367,27 @@ impl DeviceDriver for FakeDevice {
         let answer = self.log(Op::Apply, Some(target), Some(Value::Object(values.clone())), None);
         FakeDevice::play(answer).await?;
         self.reachable()?;
+        let refused = match answer {
+            Some(Answer::RefuseProperty(property)) if values.contains_key(property) => Some(property),
+            _ => None,
+        };
         let mut state = self.locked();
         if !state.deaf {
             let entry = state.targets.entry(target.to_owned()).or_default();
             for (property, value) in values {
-                entry.insert(property.clone(), value.clone());
+                if Some(property.as_str()) != refused {
+                    entry.insert(property.clone(), value.clone());
+                }
             }
         }
-        Ok(())
+        match refused {
+            Some(property) => Err(OpError::Partial(vec![mqtt_bridge_kit::PropertyFailure {
+                property: property.to_owned(),
+                class: mqtt_bridge_kit::FailureClass::Rejected,
+                error: "scripted: the device refused this property".to_owned(),
+            }])),
+            None => Ok(()),
+        }
     }
 
     async fn execute(&mut self, target: Option<&str>, call: &CommandCall) -> Result<Option<Value>, OpError> {

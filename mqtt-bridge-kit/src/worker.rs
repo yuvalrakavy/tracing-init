@@ -27,7 +27,7 @@ use serde_json::Value;
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn, Instrument, Span};
 
-use crate::driver::{DeviceDriver, DriverInfo, Feedback, LinkError, OpError, PropertyMap, Scope, TargetState, Writes};
+use crate::driver::{DeviceDriver, DriverInfo, FailureClass, Feedback, LinkError, OpError, PropertyMap, Scope, TargetState, Writes};
 use crate::link::{Abandoned, LinkContext, LinkHandle, OpClock};
 use crate::mailbox::{Held, Mailbox, ReadKey, Resolution, StateValue, Unanswered, Work};
 use crate::replies::{reply_payload, Answer, ReplyTo};
@@ -505,6 +505,32 @@ impl<D: DeviceDriver> Worker<D> {
                 Ok(values.len())
             }
             Err(OpError::Link(e)) => Err(e),
+            Err(OpError::Partial(failures)) => {
+                // Every value it does not name was applied; those it names failed, each said.
+                let failed = |v: &StateValue| failures.iter().any(|f| f.property == v.property);
+                self.mailbox.retain_in_flight(|v| !failed(v));
+                self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
+                let applied: PropertyMap =
+                    map.into_iter().filter(|(property, _)| !failures.iter().any(|f| f.property == *property)).collect();
+                let count = applied.len();
+                if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before && !applied.is_empty() {
+                    self.reports.state(target, applied, true);
+                }
+                for failure in &failures {
+                    let reason = match failure.class {
+                        FailureClass::Rejected => Reason::Rejected,
+                        FailureClass::Unusable => Reason::Unusable,
+                        FailureClass::Unsupported => Reason::Unsupported,
+                    };
+                    if reason == Reason::Rejected {
+                        warn!(kind = "command_rejected", target, property = %failure.property, error = %failure.error, "The device rejected a property of a request");
+                    } else {
+                        info!(target, property = %failure.property, error = %failure.error, ?reason, "A property of a request failed");
+                    }
+                    self.reports.error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property));
+                }
+                Ok(count)
+            }
             Err(failure) => {
                 self.mailbox.failed();
                 let properties: Vec<&str> = values.iter().map(|v| v.property.as_str()).collect();
@@ -864,6 +890,8 @@ fn classify(failure: &OpError) -> (Reason, &str) {
         OpError::Unusable(m) => (Reason::Unusable, m),
         OpError::Unsupported(m) => (Reason::Unsupported, m),
         OpError::Link(e) => (Reason::LinkLost, e.reason()),
+        // A partial outcome means something only for `apply`; elsewhere it is a refusal.
+        OpError::Partial(failures) => (Reason::Rejected, failures.first().map_or("a partial outcome", |f| f.error.as_str())),
     }
 }
 

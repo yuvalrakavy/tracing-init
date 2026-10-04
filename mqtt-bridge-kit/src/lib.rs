@@ -54,8 +54,8 @@ mod test_support;
 
 pub use config::TimingOverrides;
 pub use driver::{
-    CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, Feedback, LinkError, OpError, PropertyMap, Scope, TargetState,
-    Timing, Value, Writes,
+    CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkError, OpError, PropertyFailure,
+    PropertyMap, Scope, TargetState, Timing, Value, Writes,
 };
 pub use link::{LinkContext, LinkHandle, Reporter};
 pub use process::{install_panic_hook, Bridge, Died, Running};

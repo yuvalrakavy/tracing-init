@@ -604,12 +604,10 @@ guard       = "conflict_before_in_memory"
 [[control]]
 name        = "a_rejection_drops_the_link"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''            Err(OpError::Link(e)) => Err(e),
-            Err(failure) => {
+anchor      = '''            Err(failure) => {
                 self.mailbox.failed();
                 let properties'''
-replacement = '''            Err(OpError::Link(e)) => Err(e),
-            Err(OpError::Rejected(m)) => Err(LinkError::new(m)),
+replacement = '''            Err(OpError::Rejected(m)) => Err(LinkError::new(m)),
             Err(failure) => {
                 self.mailbox.failed();
                 let properties'''
@@ -622,12 +620,10 @@ guard       = "rejected"
 [[control]]
 name        = "an_unusable_answer_drops_the_link"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''            Err(OpError::Link(e)) => Err(e),
-            Err(failure) => {
+anchor      = '''            Err(failure) => {
                 self.mailbox.failed();
                 let properties'''
-replacement = '''            Err(OpError::Link(e)) => Err(e),
-            Err(OpError::Unusable(m)) => Err(LinkError::new(m)),
+replacement = '''            Err(OpError::Unusable(m)) => Err(LinkError::new(m)),
             Err(failure) => {
                 self.mailbox.failed();
                 let properties'''
@@ -1628,3 +1624,17 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::a_device_that_drops_right_after_its_catch_up_is_one_outage", "--exact"]
 expect_text = '''a link lost right after its catch-up was not one outage'''
 guard       = "device_outage_stable"
+
+# Item 31: a partial apply reports only the properties that failed.
+[[control]]
+name        = "a_partial_apply_fails_the_whole_write"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                let failed = |v: &StateValue| failures.iter().any(|f| f.property == v.property);'''
+replacement = '''                let failed = |_: &StateValue| true;
+                for value in &values {
+                    self.reports.error(ErrorReport::new(Reason::Rejected, "control").target(Some(target)).property(&value.property));
+                }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_partial_apply_reports_only_the_properties_that_failed", "--exact"]
+expect_text = '''the Error named more than the refused property'''
+guard       = "partial_apply"

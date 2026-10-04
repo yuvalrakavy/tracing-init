@@ -333,3 +333,31 @@ async fn an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violat
     assert_eq!(h.device.calls_of(Op::Connect).len(), 1, "an unsupported probe lost the link");
     assert!(h.stop().await);
 }
+
+/// An `apply` that wrote some values and refused one says so property by property
+/// (`OpError::Partial`): the `Error` names only the refused property, and the rest stand as
+/// applied — so the Store abandons only what failed (the mqtt_ac v2 build: the CoolMaster sends each
+/// property as a command of its own and rolls nothing back).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_apply_reports_only_the_properties_that_failed() {
+    let h = Harness::start_with("partial", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.set("t1", "power", json!(false));
+    })
+    .await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Apply, None, Answer::RefuseProperty("temp"), 1);
+    assert!(h.desire_many("t1", json!({"power": true, "temp": 22}), REQ));
+    assert!(h.eventually(BOUND, |h| !h.errors_for("rejected").is_empty()).await, "the refused property got no Error: {:?}", h.errors());
+    h.settle(SETTLE).await;
+    let rejected = h.errors_for("rejected");
+    assert_eq!(
+        rejected.iter().map(|e| e["property"].as_str()).collect::<Vec<_>>(),
+        [Some("temp")],
+        "the Error named more than the refused property: {rejected:?}"
+    );
+    assert_eq!(h.device.get("t1", "power"), Some(json!(true)));
+    assert_eq!(h.device.get("t1", "temp"), Some(json!(20)));
+    assert_eq!(h.device.calls_of(Op::Connect).len(), 1, "a partial outcome was taken for a lost link");
+    assert!(h.stop().await);
+}

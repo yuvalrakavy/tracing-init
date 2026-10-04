@@ -68,7 +68,7 @@ lost link, never a hang.
 | `connect(ctx)` | to open the device link (paced retries) | finish or fail within the connect timing; may start helpers via `ctx` | ok or `LinkError` |
 | `disconnect()` | after a lost link, at shutdown | be quick; best effort | nothing |
 | `read_state(scope)` | after connecting, on the poll interval, for `refresh`, and before resolving outage conflicts | read the device, not a cache | observed state per target |
-| `apply(target, values)` | for a request; several values arrive together for an atomic write | apply all values, in the order the device needs | ok or an error class |
+| `apply(target, values)` | for a request; several values arrive together for an atomic write | apply all values, in the order the device needs | ok, an error class for the whole write, or `Partial`: the properties that failed, each with its class (the rest were applied) |
 | `execute(target, command, params)` | for a momentary command | act once; never retry | ok with an optional reply, or an error class |
 | `configure(target, config)` | when a `Config` intent arrives or is retracted (`none`) | accept the setup | ok or an error class |
 | `probe()` | for drivers with `writes: unacknowledged`: idle and while busy | prove the device is alive (Lutron's `DLMON`) | ok or `LinkError`; defaults to a read. `Unsupported` proves nothing: from an unacknowledged driver it is a contract violation (its writes are still taken as proven) |
@@ -106,6 +106,7 @@ capped queue whose overflow is counted and logged once per episode.
 | `Rejected` | the device refused this request | publishes `Error` naming the target and property (the Store abandons it); WARN `command_rejected`; the link stays up |
 | `Unusable` | a reply the driver couldn't parse | publishes `Error` once and passes the request over; never reconnects for it (3b: that was a hot loop) |
 | `Unsupported` | no such command or property | publishes `Error`; no retry |
+| `Partial` | (`apply` only) these properties failed, each `Rejected`, `Unusable` or `Unsupported`; every other value was applied | publishes `Error` for each failed property alone (the rest stand as applied, unproven for unacknowledged writes); WARN `command_rejected` for a rejected one; the link stays up. In the plugin protocol: `{"error":{"class":"partial","failures":[{"property":…,"class":…,"message":…}]}}` |
 
 ### 4.4 Capabilities (`DriverInfo`)
 
@@ -270,7 +271,7 @@ pub trait DeviceDriver: Send + 'static {
     async fn probe(&mut self) -> Result<(), OpError> { self.read_state(Scope::Any).await.map(drop) }
 }
 
-pub enum OpError { Link(LinkError), Rejected(String), Unusable(String), Unsupported(String) }
+pub enum OpError { Link(LinkError), Rejected(String), Unusable(String), Unsupported(String), Partial(Vec<PropertyFailure>) }
 
 fn main() -> ExitCode {
     mqtt_bridge_kit::Bridge::new("Aircondition").from_cli().run(Coolmaster::new())

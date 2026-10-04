@@ -86,13 +86,34 @@ impl From<std::io::Error> for LinkError {
 ///   request), logs WARN `command_rejected`; the link stays up;
 /// - `Unusable`: a reply the driver could not parse — publishes `Error` once and passes the request
 ///   over; never reconnects for it (no-hang 3b: reconnecting for it was a hot loop);
-/// - `Unsupported`: no such command or property — publishes `Error`; no retry.
+/// - `Unsupported`: no such command or property — publishes `Error`; no retry;
+/// - `Partial` (`apply` only): the properties it names failed, each with its class, and every
+///   other value of the write was applied (unproven, for unacknowledged writes) — `Error` names
+///   only the failed ones. A plain `Rejected`, `Unusable` or `Unsupported` means the whole write
+///   failed. From any other operation it counts as `Rejected`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpError {
     Link(LinkError),
     Rejected(String),
     Unusable(String),
     Unsupported(String),
+    Partial(Vec<PropertyFailure>),
+}
+
+/// One property an `apply` could not write (`OpError::Partial`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyFailure {
+    pub property: String,
+    pub class: FailureClass,
+    pub error: String,
+}
+
+/// How one property of a partial `apply` failed: the classes of `OpError` a request can fail by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    Rejected,
+    Unusable,
+    Unsupported,
 }
 
 impl From<LinkError> for OpError {
@@ -108,6 +129,13 @@ impl fmt::Display for OpError {
             OpError::Rejected(m) => write!(f, "rejected: {m}"),
             OpError::Unusable(m) => write!(f, "unusable: {m}"),
             OpError::Unsupported(m) => write!(f, "unsupported: {m}"),
+            OpError::Partial(failures) => {
+                write!(f, "partial:")?;
+                for failure in failures {
+                    write!(f, " {} ({:?}: {})", failure.property, failure.class, failure.error)?;
+                }
+                Ok(())
+            }
         }
     }
 }
