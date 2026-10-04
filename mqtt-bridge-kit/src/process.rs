@@ -463,6 +463,8 @@ impl Bridge {
             reports: reports.clone(),
             outage: Arc::new(BrokerOutage::new(self.settings.mqtt.warn_after, self.settings.mqtt.stable_after)),
             read_back_requested: AtomicBool::new(false),
+            read_back_late: std::sync::atomic::AtomicU32::new(0),
+            read_back_next: AtomicBool::new(false),
         });
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (worker_stop, worker_stop_rx) = watch::channel(false);

@@ -175,3 +175,21 @@ fn an_unproven_assumption_is_left_out_until_proven() {
     assert_eq!(reports.values_of("u1").unwrap()["level"], json!(50), "a proven assumption was left out");
     assert_eq!(reports.snapshot()["u1"]["level"], json!(50));
 }
+
+/// The read-back the conflict rule reads is frozen when it is first done: a retained `State` that
+/// arrives after an incomplete read-back goes to the read-back a restore reads, never to the
+/// "before" values in mid-process (Claude's re-gate minor 11).
+#[test]
+fn a_late_state_does_not_change_the_read_back_basis() {
+    let reports = Reports::new();
+    reports.read_back("u1", values(&[("level", json!(10))]));
+    reports.read_back_incomplete();
+    reports.read_back("u1", values(&[("level", json!(40))]));
+    assert_eq!(reports.read_back_before().1["u1"]["level"], json!(10), "a late State changed the conflict rule's read-back");
+    assert_eq!(reports.broker_basis("u1", "level").before, Some(json!(10)));
+    assert_eq!(reports.read_back_all()["u1"]["level"], json!(40), "a late State did not reach the read-back a restore reads");
+    assert!(!reports.read_back_is_complete());
+    reports.read_back_complete();
+    assert!(reports.read_back_is_complete());
+    assert_eq!(reports.read_back_before().1["u1"]["level"], json!(10), "completing it late changed the frozen read-back");
+}

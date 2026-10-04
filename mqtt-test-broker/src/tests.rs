@@ -434,3 +434,46 @@ async fn a_packet_past_the_clients_maximum_is_discarded() {
     assert_eq!(broker.connections(), 1, "the client was dropped");
     task.abort();
 }
+
+/// A new connection starts clean: a SUBACK held for an earlier connection, and the retained
+/// messages its subscription replays, are not sent to the new one on release (the R1 re-gate's
+/// minor: released after a reconnect, they reached a client that never asked for them).
+#[tokio::test(flavor = "multi_thread")]
+async fn held_subacks_do_not_outlive_their_connection() {
+    let broker = FakeBroker::start().await;
+    broker.retain("x/1", "old", &SendOptions::default());
+    broker.hold_subacks();
+    let (first, events) = client(&broker, 10);
+    let (first_task, _) = pump(events);
+    first.subscribe("x/#", QoS::AtLeastOnce).await.unwrap();
+    assert!(broker.wait_for_subscription("x/#", BOUND).await, "the first client never subscribed");
+    first_task.abort();
+    broker.drop_connection();
+    let mut options = MqttOptions::new("second-client", "127.0.0.1", broker.port());
+    options.set_keep_alive(Duration::from_secs(5));
+    let (_second, events) = AsyncClient::new(options, 10);
+    let (_second_task, mut incoming) = pump(events);
+    let deadline = std::time::Instant::now() + BOUND;
+    while broker.connections() < 2 {
+        assert!(std::time::Instant::now() < deadline, "the second client never connected");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    broker.release_subacks();
+    let got = tokio::time::timeout(Duration::from_millis(500), incoming.recv()).await;
+    assert!(got.is_err(), "a retained message held for an earlier connection reached the new one: {got:?}");
+}
+
+/// A denied filter gets `NotAuthorized` in its SUBACK, and no subscription: nothing is replayed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_denied_subscription_is_refused_and_replays_nothing() {
+    let broker = FakeBroker::start().await;
+    broker.retain("secret/1", "x", &SendOptions::default());
+    broker.deny_subscriptions("secret/");
+    let (client, events) = client(&broker, 10);
+    let (_task, mut incoming) = pump(events);
+    client.subscribe("secret/#", QoS::AtLeastOnce).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_millis(500), incoming.recv()).await;
+    assert!(got.is_err(), "a denied subscription replayed: {got:?}");
+    assert!(!broker.events().iter().any(|e| matches!(e, BrokerEvent::Subscribed(f) if f == "secret/#")), "a denied subscription was made");
+}

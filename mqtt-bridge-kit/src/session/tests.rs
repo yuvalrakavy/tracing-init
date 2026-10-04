@@ -24,6 +24,8 @@ fn shared_for(broker: &FakeBroker) -> Shared {
         reports: Reports::new(),
         outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         read_back_requested: AtomicBool::new(false),
+        read_back_late: std::sync::atomic::AtomicU32::new(0),
+        read_back_next: AtomicBool::new(false),
     }
 }
 

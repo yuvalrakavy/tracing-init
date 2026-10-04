@@ -927,7 +927,7 @@ guard       = "worker_died"
 [[control]]
 name        = "the_fake_broker_replays_nothing"
 file        = "mqtt-test-broker/src/lib.rs"
-anchor      = '''            for f in &s.filters {
+anchor      = '''            for f in &granted {
                 packets.extend(replay(shared, &f.path));
             }'''
 replacement = ''''''
@@ -2137,3 +2137,38 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_superseded_in_one_session_is_not_applied_on_the_next_replay", "--exact"]
 expect_text = '''the change at the device was reverted by a replay already superseded'''
 guard       = "replay_basis_pinned"
+
+# Re-gate minor: only a SUBACK that grants the read-back counts; one that refuses it is incomplete.
+[[control]]
+name        = "a_refused_read_back_counts_as_granted"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''                return if granted { ReadBack::Granted } else { ReadBack::Refused };'''
+replacement = '''                return if granted || true { ReadBack::Granted } else { ReadBack::Refused };'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_read_back_the_broker_refuses_is_said_incomplete", "--exact"]
+expect_text = '''a refused read-back was not said incomplete'''
+guard       = "read_back_suback_granted"
+
+# Claude's re-gate minor 11: the conflict rule's read-back is frozen when it is first done.
+[[control]]
+name        = "a_late_state_changes_the_read_back_basis"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''                if state.readback_frozen.is_none() {
+                    state.readback_frozen = Some(state.readback.clone());
+                }'''
+replacement = '''                let _ = &mut state;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::a_late_state_does_not_change_the_read_back_basis", "--exact"]
+expect_text = '''a late State changed the conflict rule's read-back'''
+guard       = "read_back_frozen"
+
+# Re-gate minor: FakeBroker's held SUBACKs do not outlive their connection.
+[[control]]
+name        = "held_subacks_reach_a_new_connection"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''    shared.held_subacks.lock().unwrap().clear();'''
+replacement = '''    let _ = &shared.held_subacks;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::held_subacks_do_not_outlive_their_connection", "--exact"]
+expect_text = '''a retained message held for an earlier connection reached the new one'''
+guard       = "broker_held_subacks"

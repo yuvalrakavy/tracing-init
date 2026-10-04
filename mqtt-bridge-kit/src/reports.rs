@@ -151,6 +151,10 @@ struct State {
     errors: Capped<ErrorReport>,
     events: Capped<Outbound>,
     readback: BTreeMap<String, PropertyMap>,
+    /// The read-back as it stood when it was first done, complete or not: the conflict rule's
+    /// "before" values, which a retained State arriving later does not change in mid-process
+    /// (Claude's re-gate minor 11). `readback` itself goes on taking late arrivals, for a restore.
+    readback_frozen: Option<BTreeMap<String, PropertyMap>>,
     /// The model when the MQTT connection was last lost, and when.
     broker_lost: Option<(Instant, BTreeMap<String, PropertyMap>)>,
     /// The names a driver reported that cannot stand as a topic segment, each said once.
@@ -170,8 +174,9 @@ pub struct Reports {
     ready: Notify,
     /// When the bridge started: the read-back is what the bridge knew then.
     epoch: Instant,
-    /// Whether the read-back is in (or will not come), and its waiters.
-    read_back_done: std::sync::atomic::AtomicBool,
+    /// Whether the read-back is in: 0 not yet, 1 incomplete (no SUBACK in time, or refused), 2
+    /// complete; and its waiters.
+    read_back_done: std::sync::atomic::AtomicU8,
     read_back_in: Notify,
 }
 
@@ -218,6 +223,7 @@ impl Reports {
                     errors: Capped::new(ERROR_CAP),
                     events: Capped::new(EVENT_CAP),
                     readback: BTreeMap::new(),
+                    readback_frozen: None,
                     broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
                     removed: std::collections::BTreeSet::new(),
@@ -226,7 +232,7 @@ impl Reports {
             ),
             ready: Notify::new(),
             epoch: Instant::now(),
-            read_back_done: std::sync::atomic::AtomicBool::new(false),
+            read_back_done: std::sync::atomic::AtomicU8::new(0),
             read_back_in: Notify::new(),
         })
     }
@@ -529,7 +535,7 @@ impl Reports {
         let state = self.locked();
         match &state.broker_lost {
             Some((at, values)) => (*at, values.clone()),
-            None => (self.epoch, state.readback.clone()),
+            None => (self.epoch, state.readback_frozen.clone().unwrap_or_else(|| state.readback.clone())),
         }
     }
 
@@ -540,22 +546,46 @@ impl Reports {
         let state = self.locked();
         let (at, values) = match &state.broker_lost {
             Some((at, values)) => (*at, values),
-            None => (self.epoch, &state.readback),
+            None => (self.epoch, state.readback_frozen.as_ref().unwrap_or(&state.readback)),
         };
         crate::mailbox::Basis { at, before: values.get(target).and_then(|v| v.get(property)).cloned() }
     }
 
-    /// The read-back, as of the start.
+    /// The read-back, as of the start: as it stood when it was done, for the conflict rule.
     pub fn read_back_before(&self) -> (Instant, BTreeMap<String, PropertyMap>) {
-        (self.epoch, self.locked().readback.clone())
+        let state = self.locked();
+        (self.epoch, state.readback_frozen.clone().unwrap_or_else(|| state.readback.clone()))
     }
 
-    /// The read-back is in — every retained `State` the broker had for the bridge has been read —
-    /// or will not come. Never waits.
+    /// The read-back is in: every retained `State` the broker had for the bridge has been read.
+    /// Never waits.
     pub fn read_back_complete(&self) {
-        if !self.read_back_done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        self.read_back_reaches(2);
+    }
+
+    /// The read-back will not be complete for now — its SUBACK did not come in time, or the broker
+    /// refused it — and what came is what there is; a late SUBACK may still complete it. Never
+    /// waits.
+    pub fn read_back_incomplete(&self) {
+        self.read_back_reaches(1);
+    }
+
+    fn read_back_reaches(&self, level: u8) {
+        let before = self.read_back_done.fetch_max(level, std::sync::atomic::Ordering::SeqCst);
+        if before < level {
+            {
+                let mut state = self.locked();
+                if state.readback_frozen.is_none() {
+                    state.readback_frozen = Some(state.readback.clone());
+                }
+            }
             self.read_back_in.notify_waiters();
         }
+    }
+
+    /// Whether the read-back is complete (not merely done).
+    pub fn read_back_is_complete(&self) -> bool {
+        self.read_back_done.load(std::sync::atomic::Ordering::SeqCst) >= 2
     }
 
     /// Wait until the read-back is in, at most `within`; whether it is.
@@ -566,7 +596,7 @@ impl Reports {
                 let notified = self.read_back_in.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if self.read_back_done.load(std::sync::atomic::Ordering::SeqCst) {
+                if self.read_back_done.load(std::sync::atomic::Ordering::SeqCst) > 0 {
                     return;
                 }
                 // WAIT: read-back-ready

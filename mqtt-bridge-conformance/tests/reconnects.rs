@@ -152,3 +152,23 @@ async fn requests_are_subscribed_only_once_the_read_back_is_acknowledged() {
     assert!(h.broker.wait_for_subscription(&t.command(), BOUND).await, "the requests were never subscribed");
     assert!(h.stop().await);
 }
+
+/// A read-back subscription the broker refuses (an ACL) is no read-back: said at once, WARN
+/// `read_back_incomplete` — not taken for a SUBACK that granted it (the R1 re-gate's minor: any
+/// SUBACK counted, its packet id and reason codes unread).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_back_the_broker_refuses_is_said_incomplete() {
+    let h = Harness::start_unwaited("denied-read-back", acknowledged(), quick_timing(), |broker, topics, device| {
+        device.set("t1", "temp", json!(20));
+        broker.deny_subscriptions(&format!("{}/State/", topics.root()));
+    })
+    .await;
+    assert!(h.broker.wait_for_subscription(&h.topics.command(), BOUND).await, "the bridge never subscribed to its requests");
+    let warned = h.log.of_kind("read_back_incomplete");
+    assert!(
+        warned.len() == 1 && warned[0].level == tracing::Level::WARN,
+        "a refused read-back was not said incomplete: {:#?}",
+        h.log.records()
+    );
+    assert!(h.stop().await);
+}

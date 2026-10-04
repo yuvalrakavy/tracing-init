@@ -240,6 +240,8 @@ struct Shared {
     /// Whether SUBACKs (and their replays) are held, and those held, in order.
     holding_subacks: AtomicBool,
     held_subacks: Mutex<Vec<BytesMut>>,
+    /// Filters starting with one of these are refused, `NotAuthorized` (an ACL).
+    denied: Mutex<Vec<String>>,
     /// Arrivals at the `held` lock (see `lock_held`).
     #[cfg(test)]
     held_lock_reached: AtomicUsize,
@@ -288,6 +290,7 @@ impl FakeBroker {
             max_packet: Mutex::new(None),
             holding_subacks: AtomicBool::new(false),
             held_subacks: Mutex::new(Vec::new()),
+            denied: Mutex::new(Vec::new()),
             #[cfg(test)]
             held_lock_reached: AtomicUsize::new(0),
         });
@@ -437,6 +440,12 @@ impl FakeBroker {
         self.shared.holding_subacks.store(true, Ordering::SeqCst);
     }
 
+    /// Refuse every subscription to a filter starting with `prefix` from now on, with the reason
+    /// code `NotAuthorized`: no subscription is made and nothing replayed (a broker's ACL).
+    pub fn deny_subscriptions(&self, prefix: &str) {
+        self.shared.denied.lock().unwrap().push(prefix.to_owned());
+    }
+
     /// Send the SUBACKs held, and their replays, in order, and hold none from now on.
     pub fn release_subacks(&self) {
         let held = {
@@ -547,8 +556,10 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
     let (tx, mut rx) = mpsc::unbounded_channel::<BytesMut>();
     *shared.to_client.lock().unwrap() = Some(tx.clone());
     lock_held(&shared).clear();
-    // A new connection starts without a session: no subscription carries over.
+    // A new connection starts without a session: no subscription carries over, nor a SUBACK or a
+    // replay held for an earlier connection (the R1 re-gate).
     shared.active.lock().unwrap().clear();
+    shared.held_subacks.lock().unwrap().clear();
     let mut kick = shared.kick.subscribe();
     kick.mark_unchanged();
     shared.current.store(number, Ordering::SeqCst);
@@ -847,14 +858,20 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             let _ = tx.send(encode_v5(v5::Packet::ConnAck(ack)));
         }
         v5::Packet::Subscribe(s) => {
-            let codes = s.filters.iter().map(|f| v5::SubscribeReasonCode::Success(f.qos)).collect();
-            shared.subscriptions.lock().unwrap().extend(s.filters.iter().map(|f| f.path.clone()));
-            shared.active.lock().unwrap().extend(s.filters.iter().map(|f| (f.path.clone(), f.preserve_retain)));
-            for f in &s.filters {
+            let denied = |path: &str| shared.denied.lock().unwrap().iter().any(|prefix| path.starts_with(prefix.as_str()));
+            let codes = s
+                .filters
+                .iter()
+                .map(|f| if denied(&f.path) { v5::SubscribeReasonCode::NotAuthorized } else { v5::SubscribeReasonCode::Success(f.qos) })
+                .collect();
+            let granted: Vec<&v5::Filter> = s.filters.iter().filter(|f| !denied(&f.path)).collect();
+            shared.subscriptions.lock().unwrap().extend(granted.iter().map(|f| f.path.clone()));
+            shared.active.lock().unwrap().extend(granted.iter().map(|f| (f.path.clone(), f.preserve_retain)));
+            for f in &granted {
                 event(shared, BrokerEvent::Subscribed(f.path.clone()));
             }
             let mut packets = vec![encode_v5(v5::Packet::SubAck(v5::SubAck { pkid: s.pkid, return_codes: codes, properties: None }))];
-            for f in &s.filters {
+            for f in &granted {
                 packets.extend(replay(shared, &f.path));
             }
             let mut held = shared.held_subacks.lock().unwrap();

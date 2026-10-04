@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rumqttc::v5::mqttbytes::v5::{Packet, Publish};
+use rumqttc::v5::mqttbytes::v5::{Packet, Publish, SubscribeReasonCode};
 use rumqttc::v5::{Event, EventLoop};
 use rumqttc::Outgoing;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -61,8 +61,11 @@ pub enum PumpEvent {
     /// A publish, and when the pump received it: a request's expiry counts from then, not from
     /// when the session gets to it (review C7).
     Publish(Publish, Instant),
-    /// The broker acknowledged a subscription (the session waits for the read-back's).
-    SubAck,
+    /// A SUBSCRIBE was written, with its packet id: the session tells the read-back's SUBACK by it.
+    Subscribing(u16),
+    /// The broker answered a subscription: its packet id, and whether it granted every filter (an
+    /// ACL may refuse one).
+    SubAck { pkid: u16, granted: bool },
     /// The DISCONNECT the session asked for was written: the session's end.
     Disconnected,
     /// The connection failed or stalled, and its event loop is dropped: the session ends and the
@@ -372,7 +375,11 @@ impl Pump {
                     backlog.pushed();
                     PumpEvent::Publish(publish, Instant::now())
                 }
-                Event::Incoming(Packet::SubAck(_)) => PumpEvent::SubAck,
+                Event::Outgoing(Outgoing::Subscribe(pkid)) => PumpEvent::Subscribing(pkid),
+                Event::Incoming(Packet::SubAck(ack)) => PumpEvent::SubAck {
+                    pkid: ack.pkid,
+                    granted: ack.return_codes.iter().all(|code| matches!(code, SubscribeReasonCode::Success(_))),
+                },
                 Event::Outgoing(Outgoing::Disconnect) => PumpEvent::Disconnected,
                 _ => continue,
             };

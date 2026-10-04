@@ -104,6 +104,13 @@ pub(crate) struct Shared {
     pub outage: Arc<BrokerOutage>,
     /// The read-back's subscription has been made (once per process).
     pub read_back_requested: AtomicBool,
+    /// The read-back's packet id plus one, while its SUBACK is late (0: none): a late SUBACK that
+    /// grants it completes the read-back.
+    pub read_back_late: std::sync::atomic::AtomicU32,
+    /// The read-back's SUBACK granted it, and the retained `State` it replays follow it: the next
+    /// SUBACK — the next subscription's, sent after it — comes behind them, and completes the
+    /// read-back.
+    pub read_back_next: AtomicBool,
 }
 
 /// How a session ended.
@@ -183,9 +190,6 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
     let mut announced = false;
     // Whether the broker accepted this session's connection.
     let mut accepted = false;
-    // Whether this session made the read-back's subscription and waits for its end: the next
-    // SUBACK, behind which every retained State has been read.
-    let mut read_back_ends = false;
     loop {
         // WAIT: session-events
         let step = tokio::select! {
@@ -195,12 +199,19 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
         };
         let connack = matches!(step, Step::Event(Some(PumpEvent::Connected)));
         accepted |= connack;
-        if connack && !shared.read_back_requested.load(Ordering::SeqCst) {
-            read_back_ends = true;
-        }
-        if read_back_ends && matches!(step, Step::Event(Some(PumpEvent::SubAck))) {
-            shared.reports.read_back_complete();
-            read_back_ends = false;
+        if let Step::Event(Some(PumpEvent::SubAck { pkid, granted })) = &step {
+            if shared.read_back_next.swap(false, Ordering::SeqCst) {
+                // The next subscription's SUBACK, behind the read-back's replay.
+                shared.reports.read_back_complete();
+            } else if shared.read_back_late.load(Ordering::SeqCst) == u32::from(*pkid) + 1 {
+                // The read-back's SUBACK, past its wait: its replay follows, and no SUBACK comes
+                // behind it; a restore waits for the replays to go quiet.
+                shared.read_back_late.store(0, Ordering::SeqCst);
+                if *granted {
+                    info!("The read-back's SUBACK came late; the read-back is complete");
+                    shared.reports.read_back_complete();
+                }
+            }
         }
         let work = async {
             match step {
@@ -215,7 +226,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                     handle(shared, &publish, received);
                     Ok(None)
                 }
-                Step::Event(Some(PumpEvent::Disconnected | PumpEvent::SubAck)) => Ok(None),
+                Step::Event(Some(PumpEvent::Disconnected | PumpEvent::SubAck { .. } | PumpEvent::Subscribing(_))) => Ok(None),
                 Step::Event(Some(PumpEvent::Ended(_)) | None) => Ok(Some(SessionEnd::Ended { connected: false })),
                 Step::Reported => {
                     publish_changes(shared, &client, shared.reports.take()).await;
@@ -233,9 +244,11 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
         match done {
             Ok(None) => announced |= connack,
             Ok(Some(SessionEnd::Ended { .. })) => {
-                if read_back_ends && shared.read_back_requested.load(Ordering::SeqCst) {
-                    // What came of the read-back is all there will be.
-                    shared.reports.read_back_complete();
+                // A late SUBACK cannot come on another connection; a replay cut short is what
+                // there is.
+                shared.read_back_late.store(0, Ordering::SeqCst);
+                if shared.read_back_next.swap(false, Ordering::SeqCst) {
+                    shared.reports.read_back_incomplete();
                 }
                 return SessionEnd::Ended { connected: accepted };
             }
@@ -265,15 +278,25 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
         // WAIT: mqtt-request
         client.subscribe(topics.state_filter(), QoS::AtLeastOnce).await?;
         match read_back_acknowledged(shared, incoming).await {
-            None => return Ok(false),
-            Some(true) => {}
-            Some(false) => {
-                shared.reports.read_back_complete();
+            ReadBack::Ended => return Ok(false),
+            // Complete once its replay is in: at the next SUBACK, behind it.
+            ReadBack::Granted => shared.read_back_next.store(true, Ordering::SeqCst),
+            ReadBack::Refused => {
+                shared.reports.read_back_incomplete();
                 warn!(
-                kind = "read_back_incomplete",
-                waited_ms = READ_BACK_WAIT.as_millis() as u64,
-                "The broker did not acknowledge the read-back's subscription in time; subscribing to requests without it — a replay may meet no \"before\" values"
-            )
+                    kind = "read_back_incomplete",
+                    refused = true,
+                    "The broker refused the read-back's subscription; subscribing to requests without it — a replay may meet no \"before\" values"
+                );
+            }
+            ReadBack::Late(pkid) => {
+                shared.read_back_late.store(pkid.map_or(0, |p| u32::from(p) + 1), Ordering::SeqCst);
+                shared.reports.read_back_incomplete();
+                warn!(
+                    kind = "read_back_incomplete",
+                    waited_ms = READ_BACK_WAIT.as_millis() as u64,
+                    "The broker did not acknowledge the read-back's subscription in time; subscribing to requests without it — a replay may meet no \"before\" values"
+                );
             }
         }
         shared.read_back_requested.store(true, Ordering::SeqCst);
@@ -299,18 +322,37 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
     Ok(true)
 }
 
-/// The read-back's SUBACK, within [`READ_BACK_WAIT`], handling what arrives meanwhile: `Some(true)`
-/// when it came, `Some(false)` past the wait, `None` when the session ended.
-async fn read_back_acknowledged(shared: &Shared, incoming: &mut Incoming) -> Option<bool> {
+/// What came of the read-back's subscription.
+enum ReadBack {
+    /// Its SUBACK granted it: every retained State has been read.
+    Granted,
+    /// Its SUBACK refused it (an ACL): there is no read-back.
+    Refused,
+    /// No SUBACK within [`READ_BACK_WAIT`]; the subscription's packet id, if it was written.
+    Late(Option<u16>),
+    /// The session ended.
+    Ended,
+}
+
+/// The read-back's SUBACK — told by its packet id — within [`READ_BACK_WAIT`], handling what
+/// arrives meanwhile.
+async fn read_back_acknowledged(shared: &Shared, incoming: &mut Incoming) -> ReadBack {
     let deadline = Instant::now() + READ_BACK_WAIT;
+    let mut read_back: Option<u16> = None;
     loop {
         // WAIT: read-back-suback
         match tokio::time::timeout_at(deadline.into(), incoming.recv()).await {
-            Err(_) => return Some(false),
-            Ok(Some(PumpEvent::SubAck)) => return Some(true),
+            Err(_) => return ReadBack::Late(read_back),
+            // The read-back's is the session's first SUBSCRIBE.
+            Ok(Some(PumpEvent::Subscribing(pkid))) => {
+                read_back.get_or_insert(pkid);
+            }
+            Ok(Some(PumpEvent::SubAck { pkid, granted })) if Some(pkid) == read_back => {
+                return if granted { ReadBack::Granted } else { ReadBack::Refused };
+            }
+            Ok(Some(PumpEvent::SubAck { .. } | PumpEvent::Connected | PumpEvent::Disconnected)) => {}
             Ok(Some(PumpEvent::Publish(publish, received))) => handle(shared, &publish, received),
-            Ok(Some(PumpEvent::Connected | PumpEvent::Disconnected)) => {}
-            Ok(Some(PumpEvent::Ended(_)) | None) => return None,
+            Ok(Some(PumpEvent::Ended(_)) | None) => return ReadBack::Ended,
         }
     }
 }
