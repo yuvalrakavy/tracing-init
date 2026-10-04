@@ -2172,3 +2172,20 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::held_subacks_do_not_outlive_their_connection", "--exact"]
 expect_text = '''a retained message held for an earlier connection reached the new one'''
 guard       = "broker_held_subacks"
+
+# Re-gate R5: in the catch-up, a target's config goes before its held values whatever its held flag.
+[[control]]
+name        = "a_new_config_goes_after_held_values"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { target: t, .. } if *t == target)) {
+                    if let Some(Entry::Config { target, config, .. }) = inner.pending.remove(i) {
+                        inner.in_flight_config = Some((target.clone(), config.clone()));
+                        break Some(Held::Config { target, config });
+                    }
+                }
+                let (target, mut values) = inner.take_group(0);'''
+replacement = '''                let (target, mut values) = inner.take_group(0);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_targets_config_goes_before_its_held_values_whatever_its_held_flag", "--exact"]
+expect_text = '''b's held value went before its config'''
+guard       = "catch_up_configs_first"

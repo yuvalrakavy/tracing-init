@@ -230,8 +230,9 @@ commands are refused, and reads are dropped.
     are Event-shaped (`"kind":"reply"`), and the kit spec has them arrive there.
   - A target-level write's property copies are skipped for 60 s.
   - `configure` is called only while connected. Configs are held while down and applied first in the
-    catch-up: every held config before any held value; while up, a target's waiting config before
-    its values; `Config` is subscribed before `Desired`. A config's `feedback` override takes effect
+    catch-up: every held config before any held value, and a target's waiting config — one that
+    came during the catch-up too — before its values (re-gate R5); while up, a target's waiting
+    config before its values; `Config` is subscribed before `Desired`. A config's `feedback` override takes effect
     once `configure` has taken it. A config identical to the one `configure` last took on the
     current link is not handed over again (every reconnect replays the retained configs); a lost
     link forgets what was taken.

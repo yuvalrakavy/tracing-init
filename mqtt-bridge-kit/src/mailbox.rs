@@ -639,9 +639,17 @@ impl Mailbox {
                         break Some(Held::Config { target, config });
                     }
                 }
-                match inner.pending.front() {
-                    Some(Entry::State { held: true, .. }) => {}
+                let target = match inner.pending.front() {
+                    Some(Entry::State { held: true, value }) => value.target.clone(),
                     _ => break None,
+                };
+                // A target's config goes before its values, whatever its own `held` flag: one that
+                // came during the catch-up waits as not held (review R5).
+                if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { target: t, .. } if *t == target)) {
+                    if let Some(Entry::Config { target, config, .. }) = inner.pending.remove(i) {
+                        inner.in_flight_config = Some((target.clone(), config.clone()));
+                        break Some(Held::Config { target, config });
+                    }
                 }
                 let (target, mut values) = inner.take_group(0);
                 expired += inner.drop_expired(&mut values, now);

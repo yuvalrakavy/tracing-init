@@ -500,3 +500,19 @@ fn a_read_with_no_response_topic_is_refused_at_a_disconnect() {
     assert_eq!(unanswered.len(), 1, "a read with no response topic was dropped silently at a disconnect");
     assert_eq!((unanswered[0].command.as_str(), unanswered[0].replies.len()), ("refresh", 0));
 }
+
+/// In the catch-up a target's config goes before its held values whatever its own `held` flag: a
+/// newer config that arrived during the catch-up waits as not held, and still goes first (the R1
+/// re-gate's R5: only held configs went first, and the held value went before its setup).
+#[test]
+fn a_targets_config_goes_before_its_held_values_whatever_its_held_flag() {
+    let mailbox = Mailbox::new();
+    let _ = mailbox.post_config("b", Some(json!({"port": 1})));
+    let _ = mailbox.post_state(value("b", "level", json!(40)), true);
+    mailbox.connected();
+    let _ = mailbox.post_config("b", Some(json!({"port": 2})));
+    match mailbox.take_held() {
+        Some(Held::Config { target, config }) => assert_eq!((target.as_str(), config), ("b", Some(json!({"port": 2})))),
+        other => panic!("b's held value went before its config: {other:?}"),
+    }
+}
