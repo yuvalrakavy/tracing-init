@@ -145,7 +145,7 @@ pub fn usage(program: &str, family: &str, options: &[(String, String)]) -> Strin
          \x20 --mqtt-stable <d>            a connection that lasts this long ends a broker outage\n"
     );
     for (name, help) in options {
-        text.push_str(&format!("  --{name:<27} {help}\n"));
+        text.push_str(&format!("  {:<29}{help}\n", format!("--{name} <value>")));
     }
     text.push_str("  --help                       this text\n\nA duration <d>: 500ms, 10s, 2m, or seconds.\n");
     text
@@ -293,6 +293,18 @@ mod tests {
         let short = MqttTiming { keep_alive: Duration::from_secs(1), ..MqttTiming::default() };
         assert!(check_timing(&Timing::default(), &short).is_err());
         assert_eq!(check_timing(&Timing::default(), &MqttTiming::default()), Ok(()));
+    }
+
+    /// The usage text lines up: a driver's option's help starts in the same column as the built-in
+    /// options' help, and the option shows a value placeholder (the mqtt_ac v2 build).
+    #[test]
+    fn a_drivers_options_line_up_in_the_usage_text_with_a_value_placeholder() {
+        let text = usage("bridge", "A", &[("coolmaster".to_owned(), "its address".to_owned())]);
+        let column = |line: &str, help: &str| line.find(help).unwrap_or_else(|| panic!("`{help}` not in `{line}`"));
+        let root = text.lines().find(|l| l.contains("--root")).expect("the --root line");
+        let option = text.lines().find(|l| l.contains("--coolmaster")).expect("the driver's option's line");
+        assert_eq!(column(option, "its address"), column(root, "MQTT root"), "the driver's option is off its column:\n{text}");
+        assert!(option.contains("--coolmaster <value>"), "the driver's option shows no value placeholder: `{option}`");
     }
 
     #[test]

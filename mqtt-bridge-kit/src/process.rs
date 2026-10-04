@@ -107,6 +107,10 @@ pub struct Bridge {
     app_name: Option<String>,
     version: Option<String>,
     declared: Vec<(String, String)>,
+    /// The declared options the command line must give.
+    required: Vec<String>,
+    /// Whether a command line has been read.
+    parsed: bool,
     settings: Settings,
     problem: Option<Problem>,
 }
@@ -124,6 +128,8 @@ impl Bridge {
             app_name: None,
             version: None,
             declared: Vec::new(),
+            required: Vec::new(),
+            parsed: false,
             settings: Settings::new(family),
             problem: None,
         }
@@ -134,6 +140,53 @@ impl Bridge {
     pub fn option(mut self, name: &str, help: &str) -> Bridge {
         self.declared.push((name.to_owned(), help.to_owned()));
         self
+    }
+
+    /// Make a declared option required: a command line without it is a usage error (exit 2, with
+    /// the usage text). Before or after [`from_cli`](Self::from_cli).
+    pub fn require(mut self, name: &str) -> Bridge {
+        self.required.push(name.to_owned());
+        if self.parsed {
+            self.check_required();
+        }
+        self
+    }
+
+    /// A usage error the driver found in its options (an address it cannot use): `run`, or
+    /// [`usage_exit`](Self::usage_exit), says it with the usage text and exits 2. A problem the
+    /// command line already had stands.
+    pub fn usage_error(mut self, message: impl Into<String>) -> Bridge {
+        if self.problem.is_none() {
+            self.problem = Some(Problem::Usage(message.into()));
+        }
+        self
+    }
+
+    /// The command line's own end, before any driver is built: `--help` (said on stdout, exit 0)
+    /// or a usage error (said on stderr with the usage text, exit 2). `None` when the bridge is to
+    /// run. `main` returns it: `if let Some(code) = bridge.usage_exit() { return code; }`.
+    pub fn usage_exit(&self) -> Option<ExitCode> {
+        match &self.problem {
+            Some(Problem::Help) => {
+                // The command line's own output, before anything has started: exempt.
+                print!("{}", config::usage(&self.program, &self.family, &self.declared));
+                Some(ExitCode::SUCCESS)
+            }
+            Some(Problem::Usage(message)) => {
+                eprint!("{}: {message}\n\n{}", self.program, config::usage(&self.program, &self.family, &self.declared));
+                Some(ExitCode::from(2))
+            }
+            None => None,
+        }
+    }
+
+    fn check_required(&mut self) {
+        if self.problem.is_some() {
+            return;
+        }
+        if let Some(missing) = self.required.iter().find(|name| !self.settings.options.contains_key(*name)) {
+            self.problem = Some(Problem::Usage(format!("`--{missing}` is required")));
+        }
     }
 
     /// The logging's application name (the log file's prefix, GELF's `_app`); by default the
@@ -156,9 +209,11 @@ impl Bridge {
 
     /// Read `args` as the command line (without the program's name).
     pub fn args(mut self, args: impl IntoIterator<Item = String>) -> Bridge {
+        self.parsed = true;
         if let Err(problem) = config::parse(args, &mut self.settings, &self.declared) {
             self.problem = Some(problem);
         }
+        self.check_required();
         self
     }
 
@@ -214,17 +269,8 @@ impl Bridge {
     /// `main`'s whole body: `Bridge::new("Aircondition").from_cli().run(Coolmaster::new())`. See the
     /// module documentation.
     pub fn run<D: DeviceDriver>(self, driver: D) -> ExitCode {
-        match &self.problem {
-            Some(Problem::Help) => {
-                // The command line's own output, before anything has started: exempt.
-                print!("{}", config::usage(&self.program, &self.family, &self.declared));
-                return ExitCode::SUCCESS;
-            }
-            Some(Problem::Usage(message)) => {
-                eprint!("{}: {message}\n\n{}", self.program, config::usage(&self.program, &self.family, &self.declared));
-                return ExitCode::from(2);
-            }
-            None => {}
+        if let Some(code) = self.usage_exit() {
+            return code;
         }
         install_panic_hook();
         // No runtime, no bridge: said by the status alone (there is no log yet).

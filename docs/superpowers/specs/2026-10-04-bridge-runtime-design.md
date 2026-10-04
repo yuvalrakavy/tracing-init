@@ -228,7 +228,10 @@ fn main() -> ExitCode {
   single-threaded runtime (as built in R1). A driver that blocks its thread holds up neither the MQTT
   side nor the stop, and past its operation's deadline it is a dead worker (§5.2).
 - `Bridge` also has `option(name, help)` / `value(name)` for driver-specific options (mqtt_ac v2's
-  CoolMaster address), and `start(driver) -> Running` to run a bridge in-process (used by the suite).
+  CoolMaster address), `require(name)` for one the command line must give, `usage_error(message)`
+  for a value the driver cannot use, and `usage_exit()` — `--help` or a usage error said, and its
+  exit code, before any driver is built; and `start(driver) -> Running` to run a bridge in-process
+  (used by the suite).
 - The stdio binding is itself a `DeviceDriver` (`PluginDriver`) that forwards each call to the plugin
   process.
 
