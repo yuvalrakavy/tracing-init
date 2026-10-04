@@ -89,20 +89,33 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
         None => (text, "s"),
     };
     let n: u64 = number.parse().map_err(|_| bad())?;
-    match unit {
-        "ms" => Ok(Duration::from_millis(n)),
-        "s" => Ok(Duration::from_secs(n)),
-        "m" => n.checked_mul(60).map(Duration::from_secs).ok_or_else(|| format!("`{text}` is too long a duration")),
-        _ => Err(bad()),
+    let duration = match unit {
+        "ms" => Duration::from_millis(n),
+        "s" => Duration::from_secs(n),
+        "m" => n.checked_mul(60).map(Duration::from_secs).ok_or_else(|| format!("`{text}` is too long a duration"))?,
+        _ => return Err(bad()),
+    };
+    if duration > MAX_TIMING {
+        return Err(format!("`{text}` is too long a duration (at most {} days)", MAX_TIMING.as_secs() / 86_400));
     }
+    Ok(duration)
 }
 
 /// The smallest MQTT keep-alive rumqttc takes (it asserts it).
 pub const MIN_KEEP_ALIVE: Duration = Duration::from_secs(5);
 
-/// Timings that cannot run: a zero retry (an unpaced reconnect loop), a zero probe interval (a
-/// probe loop), a keep-alive under rumqttc's floor (its assertion would end the MQTT task). Checked
-/// at parse time and again for the timings set in code ([`crate::Bridge::start`]).
+/// The largest MQTT keep-alive: MQTT's field is 16 bits of seconds, and rumqttc truncates past it.
+pub const MAX_KEEP_ALIVE: Duration = Duration::from_secs(u16::MAX as u64);
+
+/// The longest timing taken: a week. Longer means nothing to a bridge, and a duration near the
+/// type's limit overflows when added to an `Instant` (a panic) or doubled for the keep-alive bound.
+pub const MAX_TIMING: Duration = Duration::from_secs(7 * 86_400);
+
+/// Timings that cannot run: a zero retry, MQTT retry or MQTT poll-retry (an unpaced reconnect
+/// loop), a zero probe interval or poll (a probe or poll loop), a keep-alive under rumqttc's floor
+/// (its assertion would end the MQTT task) or past MQTT's 16-bit field (rumqttc truncates it), and
+/// any timing past [`MAX_TIMING`] (an overflow). Checked at parse time and again for the timings
+/// set in code ([`crate::Bridge::start`]).
 pub fn check_timing(timing: &Timing, mqtt: &MqttTiming) -> Result<(), String> {
     if timing.retry.is_zero() {
         return Err("the device retry interval is zero: an unpaced reconnect loop".into());
@@ -110,10 +123,36 @@ pub fn check_timing(timing: &Timing, mqtt: &MqttTiming) -> Result<(), String> {
     if timing.probe_interval.is_zero() {
         return Err("the probe interval is zero: a probe loop".into());
     }
+    if timing.poll.is_some_and(|p| p.is_zero()) {
+        return Err("the poll interval is zero: a poll loop (no polling is `None`)".into());
+    }
+    if mqtt.retry.is_zero() || mqtt.poll_retry.is_zero() {
+        return Err("an MQTT reconnect pause is zero: an unpaced reconnect loop".into());
+    }
     if mqtt.keep_alive < MIN_KEEP_ALIVE {
         return Err(format!("the MQTT keep-alive is under {} s, rumqttc's floor", MIN_KEEP_ALIVE.as_secs()));
     }
-    Ok(())
+    if mqtt.keep_alive > MAX_KEEP_ALIVE {
+        return Err(format!("the MQTT keep-alive is over {} s, MQTT's limit", MAX_KEEP_ALIVE.as_secs()));
+    }
+    let timings = [
+        ("connect", timing.connect),
+        ("operation", timing.operation),
+        ("retry", timing.retry),
+        ("outage-warn", timing.outage_warn),
+        ("poll", timing.poll.unwrap_or_default()),
+        ("probe-interval", timing.probe_interval),
+        ("probe-deadline", timing.probe_deadline),
+        ("device-stable", timing.stable),
+        ("mqtt-retry", mqtt.retry),
+        ("mqtt-poll-retry", mqtt.poll_retry),
+        ("mqtt-warn", mqtt.warn_after),
+        ("mqtt-stable", mqtt.stable_after),
+    ];
+    match timings.iter().find(|(_, d)| *d > MAX_TIMING) {
+        Some((name, _)) => Err(format!("the {name} timing is over {} days", MAX_TIMING.as_secs() / 86_400)),
+        None => Ok(()),
+    }
 }
 
 /// `host` or `host:port`, the port defaulting to 1883.
@@ -202,9 +241,12 @@ pub fn parse(args: impl IntoIterator<Item = String>, settings: &mut Settings, op
                 d if d < MIN_KEEP_ALIVE => {
                     return Err(Problem::Usage(format!("`--mqtt-keep-alive` is at least {} s (rumqttc's floor)", MIN_KEEP_ALIVE.as_secs())))
                 }
+                d if d > MAX_KEEP_ALIVE => {
+                    return Err(Problem::Usage(format!("`--mqtt-keep-alive` is at most {} s (MQTT's limit)", MAX_KEEP_ALIVE.as_secs())))
+                }
                 d => settings.mqtt.keep_alive = d,
             },
-            "mqtt-retry" => settings.mqtt.retry = duration()?,
+            "mqtt-retry" => settings.mqtt.retry = nonzero()?,
             "mqtt-warn" => settings.mqtt.warn_after = duration()?,
             "mqtt-stable" => settings.mqtt.stable_after = duration()?,
             "restore" => {
@@ -310,6 +352,27 @@ mod tests {
         let short = MqttTiming { keep_alive: Duration::from_secs(1), ..MqttTiming::default() };
         assert!(check_timing(&Timing::default(), &short).is_err());
         assert_eq!(check_timing(&Timing::default(), &MqttTiming::default()), Ok(()));
+    }
+
+    /// The rest of the timings that cannot run (the R1 re-gate's minors): a zero MQTT retry or
+    /// poll-retry pause (an unpaced reconnect loop), a zero poll set in code, a keep-alive past
+    /// MQTT's 16-bit field (rumqttc truncates it), and a duration so long that adding it to an
+    /// `Instant`, or doubling the keep-alive, would overflow — refused at parse time and in code.
+    #[test]
+    fn timings_too_long_or_unpaced_are_refused() {
+        let usage = |line: &str| matches!(parse(args(line), &mut Settings::new("A"), &[]), Err(Problem::Usage(_)));
+        for bad in ["--mqtt-retry 0", "--mqtt-keep-alive 65536", "--connect-timeout 18446744073709551615", "--outage-warn 604801"] {
+            assert!(usage(&format!("--instance i --broker x {bad}")), "`{bad}` was accepted");
+        }
+        let refused = |timing: Timing, mqtt: MqttTiming| check_timing(&timing, &mqtt).is_err();
+        let t = Timing::default;
+        let m = MqttTiming::default;
+        assert!(refused(Timing { poll: Some(Duration::ZERO), ..t() }, m()), "a zero poll set in code was accepted");
+        assert!(refused(t(), MqttTiming { retry: Duration::ZERO, ..m() }), "a zero MQTT retry was accepted");
+        assert!(refused(t(), MqttTiming { poll_retry: Duration::ZERO, ..m() }), "a zero MQTT poll-retry was accepted");
+        assert!(refused(Timing { connect: Duration::MAX, ..t() }, m()), "a connect bound that overflows an Instant was accepted");
+        assert!(refused(t(), MqttTiming { keep_alive: Duration::from_secs(u64::MAX), ..m() }), "a keep-alive that overflows was accepted");
+        assert!(refused(t(), MqttTiming { warn_after: Duration::MAX, ..m() }), "an MQTT warn bound that overflows was accepted");
     }
 
     /// The usage text lines up: a driver's option's help starts in the same column as the built-in

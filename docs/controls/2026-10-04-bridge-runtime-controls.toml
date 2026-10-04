@@ -1846,3 +1846,24 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_read_with_no_response_topic_is_refused_at_a_disconnect", "--exact"]
 expect_text = '''a read with no response topic was dropped silently at a disconnect'''
 guard       = "reads_refused_at_disconnect"
+
+# Re-gate minors: a zero MQTT reconnect pause, a zero poll in code, a timing that overflows.
+[[control]]
+name        = "a_zero_mqtt_pause_is_taken"
+file        = "mqtt-bridge-kit/src/config.rs"
+anchor      = '''            "mqtt-retry" => settings.mqtt.retry = nonzero()?,'''
+replacement = '''            "mqtt-retry" => settings.mqtt.retry = duration()?,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "config::tests::timings_too_long_or_unpaced_are_refused", "--exact"]
+expect_text = '''`--mqtt-retry 0` was accepted'''
+guard       = "timing_ranges"
+
+[[control]]
+name        = "an_overflowing_timing_is_taken"
+file        = "mqtt-bridge-kit/src/config.rs"
+anchor      = '''    match timings.iter().find(|(_, d)| *d > MAX_TIMING) {'''
+replacement = '''    match timings.iter().find(|(_, d)| *d > Duration::MAX) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "config::tests::timings_too_long_or_unpaced_are_refused", "--exact"]
+expect_text = '''a connect bound that overflows an Instant was accepted'''
+guard       = "timing_ranges"
