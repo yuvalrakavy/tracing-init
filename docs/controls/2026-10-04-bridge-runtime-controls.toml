@@ -579,7 +579,7 @@ guard       = "conflict_request_wins"
 [[control]]
 name        = "an_unchanged_value_counts_as_changed"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''        Some(before) if before != current => match value.conflict {'''
+anchor      = '''        Some(before) if !same_value(before, current) => match value.conflict {'''
 replacement = '''        Some(_) => match value.conflict {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
