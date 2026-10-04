@@ -13,6 +13,16 @@
 # two WRONG-REASON rows did not compile, three failed at an earlier assertion of the same guard.
 # The second, after those fixes: all 69 RED (15 min).
 #
+# The R1 gate's fixes (branch `fix/r1-gate`, 2026-10-04): one row retired (the collision fix went
+# with one connection per client), 55 added, others re-anchored. Most new and re-anchored rows were
+# run in six batches as they were written: 66 RED, and 8 that were not — 4 GREEN (the test could
+# not see the guard: retargeted, or a scenario added), 2 WRONG-REASON (a mutation that did not
+# compile; a test that failed, intermittently, on messages that did not name the cause), 2
+# ANCHOR-MISS (rustfmt had moved the text) — each fixed, and RED in the whole table's run, where
+# the rest first ran. The whole table at 6c5a8a2: 119 RED, 2 GREEN, 2 WRONG-REASON
+# (24 min): four older rows the fixes had left silent, repaired in 67824c5 (their comments say how)
+# and RED on re-run. Every one of the 123 rows is RED.
+#
 # Failing first, beyond these rows: the read-back scenario
 # (`the_outage_conflict_after_a_bridge_restart_uses_the_read_back`) failed against the first
 # build — "no Error said the request was superseded: []" — because the session published the
