@@ -693,9 +693,14 @@ impl<D: DeviceDriver> Worker<D> {
                     // served before it, whatever is due: a poll slower than its interval would
                     // otherwise be due at once, every time, and starve every write (review C4).
                     last_read = Instant::now();
-                    match (polled, self.mailbox.try_take()) {
-                        (Ok(()), Some(work)) => self.work(handle, work).await,
-                        (polled, _) => polled,
+                    // A poll that lost the link takes nothing off the mailbox: what waits there is
+                    // the disconnect's to hold or refuse, and answer (review R4).
+                    match polled {
+                        Ok(()) => match self.mailbox.try_take() {
+                            Some(work) => self.work(handle, work).await,
+                            None => Ok(()),
+                        },
+                        Err(e) => Err(e),
                     }
                 }
                 Step::Work(work) => self.work(handle, work).await,

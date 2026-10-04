@@ -1109,9 +1109,14 @@ guard       = "blocking_cap_reserved"
 name        = "polls_are_due_from_their_start_and_starve_writes"
 file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''                    last_read = Instant::now();
-                    match (polled, self.mailbox.try_take()) {
-                        (Ok(()), Some(work)) => self.work(handle, work).await,
-                        (polled, _) => polled,
+                    // A poll that lost the link takes nothing off the mailbox: what waits there is
+                    // the disconnect's to hold or refuse, and answer (review R4).
+                    match polled {
+                        Ok(()) => match self.mailbox.try_take() {
+                            Some(work) => self.work(handle, work).await,
+                            None => Ok(()),
+                        },
+                        Err(e) => Err(e),
                     }'''
 replacement = '''                    polled'''
 target      = "command"
@@ -1785,3 +1790,23 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::an_operation_is_not_started_on_a_link_already_lost", "--exact"]
 expect_text = '''an operation started on a link already lost'''
 guard       = "op_refused_on_lost_link"
+
+# R4: a poll that lost the link takes nothing off the mailbox.
+[[control]]
+name        = "a_failed_poll_takes_the_next_work"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                    match polled {
+                        Ok(()) => match self.mailbox.try_take() {
+                            Some(work) => self.work(handle, work).await,
+                            None => Ok(()),
+                        },
+                        Err(e) => Err(e),
+                    }'''
+replacement = '''                    match (polled, self.mailbox.try_take()) {
+                        (Ok(()), Some(work)) => self.work(handle, work).await,
+                        (polled, _) => polled,
+                    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_queued_during_a_poll_that_loses_the_link_is_answered", "--exact"]
+expect_text = '''a command queued during a poll that lost the link was neither answered nor executed'''
+guard       = "poll_keeps_the_mailbox"

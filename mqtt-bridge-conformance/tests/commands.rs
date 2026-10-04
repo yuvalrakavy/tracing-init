@@ -370,3 +370,26 @@ async fn a_command_with_no_target_reaches_execute_with_none() {
     assert_eq!(h.device.calls_of(Op::Execute)[0].target, None, "a command with no target reached execute with one");
     assert!(h.stop().await);
 }
+
+/// A command queued while a poll is under way is not lost when the poll loses the link: it is
+/// answered (refused while the device is down) or executed, never dropped (the R1 re-gate's R4: the
+/// mailbox was served after the failed poll too, and the command it took was discarded with the
+/// poll's error).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_queued_during_a_poll_that_loses_the_link_is_answered() {
+    let timing = mqtt_bridge_kit::TimingOverrides { poll: Some(Some(Duration::from_millis(200))), ..quick_timing() };
+    let h = Harness::start_with("poll-lost", acknowledged(), timing, up_at_20).await;
+    assert!(connected(&h).await);
+    let reads = h.device.calls_of(Op::Read).len();
+    h.device.answer_times(Op::Read, None, Answer::Hang, 1);
+    assert!(h.eventually(BOUND, |h| h.device.calls_of(Op::Read).len() > reads).await, "no poll began");
+    let replies = "Store/replies/poll-lost";
+    let options = SendOptions::default().expiry(30).response_topic(replies).correlation_data(b"p-1".to_vec());
+    assert!(h.broker.publish(&h.topics.command(), json!({"target": "t1", "command": "pulse"}).to_string(), &options));
+    assert!(
+        h.eventually(BOUND, |h| !h.published(replies).is_empty() || !h.device.calls_of(Op::Execute).is_empty()).await,
+        "a command queued during a poll that lost the link was neither answered nor executed: {:?}",
+        h.errors()
+    );
+    assert!(h.stop().await);
+}
