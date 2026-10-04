@@ -188,6 +188,10 @@ pub struct Timing {
     pub probe_interval: Duration,
     /// The bound on `probe`.
     pub probe_deadline: Duration,
+    /// A device outage ends once a recovered link — proven, its catch-up done — has lasted this
+    /// long; one lost sooner is one more attempt of the same outage (review MINOR 10; the broker
+    /// side's `MqttTiming::stable_after`). `--device-stable` overrides it.
+    pub stable: Duration,
 }
 
 impl Default for Timing {
@@ -200,6 +204,7 @@ impl Default for Timing {
             poll: None,
             probe_interval: Duration::from_secs(30),
             probe_deadline: Duration::from_secs(10),
+            stable: Duration::from_secs(5),
         }
     }
 }

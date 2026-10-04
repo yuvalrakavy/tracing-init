@@ -1615,3 +1615,16 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_helper_started_off_the_worker_thread_is_not_started", "--exact"]
 expect_text = '''starting a helper off the worker thread panicked'''
 guard       = "helper_thread_check"
+
+# MINOR 10: a device outage ends only once a recovered link has lasted.
+[[control]]
+name        = "a_device_outage_ends_at_its_catch_up"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                episode.on_trial = Some(Instant::now());'''
+replacement = '''                episode.on_trial = Some(Instant::now() - Duration::from_secs(3600));
+                self.stable();
+                return;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::a_device_that_drops_right_after_its_catch_up_is_one_outage", "--exact"]
+expect_text = '''a link lost right after its catch-up was not one outage'''
+guard       = "device_outage_stable"

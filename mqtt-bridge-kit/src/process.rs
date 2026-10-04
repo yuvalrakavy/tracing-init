@@ -251,6 +251,13 @@ impl Bridge {
         self
     }
 
+    /// A device link that lasts this long ends its outage (in code; `--device-stable` on the
+    /// command line): overrides the driver's `Timing::stable`.
+    pub fn device_stable(mut self, stable: Duration) -> Bridge {
+        self.settings.device_stable = Some(stable);
+        self
+    }
+
     /// Restore one-way devices at start (in code; `--restore on|off` on the command line): see
     /// `DriverInfo::restore`, whose default this overrides.
     pub fn restore(mut self, restore: bool) -> Bridge {
@@ -364,8 +371,9 @@ impl Bridge {
         let (broker_host, broker_port) = config::broker_host_port(self.settings.broker.as_deref().ok_or("no broker")?)?;
         let span = tracing::info_span!("bridge", root = %topics.root(), instance = %instance);
         let info: DriverInfo = driver.info();
-        let info =
-            DriverInfo { timing: self.settings.timing.apply(info.timing), restore: self.settings.restore.unwrap_or(info.restore), ..info };
+        let mut timing = self.settings.timing.apply(info.timing);
+        timing.stable = self.settings.device_stable.unwrap_or(timing.stable);
+        let info = DriverInfo { timing, restore: self.settings.restore.unwrap_or(info.restore), ..info };
         config::check_timing(&info.timing, &self.settings.mqtt)?;
         let mailbox = Mailbox::new();
         let reports = Reports::new();

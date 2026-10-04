@@ -39,12 +39,9 @@ async fn a_request_while_the_device_is_down_is_applied_on_recovery_within_its_ex
         h.device.calls()
     );
     assert_eq!(h.device.applies(), vec![("t1".to_owned(), values(&[("temp", json!(22))]))]);
+    assert!(h.eventually(BOUND, |h| h.log.of_kind("device_recovered").len() == 1).await, "the outage never ended: {:#?}", h.log.records());
     let recovered = h.log.of_kind("device_recovered");
-    assert!(
-        recovered.len() == 1 && recovered[0].field("applied") == Some("1"),
-        "the recovery did not count the applied request: {:#?}",
-        h.log.records()
-    );
+    assert!(recovered[0].field("applied") == Some("1"), "the recovery did not count the applied request: {:#?}", h.log.records());
     assert!(h.stop().await);
 }
 

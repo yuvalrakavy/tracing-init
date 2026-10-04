@@ -140,7 +140,7 @@ capped queue whose overflow is counted and logged once per episode.
 | Worker | connect with pacing; proof of life before declaring recovery; catch-up (read, resolve conflicts, apply held state); poll; probes |
 | Reports | a never-waiting model for `State` and `Status`; capped queues for `Event` and `Error` |
 | Replies | a command's answer goes to its MQTT v5 response topic, carrying its correlation data |
-| Outages | broker and device episodes: INFO first failure, DEBUG retries, one WARN past 30 s, INFO recovery with `down_for_ms` and `attempts` |
+| Outages | broker and device episodes: INFO first failure, DEBUG retries, one WARN past 30 s, INFO recovery with `down_for_ms` and `attempts` — declared once a connection (broker) or a recovered link (device, `Timing::stable`, 5 s, `--device-stable`) has lasted |
 | Process | signals first (without them, the logging start is waited for at most 5 s, to say so, and the bridge does not start); logging start raced against the stop; no blocking prints (the logging's own failure is written by a thread of its own); `Active=false` and DISCONNECT; explicit runtime ended with `shutdown_timeout`; `ExitCode` |
 | Logging | tracing-init with lossy destinations; the fleet's kind names (Store `docs/guides/logging-policy.md`) |
 

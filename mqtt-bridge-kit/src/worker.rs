@@ -51,6 +51,8 @@ pub const RESTORE_WAIT: Duration = Duration::from_secs(10);
 /// policy).
 struct DeviceOutage {
     warn_after: Duration,
+    /// A recovered link that lasts this long ends the outage.
+    stable: Duration,
     current: Option<Episode>,
 }
 
@@ -58,20 +60,29 @@ struct Episode {
     since: Instant,
     attempts: u32,
     warned: bool,
+    /// What the catch-ups of the episode applied, refused and dropped, for its recovery line.
+    applied: usize,
+    refused: u32,
+    expired: u32,
+    /// When the link now on trial recovered: the outage ends once it has lasted `stable`.
+    on_trial: Option<Instant>,
 }
 
 impl DeviceOutage {
-    fn new(warn_after: Duration) -> DeviceOutage {
-        DeviceOutage { warn_after, current: None }
+    fn new(warn_after: Duration, stable: Duration) -> DeviceOutage {
+        DeviceOutage { warn_after, stable, current: None }
     }
 
-    /// The link was lost, or an attempt to connect (or prove) failed.
+    /// The link was lost, or an attempt to connect (or prove) failed. A link on trial lost is one
+    /// more attempt of its outage.
     fn failed(&mut self, error: &LinkError) {
         let Some(episode) = &mut self.current else {
-            self.current = Some(Episode { since: Instant::now(), attempts: 1, warned: false });
+            self.current =
+                Some(Episode { since: Instant::now(), attempts: 1, warned: false, applied: 0, refused: 0, expired: 0, on_trial: None });
             info!(kind = "device_connection_lost", error = %error, "Device unreachable; retrying");
             return;
         };
+        episode.on_trial = None;
         episode.attempts += 1;
         let down_for_ms = episode.since.elapsed().as_millis() as u64;
         if !episode.warned && episode.since.elapsed() >= self.warn_after {
@@ -82,19 +93,45 @@ impl DeviceOutage {
         }
     }
 
-    /// Proven alive, with the state held meanwhile applied.
+    /// Proven alive, with the state held meanwhile applied. Outside an outage that is all; during
+    /// one, the link is on trial until it has lasted `stable` ([`stable`](Self::stable)).
     fn recovered(&mut self, applied: usize, refused: u32, expired: u32) {
-        match self.current.take() {
-            Some(episode) => info!(
-                kind = "device_recovered",
-                down_for_ms = episode.since.elapsed().as_millis() as u64,
-                attempts = episode.attempts,
-                applied,
-                refused,
-                expired,
-                "Device reachable again"
-            ),
+        match &mut self.current {
+            Some(episode) => {
+                episode.applied += applied;
+                episode.refused += refused;
+                episode.expired += expired;
+                episode.on_trial = Some(Instant::now());
+                debug!(attempts = episode.attempts, "Device proven alive; the outage ends once the link lasts");
+            }
             None => info!(applied, "Connected to the device"),
+        }
+    }
+
+    /// When the link on trial will have lasted `stable`, if one is on trial.
+    fn stable_at(&self) -> Option<Instant> {
+        self.current.as_ref().and_then(|e| e.on_trial).map(|at| at + self.stable)
+    }
+
+    /// The link on trial has lasted: the outage is over — one INFO with its length, up to that
+    /// link's recovery, and what its catch-ups did.
+    fn stable(&mut self) {
+        let Some(on_trial) = self.current.as_ref().and_then(|e| e.on_trial) else {
+            return;
+        };
+        if on_trial.elapsed() < self.stable {
+            return;
+        }
+        if let Some(episode) = self.current.take() {
+            info!(
+                kind = "device_recovered",
+                down_for_ms = on_trial.saturating_duration_since(episode.since).as_millis() as u64,
+                attempts = episode.attempts,
+                applied = episode.applied,
+                refused = episode.refused,
+                expired = episode.expired,
+                "Device reachable again"
+            );
         }
     }
 }
@@ -206,6 +243,8 @@ fn index_map(map: &BTreeMap<String, PropertyMap>, into: &mut Values) {
 
 /// What the Up loop does next.
 enum Step {
+    /// The link on trial has lasted: the outage ends.
+    Stable,
     Probe,
     Poll,
     Work(Work),
@@ -249,7 +288,7 @@ impl<D: DeviceDriver> Worker<D> {
         Worker {
             restore_due,
             driver,
-            outage: DeviceOutage::new(info.timing.outage_warn),
+            outage: DeviceOutage::new(info.timing.outage_warn, info.timing.stable),
             info,
             instance: instance.to_owned(),
             mailbox,
@@ -572,15 +611,21 @@ impl<D: DeviceDriver> Worker<D> {
         loop {
             let poll_at = timing.poll.map(|p| last_read + p);
             let probe_at = self.probe_due(last_heard);
+            let stable_at = self.outage.stable_at();
             // WAIT: worker-up
             let step = tokio::select! {
                 biased;
                 lost = handle.lost() => return lost,
+                () = sleep_until(stable_at) => Step::Stable,
                 () = sleep_until(probe_at) => Step::Probe,
                 () = sleep_until(poll_at) => Step::Poll,
                 work = mailbox.take() => Step::Work(work),
             };
             let outcome = match step {
+                Step::Stable => {
+                    self.outage.stable();
+                    Ok(())
+                }
                 Step::Probe => self.probe(handle).await.map(|()| last_heard = Instant::now()),
                 Step::Poll => {
                     // WAIT: device-op

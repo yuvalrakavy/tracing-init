@@ -33,6 +33,7 @@ impl TimingOverrides {
             poll: self.poll.unwrap_or(timing.poll),
             probe_interval: self.probe_interval.unwrap_or(timing.probe_interval),
             probe_deadline: self.probe_deadline.unwrap_or(timing.probe_deadline),
+            stable: timing.stable,
         }
     }
 }
@@ -51,6 +52,8 @@ pub struct Settings {
     pub options: BTreeMap<String, String>,
     /// `--restore on|off`: overrides the driver's `DriverInfo::restore`.
     pub restore: Option<bool>,
+    /// `--device-stable`: overrides the driver's `Timing::stable`.
+    pub device_stable: Option<Duration>,
 }
 
 impl Settings {
@@ -64,6 +67,7 @@ impl Settings {
             mqtt: MqttTiming::default(),
             options: BTreeMap::new(),
             restore: None,
+            device_stable: None,
         }
     }
 }
@@ -142,6 +146,7 @@ pub fn usage(program: &str, family: &str, options: &[(String, String)]) -> Strin
          \x20 --poll <d|off>               read the device this often (0 or off: never)\n\
          \x20 --probe-interval <d>         probe a silent unacknowledged device this often\n\
          \x20 --probe-deadline <d>         the bound on a probe\n\
+         \x20 --device-stable <d>          a device link that lasts this long ends its outage\n\
          \x20 --mqtt-keep-alive <d>        MQTT keep-alive (at least 5s)\n\
          \x20 --mqtt-retry <d>             between MQTT sessions\n\
          \x20 --mqtt-warn <d>              a broker outage this long is one WARN\n\
@@ -192,6 +197,7 @@ pub fn parse(args: impl IntoIterator<Item = String>, settings: &mut Settings, op
             "poll" => settings.timing.poll = Some(Some(duration()?).filter(|d| !d.is_zero())),
             "probe-interval" => settings.timing.probe_interval = Some(nonzero()?),
             "probe-deadline" => settings.timing.probe_deadline = Some(duration()?),
+            "device-stable" => settings.device_stable = Some(duration()?),
             "mqtt-keep-alive" => match duration()? {
                 d if d < MIN_KEEP_ALIVE => {
                     return Err(Problem::Usage(format!("`--mqtt-keep-alive` is at least {} s (rumqttc's floor)", MIN_KEEP_ALIVE.as_secs())))

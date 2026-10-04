@@ -126,6 +126,7 @@ impl Harness {
             .broker(&broker.address())
             .timing(timing)
             .mqtt_timing(quick_mqtt())
+            .device_stable(Duration::from_millis(300))
             .version("conformance")
             .start(driver)
             .expect("the bridge starts");

@@ -38,7 +38,7 @@ fn the_outage_conflict_rule() {
 #[test]
 fn a_device_outage_is_one_episode() {
     let log = Capture::start();
-    let mut outage = DeviceOutage::new(Duration::from_millis(50));
+    let mut outage = DeviceOutage::new(Duration::from_millis(50), Duration::ZERO);
     let error = LinkError::new("refused");
     outage.failed(&error);
     outage.failed(&error);
@@ -46,6 +46,7 @@ fn a_device_outage_is_one_episode() {
     outage.failed(&error);
     outage.failed(&error);
     outage.recovered(2, 1, 0);
+    outage.stable();
     let kinds: Vec<(tracing::Level, String)> =
         log.records().into_iter().filter(|r| !r.kind.is_empty()).map(|r| (r.level, r.kind)).collect();
     assert_eq!(
@@ -93,4 +94,35 @@ fn json_numbers_compare_by_value() {
         Resolution::Apply,
         "an unchanged before value counted as a change"
     );
+}
+
+/// A device that answers the proving read and drops right after its catch-up is one outage, not an
+/// INFO pair per attempt and never the WARN: recovery is declared only once a recovered link has
+/// lasted (review MINOR 10; the broker side's `stable_after`).
+#[test]
+fn a_device_that_drops_right_after_its_catch_up_is_one_outage() {
+    let log = Capture::start();
+    let mut outage = DeviceOutage::new(Duration::from_millis(50), Duration::from_millis(200));
+    let error = LinkError::new("dropped after the catch-up");
+    outage.failed(&error);
+    outage.recovered(1, 0, 0);
+    outage.failed(&error);
+    std::thread::sleep(Duration::from_millis(60));
+    outage.recovered(0, 0, 0);
+    outage.failed(&error);
+    let kinds: Vec<(tracing::Level, String)> =
+        log.records().into_iter().filter(|r| !r.kind.is_empty()).map(|r| (r.level, r.kind)).collect();
+    assert_eq!(
+        kinds,
+        vec![(tracing::Level::INFO, "device_connection_lost".to_owned()), (tracing::Level::WARN, "device_unreachable".to_owned())],
+        "a link lost right after its catch-up was not one outage"
+    );
+    // A link that lasts ends it, once, with what every catch-up of it did.
+    outage.recovered(2, 0, 0);
+    outage.stable();
+    assert!(log.of_kind("device_recovered").is_empty(), "recovered before the link had lasted");
+    std::thread::sleep(Duration::from_millis(220));
+    outage.stable();
+    let recovered = log.of_kind("device_recovered");
+    assert!(recovered.len() == 1 && recovered[0].field("applied") == Some("3"), "{:#?}", log.records());
 }
