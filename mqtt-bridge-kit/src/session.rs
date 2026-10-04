@@ -44,6 +44,14 @@ use crate::wire::{self, ErrorReport, Reason};
 /// The bound on the shutdown's flush: `Active=false` and DISCONNECT, written.
 pub const FLUSH_BOUND: Duration = Duration::from_secs(2);
 
+/// The largest packet the bridge takes, advertised in its CONNECT, so a broker discards a larger
+/// message for it rather than send it. rumqttc's default, 10 KiB, is enforced but not advertised:
+/// the broker replayed a larger retained `Config` or `Desired` on every subscribe and rumqttc
+/// dropped the connection each time — a reconnect loop (review B3). 1 MiB holds the largest
+/// payloads the fleet expects (IR code sets, DMX arrays and effects: tens of KiB) many times over,
+/// matches the stdio plugin protocol's line cap (spec §7), and bounds what one message can cost.
+pub const MAX_PACKET_SIZE: u32 = 1024 * 1024;
+
 /// The test seam's environment variable (debug builds only): see [`panic_for_test`].
 pub const TEST_PANIC_TOPIC: &str = "MQTT_BRIDGE_TEST_PANIC_TOPIC";
 
@@ -127,7 +135,7 @@ fn client(shared: &Shared) -> (AsyncClient, rumqttc::v5::EventLoop) {
     let client_id = format!("{}-{}", topics.root(), topics.instance());
     let mut options = MqttOptions::new(client_id, shared.broker_host.clone(), shared.broker_port);
     let will = LastWill::new(topics.active(), "false", QoS::AtLeastOnce, true, None);
-    options.set_keep_alive(shared.timing.keep_alive).set_clean_start(true).set_last_will(will);
+    options.set_keep_alive(shared.timing.keep_alive).set_clean_start(true).set_last_will(will).set_max_packet_size(Some(MAX_PACKET_SIZE));
     AsyncClient::new(options, 100)
 }
 

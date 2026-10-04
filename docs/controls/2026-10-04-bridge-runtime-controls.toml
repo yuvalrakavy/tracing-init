@@ -1199,3 +1199,25 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_refused_publish_is_one_message_dropped", "--exact"]
 expect_text = '''the state after a refused one was never published'''
 guard       = "refused_publish_dropped_alone"
+
+# B3: the bridge advertises its maximum packet size (1 MiB).
+[[control]]
+name        = "the_maximum_packet_size_is_not_advertised"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        .set_max_packet_size(Some(MAX_PACKET_SIZE));'''
+replacement = ''';'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_large_retained_config_is_taken_and_one_past_the_limit_is_left_at_the_broker", "--exact"]
+expect_text = '''the 20 KiB config never reached configure'''
+guard       = "max_packet_advertised"
+
+# B3: FakeBroker honours the client's maximum packet size.
+[[control]]
+name        = "the_fake_broker_sends_past_the_clients_maximum"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''            if max.is_some_and(|(n, max)| n == number && packet.len() > max as usize) {'''
+replacement = '''            if max.is_some_and(|(n, max)| n == number && packet.len() > usize::MAX - max as usize) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "tests::a_packet_past_the_clients_maximum_is_discarded", "--exact"]
+expect_text = '''a publish within the bound'''
+guard       = "fake_broker_max_packet"

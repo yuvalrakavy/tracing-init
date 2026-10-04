@@ -2,6 +2,8 @@
 //! `Error` (`"reason":"malformed"`, naming what it can) with one INFO `validation_rejected`, never a
 //! panic, and the bridge goes on.
 
+use std::time::Duration;
+
 use mqtt_bridge_conformance::*;
 use serde_json::json;
 
@@ -54,5 +56,34 @@ async fn malformed_desired_and_command_payloads_are_answered_on_error() {
         h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await,
         "the bridge stopped working after malformed payloads"
     );
+    assert!(h.stop().await);
+}
+
+/// A retained `Config` of 20 KiB — an IR code set — reaches `configure` and the bridge stays on
+/// the broker; one past the bridge's advertised maximum packet size (1 MiB) is discarded by the
+/// broker, and the bridge stays all the same (review B3: rumqttc's 10 KiB limit was not
+/// advertised, so the broker replayed a larger retained message on every subscribe and rumqttc
+/// dropped the connection each time — a reconnect loop).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_retained_config_is_taken_and_one_past_the_limit_is_left_at_the_broker() {
+    let big = "x".repeat(20 * 1024);
+    let huge = "y".repeat(1536 * 1024);
+    let h = Harness::start_with("sizes", acknowledged(), quick_timing(), move |broker, topics, device| {
+        device.set("t1", "temp", json!(20));
+        broker.retain(&topics.config("ir"), json!({ "codes": big }).to_string(), &SendOptions::default());
+        broker.retain(&topics.config("huge"), json!({ "codes": huge }).to_string(), &SendOptions::default());
+    })
+    .await;
+    let configured = |h: &Harness, target: &str| h.device.calls_of(Op::Configure).iter().any(|c| c.target.as_deref() == Some(target));
+    assert!(
+        h.eventually(BOUND, |h| configured(h, "ir")).await,
+        "the 20 KiB config never reached configure; {} connections",
+        h.broker.connections()
+    );
+    h.settle(Duration::from_secs(2)).await;
+    assert_eq!(h.broker.connections(), 1, "a large retained message made the bridge reconnect");
+    assert!(!configured(&h, "huge"), "a config past the advertised maximum packet size reached the driver");
+    assert!(h.desire("t1", "temp", json!(22), Req::default()));
+    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await, "the bridge stopped working");
     assert!(h.stop().await);
 }

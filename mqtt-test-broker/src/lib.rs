@@ -44,6 +44,8 @@
 //!   A new connection reads again.
 //! - **A broker that is down:** [`FakeBroker::refuse_connections`] closes every new connection
 //!   at once, unanswered, until it is turned off.
+//! - **The client's maximum packet size** (v5): a packet larger than its CONNECT says it takes is
+//!   discarded, never sent — as MQTT v5 has a broker do.
 //! - **The last will** (v5): a connection that ends without a DISCONNECT leaves its CONNECT's will
 //!   retained, if the will is retained — as a broker publishes it.
 
@@ -231,6 +233,8 @@ struct Shared {
     /// The current connection's last will (v5), by connection number: its topic, payload and
     /// retain flag. A DISCONNECT clears it.
     will: Mutex<Option<(usize, String, Bytes, bool)>>,
+    /// The current connection's maximum packet size (v5 CONNECT), by connection number.
+    max_packet: Mutex<Option<(usize, u32)>>,
     /// Arrivals at the `held` lock (see `lock_held`).
     #[cfg(test)]
     held_lock_reached: AtomicUsize,
@@ -276,6 +280,7 @@ impl FakeBroker {
             current: AtomicUsize::new(0),
             refusing: AtomicBool::new(false),
             will: Mutex::new(None),
+            max_packet: Mutex::new(None),
             #[cfg(test)]
             held_lock_reached: AtomicUsize::new(0),
         });
@@ -525,8 +530,14 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
     // broker dropped) — also while the writer is blocked in `write_all` on a client that stopped
     // reading, which a detached writer survived, holding the client's socket open (review
     // finding T4).
+    let limits = shared.clone();
     let _writer = AbortOnDrop(tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {
+            // A packet past the client's maximum is discarded (MQTT v5 §3.1.2.11.4).
+            let max = *limits.max_packet.lock().unwrap();
+            if max.is_some_and(|(n, max)| n == number && packet.len() > max as usize) {
+                continue;
+            }
             if wr.write_all(&packet).await.is_err() {
                 break;
             }
@@ -778,7 +789,8 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
         Err(_) => return None,
     };
     match packet {
-        v5::Packet::Connect(_, will, _) => {
+        v5::Packet::Connect(connect, will, _) => {
+            *shared.max_packet.lock().unwrap() = connect.properties.as_ref().and_then(|p| p.max_packet_size).map(|max| (number, max));
             *shared.will.lock().unwrap() =
                 will.map(|w| (number, String::from_utf8_lossy(&w.topic).into_owned(), w.message.clone(), w.retain));
             shared.connections.fetch_add(1, Ordering::SeqCst);

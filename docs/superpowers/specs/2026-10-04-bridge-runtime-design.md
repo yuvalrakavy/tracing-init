@@ -196,6 +196,10 @@ commands are refused, and reads are dropped.
   panicking thread, so a panic with a stderr nobody drains still becomes a dead part — the device
   worker's `catch_unwind`, or the MQTT task's end, whose connection then closes and whose last
   will says `Active=false`.
+- **Message size:** the bridge advertises a maximum packet size of 1 MiB in its CONNECT, so a broker
+  discards a larger message for it instead of sending it (rumqttc enforces 10 KiB by default
+  without saying so, and one large retained message made a reconnect loop). 1 MiB matches the
+  plugin protocol's line cap.
 - **One message, not the session:** a publish rumqttc refuses is that message dropped (DEBUG), and
   the CONNACK duties and every later publish go on; a reported name that cannot be a topic
   segment is dropped where it is reported.

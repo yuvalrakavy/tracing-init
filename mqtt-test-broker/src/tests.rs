@@ -416,3 +416,21 @@ async fn another_clients_publish_goes_through_the_subscriptions_at_qos_1() {
     assert_eq!(broker.retained_on("kept/a").as_deref(), Some(&b"1"[..]), "a retained publish was not kept");
     task.abort();
 }
+
+/// A packet larger than the client's maximum packet size (its CONNECT) is discarded, never sent;
+/// smaller ones go on (MQTT v5; review B3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_packet_past_the_clients_maximum_is_discarded() {
+    let broker = FakeBroker::start().await;
+    broker.retain("big/a", vec![b'x'; 4096], &SendOptions::default());
+    broker.retain("big/b", "small", &SendOptions::default());
+    let mut options = MqttOptions::new("small-client", "127.0.0.1", broker.port());
+    options.set_keep_alive(Duration::from_secs(5)).set_max_packet_size(Some(1024));
+    let (client, events) = AsyncClient::new(options, 10);
+    let (task, mut incoming) = pump_publishes(events);
+    client.subscribe("big/#", QoS::AtLeastOnce).await.unwrap();
+    let first = next_publish(&mut incoming).await;
+    assert_eq!(&first.payload[..], b"small", "the packet past the client's maximum was sent");
+    assert_eq!(broker.connections(), 1, "the client was dropped");
+    task.abort();
+}
