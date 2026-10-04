@@ -296,15 +296,19 @@ argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformanc
 expect_text = '''the held request was never applied'''
 guard       = "state_held_while_down"
 
-# The property copies of a target-level write are skipped.
+# The property copies of a target-level write are skipped. (R1 gate: retargeted. Requests now reach
+# the bridge through the fake broker's subscriptions at QoS 1, so the copies follow the write
+# closely and merge into its still-pending entry; `a_target_level_write_reaches_apply_once_...`
+# no longer enters the skip, and the row went GREEN in the gate's full run. The copies arriving
+# after the apply do.)
 [[control]]
 name        = "property_copies_are_applied_again"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''Some((copy, until)) if copy == value.value && now < until => Posted::Skipped,'''
 replacement = '''Some((copy, until)) if false && copy == value.value && now < until => Posted::Skipped,'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_level_write_reaches_apply_once_with_all_values", "--exact"]
-expect_text = '''the target write did not reach apply once with all its values'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_writes_copies_arriving_after_its_apply_are_skipped", "--exact"]
+expect_text = '''a property copy arriving after the target write was applied again'''
 guard       = "target_write_copies"
 
 # A target's waiting values are applied together.
@@ -501,13 +505,20 @@ argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformanc
 expect_text = '''reconnects are not paced at the retry interval'''
 guard       = "paced_reconnects"
 
-# The fleet's F2: recovery on the device's first good answer, never on a bare connect.
+# The fleet's F2: recovery on the device's first good answer, never on a bare connect. (R1 gate:
+# since MINOR 10 `recovered` only puts the link on trial and the outage ends from `serve`, once the
+# link has lasted; a bare `recovered` at connect was cleared by the next failed attempt and the row
+# went GREEN in the gate's full run. Declaring the recovery at connect now means ending it there.)
 [[control]]
 name        = "recovery_is_declared_at_connect"
 file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        let read = match self.prove(handle).await {
 '''
 replacement = '''        self.outage.recovered(0, 0, 0);
+        if let Some(episode) = self.outage.current.as_mut() {
+            episode.on_trial = Some(Instant::now() - Duration::from_secs(60));
+        }
+        self.outage.stable();
         let read = match self.prove(handle).await {
 '''
 target      = "command"
@@ -778,7 +789,7 @@ anchor      = '''            helper.abort();'''
 replacement = '''            let _ = helper;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::dropping_the_context_cancels_its_helpers", "--exact"]
-expect_text = '''the helper outlived its link'''
+expect_text = '''a helper outlived its link'''
 guard       = "helpers_cancelled"
 
 # The fleet's F3: SIGINT and SIGTERM are taken first thing.

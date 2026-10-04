@@ -175,7 +175,9 @@ async fn a_driver_panic_ends_the_device_worker() {
     assert!(h.desire("t1", "temp", json!(22), REQ));
     let died = tokio::time::timeout(BOUND, h.running().ended()).await.expect("the driver's panic went unseen");
     assert_eq!(died.part, "device");
-    assert!(died.cause.contains("scripted panic"), "{died:?}");
+    // With the worker's end unseen, the blocked-thread watchdog still ends the bridge, past the
+    // operation's deadline and its grace: the panic itself went unseen.
+    assert!(died.cause.contains("scripted panic"), "the driver's panic went unseen; the bridge saw {died:?}");
     assert!(h.stop().await);
 }
 
