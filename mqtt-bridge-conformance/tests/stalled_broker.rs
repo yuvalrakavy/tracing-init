@@ -27,7 +27,7 @@ async fn the_device_side_works_while_the_broker_is_stalled() {
     }
     assert!(
         h.eventually(BOUND, |h| h.broker.held_acks() >= 10).await,
-        "the broker's acknowledgements were never held: the path is not saturated"
+        "the broker's acknowledgements were never held: the path is not saturated — or the pump waits on the session"
     );
     h.settle(Duration::from_millis(300)).await;
     // The barrier: a request sent now is read only by a session that is not parked on a full
@@ -48,7 +48,10 @@ async fn the_device_side_works_while_the_broker_is_stalled() {
         h.device.applies()
     );
     h.broker.release_acks();
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await, "the bridge did not recover with the broker");
+    assert!(
+        h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await,
+        "the bridge did not recover with the broker — the pump waits on the session, or its session does"
+    );
     assert!(h.stop().await);
 }
 

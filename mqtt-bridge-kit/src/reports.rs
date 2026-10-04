@@ -145,6 +145,9 @@ pub struct Reports {
     ready: Notify,
     /// When the bridge started: the read-back is what the bridge knew then.
     epoch: Instant,
+    /// Whether the read-back is in (or will not come), and its waiters.
+    read_back_done: std::sync::atomic::AtomicBool,
+    read_back_in: Notify,
 }
 
 /// What changed since the session last took it.
@@ -184,6 +187,8 @@ impl Reports {
             ),
             ready: Notify::new(),
             epoch: Instant::now(),
+            read_back_done: std::sync::atomic::AtomicBool::new(false),
+            read_back_in: Notify::new(),
         })
     }
 
@@ -430,6 +435,33 @@ impl Reports {
     /// The read-back, as of the start.
     pub fn read_back_before(&self) -> (Instant, BTreeMap<String, PropertyMap>) {
         (self.epoch, self.locked().readback.clone())
+    }
+
+    /// The read-back is in — every retained `State` the broker had for the bridge has been read —
+    /// or will not come. Never waits.
+    pub fn read_back_complete(&self) {
+        if !self.read_back_done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.read_back_in.notify_waiters();
+        }
+    }
+
+    /// Wait until the read-back is in, at most `within`; whether it is.
+    pub async fn read_back_completed(&self, within: std::time::Duration) -> bool {
+        let wait = async {
+            loop {
+                // WAIT: read-back-ready
+                let notified = self.read_back_in.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.read_back_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                // WAIT: read-back-ready
+                notified.await;
+            }
+        };
+        // WAIT: read-back-ready
+        tokio::time::timeout(within, wait).await.is_ok()
     }
 
     /// A target's state as the bridge's retained `State` held it at start.

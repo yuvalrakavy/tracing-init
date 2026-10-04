@@ -49,6 +49,8 @@ pub struct Settings {
     pub mqtt: MqttTiming,
     /// The driver's options, by name.
     pub options: BTreeMap<String, String>,
+    /// `--restore on|off`: overrides the driver's `DriverInfo::restore`.
+    pub restore: Option<bool>,
 }
 
 impl Settings {
@@ -61,6 +63,7 @@ impl Settings {
             timing: TimingOverrides::default(),
             mqtt: MqttTiming::default(),
             options: BTreeMap::new(),
+            restore: None,
         }
     }
 }
@@ -142,7 +145,8 @@ pub fn usage(program: &str, family: &str, options: &[(String, String)]) -> Strin
          \x20 --mqtt-keep-alive <d>        MQTT keep-alive (at least 5s)\n\
          \x20 --mqtt-retry <d>             between MQTT sessions\n\
          \x20 --mqtt-warn <d>              a broker outage this long is one WARN\n\
-         \x20 --mqtt-stable <d>            a connection that lasts this long ends a broker outage\n"
+         \x20 --mqtt-stable <d>            a connection that lasts this long ends a broker outage\n\
+         \x20 --restore <on|off>           restore one-way devices from the read-back at start\n"
     );
     for (name, help) in options {
         text.push_str(&format!("  {:<29}{help}\n", format!("--{name} <value>")));
@@ -197,6 +201,13 @@ pub fn parse(args: impl IntoIterator<Item = String>, settings: &mut Settings, op
             "mqtt-retry" => settings.mqtt.retry = duration()?,
             "mqtt-warn" => settings.mqtt.warn_after = duration()?,
             "mqtt-stable" => settings.mqtt.stable_after = duration()?,
+            "restore" => {
+                settings.restore = Some(match value.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(Problem::Usage(format!("`--restore` is `on` or `off`, not `{value}`"))),
+                })
+            }
             other if options.iter().any(|(o, _)| o == other) => {
                 settings.options.insert(other.to_owned(), value);
             }
@@ -305,6 +316,17 @@ mod tests {
         let option = text.lines().find(|l| l.contains("--coolmaster")).expect("the driver's option's line");
         assert_eq!(column(option, "its address"), column(root, "MQTT root"), "the driver's option is off its column:\n{text}");
         assert!(option.contains("--coolmaster <value>"), "the driver's option shows no value placeholder: `{option}`");
+    }
+
+    /// `--restore on|off` overrides the driver's default; anything else is a usage error.
+    #[test]
+    fn restore_is_on_or_off() {
+        let mut s = Settings::new("A");
+        parse(args("--instance i --broker x --restore on"), &mut s, &[]).unwrap();
+        assert_eq!(s.restore, Some(true));
+        parse(args("--instance i --broker x --restore off"), &mut s, &[]).unwrap();
+        assert_eq!(s.restore, Some(false));
+        assert!(matches!(parse(args("--instance i --broker x --restore maybe"), &mut Settings::new("A"), &[]), Err(Problem::Usage(_))));
     }
 
     #[test]

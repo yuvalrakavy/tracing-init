@@ -183,6 +183,9 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
     let mut announced = false;
     // Whether the broker accepted this session's connection.
     let mut accepted = false;
+    // Whether this session made the read-back's subscription and waits for its end: the next
+    // SUBACK, behind which every retained State has been read.
+    let mut read_back_ends = false;
     loop {
         // WAIT: session-events
         let step = tokio::select! {
@@ -192,6 +195,13 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
         };
         let connack = matches!(step, Step::Event(Some(PumpEvent::Connected)));
         accepted |= connack;
+        if connack && !shared.read_back_requested.load(Ordering::SeqCst) {
+            read_back_ends = true;
+        }
+        if read_back_ends && matches!(step, Step::Event(Some(PumpEvent::SubAck))) {
+            shared.reports.read_back_complete();
+            read_back_ends = false;
+        }
         let work = async {
             match step {
                 Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client, &mut incoming).await.map(|goes_on| {
@@ -222,7 +232,13 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
         };
         match done {
             Ok(None) => announced |= connack,
-            Ok(Some(SessionEnd::Ended { .. })) => return SessionEnd::Ended { connected: accepted },
+            Ok(Some(SessionEnd::Ended { .. })) => {
+                if read_back_ends && shared.read_back_requested.load(Ordering::SeqCst) {
+                    // What came of the read-back is all there will be.
+                    shared.reports.read_back_complete();
+                }
+                return SessionEnd::Ended { connected: accepted };
+            }
             Ok(Some(SessionEnd::Shutdown)) => {
                 flush(shared, &client, &mut incoming).await;
                 return SessionEnd::Shutdown;
@@ -251,11 +267,14 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
         match read_back_acknowledged(shared, incoming).await {
             None => return Ok(false),
             Some(true) => {}
-            Some(false) => warn!(
+            Some(false) => {
+                shared.reports.read_back_complete();
+                warn!(
                 kind = "read_back_incomplete",
                 waited_ms = READ_BACK_WAIT.as_millis() as u64,
                 "The broker did not acknowledge the read-back's subscription in time; subscribing to requests without it — a replay may meet no \"before\" values"
-            ),
+            )
+            }
         }
         shared.read_back_requested.store(true, Ordering::SeqCst);
     }

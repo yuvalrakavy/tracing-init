@@ -42,6 +42,10 @@ pub const BUSY_PROBE: Duration = Duration::from_secs(2);
 /// The bound on `disconnect` at shutdown.
 pub const DISCONNECT_BOUND: Duration = Duration::from_secs(2);
 
+/// How long a restore (`DriverInfo::restore`) waits for the read-back before it restores what is
+/// in: past the read-back's own bound (5 s), and the SUBACK behind it.
+pub const RESTORE_WAIT: Duration = Duration::from_secs(10);
+
 /// The device's reachability as the worker sees it. The worker outlives every link, so an outage
 /// is one episode however many attempts it takes (the logging policy, and the owner's device-down
 /// policy).
@@ -234,11 +238,16 @@ pub(crate) struct Worker<D: DeviceDriver> {
     configured: HashMap<String, Option<Value>>,
     /// Whether the driver's `Unsupported` probe was said (once per process).
     unsupported_probe_said: bool,
+    /// Whether the one-way targets are still to be restored from the read-back (the process's
+    /// first catch-up that ends; `DriverInfo::restore`).
+    restore_due: bool,
 }
 
 impl<D: DeviceDriver> Worker<D> {
     pub(crate) fn new(driver: D, info: DriverInfo, instance: &str, mailbox: Arc<Mailbox>, reports: Arc<Reports>) -> Worker<D> {
+        let restore_due = info.restore;
         Worker {
+            restore_due,
             driver,
             outage: DeviceOutage::new(info.timing.outage_warn),
             info,
@@ -350,6 +359,15 @@ impl<D: DeviceDriver> Worker<D> {
             proving.entry(state.target).or_default().extend(state.values);
         }
         let mut applied = 0;
+        // A target's setup first; then, at the process's first catch-up, a one-way device's
+        // restore; then the held values.
+        while let Some((target, config)) = self.mailbox.take_held_config() {
+            self.configure(handle, &target, config).await?;
+        }
+        if self.restore_due {
+            applied += self.restore(handle).await?;
+            self.restore_due = false;
+        }
         loop {
             match self.mailbox.take_held() {
                 None => break,
@@ -364,6 +382,47 @@ impl<D: DeviceDriver> Worker<D> {
             self.probe(handle).await?;
         }
         Ok(applied)
+    }
+
+    /// Restore a one-way device (`DriverInfo::restore`, review M8): once the read-back is in (at
+    /// most [`RESTORE_WAIT`]), each target with assumed feedback gets the read-back's values — what
+    /// the previous run said it had set — but for a property a newer request waits for. Returns
+    /// how many values were written; a lost link leaves the restore to the next link.
+    async fn restore(&mut self, handle: &LinkHandle) -> Result<usize, LinkError> {
+        if !self.reports.read_back_completed(RESTORE_WAIT).await {
+            info!(waited_ms = RESTORE_WAIT.as_millis() as u64, "The read-back is not complete; restoring what is in");
+        }
+        let (_, read_back) = self.reports.read_back_before();
+        let timing = self.info.timing;
+        let (mut restored, mut targets) = (0, 0);
+        for (target, values) in read_back {
+            if self.mailbox.feedback(&target, self.info.feedback) != Feedback::Assumed {
+                continue;
+            }
+            let values: PropertyMap = values.into_iter().filter(|(property, _)| !self.mailbox.waits_for_key(&target, property)).collect();
+            if values.is_empty() {
+                continue;
+            }
+            let reported_before = self.reports.reports_for(&target);
+            match op(handle, timing.operation, "apply", self.driver.apply(&target, &values)).await {
+                Ok(()) => {
+                    if self.reports.reports_for(&target) == reported_before {
+                        self.reports.state(&target, values.clone(), true);
+                    }
+                    restored += values.len();
+                    targets += 1;
+                }
+                Err(OpError::Link(e)) => return Err(e),
+                Err(failure) => {
+                    let (_, message) = classify(&failure);
+                    warn!(kind = "command_rejected", target = %target, error = message, "The device refused a restore from the read-back");
+                }
+            }
+        }
+        if targets > 0 {
+            info!(targets, values = restored, "Restored one-way targets from the read-back");
+        }
+        Ok(restored)
     }
 
     /// Requests a change at the device won (`unknown`: whose current value is unknown, under

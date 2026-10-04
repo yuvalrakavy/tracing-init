@@ -710,6 +710,25 @@ impl Mailbox {
         kept
     }
 
+    /// The next config held while the device was down, if any — only configs, values left waiting —
+    /// in flight until [`configured`](Self::configured) or [`failed`](Self::failed). Never waits.
+    pub fn take_held_config(&self) -> Option<(String, Option<Value>)> {
+        let mut inner = self.locked();
+        let i = inner.pending.iter().position(|e| matches!(e, Entry::Config { held: true, .. }))?;
+        match inner.pending.remove(i) {
+            Some(Entry::Config { target, config, .. }) => {
+                inner.in_flight_config = Some((target.clone(), config.clone()));
+                Some((target, config))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a value for `target` and `property` waits. Never waits.
+    pub fn waits_for_key(&self, target: &str, property: &str) -> bool {
+        self.locked().pending.iter().any(|e| matches!(e, Entry::State { value, .. } if value.is_key(target, property)))
+    }
+
     /// Keep in flight only the values `keep` says (the rest were decided by the conflict rule).
     pub fn retain_in_flight(&self, keep: impl Fn(&StateValue) -> bool) {
         self.locked().in_flight.retain(|v| keep(v));

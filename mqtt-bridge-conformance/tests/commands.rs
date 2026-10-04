@@ -328,3 +328,33 @@ async fn a_driver_retracts_a_target_or_a_property() {
     assert!(h.broker.retained_on(&t.state("u2")).is_none(), "the removed target came back with the model");
     assert!(h.stop().await);
 }
+
+/// A one-way device that restarts dark is restored: with `restore` on, at the process's first
+/// connect its assumed targets get the read-back's values — what the previous run said it had set —
+/// after the read-back is in and before any held value (review M8: a DMX restart left the lights
+/// dark and the retained assumed State claiming the old levels). Off, the default, nothing is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_way_device_is_restored_from_the_read_back_when_restore_is_on() {
+    for restore in [true, false] {
+        let info = mqtt_bridge_kit::DriverInfo { restore, ..info(Writes::Acknowledged, Feedback::Assumed) };
+        let h = Harness::start_with("restore", info, quick_timing(), |broker, topics, device| {
+            broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+            // A one-way device: nothing can be read back.
+            device.answer(Op::Read, None, Answer::Unsupported);
+        })
+        .await;
+        assert!(connected(&h).await);
+        if restore {
+            assert!(
+                h.eventually(BOUND, |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
+                "the assumed target was not restored from the read-back: {:?}",
+                h.device.calls()
+            );
+            assert_eq!(h.device.calls_of(Op::Apply).len(), 1, "restored more than once");
+        } else {
+            h.settle(Duration::from_millis(600)).await;
+            assert!(h.device.calls_of(Op::Apply).is_empty(), "restored with restore off");
+        }
+        assert!(h.stop().await);
+    }
+}

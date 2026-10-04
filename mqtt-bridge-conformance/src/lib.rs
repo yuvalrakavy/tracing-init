@@ -303,6 +303,7 @@ pub fn info(writes: mqtt_bridge_kit::Writes, feedback: mqtt_bridge_kit::Feedback
             CommandSpec::new("status", CommandClass::Read),
         ],
         timing: mqtt_bridge_kit::Timing::default(),
+        restore: false,
     }
 }
 

@@ -119,6 +119,11 @@ capped queue whose overflow is counted and logged once per episode.
   driver) are standard and handled by the runtime.
 - **`timing`:** defaults for connect, operation, retry pacing, the outage WARN threshold (30 s), the poll
   interval, and the probe interval and deadline. Each can be overridden on the command line.
+- **`restore`** (default off; `--restore on|off` overrides it, `Bridge::restore` in code): at the
+  process's first connect, each target with assumed feedback gets the read-back's values — what the
+  previous run said it had set — after the held configs, before any held value, once the read-back
+  is in (at most 10 s). For a one-way device that comes back dark (DMX). A property a newer request
+  waits for is left to that request.
 
 ## 5. What the runtime owns
 
