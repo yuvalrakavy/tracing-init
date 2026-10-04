@@ -433,7 +433,8 @@ impl<D: DeviceDriver> Worker<D> {
         })
     }
 
-    /// `Up`: the mailbox, polls and probes, until the link is lost.
+    /// `Up`: the mailbox, polls and probes, until the link is lost. A poll is due an interval after
+    /// the last one ended, and one waiting request is served after each poll.
     async fn serve(&mut self, handle: &LinkHandle) -> LinkError {
         let timing = self.info.timing;
         let mut last_read = Instant::now();
@@ -453,9 +454,8 @@ impl<D: DeviceDriver> Worker<D> {
             let outcome = match step {
                 Step::Probe => self.probe(handle).await.map(|()| last_heard = Instant::now()),
                 Step::Poll => {
-                    last_read = Instant::now();
                     // WAIT: device-op
-                    match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::All)).await {
+                    let polled = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::All)).await {
                         Ok(states) => {
                             last_heard = Instant::now();
                             self.mailbox.proven();
@@ -467,6 +467,14 @@ impl<D: DeviceDriver> Worker<D> {
                             debug!(error = %other, "A poll's answer was unusable");
                             Ok(())
                         }
+                    };
+                    // The next poll is due an interval after this one ended, and the mailbox is
+                    // served before it, whatever is due: a poll slower than its interval would
+                    // otherwise be due at once, every time, and starve every write (review C4).
+                    last_read = Instant::now();
+                    match (polled, self.mailbox.try_take()) {
+                        (Ok(()), Some(work)) => self.work(handle, work).await,
+                        (polled, _) => polled,
                     }
                 }
                 Step::Work(work) => self.work(handle, work).await,

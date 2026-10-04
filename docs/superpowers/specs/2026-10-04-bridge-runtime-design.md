@@ -192,6 +192,8 @@ commands are refused, and reads are dropped.
   will says `Active=false`.
 - **Succeeded, then the link died:** an operation that has completed wins over a `link_lost`
   noticed at the same moment; its result stands, and the loss is seen at the worker's next step.
+- **Polls:** the next poll is due an interval after the last one ended, and one waiting request is
+  served between polls, so a poll slower than its interval cannot starve the writes.
 
 **Out of scope:** airzoned (a media daemon) keeps its own structure. mqtt_mdns adopts only the pump,
 reports and process pieces, since it has no device link.

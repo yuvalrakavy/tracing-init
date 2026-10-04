@@ -243,3 +243,28 @@ async fn a_helper_that_ends_is_a_lost_link() {
         assert!(h.stop().await);
     }
 }
+
+/// A poll slower than its interval does not starve the device's other work: the next poll is due
+/// an interval after the last one ended, and the mailbox is served between polls (review C4: due
+/// from the last one's start, every poll was due at once, and no write ever ran).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_poll_slower_than_its_interval_does_not_starve_writes() {
+    let timing = TimingOverrides { poll: Some(Some(Duration::from_millis(300))), ..quick_timing() };
+    let h = Harness::start_with("slowpoll", acknowledged(), timing, |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        // Each read takes 400 ms: longer than the interval, within the 500 ms bound.
+        device.answer(Op::Read, None, Answer::Delay(Duration::from_millis(400)));
+    })
+    .await;
+    assert!(connected(&h).await);
+    // Polls running back to back by now.
+    h.settle(Duration::from_millis(1000)).await;
+    assert!(h.desire("t1", "temp", json!(22), REQ));
+    assert!(
+        h.eventually(Duration::from_secs(3), |h| h.device.get("t1", "temp") == Some(json!(22))).await,
+        "with polls slower than their interval, a write never ran: {} reads, {} applies",
+        h.device.calls_of(Op::Read).len(),
+        h.device.calls_of(Op::Apply).len()
+    );
+    assert!(h.stop().await);
+}

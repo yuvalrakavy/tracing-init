@@ -1074,3 +1074,18 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_helpers_blocking_calls_count_towards_the_cap", "--exact"]
 expect_text = '''a blocking call past the cap was run'''
 guard       = "blocking_cap_reserved"
+
+# C4: the next poll is due an interval after the last one ended; the mailbox is served between polls.
+[[control]]
+name        = "polls_are_due_from_their_start_and_starve_writes"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                    last_read = Instant::now();
+                    match (polled, self.mailbox.try_take()) {
+                        (Ok(()), Some(work)) => self.work(handle, work).await,
+                        (polled, _) => polled,
+                    }'''
+replacement = '''                    polled'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_poll_slower_than_its_interval_does_not_starve_writes", "--exact"]
+expect_text = '''with polls slower than their interval, a write never ran'''
+guard       = "poll_from_completion"
