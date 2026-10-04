@@ -1105,6 +1105,10 @@ expect_text = '''a blocking call past the cap was run'''
 guard       = "blocking_cap_reserved"
 
 # C4: the next poll is due an interval after the last one ended; the mailbox is served between polls.
+# (Re-gate R16: each of the two keeps writes from starving on its own — scheduled from the end,
+# the interval's gap lets the mailbox in; served between polls, back-to-back polls still pass one
+# item each — so the starvation row removes both. The row after it controls the scheduling alone,
+# by the polls' spacing. The service between polls is not observable while the scheduling holds.)
 [[control]]
 name        = "polls_are_due_from_their_start_and_starve_writes"
 file        = "mqtt-bridge-kit/src/worker.rs"
@@ -1122,6 +1126,54 @@ replacement = '''                    polled'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_poll_slower_than_its_interval_does_not_starve_writes", "--exact"]
 expect_text = '''with polls slower than their interval, a write never ran'''
+guard       = "poll_from_completion"
+
+# C4 / re-gate R16: the next poll is due an interval after the last ended — alone.
+[[control]]
+name        = "polls_are_due_from_their_start"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                Step::Poll => {
+                    // WAIT: device-op
+                    let polled = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::All)).await {
+                        Ok(states) => {
+                            last_heard = Instant::now();
+                            self.mailbox.proven();
+                            self.fold(&states);
+                            Ok(())
+                        }
+                        Err(OpError::Link(e)) => Err(e),
+                        Err(other) => {
+                            debug!(error = %other, "A poll's answer was unusable");
+                            Ok(())
+                        }
+                    };
+                    // The next poll is due an interval after this one ended, and the mailbox is
+                    // served before it, whatever is due: a poll slower than its interval would
+                    // otherwise be due at once, every time, and starve every write (review C4).
+                    last_read = Instant::now();'''
+replacement = '''                Step::Poll => {
+                    let started = Instant::now();
+                    // WAIT: device-op
+                    let polled = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::All)).await {
+                        Ok(states) => {
+                            last_heard = Instant::now();
+                            self.mailbox.proven();
+                            self.fold(&states);
+                            Ok(())
+                        }
+                        Err(OpError::Link(e)) => Err(e),
+                        Err(other) => {
+                            debug!(error = %other, "A poll's answer was unusable");
+                            Ok(())
+                        }
+                    };
+                    // The next poll is due an interval after this one ended, and the mailbox is
+                    // served before it, whatever is due: a poll slower than its interval would
+                    // otherwise be due at once, every time, and starve every write (review C4).
+                    last_read = started;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "polls_are_spaced_an_interval_after_the_last_one_ended", "--exact"]
+expect_text = '''the next poll was not due an interval after the last ended'''
 guard       = "poll_from_completion"
 
 # C5: a newer unproven write of a key keeps the oldest proof deadline.
@@ -1520,6 +1572,24 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violation", "--exact"]
 expect_text = '''an unsupported probe of an unacknowledged driver was not one ERROR'''
 guard       = "unsupported_probe"
+
+# C11b / re-gate R16: an Unsupported probe still counts as proof, or it is a probe hot loop.
+[[control]]
+name        = "an_unsupported_probe_proves_nothing"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                if let Err(OpError::Unsupported(message)) = other {
+                    self.unsupported_probe(&message);
+                }
+                self.mailbox.proven();'''
+replacement = '''                if let Err(OpError::Unsupported(message)) = other {
+                    self.unsupported_probe(&message);
+                    return Ok(());
+                }
+                self.mailbox.proven();'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violation", "--exact"]
+expect_text = '''a probe loop'''
+guard       = "unsupported_probe_proof"
 
 # M4: Config is subscribed before Desired (a device already up when the replays arrive).
 [[control]]

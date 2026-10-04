@@ -251,10 +251,12 @@ async fn a_helper_that_ends_is_a_lost_link() {
 /// from the last one's start, every poll was due at once, and no write ever ran).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_poll_slower_than_its_interval_does_not_starve_writes() {
-    let timing = TimingOverrides { poll: Some(Some(Duration::from_millis(300))), ..quick_timing() };
+    // Operations may take 2 s here, so a loaded machine cannot turn the slow reads into lost links.
+    let timing =
+        TimingOverrides { poll: Some(Some(Duration::from_millis(300))), operation: Some(Duration::from_secs(2)), ..quick_timing() };
     let h = Harness::start_with("slowpoll", acknowledged(), timing, |_, _, device| {
         device.set("t1", "temp", json!(20));
-        // Each read takes 400 ms: longer than the interval, within the 500 ms bound.
+        // Each read takes 400 ms: longer than the interval, well within the 2 s bound.
         device.answer(Op::Read, None, Answer::Delay(Duration::from_millis(400)));
     })
     .await;
@@ -268,6 +270,34 @@ async fn a_poll_slower_than_its_interval_does_not_starve_writes() {
         h.device.calls_of(Op::Read).len(),
         h.device.calls_of(Op::Apply).len()
     );
+    assert_eq!(h.device.calls_of(Op::Connect).len(), 1, "a slow read lost the link: the test proves nothing about starvation");
+    assert!(h.stop().await);
+}
+
+/// The next poll is due an interval after the last one ended, not after it began: a poll slower
+/// than its interval does not run back to back (review C4; the re-gate split its control). Load
+/// can only lengthen the gaps, so it cannot fail this falsely.
+#[tokio::test(flavor = "multi_thread")]
+async fn polls_are_spaced_an_interval_after_the_last_one_ended() {
+    let timing =
+        TimingOverrides { poll: Some(Some(Duration::from_millis(400))), operation: Some(Duration::from_secs(2)), ..quick_timing() };
+    let h = Harness::start_with("pollgap", acknowledged(), timing, |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.answer(Op::Read, None, Answer::Delay(Duration::from_millis(600)));
+    })
+    .await;
+    assert!(connected(&h).await);
+    let first = h.device.calls_of(Op::Read).len();
+    h.settle(Duration::from_millis(3500)).await;
+    let starts: Vec<std::time::Instant> = h.device.calls_of(Op::Read).iter().skip(first).map(|c| c.at).collect();
+    assert!(starts.len() >= 2, "too few polls to measure: {}", starts.len());
+    for pair in starts.windows(2) {
+        let gap = pair[1] - pair[0];
+        assert!(
+            gap >= Duration::from_millis(900),
+            "two polls started {gap:?} apart: the next poll was not due an interval after the last ended (600 ms + 400 ms)"
+        );
+    }
     assert!(h.stop().await);
 }
 
