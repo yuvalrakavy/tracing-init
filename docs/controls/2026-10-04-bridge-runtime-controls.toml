@@ -1686,10 +1686,8 @@ guard       = "retraction_republished"
 [[control]]
 name        = "restore_does_nothing"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''            applied += self.restore(handle).await?;
-        }'''
-replacement = '''            let _ = &mut applied;
-        }'''
+anchor      = '''        let restore_due = info.restore;'''
+replacement = '''        let restore_due = info.restore && false;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_one_way_device_is_restored_from_the_read_back_when_restore_is_on", "--exact"]
 expect_text = '''the assumed target was not restored from the read-back'''
