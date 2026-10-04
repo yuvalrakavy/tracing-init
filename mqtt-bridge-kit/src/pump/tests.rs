@@ -206,9 +206,15 @@ async fn a_broker_that_acknowledges_nothing_ends_the_session_within_twice_the_ke
     let ended = ended_within(&mut incoming, Duration::from_secs(20)).await;
     let reason = ended.expect("the pump went on for 20 s with a publish its broker never acknowledged");
     assert!(reason.contains("acknowledged nothing"), "the session ended for another reason: {reason}");
-    assert!(started.elapsed() >= Duration::from_secs(9), "ended sooner than twice the keep-alive: {:?}", started.elapsed());
+    let took = started.elapsed();
+    assert!(took >= Duration::from_secs(9), "ended sooner than twice the keep-alive: {took:?}");
+    // Twice the keep-alive, and a stated tolerance for scheduling on a loaded machine.
+    assert!(took <= Duration::from_secs(10) + STALL_TOLERANCE, "ended later than twice the keep-alive and {STALL_TOLERANCE:?}: {took:?}");
     assert!(broker.held_acks() >= 1, "nothing was held, so this test proves nothing");
 }
+
+/// How late past its bound a stalled session may end, for scheduling on a loaded machine.
+const STALL_TOLERANCE: Duration = Duration::from_secs(2);
 
 /// A broker that stops reading leaves rumqttc in its flush, inside `poll`, where its keep-alive
 /// cannot fire; the kernel gives such a connection up only after many minutes. The pump bounds
@@ -230,10 +236,20 @@ async fn a_poll_that_does_not_return_ends_the_session_within_twice_the_keep_aliv
     broker.stop_reading();
     // Far more than the two sockets' buffers hold, at QoS 0 (no in-flight limit): the flush blocks.
     let payload = vec![0u8; 1 << 20];
+    let started = std::time::Instant::now();
     for _ in 0..64 {
         client.try_publish("big", QoS::AtMostOnce, false, payload.clone()).expect("queue a publish");
     }
     let ended = ended_within(&mut incoming, Duration::from_secs(20)).await;
     let reason = ended.expect("the pump's poll did not return for 20 s with the broker not reading");
     assert!(reason.contains("did not return"), "the session ended for another reason: {reason}");
+    let took = started.elapsed();
+    assert!(took <= Duration::from_secs(10) + STALL_TOLERANCE, "ended later than twice the keep-alive and {STALL_TOLERANCE:?}: {took:?}");
+    // Bytes were still in the flush when the bound fired: an idle poll — nothing to write — would
+    // end the same way with this long keep-alive (the R1 re-gate's minor).
+    let delivered = broker.received_on("big").len();
+    assert!(
+        delivered < 64,
+        "every publish reached the broker: the flush was never blocked, so this test proves nothing ({delivered} of 64)"
+    );
 }

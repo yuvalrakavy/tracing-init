@@ -542,21 +542,33 @@ async fn device_wins_does_not_apply_a_held_request_whose_current_value_is_unknow
 /// (review C8: the worker applied its private copy).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_retracted_during_its_conflict_read_is_not_applied() {
-    let h = Harness::start_with("retracted-read", acknowledged(), quick_timing(), |broker, topics, device| {
+    // Operations may take 4 s: the slow read below is far from its bound.
+    let timing = mqtt_bridge_kit::TimingOverrides { operation: Some(Duration::from_secs(4)), ..quick_timing() };
+    let h = Harness::start_with("retracted-read", acknowledged(), timing, |broker, topics, device| {
         device.set("t1", "temp", json!(20));
-        // The conflict check's read of t1 is slow — within its 500 ms bound.
-        device.answer(Op::Read, Some("t1"), Answer::Delay(Duration::from_millis(400)));
+        // Down at first, so the replay is held; and its proving read gives no target, so the
+        // catch-up reads t1 on its own — slowly.
+        device.set_up(false);
+        device.answer_read_all(Answer::Unsupported);
+        device.answer(Op::Read, Some("t1"), Answer::Delay(Duration::from_millis(1500)));
         broker.retain(&topics.desired("t1", "temp"), "22", &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"));
     })
     .await;
+    // The startup's order, gated: the replay held first, then the device up (the R1 re-gate's
+    // minor: the test leaned on startup choosing the replay path, and on a 400 ms read within a
+    // 500 ms bound).
+    assert!(h.broker.wait_for_subscription(&h.topics.desired_property_filter(), BOUND).await, "the bridge never subscribed");
+    h.settle(Duration::from_millis(300)).await;
+    let disconnects = h.device.calls_of(Op::Disconnect).len();
+    h.device.set_up(true);
     assert!(
         h.eventually(BOUND, |h| h.device.calls_of(Op::Read).iter().any(|c| c.target.as_deref() == Some("t1"))).await,
         "the replayed request was never checked"
     );
     assert!(h.retract("t1", "temp"));
-    h.settle(Duration::from_millis(1200)).await;
+    h.settle(Duration::from_millis(2500)).await;
     assert!(h.device.applies().is_empty(), "a request retracted during its conflict read was applied: {:?}", h.device.applies());
-    assert_eq!(h.device.calls_of(Op::Connect).len(), 1, "the link was lost, so this test proves nothing");
+    assert_eq!(h.device.calls_of(Op::Disconnect).len(), disconnects, "the link was lost, so this test proves nothing");
     assert!(h.stop().await);
 }
 

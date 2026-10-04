@@ -2316,3 +2316,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "pump::tests::connections_dropped_at_once_are_paced_as_failures", "--exact"]
 expect_text = '''the retry pause never came'''
 guard       = "pacing_quick_drops"
+
+# Re-gate minor: the blocked-flush test proves bytes were stuck in the flush (FakeBroker's fault).
+[[control]]
+name        = "the_broker_never_stops_reading"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''        self.shared.wedged.send_replace(Some(self.shared.current.load(Ordering::SeqCst)));'''
+replacement = '''        let _ = &self.shared.wedged;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "pump::tests::a_poll_that_does_not_return_ends_the_session_within_twice_the_keep_alive", "--exact"]
+expect_text = '''the flush was never blocked, so this test proves nothing'''
+guard       = "broker_stop_reading"
