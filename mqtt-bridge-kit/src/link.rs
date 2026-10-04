@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use lock_order::sync::Mutex;
 use serde_json::Value;
 use tokio::sync::Notify;
 use tracing::{error, Instrument};
@@ -145,6 +146,28 @@ struct LinkShared {
     /// The worker's operation clock, which the watchdog reads.
     clock: Arc<OpClock>,
     instance: String,
+    /// The link's helpers, to abort when the link is dropped; `None` once it is.
+    helpers: Mutex<Option<Vec<tokio::task::AbortHandle>>>,
+    /// The device worker's thread: helpers run on its runtime, so only it may start them.
+    thread: std::thread::ThreadId,
+}
+
+/// Start a helper for `handle`'s link (see [`LinkContext::spawn`]).
+fn spawn_helper<F>(handle: &LinkHandle, task: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    if std::thread::current().id() != handle.shared.thread {
+        error!(kind = "driver_contract_violation", "A helper was started off the device worker's thread; it is not started");
+        return;
+    }
+    let watched = Watched { task: Box::pin(task), handle: handle.clone() }.in_current_span();
+    // WAIT: link-helpers
+    let mut helpers = handle.shared.helpers.lock().unwrap_or_else(|p| p.into_inner());
+    // A link already dropped starts no helper.
+    if let Some(helpers) = helpers.as_mut() {
+        helpers.push(tokio::task::spawn_local(watched).abort_handle());
+    }
 }
 
 /// A handle on one link, for a driver's later operations and its helpers. Cheap to clone.
@@ -183,6 +206,17 @@ impl LinkHandle {
     /// The bridge's instance.
     pub fn instance(&self) -> &str {
         &self.shared.instance
+    }
+
+    /// Start a helper for this link, as [`LinkContext::spawn`] does — from a driver's later
+    /// operation or another helper. Only on the device worker's thread, where helpers run: called
+    /// elsewhere it starts nothing (ERROR `driver_contract_violation`); on a link already lost, it
+    /// starts nothing either.
+    pub fn spawn<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        spawn_helper(self, task);
     }
 
     /// Wait until the link is reported lost; its reason. Cancellation-safe.
@@ -298,8 +332,20 @@ pub struct LinkContext {
     /// The reporter: observed or assumed state, and events.
     pub report: Reporter,
     handle: LinkHandle,
-    /// The link's helpers, aborted when the context is dropped (the link lost).
-    helpers: tokio::task::JoinSet<()>,
+}
+
+/// The link is lost: its helpers are cancelled, and none starts for it from now on.
+impl Drop for LinkContext {
+    fn drop(&mut self) {
+        let helpers = {
+            // WAIT: link-helpers
+            let mut helpers = self.handle.shared.helpers.lock().unwrap_or_else(|p| p.into_inner());
+            helpers.take()
+        };
+        for helper in helpers.into_iter().flatten() {
+            helper.abort();
+        }
+    }
 }
 
 impl LinkContext {
@@ -321,18 +367,22 @@ impl LinkContext {
             abandoned,
             clock,
             instance: instance.to_owned(),
+            helpers: Mutex::new("link-helpers", Some(Vec::new())),
+            thread: std::thread::current().id(),
         });
-        LinkContext { report: report.clone(), handle: LinkHandle { shared, report }, helpers: tokio::task::JoinSet::new() }
+        LinkContext { report: report.clone(), handle: LinkHandle { shared, report } }
     }
 
     /// Start a helper the runtime owns — an unsolicited-input reader, say — for the life of the
     /// link: cancelled when the link drops, and watched — a helper that ends, returning or
     /// panicking, is the link lost (a panic is also a driver bug, ERROR `driver_contract_violation`).
+    /// It runs on the device worker's own single-threaded runtime, as the driver does, so it need
+    /// not be `Send`.
     pub fn spawn<F>(&mut self, task: F)
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future<Output = ()> + 'static,
     {
-        self.helpers.spawn(Watched { task: Box::pin(task), handle: self.handle.clone() }.in_current_span());
+        spawn_helper(&self.handle, task);
     }
 
     /// The link died, as the driver noticed outside an operation.

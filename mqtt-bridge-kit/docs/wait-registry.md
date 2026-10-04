@@ -56,6 +56,7 @@ side.
 | `mailbox-posted` | acyclic | the mailbox, read by the worker (`Mailbox::take`) | An idle wait for work. A post never waits — a short lock, then a notify — so no poster waits on the worker. The worker takes only while the device is up; while it is down nothing takes: state waits (the latest per key, so bounded), momentary commands are refused at once, reads dropped. |
 | `mailbox-lock` | acyclic | the mailbox's state (`lock-order` mutex, class `mailbox-lock`) | Held only to read or change what waits: never across an await, no other lock taken under it, nothing logged under it — a refusal or a drop at a deadline is logged after the guard is dropped. The conflict rule's resolver runs under it on the worker's own data, taking no lock. |
 | `device-op` | bounded | one driver operation (`connect`, `read_state`, `apply`, `execute`, `configure`, `probe`), raced against the link's `link_lost` | The operation's timing: `connect` for a connect, `probe_deadline` for a probe, `operation` for the rest (driver defaults, each overridable on the command line). On expiry, or when a helper reports the link lost, the operation's future is dropped and the link is lost: helpers cancelled, `disconnect` (bounded), what the device may not have taken held again, momentary commands refused, the outage episode advanced, and the next connect paced. Never a hang. A driver that blocks its thread synchronously holds only the worker's own thread (`worker-thread`), where these timers cannot fire either; the deadline is also on the worker's `OpClock`, which the watchdog on the MQTT side reads (`bridge-parts`): past it and `BLOCKED_GRACE` (2 s) the device worker is dead. |
+| `link-helpers` | acyclic | one link's helper list (`lock-order` mutex, class `link-helpers`) | Held only to push a helper's abort handle or take the list: never across an await, no other lock taken under it, nothing logged under it. Taken on the device worker's thread, by a helper's start and by the link's drop. |
 | `link-lost` | acyclic | a helper's word that the link died (`LinkHandle::lost`) | Only ever raced: against an operation (`device-op`) or the worker's idle wait (`worker-up`). A `link_lost` never waits. |
 | `worker-up` | acyclic | the link lost, a probe or poll falling due, the mailbox (`select!`) | The worker's idle wait while the device is up: timers, a notify (`link-lost`), and the mailbox (`mailbox-posted`) — nothing it waits on waits on it. |
 | `device-disconnect` | bounded | the driver's `disconnect` | The operation timing after a lost link; `DISCONNECT_BOUND`, 2 s, at shutdown. On expiry the call is dropped: `disconnect` is best effort. |
@@ -99,6 +100,8 @@ device-op src/worker.rs Worker::prove
 device-op src/worker.rs Worker::serve
 device-op src/worker.rs Worker::work
 device-op src/worker.rs op
+link-helpers src/link.rs <LinkContext as Drop>::drop
+link-helpers src/link.rs spawn_helper
 link-lost src/link.rs LinkHandle::lost
 logging-start src/process.rs Bridge::serve
 mailbox-lock src/mailbox.rs Mailbox::locked

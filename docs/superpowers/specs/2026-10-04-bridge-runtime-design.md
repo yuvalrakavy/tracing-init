@@ -83,13 +83,15 @@ lost link, never a hang.
 - `ctx.report.event(event)`: something that happened.
 - `ctx.spawn(task)`: a helper the runtime owns (an unsolicited-input reader), for the life of the link:
   cancelled when the link drops, and watched — a helper that ends, by returning or panicking, is the
-  link lost (a panic is also ERROR `driver_contract_violation`).
+  link lost (a panic is also ERROR `driver_contract_violation`). Helpers run on the worker's own
+  single-threaded runtime, as the driver does, so they need not be `Send`; `LinkHandle::spawn`
+  starts one from a later operation or another helper (only on the worker's thread).
 - `ctx.link_lost(reason)`: a helper noticed the link died.
 - `ctx.blocking(fn)`: a synchronous library call on a worker thread, under the current deadline. An
   overrun abandons the thread and counts as a lost link. Every call's thread is counted from before
   it starts until it ends — in use or abandoned, a helper's or a cancelled caller's too — and at
   most four run at once; past that a call is refused as a lost link.
-- `ctx.handle()`: a cloneable `LinkHandle` (`report()`, `link_lost()`, `is_lost()`, `blocking()`) to
+- `ctx.handle()`: a cloneable `LinkHandle` (`report()`, `link_lost()`, `is_lost()`, `blocking()`, `spawn()`) to
   keep for later calls, since the context itself is only handed to `connect`. `ctx.report` is a
   cloneable `Reporter`.
 

@@ -145,18 +145,70 @@ async fn a_helpers_blocking_calls_count_towards_the_cap() {
     }
 }
 
-/// Dropping the context — the link lost — cancels its helpers.
+/// Dropping the context — the link lost — cancels its helpers, those started through a handle too.
+/// Helpers run on the worker's own runtime, so the tests run them in a `LocalSet`, as the worker
+/// does.
 #[tokio::test]
 async fn dropping_the_context_cancels_its_helpers() {
-    let mut ctx = context(1);
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-    ctx.spawn(async move {
-        let _keep = tx;
-        std::future::pending::<()>().await;
-    });
-    drop(ctx);
-    let closed = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("the helper outlived its link");
-    assert!(closed.is_none());
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut ctx = context(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+            let through_handle = tx.clone();
+            ctx.spawn(async move {
+                let _keep = tx;
+                std::future::pending::<()>().await;
+            });
+            ctx.handle().spawn(async move {
+                let _keep = through_handle;
+                std::future::pending::<()>().await;
+            });
+            tokio::task::yield_now().await;
+            drop(ctx);
+            let closed = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("a helper outlived its link");
+            assert!(closed.is_none());
+        })
+        .await;
+}
+
+/// A helper need not be `Send`: it runs on the device worker's own single-threaded runtime, as the
+/// driver does (review MINOR 12).
+#[tokio::test]
+async fn a_helper_need_not_be_send() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut ctx = context(1);
+            let handle = ctx.handle();
+            let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+            let (first, second) = (ran.clone(), ran.clone());
+            ctx.spawn(async move { first.set(first.get() + 1) });
+            handle.spawn(async move { second.set(second.get() + 1) });
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(ran.get(), 2, "the helpers did not run");
+            assert!(handle.is_lost(), "a helper that returned did not lose the link");
+        })
+        .await;
+}
+
+/// A handle used to start a helper off the device worker's thread starts none: helpers run on the
+/// worker's runtime only (a driver bug, ERROR `driver_contract_violation`).
+#[tokio::test]
+async fn a_helper_started_off_the_worker_thread_is_not_started() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let ctx = context(1);
+            let handle = ctx.handle();
+            let started = std::sync::Arc::new(AtomicBool::new(false));
+            let flag = started.clone();
+            let elsewhere = std::thread::spawn(move || handle.spawn(async move { flag.store(true, Ordering::SeqCst) }));
+            assert!(elsewhere.join().is_ok(), "starting a helper off the worker thread panicked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!started.load(Ordering::SeqCst), "a helper started off the worker thread ran");
+            drop(ctx);
+        })
+        .await;
 }
 
 /// An event without a string `kind` is a driver bug: dropped, with an ERROR.

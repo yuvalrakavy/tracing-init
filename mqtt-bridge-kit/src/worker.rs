@@ -844,8 +844,11 @@ pub(crate) fn spawn<D: DeviceDriver>(
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| format!("its runtime: {e}"))?;
             let mut worker = worker;
+            // Helpers run here too, on this runtime's local set: they need not be `Send`.
+            let local = tokio::task::LocalSet::new();
             // WAIT: worker-thread
-            runtime.block_on(
+            local.block_on(
+                &runtime,
                 async {
                     // WAIT: worker-stop
                     tokio::select! {
