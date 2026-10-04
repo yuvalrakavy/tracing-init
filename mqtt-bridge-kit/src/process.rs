@@ -340,7 +340,29 @@ impl Bridge {
                 return ExitCode::FAILURE;
             }
         };
-        let running = match self.start(driver) {
+        // `info()` should be pure; one that is not must not hold up the stop. It runs on a blocking
+        // thread, raced against the stop signals, and a stop abandons it within the runtime's grace
+        // (Codex, process.rs:251).
+        let describing = tokio::task::spawn_blocking(move || {
+            let info = driver.info();
+            (driver, info)
+        });
+        // WAIT: driver-info
+        let (driver, info) = tokio::select! {
+            described = describing => match described {
+                Ok(described) => described,
+                // A panic, said through the hook.
+                Err(e) => {
+                    warn!(kind = "startup_failed", error = %e, "The driver could not describe itself");
+                    return ExitCode::FAILURE;
+                }
+            },
+            _ = signals.next() => {
+                info!("Stopped before the driver described itself");
+                return ExitCode::SUCCESS;
+            }
+        };
+        let running = match self.launch(driver, Some(info)) {
             Ok(running) => running,
             Err(e) => {
                 warn!(kind = "startup_failed", error = %e, "The bridge could not start");
@@ -360,6 +382,12 @@ impl Bridge {
     /// [`install_panic_hook`] itself (the conformance suite uses this directly, and keeps the test
     /// harness's own hook).
     pub fn start<D: DeviceDriver>(self, driver: D) -> Result<Running, String> {
+        self.launch(driver, None)
+    }
+
+    /// [`start`](Self::start), with the driver's `info()` already taken (by [`run`](Self::run), off
+    /// the runtime) or taken here.
+    fn launch<D: DeviceDriver>(self, driver: D, info: Option<DriverInfo>) -> Result<Running, String> {
         if let Some(problem) = &self.problem {
             return Err(match problem {
                 Problem::Help => "--help".to_owned(),
@@ -370,7 +398,7 @@ impl Bridge {
         let topics = Topics::new(&self.settings.root, &instance)?;
         let (broker_host, broker_port) = config::broker_host_port(self.settings.broker.as_deref().ok_or("no broker")?)?;
         let span = tracing::info_span!("bridge", root = %topics.root(), instance = %instance);
-        let info: DriverInfo = driver.info();
+        let info: DriverInfo = info.unwrap_or_else(|| driver.info());
         let mut timing = self.settings.timing.apply(info.timing);
         timing.stable = self.settings.device_stable.unwrap_or(timing.stable);
         let info = DriverInfo { timing, restore: self.settings.restore.unwrap_or(info.restore), ..info };

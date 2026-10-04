@@ -1753,3 +1753,20 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::an_acknowledged_write_is_known_to_the_snapshots_and_never_published", "--exact"]
 expect_text = '''a report did not replace the written value'''
 guard       = "written_known"
+
+# F3 (Codex, process.rs:251): the driver's info() runs off the runtime, raced against the stop.
+[[control]]
+name        = "the_drivers_info_holds_the_stop"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        let describing = tokio::task::spawn_blocking(move || {
+            let info = driver.info();
+            (driver, info)
+        });'''
+replacement = '''        let describing = {
+            let info = driver.info();
+            async move { Ok::<_, tokio::task::JoinError>((driver, info)) }
+        };'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_while_the_drivers_info_has_not_returned_stops_the_bridge_within_its_bound", "--exact"]
+expect_text = '''did not stop cleanly within its bound on SIGTERM while its driver's info() was held'''
+guard       = "driver_info_raced"

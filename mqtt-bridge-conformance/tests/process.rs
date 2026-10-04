@@ -181,6 +181,35 @@ async fn sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound()
     assert_eq!(broker.connections(), 0, "the bridge reached its service, so its logging start was not held and this test proves nothing");
 }
 
+/// SIGTERM while the driver's `info()` has not returned — a driver breaking "info is pure" — stops
+/// the bridge cleanly within 3 s: `info()` runs on a thread of its own, raced against the stop
+/// signals taken before it (Codex, `process.rs:251`; the lead's F3). The test waits until `info()`
+/// has begun, which it says by writing a file; a regression holds the stop for the 30 s the call
+/// blocks, so no delay can let it pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_while_the_drivers_info_has_not_returned_stops_the_bridge_within_its_bound() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(20);
+    let dir = workdir("held_info");
+    let mut child =
+        bridge(&dir, &broker, &["--device", "hang-info"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("start the bridge");
+    let marker = dir.join("info-entered");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "the driver's info() was never called");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    signal(&child, "-TERM");
+    let signalled = Instant::now();
+    let status = exit_within(&mut child, Duration::from_secs(15)).await;
+    let took = signalled.elapsed();
+    assert!(
+        status.is_some_and(|s| s.success()) && took < Duration::from_secs(3),
+        "the bridge did not stop cleanly within its bound on SIGTERM while its driver's info() was held: {status:?}, {took:?} after the signal"
+    );
+    assert_eq!(broker.connections(), 0, "the bridge reached its service, so info() did not hold it and this test proves nothing");
+}
+
 /// A stream whose buffer is already full, as a supervisor's stdout that stopped draining. Returns
 /// the full end, for the bridge, and the other, to hold unread until the bridge has exited.
 fn full_stream() -> (UnixStream, UnixStream) {

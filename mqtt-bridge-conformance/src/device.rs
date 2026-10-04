@@ -90,6 +90,8 @@ struct State {
     helper: Option<Helper>,
     /// How a read of every target (`Scope::All`) answers, in place of the device's own answer.
     read_all: Option<Answer>,
+    /// `info()` writes this file, then blocks its thread this long: a driver breaking "info is pure".
+    info_hold: Option<(std::path::PathBuf, Duration)>,
 }
 
 impl State {
@@ -146,6 +148,12 @@ impl Device {
         if let Some(link) = link {
             link.link_lost("the fake device went down");
         }
+    }
+
+    /// Make `info()` write `marker` and then block its thread for `hold` — a driver that breaks
+    /// "info is pure", for the process scenarios.
+    pub fn hold_info(&self, marker: std::path::PathBuf, hold: Duration) {
+        self.locked().info_hold = Some((marker, hold));
     }
 
     /// Take writes without acting on them, and leave probes unanswered — a processor that lost
@@ -302,6 +310,11 @@ impl FakeDevice {
 
 impl DeviceDriver for FakeDevice {
     fn info(&self) -> DriverInfo {
+        let hold = self.shared.lock().unwrap_or_else(|p| p.into_inner()).info_hold.clone();
+        if let Some((marker, hold)) = hold {
+            let _ = std::fs::write(marker, b"");
+            std::thread::sleep(hold);
+        }
         self.info.clone()
     }
 

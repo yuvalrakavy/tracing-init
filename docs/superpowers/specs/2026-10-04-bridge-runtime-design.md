@@ -240,6 +240,9 @@ commands are refused, and reads are dropped.
   request while its pings succeed; a broker that stops reading holds rumqttc in its flush,
   inside the poll, where its keep-alive cannot fire. Reconnects are paced by `poll_retry`, and by
   `retry` after every fifth failed connect in a row.
+- **A driver's `info()` that does not return:** `run` calls it on a blocking thread, raced against
+  the stop signals taken before it, so a driver breaking "info is pure" cannot hold up the stop
+  (Codex, `process.rs:251`).
 - **A driver that blocks its thread:** its operation's deadline cannot fire on the worker's own
   runtime, so a watchdog on the MQTT side reads it (an atomic). Past the deadline and a 2 s grace:
   ERROR `worker_died`, `Status=unreachable`, the momentary commands waiting refused, and the
