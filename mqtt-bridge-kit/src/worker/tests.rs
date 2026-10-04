@@ -87,19 +87,49 @@ fn a_device_outage_is_one_episode() {
     );
 }
 
+fn link_context() -> LinkContext {
+    LinkContext::new(1, "i", Reports::new(), Arc::new(crate::link::Abandoned::default()), Arc::new(OpClock::new()))
+}
+
 /// An operation that has completed wins over a link loss noticed at the same moment: its result is
 /// what the device did, and the loss is seen at the worker's next step. Raced unbiased, a helper's
 /// `link_lost` turned a completed `Ok` into a `Link` error half the time (the mqtt_ac v2 build).
+/// Here the loss comes while the operation runs, in the poll that completes it.
 #[tokio::test]
 async fn an_operation_that_completed_wins_over_a_link_lost_at_the_same_moment() {
-    let ctx = LinkContext::new(1, "i", Reports::new(), Arc::new(crate::link::Abandoned::default()), Arc::new(OpClock::new()));
-    let handle = ctx.handle();
-    handle.link_lost("lost meanwhile");
     for _ in 0..64 {
-        let result = op(&handle, Duration::from_secs(5), "apply", async { Ok::<u32, OpError>(7) }).await;
+        let ctx = link_context();
+        let handle = ctx.handle();
+        let losing = handle.clone();
+        let result = op(&handle, Duration::from_secs(5), "apply", async move {
+            losing.link_lost("lost meanwhile");
+            Ok::<u32, OpError>(7)
+        })
+        .await;
         assert_eq!(result, Ok(7), "a completed operation was turned into a lost link");
+        assert!(handle.is_lost(), "the loss itself was forgotten");
     }
-    assert!(handle.is_lost(), "the loss itself was forgotten");
+}
+
+/// An operation is not started on a link already lost: it is refused at once with the loss, and
+/// the driver is not called (the R1 re-gate's R6: the biased wrapper ran every new operation on a
+/// lost link, and catch-up or restore writes went on after the loss).
+#[tokio::test]
+async fn an_operation_is_not_started_on_a_link_already_lost() {
+    let ctx = link_context();
+    let handle = ctx.handle();
+    handle.link_lost("lost before");
+    let started = std::sync::atomic::AtomicBool::new(false);
+    let result = op(&handle, Duration::from_secs(5), "apply", async {
+        started.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok::<u32, OpError>(7)
+    })
+    .await;
+    assert!(
+        matches!(&result, Err(OpError::Link(e)) if e.reason().contains("lost before")),
+        "an operation started on a link already lost: {result:?}"
+    );
+    assert!(!started.load(std::sync::atomic::Ordering::SeqCst), "the driver was called on a link already lost");
 }
 
 /// JSON numbers compare by value: `24` and `24.0` are the same value, so a held request the device

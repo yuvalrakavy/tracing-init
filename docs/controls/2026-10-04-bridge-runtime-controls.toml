@@ -1770,3 +1770,18 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_while_the_drivers_info_has_not_returned_stops_the_bridge_within_its_bound", "--exact"]
 expect_text = '''did not stop cleanly within its bound on SIGTERM while its driver's info() was held'''
 guard       = "driver_info_raced"
+
+# R6: an operation is not started on a link already lost.
+[[control]]
+name        = "operations_start_on_a_lost_link"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''    if let Some(lost) = handle.loss() {
+        return Err(OpError::Link(lost));
+    }'''
+replacement = '''    if let Some(lost) = handle.loss().filter(|_| false) {
+        return Err(OpError::Link(lost));
+    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::an_operation_is_not_started_on_a_link_already_lost", "--exact"]
+expect_text = '''an operation started on a link already lost'''
+guard       = "op_refused_on_lost_link"

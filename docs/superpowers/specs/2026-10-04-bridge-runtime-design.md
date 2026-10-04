@@ -240,6 +240,9 @@ commands are refused, and reads are dropped.
   request while its pings succeed; a broker that stops reading holds rumqttc in its flush,
   inside the poll, where its keep-alive cannot fire. Reconnects are paced by `poll_retry`, and by
   `retry` after every fifth failed connect in a row.
+- **No operation on a lost link:** an operation is refused at once, the driver not called, on a
+  link already reported lost; one admitted while the link was live and completed keeps its result
+  over a loss noticed at the same moment (re-gate R6).
 - **A driver's `info()` that does not return:** `run` calls it on a blocking thread, raced against
   the stop signals taken before it, so a driver breaking "info is pure" cannot hold up the stop
   (Codex, `process.rs:251`).

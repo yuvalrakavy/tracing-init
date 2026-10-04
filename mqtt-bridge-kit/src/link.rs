@@ -219,6 +219,11 @@ impl LinkHandle {
         spawn_helper(self, task);
     }
 
+    /// The link's loss, if it was reported lost.
+    pub(crate) fn loss(&self) -> Option<LinkError> {
+        self.is_lost().then(|| LinkError::new(self.shared.reason.get().cloned().unwrap_or_else(|| "the link was reported lost".into())))
+    }
+
     /// Wait until the link is reported lost; its reason. Cancellation-safe.
     pub(crate) async fn lost(&self) -> LinkError {
         loop {
@@ -226,8 +231,8 @@ impl LinkHandle {
             let notified = self.shared.lost_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.is_lost() {
-                return LinkError::new(self.shared.reason.get().cloned().unwrap_or_else(|| "the link was reported lost".into()));
+            if let Some(lost) = self.loss() {
+                return lost;
             }
             // WAIT: link-lost
             notified.await;

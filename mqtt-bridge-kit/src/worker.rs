@@ -137,14 +137,18 @@ impl DeviceOutage {
 }
 
 /// One driver operation, under `bound` and the link's `link_lost`: an overrun or a lost link is a
-/// `LinkError`. An operation that has completed wins over a loss noticed at the same moment — its
-/// result is what the device did; the loss is seen at the worker's next step.
+/// `LinkError`. An operation is not started on a link already lost (review R6). One admitted while
+/// the link was live and completed wins over a loss noticed at the same moment — its result is what
+/// the device did; the loss is seen at the worker's next step.
 async fn op<T>(
     handle: &LinkHandle,
     bound: Duration,
     what: &str,
     operation: impl Future<Output = Result<T, OpError>>,
 ) -> Result<T, OpError> {
+    if let Some(lost) = handle.loss() {
+        return Err(OpError::Link(lost));
+    }
     let deadline = Instant::now() + bound;
     handle.set_deadline(Some(deadline));
     // WAIT: device-op
