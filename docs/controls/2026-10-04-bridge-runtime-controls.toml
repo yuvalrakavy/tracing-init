@@ -1406,8 +1406,8 @@ guard       = "revalidate_after_read"
 [[control]]
 name        = "json_numbers_compare_as_written"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''        (Value::Number(x), Value::Number(y)) => x == y || x.as_f64().zip(y.as_f64()).is_some_and(|(x, y)| x == y),'''
-replacement = '''        (Value::Number(x), Value::Number(y)) => x == y,'''
+anchor      = '''            _ => x == y || x.as_f64().zip(y.as_f64()).is_some_and(|(x, y)| x == y),'''
+replacement = '''            _ => x == y,'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::json_numbers_compare_by_value", "--exact"]
 expect_text = '''24 and 24.0 differ'''
@@ -1810,3 +1810,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_queued_during_a_poll_that_loses_the_link_is_answered", "--exact"]
 expect_text = '''a command queued during a poll that lost the link was neither answered nor executed'''
 guard       = "poll_keeps_the_mailbox"
+
+# Re-gate minor: two integers compare exactly, never through f64.
+[[control]]
+name        = "integers_compare_through_f64"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''            (Some(x), Some(y)) => x == y,'''
+replacement = '''            (Some(x), Some(y)) => x as f64 == y as f64,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::json_numbers_compare_by_value", "--exact"]
+expect_text = '''two different integers compared as the same value'''
+guard       = "numbers_by_value"

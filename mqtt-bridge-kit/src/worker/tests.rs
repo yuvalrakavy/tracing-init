@@ -147,6 +147,17 @@ fn json_numbers_compare_by_value() {
         Resolution::Apply,
         "an unchanged before value counted as a change"
     );
+    // Two integers compare exactly: through f64, 2^53 + 1 and 2^53 are one (re-gate minor).
+    assert_eq!(
+        resolve(&request(json!(9_007_199_254_740_993_u64), Conflict::DeviceWins), Some(&json!(9_007_199_254_740_992_u64)), None),
+        Resolution::Apply,
+        "two different integers compared as the same value"
+    );
+    assert_eq!(
+        resolve(&request(json!(-9_007_199_254_740_993_i64), Conflict::DeviceWins), Some(&json!(-9_007_199_254_740_992_i64)), None),
+        Resolution::Apply,
+        "two different negative integers compared as the same value"
+    );
 }
 
 /// A device that answers the proving read and drops right after its catch-up is one outage, not an

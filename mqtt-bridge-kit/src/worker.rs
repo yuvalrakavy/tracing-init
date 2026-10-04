@@ -205,12 +205,21 @@ pub(crate) fn resolve(value: &StateValue, current: Option<&Value>, before: Optio
 }
 
 /// Whether two JSON values are the same value: numbers by value — `24` and `24.0` are one, as a
-/// device may report what was asked written another way — the rest as written.
+/// device may report what was asked written another way — the rest as written. Two integers
+/// compare exactly; only a float goes through `f64`.
 fn same_value(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x == y || x.as_f64().zip(y.as_f64()).is_some_and(|(x, y)| x == y),
+        (Value::Number(x), Value::Number(y)) => match (integer(x), integer(y)) {
+            (Some(x), Some(y)) => x == y,
+            _ => x == y || x.as_f64().zip(y.as_f64()).is_some_and(|(x, y)| x == y),
+        },
         _ => a == b,
     }
+}
+
+/// A JSON integer, exactly.
+fn integer(n: &serde_json::Number) -> Option<i128> {
+    n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from))
 }
 
 /// Values by target and property, for the conflict rule.
