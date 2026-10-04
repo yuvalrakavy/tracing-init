@@ -2115,3 +2115,25 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::an_unproven_assumption_is_left_out_until_proven", "--exact"]
 expect_text = '''a proven assumption was left out'''
 guard       = "assumptions_proven"
+
+# Re-gate R2: a replay's basis is the one captured when it arrived.
+[[control]]
+name        = "a_replays_basis_is_read_at_its_decision"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        let broker = value.basis.as_ref().map(|b| (b.at, b.before.as_ref())).unwrap_or_else(|| (self.broker.0, self.broker.1.get(&key)));'''
+replacement = '''        let broker = (self.broker.0, self.broker.1.get(&key));'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_broker_disconnect_during_a_conflict_read_keeps_the_requests_basis", "--exact"]
+expect_text = '''a disconnect during the conflict read replaced the request's basis'''
+guard       = "replay_basis_at_arrival"
+
+# Re-gate R12: a replay of a value already replayed keeps its first basis.
+[[control]]
+name        = "a_replay_again_takes_a_new_basis"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                            Some((first, basis)) if *first == value.value => value.basis = Some(basis.clone()),'''
+replacement = '''                            Some((first, basis)) if *first == value.value && false => value.basis = Some(basis.clone()),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_superseded_in_one_session_is_not_applied_on_the_next_replay", "--exact"]
+expect_text = '''the change at the device was reverted by a replay already superseded'''
+guard       = "replay_basis_pinned"

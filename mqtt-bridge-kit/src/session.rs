@@ -415,6 +415,8 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                 Ok(Some(value)) => match wire::request_meta(properties, now) {
                     Err(e) => malformed(e, report),
                     Ok(meta) => {
+                        // A replay's "before" basis, as of its arrival (re-gate R2).
+                        let basis = publish.retain.then(|| shared.reports.broker_basis(&target, &property));
                         let value = StateValue {
                             target,
                             property,
@@ -422,6 +424,7 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                             deadline: meta.deadline,
                             conflict: meta.conflict,
                             check: Check::default(),
+                            basis,
                         };
                         shared.mailbox.post_state(value, publish.retain);
                     }
@@ -445,6 +448,7 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                             deadline: meta.deadline,
                             conflict: meta.conflict,
                             check: Check::default(),
+                            basis: None,
                         })
                         .collect();
                     shared.mailbox.post_target(values);

@@ -78,6 +78,20 @@ pub struct StateValue {
     /// Why the outage conflict rule decides it, if it does; the mailbox sets it when the value is
     /// posted, and when it is held again.
     pub check: Check,
+    /// For a value the broker replayed: its "before" value, captured when it arrived — or, for a
+    /// replay of a value already replayed, the one captured then — and kept through reads,
+    /// re-holds and later disconnects (re-gate R2, R12).
+    pub basis: Option<Basis>,
+}
+
+/// A replayed value's "before" basis: the bridge's knowledge of the key when it stopped listening
+/// to the broker before the value's first replay — the read-back in the process's first session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Basis {
+    /// As of when.
+    pub at: Instant,
+    /// The key's value then; `None`, none.
+    pub before: Option<Value>,
 }
 
 /// Why a value is checked by the outage conflict rule — which decides its "before" values (Store
@@ -290,6 +304,11 @@ struct Inner {
     full_logged: bool,
     /// Held values dropped at their deadline, for the recovery line.
     expired: u32,
+    /// The basis each retained request was first replayed with, by key: a replay of the same value
+    /// later — the Store has not retracted it yet — is decided against it again, not against a
+    /// later snapshot that holds the change at the device (re-gate R12). Dropped when the Store
+    /// retracts the key or writes it live, or a replay of another value replaces it.
+    bases: HashMap<(String, String), (Value, Basis)>,
 }
 
 impl Inner {
@@ -400,6 +419,19 @@ impl Mailbox {
                 _ => {
                     let held = !inner.connected;
                     value.check = Check { replayed: replay, held };
+                    if replay {
+                        match inner.bases.get(&key) {
+                            Some((first, basis)) if *first == value.value => value.basis = Some(basis.clone()),
+                            _ => {
+                                if let Some(basis) = &value.basis {
+                                    inner.bases.insert(key, (value.value.clone(), basis.clone()));
+                                }
+                            }
+                        }
+                    } else {
+                        inner.bases.remove(&key);
+                        value.basis = None;
+                    }
                     inner.replace_state(value, held);
                     if held {
                         Posted::Held
@@ -440,6 +472,7 @@ impl Mailbox {
         inner.in_flight.retain(|v| !v.is_key(target, property));
         inner.unproven.retain(|(v, _)| !v.is_key(target, property));
         inner.copies.remove(&(target.to_owned(), property.to_owned()));
+        inner.bases.remove(&(target.to_owned(), property.to_owned()));
     }
 
     /// A target's setup, or (`None`) its retraction; the latest per target. Its `feedback`, if it

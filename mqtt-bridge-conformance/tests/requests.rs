@@ -636,3 +636,58 @@ async fn a_targets_config_is_configured_before_its_replayed_values_for_a_device_
     assert_eq!(order.first(), Some(&Op::Configure), "the replayed value reached apply before the target's config: {order:?}");
     assert!(h.stop().await);
 }
+
+/// A replayed request's "before" basis is captured when it arrives, and kept: a broker disconnect
+/// during its conflict read does not replace it with the model at that disconnect, which already
+/// holds the change at the device (the R1 re-gate's R2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broker_disconnect_during_a_conflict_read_keeps_the_requests_basis() {
+    let timing = mqtt_bridge_kit::TimingOverrides { operation: Some(Duration::from_secs(3)), ..quick_timing() };
+    let h = Harness::start_with("basis-kept", acknowledged(), timing, |broker, topics, device| {
+        broker.retain(&topics.state("t1"), json!({"temp": 20}).to_string(), &SendOptions::default());
+        broker.retain(&topics.desired("t1", "temp"), "22", &SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins"));
+        // At the wall, before the bridge started: 18.
+        device.set("t1", "temp", json!(18));
+        // The conflict read of t1 is slow, within its 3 s bound.
+        device.answer(Op::Read, Some("t1"), Answer::Delay(Duration::from_millis(800)));
+    })
+    .await;
+    assert!(
+        h.eventually(BOUND, |h| h.device.calls_of(Op::Read).iter().any(|c| c.target.as_deref() == Some("t1"))).await,
+        "no conflict read began"
+    );
+    // The broker connection drops while the read is under way.
+    h.broker.drop_connection();
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22)) || !h.errors_for("superseded").is_empty()).await,
+        "nothing became of the replayed request"
+    );
+    h.settle(Duration::from_millis(500)).await;
+    assert_eq!(
+        h.device.get("t1", "temp"),
+        Some(json!(18)),
+        "a disconnect during the conflict read replaced the request's basis: the change at the device was reverted"
+    );
+    assert!(h.stop().await);
+}
+
+/// A replayed request already superseded, still retained at the next session (the Store has not
+/// retracted it yet), is superseded again — its basis is the one it was first decided against, not
+/// the later broker-loss snapshot, which holds the change at the device (the R1 re-gate's R12, its
+/// RG5).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_superseded_in_one_session_is_not_applied_on_the_next_replay() {
+    let h = Harness::start_with("superseded-again", acknowledged(), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("t1"), json!({"temp": 20}).to_string(), &SendOptions::default());
+        broker.retain(&topics.desired("t1", "temp"), "22", &SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins"));
+        device.set("t1", "temp", json!(18));
+    })
+    .await;
+    assert!(h.eventually(BOUND, |h| !h.errors_for("superseded").is_empty()).await, "the first replay was not superseded: {:?}", h.errors());
+    let connects = h.broker.connections();
+    h.broker.drop_connection();
+    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await);
+    h.settle(Duration::from_millis(800)).await;
+    assert_eq!(h.device.get("t1", "temp"), Some(json!(18)), "the change at the device was reverted by a replay already superseded");
+    assert!(h.stop().await);
+}

@@ -16,6 +16,7 @@ fn value(target: &str, property: &str, v: Value) -> StateValue {
         deadline: None,
         conflict: Conflict::DeviceWins,
         check: Check::default(),
+        basis: None,
     }
 }
 

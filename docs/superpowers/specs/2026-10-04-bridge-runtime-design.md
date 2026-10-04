@@ -187,7 +187,14 @@ commands are refused, and reads are dropped.
     model as it stood when the device's last recovered link was lost — before any, the read-back;
     a value both replayed and held takes the older snapshot first. A device snapshot is taken only
     when a link whose catch-up was done is lost, so a link lost during its catch-up keeps the
-    pre-outage values. The check applies to each value on its own: a live value taken with a
+    pre-outage values. A replayed value's broker basis is captured when it arrives and kept
+    through reads, re-holds and later disconnects, so a disconnect during its conflict read does
+    not replace it; and it is pinned per key: a replay of the same retained value in a later
+    session (the Store has not retracted it yet) is decided against the basis it was first
+    replayed with, not a later snapshot that already holds the change at the device. A live write
+    or a retraction of the key, or a replay of another value, drops the pin (re-gate R2, R12). What
+    an acknowledged write teaches the bridge changes later snapshots only, never a basis already
+    captured. The check applies to each value on its own: a live value taken with a
     checked one is applied as it is.
   - **Unproven assumptions:** for a target with assumed feedback, what the runtime assumes from
     an unacknowledged write is published as assumed `State` at once, but the conflict rule's

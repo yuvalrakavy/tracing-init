@@ -533,6 +533,18 @@ impl Reports {
         }
     }
 
+    /// A replayed request's basis for `target`'s `property`, as of now ([`broker_before`]).
+    ///
+    /// [`broker_before`]: Self::broker_before
+    pub fn broker_basis(&self, target: &str, property: &str) -> crate::mailbox::Basis {
+        let state = self.locked();
+        let (at, values) = match &state.broker_lost {
+            Some((at, values)) => (*at, values),
+            None => (self.epoch, &state.readback),
+        };
+        crate::mailbox::Basis { at, before: values.get(target).and_then(|v| v.get(property)).cloned() }
+    }
+
     /// The read-back, as of the start.
     pub fn read_back_before(&self) -> (Instant, BTreeMap<String, PropertyMap>) {
         (self.epoch, self.locked().readback.clone())

@@ -239,17 +239,20 @@ impl Befores {
     /// it stopped listening; a held one's, what it knew of the device when its outage began; one
     /// both replayed and held takes the older of the two first, and the other where the older
     /// lacks the key.
-    fn of(&self, value: &StateValue) -> Option<&Value> {
+    fn of<'a>(&'a self, value: &'a StateValue) -> Option<&'a Value> {
         let key = (value.target.clone(), value.property.clone());
-        let mut sources: Vec<&(Instant, Values)> = Vec::new();
+        // A replay's basis was captured when it arrived (re-gate R2); one without falls back to
+        // the snapshot now.
+        let broker = value.basis.as_ref().map(|b| (b.at, b.before.as_ref())).unwrap_or_else(|| (self.broker.0, self.broker.1.get(&key)));
+        let mut sources: Vec<(Instant, Option<&Value>)> = Vec::new();
         if value.check.replayed {
-            sources.push(&self.broker);
+            sources.push(broker);
         }
         if value.check.held {
-            sources.push(&self.device);
+            sources.push((self.device.0, self.device.1.get(&key)));
         }
         sources.sort_by_key(|(at, _)| *at);
-        sources.into_iter().find_map(|(_, values)| values.get(&key))
+        sources.into_iter().find_map(|(_, before)| before)
     }
 }
 
