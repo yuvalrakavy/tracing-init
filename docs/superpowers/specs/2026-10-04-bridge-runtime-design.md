@@ -263,7 +263,7 @@ pub trait DeviceDriver: Send + 'static {
     async fn disconnect(&mut self);
     async fn read_state(&mut self, scope: Scope) -> Result<Vec<TargetState>, OpError>;
     async fn apply(&mut self, target: &str, values: &PropertyMap) -> Result<(), OpError>;
-    async fn execute(&mut self, target: &str, call: &CommandCall) -> Result<Option<Value>, OpError>;
+    async fn execute(&mut self, target: Option<&str>, call: &CommandCall) -> Result<Option<Value>, OpError>;
     async fn configure(&mut self, target: &str, config: Option<&Value>) -> Result<(), OpError>;
     async fn probe(&mut self) -> Result<(), OpError> { self.read_state(Scope::Any).await.map(drop) }
 }

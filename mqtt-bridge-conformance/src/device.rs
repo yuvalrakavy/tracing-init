@@ -372,8 +372,8 @@ impl DeviceDriver for FakeDevice {
         Ok(())
     }
 
-    async fn execute(&mut self, target: &str, call: &CommandCall) -> Result<Option<Value>, OpError> {
-        let answer = self.log(Op::Execute, Some(target), Some(Value::Object(call.params.clone())), Some(&call.command));
+    async fn execute(&mut self, target: Option<&str>, call: &CommandCall) -> Result<Option<Value>, OpError> {
+        let answer = self.log(Op::Execute, target, Some(Value::Object(call.params.clone())), Some(&call.command));
         FakeDevice::play(answer).await?;
         self.reachable()?;
         Ok(Some(json!({ "executed": call.command })))

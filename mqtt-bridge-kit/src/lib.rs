@@ -11,7 +11,7 @@
 //! #     async fn disconnect(&mut self) {}
 //! #     async fn read_state(&mut self, _: Scope) -> Result<Vec<TargetState>, OpError> { Ok(vec![]) }
 //! #     async fn apply(&mut self, _: &str, _: &PropertyMap) -> Result<(), OpError> { Ok(()) }
-//! #     async fn execute(&mut self, _: &str, _: &CommandCall) -> Result<Option<Value>, OpError> { Ok(None) }
+//! #     async fn execute(&mut self, _: Option<&str>, _: &CommandCall) -> Result<Option<Value>, OpError> { Ok(None) }
 //! #     async fn configure(&mut self, _: &str, _: Option<&Value>) -> Result<(), OpError> { Ok(()) }
 //! # }
 //! fn main() -> std::process::ExitCode {

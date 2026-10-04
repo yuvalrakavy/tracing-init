@@ -358,3 +358,15 @@ async fn a_one_way_device_is_restored_from_the_read_back_when_restore_is_on() {
         assert!(h.stop().await);
     }
 }
+
+/// A command that names no target reaches `execute` with none — not an empty name a driver must
+/// know to read as "none" (review MINOR 13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_with_no_target_reaches_execute_with_none() {
+    let h = Harness::start_with("notarget", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    assert!(h.command(json!({"command": "pulse"}), None));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "the command was never executed");
+    assert_eq!(h.device.calls_of(Op::Execute)[0].target, None, "a command with no target reached execute with one");
+    assert!(h.stop().await);
+}

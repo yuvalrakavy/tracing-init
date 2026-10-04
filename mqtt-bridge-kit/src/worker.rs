@@ -633,7 +633,7 @@ impl<D: DeviceDriver> Worker<D> {
                 Ok(())
             }
             Work::Execute { target, call, reply } => {
-                let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref().unwrap_or(""), &call)).await;
+                let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref(), &call)).await;
                 self.answered(target.as_deref(), &call.command, result, reply.into_iter().collect(), true)
             }
             Work::Read { key: ReadKey::Refresh(target), replies, .. } => {
@@ -649,7 +649,7 @@ impl<D: DeviceDriver> Worker<D> {
             }
             Work::Read { key: ReadKey::Command { target, command }, call, replies } => {
                 let call = call.unwrap_or_else(|| crate::driver::CommandCall { command: command.clone(), params: PropertyMap::new() });
-                let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref().unwrap_or(""), &call)).await;
+                let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref(), &call)).await;
                 self.answered(target.as_deref(), &command, result, replies, true)
             }
         }
