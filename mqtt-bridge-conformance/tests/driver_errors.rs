@@ -363,3 +363,28 @@ async fn a_partial_apply_reports_only_the_properties_that_failed() {
     assert_eq!(h.device.calls_of(Op::Connect).len(), 1, "a partial outcome was taken for a lost link");
     assert!(h.stop().await);
 }
+
+/// Of a partial apply to a device with unacknowledged writes, the values written stay unproven like
+/// any write: when the link dies before a probe proves them, they are held again and applied on the
+/// next link (the R1 re-gate's R10: no test saw that accounting).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_applys_written_values_are_held_again_when_the_link_dies_before_proof() {
+    let h = Harness::start_with("partial-unproven", info(Writes::Unacknowledged, Feedback::Observed), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.set("t1", "power", json!(false));
+    })
+    .await;
+    assert!(connected(&h).await);
+    h.device.set_deaf(true);
+    h.device.answer_times(Op::Apply, None, Answer::RefuseProperty("temp"), 1);
+    let req = Req { expiry: Some(3600), conflict: Some("RequestWins") };
+    assert!(h.desire_many("t1", json!({"power": true, "temp": 22}), req));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Probe).is_empty()).await, "the write was never probed: {:?}", h.device.calls());
+    h.device.set_deaf(false);
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "power") == Some(json!(true))).await,
+        "the value a partial apply wrote was not held again when the link died before proof: {:?}",
+        h.device.calls()
+    );
+    assert!(h.stop().await);
+}

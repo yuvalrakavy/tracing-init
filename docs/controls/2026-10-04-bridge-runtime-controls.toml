@@ -1661,19 +1661,30 @@ argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.
 expect_text = '''a link lost right after its catch-up was not one outage'''
 guard       = "device_outage_stable"
 
-# Item 31: a partial apply reports only the properties that failed.
+# Item 31: a partial apply reports only the properties that failed. (Re-gate R10: the compound row
+# — in-flight filtering and injected Errors at once — split in two, one guard each.)
 [[control]]
 name        = "a_partial_apply_fails_the_whole_write"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''                let failed = |v: &StateValue| failures.iter().any(|f| f.property == v.property);'''
-replacement = '''                let failed = |_: &StateValue| true;
-                for value in &values {
-                    self.reports.error(ErrorReport::new(Reason::Rejected, "control").target(Some(target)).property(&value.property));
-                }'''
+anchor      = '''                    self.reports.error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property));'''
+replacement = '''                    for value in &values {
+                        self.reports.error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&value.property));
+                    }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_partial_apply_reports_only_the_properties_that_failed", "--exact"]
 expect_text = '''the Error named more than the refused property'''
 guard       = "partial_apply"
+
+# Item 31 / re-gate R10: the values a partial apply wrote stay unproven, like any write.
+[[control]]
+name        = "a_partial_applys_written_values_are_not_tracked"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                self.mailbox.retain_in_flight(|v| !failed(v));'''
+replacement = '''                self.mailbox.retain_in_flight(|v| !failed(v) && false);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_partial_applys_written_values_are_held_again_when_the_link_dies_before_proof", "--exact"]
+expect_text = '''the value a partial apply wrote was not held again when the link died before proof'''
+guard       = "partial_apply_unproven"
 
 # F1 (after the R1 re-gate): with no "before" value — a first install — the request is applied, the
 # current value known or not; the unknown-value row comes after it.
