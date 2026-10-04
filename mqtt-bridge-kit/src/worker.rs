@@ -171,25 +171,32 @@ async fn sleep_until(at: Option<Instant>) {
 
 /// How the outage conflict rule decides a checked value (Store kit spec §4.5): against the
 /// device's current value (`None`: the device did not say) and the last value the bridge saw
-/// before the outage (`None`: none, a first install). A current value still unknown is no reason
-/// to revert a person's change: under `DeviceWins` the request is not applied on a guess (review
-/// M6).
+/// before the outage (`None`: none, a first install). The first row that holds decides:
+/// 1. the current value known and the requested one → nothing to write;
+/// 2. no before value → applied: nothing can have changed;
+/// 3. the current value unknown → under `DeviceWins` not applied on a guess (review M6), under
+///    `RequestWins` applied;
+/// 4. changed since before → `DeviceWins` supersedes, `RequestWins` applies;
+/// 5. otherwise → applied.
 pub(crate) fn resolve(value: &StateValue, current: Option<&Value>, before: Option<&Value>) -> Resolution {
+    if current.is_some_and(|current| same_value(current, &value.value)) {
+        return Resolution::Satisfied;
+    }
+    let Some(before) = before else {
+        return Resolution::Apply;
+    };
     let Some(current) = current else {
         return match value.conflict {
             Conflict::DeviceWins => Resolution::Unknown,
             Conflict::RequestWins => Resolution::Apply,
         };
     };
-    if same_value(current, &value.value) {
-        return Resolution::Satisfied;
+    if same_value(before, current) {
+        return Resolution::Apply;
     }
-    match before {
-        Some(before) if !same_value(before, current) => match value.conflict {
-            Conflict::DeviceWins => Resolution::Superseded,
-            Conflict::RequestWins => Resolution::Apply,
-        },
-        _ => Resolution::Apply,
+    match value.conflict {
+        Conflict::DeviceWins => Resolution::Superseded,
+        Conflict::RequestWins => Resolution::Apply,
     }
 }
 

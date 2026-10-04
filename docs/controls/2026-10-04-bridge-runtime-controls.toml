@@ -577,8 +577,10 @@ guard       = "status_unreachable"
 [[control]]
 name        = "device_wins_never_supersedes"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''            Conflict::DeviceWins => Resolution::Superseded,'''
-replacement = '''            Conflict::DeviceWins => Resolution::Apply,'''
+anchor      = '''    match value.conflict {
+        Conflict::DeviceWins => Resolution::Superseded,'''
+replacement = '''    match value.conflict {
+        Conflict::DeviceWins => Resolution::Apply,'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
 expect_text = '''no Error said the request was superseded'''
@@ -588,10 +590,14 @@ guard       = "conflict_device_wins"
 [[control]]
 name        = "request_wins_is_superseded"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''            Conflict::DeviceWins => Resolution::Superseded,
-            Conflict::RequestWins => Resolution::Apply,'''
-replacement = '''            Conflict::DeviceWins => Resolution::Superseded,
-            Conflict::RequestWins => Resolution::Superseded,'''
+anchor      = '''        Conflict::DeviceWins => Resolution::Superseded,
+        Conflict::RequestWins => Resolution::Apply,
+    }
+}'''
+replacement = '''        Conflict::DeviceWins => Resolution::Superseded,
+        Conflict::RequestWins => Resolution::Superseded,
+    }
+}'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_request_wins", "--exact"]
 expect_text = '''the request did not win'''
@@ -601,8 +607,12 @@ guard       = "conflict_request_wins"
 [[control]]
 name        = "an_unchanged_value_counts_as_changed"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''        Some(before) if !same_value(before, current) => match value.conflict {'''
-replacement = '''        Some(_) => match value.conflict {'''
+anchor      = '''    if same_value(before, current) {
+        return Resolution::Apply;
+    }'''
+replacement = '''    if false && same_value(before, current) {
+        return Resolution::Apply;
+    }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
 expect_text = '''the unchanged property's request was not applied'''
@@ -1402,10 +1412,10 @@ guard       = "numbers_by_value"
 [[control]]
 name        = "a_satisfied_value_is_applied"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''    if same_value(current, &value.value) {
+anchor      = '''    if current.is_some_and(|current| same_value(current, &value.value)) {
         return Resolution::Satisfied;
     }'''
-replacement = '''    if same_value(current, &value.value) {
+replacement = '''    if current.is_some_and(|current| same_value(current, &value.value)) {
         return Resolution::Apply;
     }'''
 target      = "command"
@@ -1659,3 +1669,22 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_partial_apply_reports_only_the_properties_that_failed", "--exact"]
 expect_text = '''the Error named more than the refused property'''
 guard       = "partial_apply"
+
+# F1 (after the R1 re-gate): with no "before" value — a first install — the request is applied, the
+# current value known or not; the unknown-value row comes after it.
+[[control]]
+name        = "a_first_install_with_an_unknown_value_is_superseded"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''    let Some(before) = before else {
+        return Resolution::Apply;
+    };'''
+replacement = '''    if current.is_none() && matches!(value.conflict, Conflict::DeviceWins) {
+        return Resolution::Unknown;
+    }
+    let Some(before) = before else {
+        return Resolution::Apply;
+    };'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::the_conflict_rule_takes_its_rows_in_order", "--exact"]
+expect_text = '''row 2: a first install was not applied because the current value is unknown'''
+guard       = "conflict_rule_order"

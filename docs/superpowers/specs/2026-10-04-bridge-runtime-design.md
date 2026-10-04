@@ -182,11 +182,15 @@ commands are refused, and reads are dropped.
     checked one is applied as it is.
   - **Current values:** for a target with assumed feedback, the model's (what the bridge
     believes); otherwise the proving read's, and a target it did not give (a device read one
-    address at a time answers a read of all `Unsupported`) is read on its own. A current value
-    still unknown is not a reason to revert a person's change: under `DeviceWins` the request is
-    not applied but reported `superseded`, its `error` saying the current value is unknown;
-    `RequestWins` applies it. After the conflict read's wait, a value retracted, replaced or past
-    its deadline meanwhile is dropped.
+    address at a time answers a read of all `Unsupported`) is read on its own. After the conflict
+    read's wait, a value retracted, replaced or past its deadline meanwhile is dropped.
+  - **The rule's rows, the first that holds deciding:** (1) the current value known and the
+    requested one: satisfied; (2) no "before" value (a first install): applied, the current value
+    known or not — nothing can have changed; (3) the current value unknown: under `DeviceWins` not
+    applied but reported `superseded`, its `error` saying the current value is unknown (a current
+    value still unknown is no reason to revert a person's change), under `RequestWins` applied;
+    (4) changed since before: `DeviceWins` supersedes, `RequestWins` applies; (5) otherwise
+    applied.
   - A retained target-level `Desired`, or a retained `Command`, is refused as `malformed` — replayed
     or live: both are subscribed retain-as-published, so the broker keeps the flag on a live
     delivery. Property writes are subscribed without it, so a live retained one (every Store write)
@@ -391,8 +395,8 @@ schemas/                  JSON Schemas for each lane's payload
 - **A plugin is a second process to deploy.** The host supervises it.
 - **The read-back can miss.** A connection lost before the read-back's SUBACK leaves it to the next
   session, which subscribes again; but past 5 s without the SUBACK the requests are subscribed
-  without it (WARN `read_back_incomplete`), and a replay that meets no "before" values is applied
-  (under `DeviceWins`, only where the current value is known). After a broker-only outage, replayed
+  without it (WARN `read_back_incomplete`), and a replay that meets no "before" values is applied.
+  After a broker-only outage, replayed
   requests are checked against the model as it stood when the connection was lost; the read-back
   serves only the process's first session (and held values until the device's first outage
   snapshot). A change at the device the bridge never saw — made while the bridge was away, between

@@ -23,13 +23,36 @@ fn the_outage_conflict_rule() {
     }
     assert_eq!(resolve(&request(json!(22), Conflict::RequestWins), None, Some(&b)), Resolution::Apply, "current unknown, RequestWins");
     assert_eq!(resolve(&request(json!(22), Conflict::DeviceWins), None, Some(&b)), Resolution::Unknown, "current unknown, DeviceWins");
-    assert_eq!(
-        resolve(&request(json!(22), Conflict::DeviceWins), None, None),
-        Resolution::Unknown,
-        "current unknown, no before, DeviceWins"
-    );
     assert_eq!(resolve(&request(json!(22), Conflict::DeviceWins), Some(&c), Some(&b)), Resolution::Superseded);
     assert_eq!(resolve(&request(json!(22), Conflict::RequestWins), Some(&c), Some(&b)), Resolution::Apply);
+}
+
+/// The rule's rows, in the order they are taken (the lead's F1, after the R1 re-gate): the first
+/// that holds decides. With no "before" value — a first install — nothing can have changed, so
+/// the request is applied even when the device cannot say its current value (kit spec §4.5).
+#[test]
+fn the_conflict_rule_takes_its_rows_in_order() {
+    let (b, c) = (json!(20), json!(18));
+    for conflict in [Conflict::DeviceWins, Conflict::RequestWins] {
+        // 1. The current value known and the requested one: nothing to write, before or not.
+        assert_eq!(resolve(&request(json!(18), conflict), Some(&c), Some(&b)), Resolution::Satisfied, "row 1, {conflict:?}");
+        assert_eq!(resolve(&request(json!(18), conflict), Some(&c), None), Resolution::Satisfied, "row 1 with no before, {conflict:?}");
+        // 2. No before value: applied, the current value known or not.
+        assert_eq!(resolve(&request(json!(22), conflict), Some(&c), None), Resolution::Apply, "row 2, {conflict:?}");
+        assert_eq!(
+            resolve(&request(json!(22), conflict), None, None),
+            Resolution::Apply,
+            "row 2: a first install was not applied because the current value is unknown, {conflict:?}"
+        );
+        // 5. Unchanged since before: applied.
+        assert_eq!(resolve(&request(json!(22), conflict), Some(&b), Some(&b)), Resolution::Apply, "row 5, {conflict:?}");
+    }
+    // 3. A before value, and the current one unknown: not applied on a guess under DeviceWins.
+    assert_eq!(resolve(&request(json!(22), Conflict::DeviceWins), None, Some(&b)), Resolution::Unknown, "row 3, DeviceWins");
+    assert_eq!(resolve(&request(json!(22), Conflict::RequestWins), None, Some(&b)), Resolution::Apply, "row 3, RequestWins");
+    // 4. Changed since before.
+    assert_eq!(resolve(&request(json!(22), Conflict::DeviceWins), Some(&c), Some(&b)), Resolution::Superseded, "row 4, DeviceWins");
+    assert_eq!(resolve(&request(json!(22), Conflict::RequestWins), Some(&c), Some(&b)), Resolution::Apply, "row 4, RequestWins");
 }
 
 /// A device outage is one episode: INFO `device_connection_lost` on its first failure, DEBUG

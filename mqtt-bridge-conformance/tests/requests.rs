@@ -434,19 +434,29 @@ async fn the_catch_up_reads_a_target_the_proving_read_did_not_give() {
 
 /// When the device's current value stays unknown — it does not report that property — DeviceWins
 /// does not apply a held request on a guess: it is reported superseded, saying why; RequestWins
-/// applies it (review M6).
+/// applies it (review M6). With no "before" value — a first install — nothing can have changed,
+/// and the request is applied, the current value unknown or not (the lead's F1).
 #[tokio::test(flavor = "multi_thread")]
 async fn device_wins_does_not_apply_a_held_request_whose_current_value_is_unknown() {
-    let h = Harness::start_with("unknown", acknowledged(), quick_timing(), |_, _, device| {
+    let h = Harness::start_with("unknown", acknowledged(), quick_timing(), |broker, topics, device| {
         device.set("t1", "temp", json!(20));
         device.set_up(false);
+        // The bridge's own State from before its start: the "before" values of fan and mode.
+        broker.retain(&topics.state("t1"), r#"{"temp":20,"fan":"low","mode":"heat"}"#, &SendOptions::default());
     })
     .await;
     assert!(h.desire("t1", "fan", json!("high"), DEVICE_WINS));
     assert!(h.desire("t1", "mode", json!("cool"), Req { expiry: Some(3600), conflict: Some("RequestWins") }));
+    // Never seen: no before value.
+    assert!(h.desire("t1", "swing", json!(true), DEVICE_WINS));
     h.settle(Duration::from_millis(300)).await;
     h.device.set_up(true);
     assert!(h.eventually(BOUND, |h| h.device.get("t1", "mode") == Some(json!("cool"))).await, "the RequestWins request was not applied");
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "swing") == Some(json!(true))).await,
+        "a DeviceWins request with no before value was not applied because the current value is unknown: {:?}",
+        h.errors()
+    );
     assert!(
         h.eventually(BOUND, |h| h.errors_for("superseded").iter().any(|e| e["property"] == "fan")).await,
         "the DeviceWins request on an unknown value was not reported superseded: {:?}",
