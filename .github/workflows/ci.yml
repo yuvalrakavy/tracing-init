@@ -55,14 +55,15 @@ jobs:
       - run: cargo test ${{ matrix.features }} --workspace
 
   # The tooling crates beside tracing-init are packages of their own, not workspace members, so
-  # the jobs above never see them.
+  # the jobs above never see them. The Bridge Runtime (mqtt-bridge-kit) and its conformance suite
+  # are covered the same way; the suite runs against FakeBroker on 127.0.0.1 only.
   tools:
     name: tools (${{ matrix.crate }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        crate: [wait-lint, lock-order, mqtt-test-broker]
+        crate: [wait-lint, lock-order, mqtt-test-broker, mqtt-bridge-kit, mqtt-bridge-conformance]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
