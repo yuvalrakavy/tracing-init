@@ -1166,3 +1166,36 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--", "tests::another_clients_publish_goes_through_the_subscriptions_at_qos_1", "--exact"]
 expect_text = '''a publish nothing subscribed to was delivered'''
 guard       = "fake_broker_matching"
+
+# B2: a reported name that cannot stand as a topic segment is dropped where it is reported.
+[[control]]
+name        = "a_bad_reported_name_reaches_the_model"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''            if !valid_segment(target) {
+                (false, newly_refused)
+            } else {
+                (Self::merge(&mut state, target, values, assumed), newly_refused)
+            }'''
+replacement = '''            (Self::merge(&mut state, target, values, assumed), newly_refused)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_reported_name_that_is_no_topic_segment_is_dropped_and_the_session_goes_on", "--exact"]
+expect_text = '''the target beside the bad name was not published'''
+guard       = "reported_names_validated"
+
+# B2: a refused publish is one message dropped, not the CONNACK duties.
+[[control]]
+name        = "a_refused_publish_ends_the_connack_duties"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    for (target, document) in model.states {
+        emit(client, shared.topics.state(&target), true, document, properties()).await;
+    }'''
+replacement = '''    for (target, document) in model.states {
+        if target.contains('#') {
+            return;
+        }
+        emit(client, shared.topics.state(&target), true, document, properties()).await;
+    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_refused_publish_is_one_message_dropped", "--exact"]
+expect_text = '''the state after a refused one was never published'''
+guard       = "refused_publish_dropped_alone"

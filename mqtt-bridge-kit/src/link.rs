@@ -42,7 +42,9 @@ impl Reporter {
     }
 
     /// A target's observed state — or, with `assumed`, what the bridge believes it is without
-    /// having read it back. Merged into the target's retained `State`. Never waits.
+    /// having read it back. Merged into the target's retained `State`. Never waits. Each name must
+    /// stand as one topic segment (no `/`, `+`, `#`, not empty): one that cannot is dropped, a
+    /// driver bug, ERROR `driver_contract_violation`.
     pub fn state(&self, target: &str, values: PropertyMap, assumed: bool) {
         self.reports.state(target, values, assumed);
     }

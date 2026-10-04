@@ -142,9 +142,15 @@ fn properties() -> PublishProperties {
 
 type Failed = rumqttc::v5::ClientError;
 
-async fn emit(client: &AsyncClient, topic: String, retain: bool, payload: Vec<u8>, properties: PublishProperties) -> Result<(), Failed> {
+/// Publish one message. A refusal — a topic rumqttc does not publish to, or the event loop gone —
+/// is that one message dropped, said at DEBUG; the caller goes on with the rest (review B2: the
+/// first refusal ended the CONNACK duties, and the session never published a report again).
+async fn emit(client: &AsyncClient, topic: String, retain: bool, payload: Vec<u8>, properties: PublishProperties) {
+    let refused_topic = topic.clone();
     // WAIT: mqtt-request
-    client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await
+    if let Err(e) = client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await {
+        debug!(topic = %refused_topic, error = %e, "An MQTT publish was refused; this message is dropped");
+    }
 }
 
 /// One session: a fresh client and its pump, for one connection, until it ends or the shutdown.
@@ -176,7 +182,10 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                 }
                 Step::Event(Some(PumpEvent::Disconnected)) => Ok(None),
                 Step::Event(Some(PumpEvent::Ended(_)) | None) => Ok(Some(SessionEnd::Ended { connected: false })),
-                Step::Reported => publish_changes(shared, &client, shared.reports.take()).await.map(|()| None),
+                Step::Reported => {
+                    publish_changes(shared, &client, shared.reports.take()).await;
+                    Ok(None)
+                }
                 Step::Shutdown => Ok(Some(SessionEnd::Shutdown)),
             }
         };
@@ -220,41 +229,40 @@ async fn connected(shared: &Shared, client: &AsyncClient) -> Result<(), Failed> 
         // WAIT: mqtt-request
         client.subscribe(filter, QoS::AtLeastOnce).await?;
     }
-    emit(client, topics.active(), true, b"true".to_vec(), properties()).await?;
-    emit(client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await?;
-    republish(shared, client, shared.reports.model()).await
-}
-
-/// Everything known, again.
-async fn republish(shared: &Shared, client: &AsyncClient, model: Model) -> Result<(), Failed> {
-    debug!(targets = model.states.len(), "Publishing the retained model again after a CONNACK");
-    if let Some(status) = model.status {
-        emit(client, shared.topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await?;
-    }
-    for (target, document) in model.states {
-        emit(client, shared.topics.state(&target), true, document, properties()).await?;
-    }
+    emit(client, topics.active(), true, b"true".to_vec(), properties()).await;
+    emit(client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
+    republish(shared, client, shared.reports.model()).await;
     Ok(())
 }
 
-/// What the device side reported since the last take.
-async fn publish_changes(shared: &Shared, client: &AsyncClient, changes: Changes) -> Result<(), Failed> {
+/// Everything known, again. A message refused is dropped alone.
+async fn republish(shared: &Shared, client: &AsyncClient, model: Model) {
+    debug!(targets = model.states.len(), "Publishing the retained model again after a CONNACK");
+    if let Some(status) = model.status {
+        emit(client, shared.topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await;
+    }
+    for (target, document) in model.states {
+        emit(client, shared.topics.state(&target), true, document, properties()).await;
+    }
+}
+
+/// What the device side reported since the last take. A message refused is dropped alone.
+async fn publish_changes(shared: &Shared, client: &AsyncClient, changes: Changes) {
     let topics = &shared.topics;
     if let Some(status) = changes.status {
-        emit(client, topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await?;
+        emit(client, topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await;
     }
     for (target, document) in changes.states {
-        emit(client, topics.state(&target), true, document, properties()).await?;
+        emit(client, topics.state(&target), true, document, properties()).await;
     }
     for error in changes.errors {
-        emit(client, topics.error(), false, error.encode(), properties()).await?;
+        emit(client, topics.error(), false, error.encode(), properties()).await;
     }
     for event in changes.events {
         let mut props = properties();
         props.correlation_data = event.correlation;
-        emit(client, event.topic.unwrap_or_else(|| topics.event()), false, event.payload, props).await?;
+        emit(client, event.topic.unwrap_or_else(|| topics.event()), false, event.payload, props).await;
     }
-    Ok(())
 }
 
 /// The shutdown's flush: `Active=false` and DISCONNECT, polling until it is written, within
@@ -265,7 +273,7 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) {
         return;
     }
     let flushed = async {
-        emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await?;
+        emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
         // WAIT: mqtt-request
         client.disconnect().await?;
         loop {
@@ -453,3 +461,6 @@ fn panic_for_test(_: &str) {}
 pub(crate) fn spawn(shared: Arc<Shared>, shutdown: watch::Receiver<bool>, set: &mut tokio::task::JoinSet<()>) {
     set.spawn(run(shared, shutdown).in_current_span());
 }
+
+#[cfg(test)]
+mod tests;

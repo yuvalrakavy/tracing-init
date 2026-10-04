@@ -29,9 +29,10 @@ use bytes::Bytes;
 use lock_order::sync::Mutex;
 use serde_json::Value;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::driver::PropertyMap;
+use crate::topics::valid_segment;
 use crate::wire::{encode_state, ErrorReport};
 
 /// `Error` messages that may wait for the session; past it, the oldest is displaced.
@@ -121,6 +122,8 @@ struct State {
     errors: Capped<ErrorReport>,
     events: Capped<Outbound>,
     readback: BTreeMap<String, PropertyMap>,
+    /// The names a driver reported that cannot stand as a topic segment, each said once.
+    refused_names: std::collections::BTreeSet<String>,
 }
 
 /// See the module documentation.
@@ -160,6 +163,7 @@ impl Reports {
                     errors: Capped::new(ERROR_CAP),
                     events: Capped::new(EVENT_CAP),
                     readback: BTreeMap::new(),
+                    refused_names: std::collections::BTreeSet::new(),
                 },
             ),
             ready: Notify::new(),
@@ -187,10 +191,43 @@ impl Reports {
         }
     }
 
-    /// A target's observed (or assumed) values, merged into its state. Never waits.
-    pub fn state(&self, target: &str, values: PropertyMap, assumed: bool) {
-        let changed = {
+    /// A target's observed (or assumed) values, merged into its state. Never waits. A target or
+    /// property name that cannot stand as one topic segment (empty, or holding `/`, `+`, `#`) is
+    /// a driver bug: dropped, with one ERROR `driver_contract_violation` per name (review B2: one
+    /// such target left the session deaf for the life of the process).
+    pub fn state(&self, target: &str, mut values: PropertyMap, assumed: bool) {
+        let mut refused: Vec<String> = Vec::new();
+        if !valid_segment(target) {
+            refused.push(format!("target `{target}`"));
+            values.clear();
+        }
+        values.retain(|property, _| {
+            let ok = valid_segment(property);
+            if !ok {
+                refused.push(format!("property `{property}` of `{target}`"));
+            }
+            ok
+        });
+        let (changed, newly_refused) = {
             let mut state = self.locked();
+            let newly_refused: Vec<String> = refused.into_iter().filter(|name| state.refused_names.insert(name.clone())).collect();
+            if !valid_segment(target) {
+                (false, newly_refused)
+            } else {
+                (Self::merge(&mut state, target, values, assumed), newly_refused)
+            }
+        };
+        for name in newly_refused {
+            error!(kind = "driver_contract_violation", name = %name, "A reported name cannot stand as a topic segment; dropped");
+        }
+        if changed {
+            self.ready.notify_one();
+        }
+    }
+
+    /// Merge a validated report into the model; whether anything changed.
+    fn merge(state: &mut State, target: &str, values: PropertyMap, assumed: bool) -> bool {
+        {
             let new = !state.targets.contains_key(target);
             let model = state.targets.entry(target.to_owned()).or_default();
             model.reports += 1;
@@ -206,9 +243,6 @@ impl Reports {
                 state.changed.push(target.to_owned());
             }
             changed
-        };
-        if changed {
-            self.ready.notify_one();
         }
     }
 

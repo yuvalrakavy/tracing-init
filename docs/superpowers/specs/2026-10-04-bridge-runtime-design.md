@@ -167,7 +167,9 @@ commands are refused, and reads are dropped.
   `Option`.
 - **Kinds:**
   - `event_report_dropped` (WARN) and `event_report_drop_ended` (INFO);
-  - `driver_contract_violation` (ERROR): an event without a string `kind`; a helper's panic;
+  - `driver_contract_violation` (ERROR): an event without a string `kind`; a helper's panic; a
+    reported target or property name that cannot stand as one topic segment (dropped, said once
+    per name);
   - `device_recovered` gains `expired`;
   - the runtime also emits `startup_failed` and `bridge_shutdown_cut`;
   - `panic` (ERROR), from the panic hook: `thread`, `location`, `payload`.
@@ -194,6 +196,9 @@ commands are refused, and reads are dropped.
   panicking thread, so a panic with a stderr nobody drains still becomes a dead part — the device
   worker's `catch_unwind`, or the MQTT task's end, whose connection then closes and whose last
   will says `Active=false`.
+- **One message, not the session:** a publish rumqttc refuses is that message dropped (DEBUG), and
+  the CONNACK duties and every later publish go on; a reported name that cannot be a topic
+  segment is dropped where it is reported.
 - **Succeeded, then the link died:** an operation that has completed wins over a `link_lost`
   noticed at the same moment; its result stands, and the loss is seen at the worker's next step.
 - **Polls:** the next poll is due an interval after the last one ended, and one waiting request is

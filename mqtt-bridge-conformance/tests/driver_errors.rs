@@ -268,3 +268,39 @@ async fn a_poll_slower_than_its_interval_does_not_starve_writes() {
     );
     assert!(h.stop().await);
 }
+
+/// A target or property name a driver reports that cannot stand as one topic segment (`a#b`,
+/// `a/b`) is a driver bug: dropped, with an ERROR `driver_contract_violation`, and the session goes
+/// on — after a reconnect too (review B2: rumqttc refused its `State` publish, the CONNACK duties
+/// stopped there, and the session never published a report again).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reported_name_that_is_no_topic_segment_is_dropped_and_the_session_goes_on() {
+    let h = Harness::start_with("badname", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.set("a#b", "x", json!(1));
+        device.set("t2", "a/b", json!(1));
+        device.set("t2", "ok", json!(2));
+    })
+    .await;
+    assert!(connected(&h).await);
+    assert!(h.eventually(BOUND, |h| h.state("t2").is_some()).await, "the target beside the bad name was not published");
+    let connects = h.broker.connections();
+    h.broker.drop_connection();
+    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects).await, "the bridge did not reconnect");
+    h.device.set("t1", "temp", json!(25));
+    assert!(h.command(json!({"target": "t1", "command": "refresh"}), Some(("Store/r", b"1"))));
+    assert!(
+        h.eventually(BOUND, |h| h.state("t1").is_some_and(|s| s["temp"] == 25)).await,
+        "after a reconnect the session published nothing: state(t1) = {:?}",
+        h.state("t1")
+    );
+    assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the refresh was not answered");
+    assert_eq!(h.state("t2"), Some(json!({"ok": 2})), "the bad property was published, or the good one dropped");
+    let violations = h.log.of_kind("driver_contract_violation");
+    assert!(
+        violations.len() == 2 && violations.iter().all(|v| v.level == tracing::Level::ERROR),
+        "not one ERROR per bad name: {:#?}",
+        h.log.records()
+    );
+    assert!(h.stop().await);
+}
