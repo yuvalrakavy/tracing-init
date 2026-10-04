@@ -1099,17 +1099,18 @@ guard       = "blocking_slot_raii"
 [[control]]
 name        = "the_blocking_cap_is_not_reserved"
 file        = "mqtt-bridge-kit/src/link.rs"
-anchor      = '''        abandoned
+anchor      = '''        let slot = abandoned
             .running
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| (running < ABANDONED_CAP).then_some(running + 1))
             .ok()
-            .map(|_| Slot(abandoned.clone()))'''
-replacement = '''        if abandoned.running.load(Ordering::SeqCst) >= ABANDONED_CAP {
-            return None;
-        }
-        std::thread::yield_now();
-        abandoned.running.fetch_add(1, Ordering::SeqCst);
-        Some(Slot(abandoned.clone()))'''
+            .map(|_| Slot(abandoned.clone()));'''
+replacement = '''        let slot = if abandoned.running.load(Ordering::SeqCst) >= ABANDONED_CAP {
+            None
+        } else {
+            std::thread::yield_now();
+            abandoned.running.fetch_add(1, Ordering::SeqCst);
+            Some(Slot(abandoned.clone()))
+        };'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::racing_calls_never_reserve_past_the_cap", "--exact"]
 expect_text = '''racing calls reserved past the cap'''
@@ -1970,3 +1971,53 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::a_helpers_blocking_call_is_not_held_to_an_operation_it_overlapped", "--exact"]
 expect_text = '''a helper's read was held to the deadline of an operation it overlapped'''
 guard       = "blocking_deadline_task_scoped"
+
+# Re-gate R1: with no operation running, a silent heartbeat is a blocked worker.
+[[control]]
+name        = "a_blocked_idle_worker_goes_unseen"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        } else if let Some(quiet) = clock.since_beat().filter(|quiet| *quiet > IDLE_BOUND) {'''
+replacement = '''        } else if let Some(quiet) = clock.since_beat().filter(|_| false) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_helper_that_blocks_the_worker_thread_while_idle_is_a_dead_worker", "--exact"]
+expect_text = '''a helper blocking the idle worker's thread went unseen'''
+guard       = "worker_heartbeat"
+
+# Re-gate R1: the watchdog runs on its own and keeps its verdict; a read that ends does not restart it.
+[[control]]
+name        = "the_watchdog_restarts_with_each_read"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''                    // WAIT: bridge-parts
+                    Some(supervisor) => supervisor.await,'''
+replacement = '''                    // WAIT: bridge-parts
+                    Some(supervisor) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        supervisor.await
+                    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline", "--exact"]
+expect_text = '''went unseen for 7 s, read in slices'''
+guard       = "watchdog_independent"
+
+# Re-gate R13: a blocking cap full past twice the operation bound is a dead worker.
+[[control]]
+name        = "a_full_blocking_cap_is_never_escalated"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        if let Some(full) = abandoned.full_for().filter(|full| *full > cap_bound) {'''
+replacement = '''        if let Some(full) = abandoned.full_for().filter(|_| false) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_blocking_cap_that_stays_full_is_a_dead_worker", "--exact"]
+expect_text = '''a blocking cap full for good went unseen'''
+guard       = "blocking_cap_escalated"
+
+# Re-gate R16 (T4): a disconnect is watched like an operation.
+[[control]]
+name        = "a_blocked_disconnect_has_no_deadline"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''        let deadline = Instant::now() + self.info.timing.operation;
+        self.clock.set(Some(deadline));'''
+replacement = '''        let deadline = Instant::now() + self.info.timing.operation;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_disconnect_that_blocks_the_worker_thread_is_a_dead_worker_past_its_bound", "--exact"]
+expect_text = '''the blocked disconnect was not seen past its bound'''
+guard       = "disconnect_watched"

@@ -67,6 +67,13 @@ pub enum Helper {
     ReturnAfter(Duration),
     /// Panics this long after the connect (a bug).
     PanicAfter(Duration),
+    /// This long after the connect, blocks the worker's thread synchronously for the second
+    /// duration — a reader calling a synchronous read without `blocking()` (a bug the watchdog's
+    /// heartbeat catches).
+    BlockAfter(Duration, Duration),
+    /// Starts one more blocking call than the cap allows, each a thread that never ends in the
+    /// test's time — a reader whose synchronous reads never return.
+    HoldBlocking,
 }
 
 #[derive(Debug, Clone)]
@@ -335,12 +342,29 @@ impl DeviceDriver for FakeDevice {
         state.connected = true;
         state.link = Some(ctx.handle());
         if let Some(helper) = state.helper.take() {
+            let handle = ctx.handle();
             ctx.spawn(async move {
                 match helper {
                     Helper::ReturnAfter(after) => tokio::time::sleep(after).await,
                     Helper::PanicAfter(after) => {
                         tokio::time::sleep(after).await;
                         panic!("the fake driver's helper's scripted panic");
+                    }
+                    Helper::BlockAfter(after, block) => {
+                        tokio::time::sleep(after).await;
+                        std::thread::sleep(block);
+                        std::future::pending::<()>().await;
+                    }
+                    Helper::HoldBlocking => {
+                        let stuck = |h: LinkHandle| async move { h.blocking(|| std::thread::sleep(Duration::from_secs(60))).await };
+                        let _ = tokio::join!(
+                            stuck(handle.clone()),
+                            stuck(handle.clone()),
+                            stuck(handle.clone()),
+                            stuck(handle.clone()),
+                            stuck(handle.clone())
+                        );
+                        std::future::pending::<()>().await;
                     }
                 }
             });
@@ -349,7 +373,10 @@ impl DeviceDriver for FakeDevice {
     }
 
     async fn disconnect(&mut self) {
-        let _ = self.log(Op::Disconnect, None, None, None);
+        // A scripted `Block` blocks the worker's thread, as a synchronous close with no timeout.
+        if let Some(Answer::Block(d)) = self.log(Op::Disconnect, None, None, None) {
+            std::thread::sleep(d);
+        }
         let mut state = self.locked();
         state.connected = false;
         state.link = None;

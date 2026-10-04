@@ -252,11 +252,21 @@ commands are refused, and reads are dropped.
   the stop signals taken before it, so a driver breaking "info is pure" cannot hold up the stop
   (Codex, `process.rs:251`).
 - **A driver that blocks its thread:** its operation's deadline cannot fire on the worker's own
-  runtime, so a watchdog on the MQTT side reads it (an atomic). Past the deadline and a 2 s grace:
-  ERROR `worker_died`, `Status=unreachable`, the momentary commands waiting refused, and the
-  dead-part path — the bounded shutdown and a failure exit, so the supervisor restarts the
-  process. A thread cannot be cancelled; the restart is the recovery. (A helper that blocks the
-  thread while no operation runs has no deadline to pass; it is not seen.)
+  runtime, so a watchdog on the MQTT side reads it (an atomic). The watchdog is a task of its own,
+  started with the bridge, and keeps its verdict until it is read: an in-process user of
+  `Bridge::start` gets the verdict, and the dead-part path, only by polling `Running::ended()`,
+  but the device is said unreachable and the waiting commands refused at once either way. It
+  declares the worker dead when:
+  - an operation (or the disconnect) is past its deadline and a 2 s grace;
+  - no operation runs and the worker runtime's heartbeat — a ticker on the worker's thread, every
+    250 ms — has been silent for 5 s: a helper blocking the thread with a synchronous call;
+  - the blocking calls' cap has refused calls, with no place freed, for twice the operation bound:
+    threads stuck in synchronous calls for good, so every later call would be refused.
+
+  Then: ERROR `worker_died`, `Status=unreachable`, the momentary commands waiting refused, and the
+  dead-part path — the bounded shutdown (which does not wait for the blocked worker) and a failure
+  exit, so the supervisor restarts the process. A thread cannot be cancelled; the restart is the
+  recovery (re-gate R1, R13).
 - **Panics:** `Bridge::run` installs a process-global panic hook (`install_panic_hook`, also for
   in-process users of `Bridge::start`): ERROR `panic` through tracing (lossy), and the report for
   stderr written by a thread of its own, abandoned after 200 ms. Nothing is written on the

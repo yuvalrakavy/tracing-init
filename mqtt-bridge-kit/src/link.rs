@@ -91,9 +91,34 @@ impl Reporter {
 }
 
 /// The blocking calls whose threads are running, across links: in use, or abandoned.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Abandoned {
     running: AtomicUsize,
+    epoch: Instant,
+    /// Since when a call was refused for want of a place, in milliseconds since `epoch` plus one;
+    /// 0 once a place is free again. A cap that stays full is a dead worker (re-gate R13).
+    full_since: AtomicU64,
+}
+
+impl Default for Abandoned {
+    fn default() -> Abandoned {
+        Abandoned { running: AtomicUsize::new(0), epoch: Instant::now(), full_since: AtomicU64::new(0) }
+    }
+}
+
+impl Abandoned {
+    /// How long calls have been refused for want of a place, with none freed since.
+    pub(crate) fn full_for(&self) -> Option<Duration> {
+        match self.full_since.load(Ordering::SeqCst) {
+            0 => None,
+            stamp => Some(self.epoch.elapsed().saturating_sub(Duration::from_millis(stamp - 1))),
+        }
+    }
+
+    fn refused(&self) {
+        let stamp = self.epoch.elapsed().as_millis() as u64 + 1;
+        let _ = self.full_since.compare_exchange(0, stamp, Ordering::SeqCst, Ordering::SeqCst);
+    }
 }
 
 /// One blocking call's place under [`ABANDONED_CAP`]: reserved before its thread starts, and held
@@ -104,33 +129,55 @@ struct Slot(Arc<Abandoned>);
 
 impl Slot {
     fn reserve(abandoned: &Arc<Abandoned>) -> Option<Slot> {
-        abandoned
+        let slot = abandoned
             .running
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| (running < ABANDONED_CAP).then_some(running + 1))
             .ok()
-            .map(|_| Slot(abandoned.clone()))
+            .map(|_| Slot(abandoned.clone()));
+        if slot.is_none() {
+            abandoned.refused();
+        }
+        slot
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
         self.0.running.fetch_sub(1, Ordering::SeqCst);
+        self.0.full_since.store(0, Ordering::SeqCst);
     }
 }
 
-/// The deadline of the operation the device worker is running, for the watchdog on the MQTT side
-/// ([`crate::process::Running::ended`]): a worker whose thread is blocked in a synchronous call
-/// cannot fire its own timers, so only another thread can see the deadline pass. Across links.
+/// The deadline of the operation the device worker is running, and the worker runtime's
+/// heartbeat, for the watchdog on the MQTT side ([`crate::process`]): a worker whose thread is
+/// blocked in a synchronous call cannot fire its own timers, so only another thread can see the
+/// deadline pass, or the heartbeat stop. Across links.
 #[derive(Debug)]
 pub(crate) struct OpClock {
     epoch: Instant,
     /// In milliseconds since `epoch` plus one; 0 between operations.
     deadline: AtomicU64,
+    /// The worker runtime's last heartbeat, in milliseconds since `epoch` plus one; 0 before the
+    /// first.
+    beat: AtomicU64,
 }
 
 impl OpClock {
     pub(crate) fn new() -> OpClock {
-        OpClock { epoch: Instant::now(), deadline: AtomicU64::new(0) }
+        OpClock { epoch: Instant::now(), deadline: AtomicU64::new(0), beat: AtomicU64::new(0) }
+    }
+
+    /// The worker's runtime is running: a ticker on it stamps this (re-gate R1).
+    pub(crate) fn beat(&self) {
+        self.beat.store(self.epoch.elapsed().as_millis() as u64 + 1, Ordering::SeqCst);
+    }
+
+    /// How long since the last heartbeat; `None` before the first.
+    pub(crate) fn since_beat(&self) -> Option<Duration> {
+        match self.beat.load(Ordering::SeqCst) {
+            0 => None,
+            stamp => Some(self.epoch.elapsed().saturating_sub(Duration::from_millis(stamp - 1))),
+        }
     }
 
     pub(crate) fn set(&self, deadline: Option<Instant>) {

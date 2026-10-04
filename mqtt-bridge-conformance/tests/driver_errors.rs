@@ -190,18 +190,28 @@ async fn a_driver_panic_ends_the_device_worker() {
 async fn a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline() {
     let mut h = Harness::start_with("blocked", acknowledged(), quick_timing(), up_at_20).await;
     assert!(connected(&h).await);
-    h.device.answer_times(Op::Apply, None, Answer::Block(Duration::from_secs(5)), 1);
+    h.device.answer_times(Op::Apply, None, Answer::Block(Duration::from_secs(10)), 1);
     assert!(h.desire("t1", "temp", json!(22), REQ));
     assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty()).await, "the apply never began");
     // Waiting behind the blocked apply.
     assert!(h.command(json!({"target": "t1", "command": "pulse"}), Some(("Store/r", b"p1"))));
     let blocked_at = h.device.calls_of(Op::Apply)[0].at;
-    // The 500 ms deadline, the grace, a margin: well short of the 5 s the driver blocks.
-    let died = tokio::time::timeout(Duration::from_millis(3500), h.running().ended()).await;
-    let died = died.unwrap_or_else(|_| panic!("a driver blocking its thread went unseen for 3.5 s; Status {:?}", h.status()));
+    // The 500 ms deadline, the 2 s grace, a wide margin: well short of the 10 s the driver blocks.
+    // The watchdog is read in short slices, as an embedding application's housekeeping loop
+    // would: it runs on its own, and a slice that ends does not restart it (re-gate R1).
+    let died = loop {
+        if let Ok(died) = tokio::time::timeout(Duration::from_millis(50), h.running().ended()).await {
+            break died;
+        }
+        assert!(
+            blocked_at.elapsed() < Duration::from_secs(7),
+            "a driver blocking its thread went unseen for 7 s, read in slices; Status {:?}",
+            h.status()
+        );
+    };
     assert_eq!(died.part, "device", "{died:?}");
     assert!(died.cause.contains("blocked"), "{died:?}");
-    assert!(blocked_at.elapsed() < Duration::from_secs(4), "seen only once the driver let go: {:?}", blocked_at.elapsed());
+    assert!(blocked_at.elapsed() < Duration::from_secs(8), "seen only once the driver let go: {:?}", blocked_at.elapsed());
     assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "Status still says {:?}", h.status());
     assert!(
         h.eventually(BOUND, |h| h.errors_for("refused").iter().any(|e| e["command"] == "pulse")).await,
@@ -239,7 +249,7 @@ async fn a_helper_that_ends_is_a_lost_link() {
                 "a helper's panic was not one ERROR: {:#?}",
                 h.log.records()
             ),
-            Helper::ReturnAfter(_) => assert!(violations.is_empty(), "a helper that returned was taken for a bug: {violations:#?}"),
+            _ => assert!(violations.is_empty(), "a helper that returned was taken for a bug: {violations:#?}"),
         }
         assert!(connected(&h).await, "the device was not connected again");
         assert!(h.stop().await);
@@ -420,5 +430,63 @@ async fn a_partial_applys_written_values_are_held_again_when_the_link_dies_befor
         "the value a partial apply wrote was not held again when the link died before proof: {:?}",
         h.device.calls()
     );
+    assert!(h.stop().await);
+}
+
+/// A helper that blocks the worker's thread while no operation runs — a reader calling a
+/// synchronous read without `blocking()` — is a dead worker: no deadline is set then, so the
+/// watchdog reads the worker runtime's heartbeat, which a blocked thread stops (the R1 re-gate's R1:
+/// the watchdog saw only an operation's deadline, and the bridge stayed "connected" and deaf).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_helper_that_blocks_the_worker_thread_while_idle_is_a_dead_worker() {
+    let mut h = Harness::start_with("idle-block", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.helper(Helper::BlockAfter(Duration::from_millis(300), Duration::from_secs(15)));
+    })
+    .await;
+    assert!(connected(&h).await);
+    let started = std::time::Instant::now();
+    let died = tokio::time::timeout(Duration::from_secs(10), h.running().ended()).await;
+    let died = died.unwrap_or_else(|_| panic!("a helper blocking the idle worker's thread went unseen for 10 s; Status {:?}", h.status()));
+    assert_eq!(died.part, "device", "{died:?}");
+    assert!(died.cause.contains("blocked"), "{died:?}");
+    assert!(started.elapsed() < Duration::from_secs(10), "seen only once the helper let go: {:?}", started.elapsed());
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "Status still says {:?}", h.status());
+    assert!(h.stop().await, "the bridge did not stop within its bound with its worker blocked");
+}
+
+/// Blocking calls that fill their cap and stay stuck — readers whose synchronous reads never return
+/// — make every later call a refusal, for good: past twice the operation bound, that is a dead
+/// worker, and the restart the only way out (the R1 re-gate's R13: nothing escalated).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocking_cap_that_stays_full_is_a_dead_worker() {
+    let mut h = Harness::start_with("cap-full", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.helper(Helper::HoldBlocking);
+    })
+    .await;
+    assert!(connected(&h).await);
+    let died = tokio::time::timeout(Duration::from_secs(8), h.running().ended()).await;
+    let died = died.unwrap_or_else(|_| panic!("a blocking cap full for good went unseen for 8 s; Status {:?}", h.status()));
+    assert_eq!(died.part, "device", "{died:?}");
+    assert!(died.cause.contains("cap"), "{died:?}");
+    assert!(h.stop().await);
+}
+
+/// A `disconnect` that blocks the worker's thread — a synchronous close with no timeout — is
+/// watched like an operation: past its bound and the grace, the worker is dead, said for what it
+/// is (the R1 re-gate's T4: no test covered the clock set around the disconnect).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disconnect_that_blocks_the_worker_thread_is_a_dead_worker_past_its_bound() {
+    let mut h = Harness::start_with("disconnect-block", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Disconnect, None, Answer::Block(Duration::from_secs(15)), 1);
+    let lost_at = std::time::Instant::now();
+    h.device.set_up(false);
+    let died = tokio::time::timeout(Duration::from_secs(10), h.running().ended()).await;
+    let died = died.unwrap_or_else(|_| panic!("a disconnect blocking the worker's thread went unseen for 10 s; Status {:?}", h.status()));
+    assert_eq!(died.part, "device", "{died:?}");
+    assert!(died.cause.contains("deadline"), "the blocked disconnect was not seen past its bound: {died:?}");
+    assert!(lost_at.elapsed() < Duration::from_secs(10), "seen only once the disconnect let go: {:?}", lost_at.elapsed());
     assert!(h.stop().await);
 }

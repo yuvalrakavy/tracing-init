@@ -26,10 +26,12 @@
 //! - **Dead workers:** none of the bridge's parts ends on its own; one that does (a driver's
 //!   panic) is ERROR `worker_died`, the bounded shutdown, and a failure status, for the service
 //!   manager to restart the bridge. So is a device worker whose thread is blocked — a synchronous
-//!   call with no timeout, where its own timers cannot fire: a watchdog here reads the running
-//!   operation's deadline, and past it and [`BLOCKED_GRACE`] says the device is unreachable,
-//!   refuses the momentary commands waiting, and ends the bridge. A thread cannot be cancelled;
-//!   the restart is the recovery.
+//!   call with no timeout, where its own timers cannot fire. A watchdog task, running from the
+//!   start whoever reads it, reads the running operation's deadline (past it and
+//!   [`BLOCKED_GRACE`]), the worker runtime's heartbeat when no operation runs (silent past
+//!   [`IDLE_BOUND`]: a helper blocking the thread), and the blocking calls' cap (full for twice
+//!   the operation bound): it then says the device is unreachable, refuses the momentary commands
+//!   waiting, and ends the bridge. A thread cannot be cancelled; the restart is the recovery.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -44,7 +46,7 @@ use tracing::{error, info, warn, Instrument, Span};
 
 use crate::config::{self, Problem, Settings, TimingOverrides};
 use crate::driver::{DeviceDriver, DriverInfo};
-use crate::link::OpClock;
+use crate::link::{Abandoned, OpClock};
 use crate::mailbox::Mailbox;
 use crate::pump::BrokerOutage;
 use crate::reports::{LinkStatus, Reports};
@@ -59,8 +61,11 @@ pub const RUNTIME_GRACE: Duration = Duration::from_secs(1);
 /// Past its operation's deadline by this much, a device worker is blocked: its thread is in a
 /// call its own timers cannot interrupt, and the watchdog declares it dead.
 pub const BLOCKED_GRACE: Duration = Duration::from_secs(2);
-/// How often the watchdog reads the operation's deadline.
+/// How often the watchdog reads the operation's deadline and the heartbeat.
 const WATCH_TICK: Duration = Duration::from_millis(100);
+/// With no operation running, a worker runtime silent this long has its thread blocked — a
+/// helper's synchronous call — and is dead (re-gate R1).
+pub const IDLE_BOUND: Duration = Duration::from_secs(5);
 /// How long a panicking thread waits for its report to reach stderr before it goes on without.
 pub const PANIC_REPORT_BOUND: Duration = Duration::from_millis(200);
 
@@ -377,10 +382,16 @@ impl Bridge {
     }
 
     /// Start the bridge on the current tokio runtime, in-process: the MQTT side as tasks, the
-    /// device worker on a thread of its own. No logging start, no signals and no panic hook —
-    /// [`run`](Self::run) adds those; a process that runs bridges this way calls
+    /// device worker on a thread of its own, and the watchdog. No logging start, no signals and no
+    /// panic hook — [`run`](Self::run) adds those; a process that runs bridges this way calls
     /// [`install_panic_hook`] itself (the conformance suite uses this directly, and keeps the test
     /// harness's own hook).
+    ///
+    /// A part's death — the watchdog's verdict on a blocked device worker included — reaches the
+    /// caller only through [`Running::ended`]: an in-process user must poll it (in any slices it
+    /// likes) and take the dead-part path itself, [`Running::stop`] and a restart. The watchdog runs
+    /// whether or not it is polled, and says the device unreachable and refuses the waiting
+    /// commands at once.
     pub fn start<D: DeviceDriver>(self, driver: D) -> Result<Running, String> {
         self.launch(driver, None)
     }
@@ -419,14 +430,19 @@ impl Bridge {
         });
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (worker_stop, worker_stop_rx) = watch::channel(false);
+        let operation_bound = info.timing.operation;
         let worker = Worker::new(driver, info, &instance, mailbox.clone(), reports.clone());
         let clock = worker.clock();
+        let abandoned = worker.abandoned();
         let worker = worker::spawn(worker, worker_stop_rx, span.clone()).map_err(|e| format!("the device worker's thread: {e}"))?;
+        // The watchdog runs on its own, from now, whoever reads it (re-gate R1).
+        let supervisor =
+            tokio::spawn(supervise(clock, abandoned, operation_bound * 2, reports.clone(), mailbox.clone()).instrument(span.clone()));
         let mut tasks = JoinSet::new();
         let _entered = span.enter();
         session::spawn(shared, shutdown_rx, &mut tasks);
         drop(_entered);
-        Ok(Running { tasks, worker: Some(worker), shutdown, worker_stop, span, clock, watching: true, reports, mailbox })
+        Ok(Running { tasks, worker: Some(worker), shutdown, worker_stop, span, supervisor: Some(supervisor), worker_blocked: false })
     }
 }
 
@@ -437,26 +453,43 @@ pub struct Running {
     shutdown: watch::Sender<bool>,
     worker_stop: watch::Sender<bool>,
     span: Span,
-    /// The device worker's operation clock, and whether the watchdog still reads it (it fires
-    /// once).
-    clock: Arc<OpClock>,
-    watching: bool,
-    reports: Arc<Reports>,
-    mailbox: Arc<Mailbox>,
+    /// The watchdog: a task of its own, its verdict kept until it is read; `None` once read.
+    supervisor: Option<tokio::task::JoinHandle<Died>>,
+    /// Whether the watchdog found the worker's thread blocked: the stop then does not wait for it.
+    worker_blocked: bool,
 }
 
-/// Until the device worker's running operation is past its deadline by [`BLOCKED_GRACE`]; by how
-/// much it is.
-async fn blocked(clock: &OpClock) -> Duration {
-    loop {
+/// The watchdog, until the device worker is dead: an operation past its deadline by
+/// [`BLOCKED_GRACE`]; with none running, a heartbeat silent past [`IDLE_BOUND`]; or the blocking
+/// calls' cap full for `cap_bound`. Then the device is unreachable and the momentary commands
+/// waiting are refused — at once, whether or not anyone reads the verdict yet.
+async fn supervise(
+    clock: Arc<OpClock>,
+    abandoned: Arc<Abandoned>,
+    cap_bound: Duration,
+    reports: Arc<Reports>,
+    mailbox: Arc<Mailbox>,
+) -> Died {
+    let cause = loop {
         tokio::time::sleep(WATCH_TICK).await;
         if let Some(deadline) = clock.deadline() {
             let over = std::time::Instant::now().saturating_duration_since(deadline);
             if over > BLOCKED_GRACE {
-                return over;
+                break format!("the device worker blocked its thread {} ms past its operation's deadline", over.as_millis());
             }
+        } else if let Some(quiet) = clock.since_beat().filter(|quiet| *quiet > IDLE_BOUND) {
+            break format!("the device worker's thread was blocked for {} ms with no operation running", quiet.as_millis());
         }
-    }
+        if let Some(full) = abandoned.full_for().filter(|full| *full > cap_bound) {
+            break format!(
+                "the device worker's blocking calls have filled their cap for {} ms: threads stuck in synchronous calls",
+                full.as_millis()
+            );
+        }
+    };
+    reports.status(LinkStatus::Unreachable);
+    worker::report_refused(&reports, mailbox.disconnected(), worker::LINK_LOST_BEFORE);
+    Died { part: "device", cause }
 }
 
 /// A part of the bridge that ended on its own.
@@ -472,17 +505,19 @@ impl Running {
     /// deadline (then the device is said unreachable and the momentary commands waiting are
     /// refused first). Cancellation-safe.
     pub async fn ended(&mut self) -> Died {
-        let watching = self.watching && self.worker.is_some();
         // WAIT: bridge-parts
         tokio::select! {
-            over = blocked(&self.clock), if watching => {
-                self.watching = false;
-                self.reports.status(LinkStatus::Unreachable);
-                worker::report_refused(&self.reports, self.mailbox.disconnected(), worker::LINK_LOST_BEFORE);
-                Died {
-                    part: "device",
-                    cause: format!("the device worker blocked its thread {} ms past its operation's deadline", over.as_millis()),
+            verdict = async {
+                match self.supervisor.as_mut() {
+                    // WAIT: bridge-parts
+                    Some(supervisor) => supervisor.await,
+                    // WAIT: bridge-parts
+                    None => std::future::pending().await,
                 }
+            } => {
+                self.supervisor = None;
+                self.worker_blocked = true;
+                verdict.unwrap_or_else(|e| Died { part: "device", cause: format!("the watchdog ended: {e}") })
             }
             Some(joined) = self.tasks.join_next() => Died { part: "mqtt", cause: match joined {
                 Ok(()) => "returned".to_owned(),
@@ -512,9 +547,13 @@ impl Running {
     pub async fn stop(mut self) -> bool {
         let span = self.span.clone();
         async move {
+            if let Some(supervisor) = self.supervisor.take() {
+                supervisor.abort();
+            }
             let _ = self.shutdown.send(true);
             let _ = self.worker_stop.send(true);
-            let worker = self.worker.take();
+            // A worker whose thread the watchdog found blocked will not stop: not waited for.
+            let worker = self.worker.take().filter(|_| !self.worker_blocked);
             let tasks = &mut self.tasks;
             let all = async move {
                 // WAIT: shutdown

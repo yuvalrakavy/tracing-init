@@ -329,6 +329,12 @@ impl<D: DeviceDriver> Worker<D> {
         self.clock.clone()
     }
 
+    /// The blocking calls' count, which the watchdog reads too: a cap that stays full is a dead
+    /// worker.
+    pub(crate) fn abandoned(&self) -> Arc<Abandoned> {
+        self.abandoned.clone()
+    }
+
     /// The worker's life: link after link. It never returns; the stop cancels it.
     pub(crate) async fn run(&mut self) {
         self.reports.status(LinkStatus::Connecting);
@@ -950,6 +956,7 @@ pub(crate) fn spawn<D: DeviceDriver>(
     span: Span,
 ) -> std::io::Result<oneshot::Receiver<WorkerEnd>> {
     let (tx, rx) = oneshot::channel();
+    let clock = worker.clock();
     std::thread::Builder::new().name("bridge-worker".into()).spawn(move || {
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| format!("its runtime: {e}"))?;
@@ -960,6 +967,8 @@ pub(crate) fn spawn<D: DeviceDriver>(
             local.block_on(
                 &runtime,
                 async {
+                    // The heartbeat the watchdog reads: a blocked thread stops it (re-gate R1).
+                    tokio::task::spawn_local(heartbeat(clock));
                     // WAIT: worker-stop
                     tokio::select! {
                         () = worker.run() => {}
@@ -981,6 +990,18 @@ pub(crate) fn spawn<D: DeviceDriver>(
         let _ = tx.send(end);
     })?;
     Ok(rx)
+}
+
+/// How often the worker's runtime says it runs.
+pub(crate) const HEARTBEAT_TICK: Duration = Duration::from_millis(250);
+
+/// The worker runtime's heartbeat, until the runtime ends: a ticker on the worker's own thread, so
+/// any block of the thread — a helper's synchronous read, a driver's sleep — stops it.
+async fn heartbeat(clock: Arc<OpClock>) {
+    loop {
+        clock.beat();
+        tokio::time::sleep(HEARTBEAT_TICK).await;
+    }
 }
 
 /// A panic's payload, as text.
