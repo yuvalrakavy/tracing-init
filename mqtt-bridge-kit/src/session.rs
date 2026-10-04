@@ -578,6 +578,12 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
             }
         }
         "assume" => match &target {
+            // The Store's input: a property that cannot stand as a topic segment is malformed, not
+            // a driver's contract violation (Claude's re-gate minor 6).
+            Some(_) if call.params.keys().any(|p| !crate::topics::valid_segment(p)) => {
+                info!(kind = "validation_rejected", command = "assume", "`assume` names a property that cannot stand as a topic segment");
+                refused(Reason::Malformed, "`assume` names a property that cannot stand as a topic segment");
+            }
             Some(t) if !call.params.is_empty() => {
                 shared.reports.state(t, call.params.clone(), true);
                 answer(Answer::Done(None));

@@ -593,3 +593,17 @@ async fn a_restore_in_the_catch_up_configures_a_config_that_came_meanwhile() {
     assert_eq!(ops.first(), Some(&Op::Configure), "the restore wrote before a config that came while it waited: {ops:?}");
     assert!(h.stop().await);
 }
+
+/// An `assume` naming a property that cannot stand as a topic segment is the Store's malformed
+/// input: refused as `malformed` and answered — not a driver's contract violation, and not
+/// answered `done` (Claude's re-gate minor 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assume_with_a_bad_property_name_is_malformed() {
+    let h = Harness::start_with("assume-bad-name", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    assert!(h.command(json!({"target": "t1", "command": "assume", "a/b": 1}), Some(("Store/r", b"a-1"))));
+    assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the assume was not answered");
+    assert_eq!(json_of(&h.published("Store/r")[0])["reason"], "malformed", "a bad assume was not refused as malformed");
+    assert!(h.log.of_kind("driver_contract_violation").is_empty(), "the Store's input was taken for a driver bug");
+    assert!(h.stop().await);
+}

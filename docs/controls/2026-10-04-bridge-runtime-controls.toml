@@ -2280,3 +2280,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_answers_the_commands_waiting_for_the_device", "--exact"]
 expect_text = '''the command waiting at SIGTERM was not answered'''
 guard       = "flush_publishes_pending"
+
+# Claude's re-gate minor 6: an assume with a bad property name is the Store's malformed input.
+[[control]]
+name        = "a_bad_assume_is_a_driver_bug"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''            Some(_) if call.params.keys().any(|p| !crate::topics::valid_segment(p)) => {'''
+replacement = '''            Some(_) if false => {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_assume_with_a_bad_property_name_is_malformed", "--exact"]
+expect_text = '''a bad assume was not refused as malformed'''
+guard       = "assume_validated"
