@@ -303,6 +303,9 @@ commands are refused, and reads are dropped.
   - the blocking calls' cap has refused calls, with no place freed, for twice the operation bound:
     threads stuck in synchronous calls for good, so every later call would be refused.
 
+  A watchdog tick that comes more than 1 s late is a pause of the whole process (SIGSTOP, a VM's
+  pause): the worker was paused too, so for 2 s after it the watchdog judges nothing (re-gate 3 S6).
+
   Then: ERROR `worker_died`, `Status=unreachable`, the momentary commands waiting refused, and the
   dead-part path — the bounded shutdown (which does not wait for the blocked worker) and a failure
   exit, so the supervisor restarts the process. A thread cannot be cancelled; the restart is the
@@ -316,12 +319,17 @@ commands are refused, and reads are dropped.
 - **Several workers per session (mqtt_ynca's receivers): not built.** What would have to become
   per worker: `Shared`'s mailbox, reports and commands (a router from target to worker); the
   `Status` lane (one per receiver: there is no per-receiver availability lane yet); `Running`'s
-  worker, clock and watchdog; and `Bridge::start`, which takes one driver. The read-back and the
+  worker, clock and watchdog — the watchdog's verdict must become per worker, with an outcome per
+  worker, since today one stuck worker ends the whole bridge, and under one session that would take
+  every receiver down; and `Bridge::start`, which takes one driver. The read-back and the
   broker snapshot can stay shared; the panic hook is process-global already.
 - **Test seams:** the environment variables `MQTT_BRIDGE_TEST_*` (a held logging start, refused
   stop signals, a panicking session) are compiled in only with the kit's `test-seams` cargo
   feature, which the conformance suite enables — never in a deployed bridge, debug build or not
   (Claude's re-gate minor 4).
+- **Best effort at the end:** the reports a session had taken for a publish when the shutdown cut
+  that publish short are not put back: the flush publishes what is pending after them, and what
+  was taken and cut is lost (re-gate 3 S6: documented, not counted).
 - **What a stop answers:** the bounded shutdown first stops the worker taking work, refuses every
   command still waiting for the device — and the one the worker had taken and was cut off from
   answering, which the mailbox keeps as in flight until it is answered (re-gate 3 S3; the

@@ -63,6 +63,10 @@ pub const RUNTIME_GRACE: Duration = Duration::from_secs(1);
 pub const BLOCKED_GRACE: Duration = Duration::from_secs(2);
 /// How often the watchdog reads the operation's deadline and the heartbeat.
 const WATCH_TICK: Duration = Duration::from_millis(100);
+/// A watchdog tick later than asked by more than this is a pause of the whole process.
+const PAUSE_SLACK: Duration = Duration::from_secs(1);
+/// After a pause, how long the watchdog gives the worker to resume before it judges again.
+const PAUSE_GRACE: Duration = Duration::from_secs(2);
 /// With no operation running, a worker runtime silent this long has its thread blocked — a
 /// helper's synchronous call — and is dead (re-gate R1).
 pub const IDLE_BOUND: Duration = Duration::from_secs(5);
@@ -512,8 +516,23 @@ async fn supervise(
     reports: Arc<Reports>,
     mailbox: Arc<Mailbox>,
 ) -> Died {
+    // A tick that came far later than asked — the process was paused (SIGSTOP, a VM's pause) —
+    // starts a grace: the worker was paused too, and its heartbeat and timers resume with it, so
+    // what the clocks say across the pause is no verdict (re-gate 3 S6).
+    let mut last_tick = std::time::Instant::now();
+    let mut grace_until: Option<std::time::Instant> = None;
     let cause = loop {
         tokio::time::sleep(WATCH_TICK).await;
+        let now = std::time::Instant::now();
+        let gap = now.saturating_duration_since(last_tick);
+        last_tick = now;
+        if gap > WATCH_TICK + PAUSE_SLACK {
+            grace_until = Some(now + PAUSE_GRACE);
+            continue;
+        }
+        if grace_until.is_some_and(|until| now < until) {
+            continue;
+        }
         if let Some(deadline) = clock.deadline() {
             let over = std::time::Instant::now().saturating_duration_since(deadline);
             if over > BLOCKED_GRACE {

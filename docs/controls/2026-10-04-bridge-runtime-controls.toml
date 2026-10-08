@@ -2411,3 +2411,14 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "topics::tests::the_lanes_follow_the_grammar", "--exact"]
 expect_text = '''another family's request lane `Lutron/Command/x` was not reserved'''
 guard       = "reply_lanes_any_root"
+
+# Re-gate 3 S6: a pause of the whole process is no verdict.
+[[control]]
+name        = "a_pause_is_a_dead_worker"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        if gap > WATCH_TICK + PAUSE_SLACK {'''
+replacement = '''        if false && gap > WATCH_TICK + PAUSE_SLACK {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_paused_process_is_no_dead_worker_when_it_wakes", "--exact"]
+expect_text = '''a pause was taken for a dead worker'''
+guard       = "watchdog_pause"

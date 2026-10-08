@@ -250,6 +250,33 @@ async fn sigterm_answers_the_commands_waiting_for_the_device() {
     assert_eq!(broker.received_on(&active).last().map(|r| r.payload.clone()).as_deref(), Some(&b"false"[..]));
 }
 
+/// A process paused longer than the watchdog's idle bound — SIGSTOP, a VM's pause — is no dead
+/// worker when it wakes: the watchdog measures against the gap it saw itself (the re-gate 3 S6: on
+/// waking, the heartbeat looked 6 s old, and the bridge ended itself).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paused_process_is_no_dead_worker_when_it_wakes() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(20);
+    let dir = workdir("paused");
+    let mut child = bridge(&dir, &broker, &[]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("start the bridge");
+    let status_topic = format!("Proc/Status/{INSTANCE}");
+    assert!(
+        broker.wait_until(BOUND, |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connected")).await,
+        "the device never connected"
+    );
+    signal(&child, "-STOP");
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    signal(&child, "-CONT");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let ended = child.try_wait().expect("the bridge's status");
+    if ended.is_none() {
+        signal(&child, "-TERM");
+        let _ = exit_within(&mut child, Duration::from_secs(15)).await;
+    }
+    let log = logged(&dir);
+    assert!(ended.is_none() && !log.contains("worker_died"), "a pause was taken for a dead worker: {ended:?}; the log:\n{log}");
+}
+
 /// The threads `pid` runs now: `/proc/<pid>/task` on Linux; elsewhere (macOS) `ps -M`, a header
 /// line and one line per thread — on Linux procps `-M` means something else (the re-gate 3 S4).
 fn threads(pid: u32) -> usize {
