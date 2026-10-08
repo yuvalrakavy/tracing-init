@@ -673,3 +673,23 @@ async fn a_catch_up_after_a_refused_read_back_does_not_wait() {
     assert!(h.eventually(BOUND, |h| !h.published(replies).is_empty()).await, "the command was never answered");
     assert!(h.stop().await);
 }
+
+/// A burst of commands refused at arrival — the device down — each with a response topic: every one
+/// is answered. The session publishes what is pending between reads, so replies are not displaced
+/// past the event cap while it drains a backlog (the re-gate's RG3-3: with the reads polled before
+/// the reports, about 64 of 200 were answered).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_of_refused_commands_is_answered_every_one() {
+    let h = Harness::start_with("burst", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.set_up(false);
+    })
+    .await;
+    let replies = "Store/replies/burst";
+    for i in 0..200u32 {
+        assert!(h.command(json!({"target": "t1", "command": "pulse"}), Some((replies, &i.to_be_bytes()))));
+    }
+    h.eventually(Duration::from_secs(5), |h| h.published(replies).len() >= 200).await;
+    assert_eq!(h.published(replies).len(), 200, "replies were lost in a burst");
+    assert!(h.stop().await);
+}

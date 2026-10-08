@@ -203,13 +203,15 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
     let mut accepted = false;
     loop {
         // WAIT: session-events
-        // The stop first: its flush publishes what is pending anyway (re-gate R15), and a random
-        // pick between the two would leave that to chance.
+        // The stop first: its flush publishes what is pending anyway (re-gate R15). Then what is
+        // pending before the next read: `reported` fires only with something queued, so it cannot
+        // starve the reads, while the reads polled first would drain a whole backlog before a
+        // publish and displace its replies past the event cap (re-gate 3 S2, RG3-3).
         let step = tokio::select! {
             biased;
             _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
-            event = incoming.recv() => Step::Event(event),
             () = shared.reports.reported(), if announced => Step::Reported,
+            event = incoming.recv() => Step::Event(event),
         };
         let connack = matches!(step, Step::Event(Some(PumpEvent::Connected)));
         accepted |= connack;

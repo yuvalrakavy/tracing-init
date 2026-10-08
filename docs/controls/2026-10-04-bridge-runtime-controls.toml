@@ -2280,3 +2280,16 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_follows_the_targets_config_and_yields_to_a_newer_request", "--exact"]
 expect_text = '''the target was written before its config'''
 guard       = "restore_behind_subscriptions"
+
+# Re-gate 3 S2: the session publishes what is pending before its next read.
+[[control]]
+name        = "the_reads_starve_the_reports"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''            () = shared.reports.reported(), if announced => Step::Reported,
+            event = incoming.recv() => Step::Event(event),'''
+replacement = '''            event = incoming.recv() => Step::Event(event),
+            () = shared.reports.reported(), if announced => Step::Reported,'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_burst_of_refused_commands_is_answered_every_one", "--exact"]
+expect_text = '''replies were lost in a burst'''
+guard       = "reports_not_starved"
