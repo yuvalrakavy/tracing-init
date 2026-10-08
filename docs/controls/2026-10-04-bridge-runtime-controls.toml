@@ -2284,6 +2284,22 @@ argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformanc
 expect_text = '''the target was written before its config'''
 guard       = "restore_behind_subscriptions"
 
+# Re-gate 3 S5: the old `a_restore_is_never_unproven` undid the restore's own unproven path, which
+# S1 removed — a restore is an ordinary request, so it is re-held by the mailbox's one unproven
+# rule. Rebound to that rule: undone, the restore the deaf device never took is not applied again.
+[[control]]
+name        = "a_restore_is_never_unproven"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''            let mut again: Vec<StateValue> = inner.unproven.drain(..).map(|(v, _)| v).collect();
+'''
+replacement = '''            inner.unproven.clear();
+            let mut again: Vec<StateValue> = Vec::new();
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_unproven_restore_is_applied_again_when_the_link_dies_before_proof", "--exact"]
+expect_text = '''the restore the deaf device never took was not applied again'''
+guard       = "restore_unproven"
+
 # Re-gate 3 S2: the session publishes what is pending before its next read.
 [[control]]
 name        = "the_reads_starve_the_reports"
