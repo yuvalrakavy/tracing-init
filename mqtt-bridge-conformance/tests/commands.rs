@@ -693,3 +693,22 @@ async fn a_burst_of_refused_commands_is_answered_every_one() {
     assert_eq!(h.published(replies).len(), 200, "replies were lost in a burst");
     assert!(h.stop().await);
 }
+
+/// A command the worker is executing when the stop comes is answered — refused, on `Error` and on
+/// its response topic — as is the one waiting behind it (the re-gate's RG3-2: the stop cancelled it
+/// mid-operation, and its reply went with it).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_executing_at_the_stop_is_answered() {
+    let timing = mqtt_bridge_kit::TimingOverrides { operation: Some(Duration::from_secs(3)), ..quick_timing() };
+    let mut h = Harness::start_with("stop-in-flight", acknowledged(), timing, up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(2500)), 1);
+    let replies = "Store/replies/stop-in-flight";
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-1"))));
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-2"))));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
+    assert!(h.stop_bridge().await);
+    let answered: Vec<_> = h.published(replies).iter().map(|r| r.correlation_data().map(|c| c.to_vec())).collect();
+    assert_eq!(answered.len(), 2, "a command in flight at the stop got no reply: {answered:?}");
+    assert_eq!(h.errors_for("refused").len(), 2, "a command in flight at the stop was not refused on Error: {:?}", h.errors());
+}

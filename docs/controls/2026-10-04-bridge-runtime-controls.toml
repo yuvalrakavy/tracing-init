@@ -2293,3 +2293,16 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_burst_of_refused_commands_is_answered_every_one", "--exact"]
 expect_text = '''replies were lost in a burst'''
 guard       = "reports_not_starved"
+
+# Re-gate 3 S3: the command the worker was cut off from answering is refused too.
+[[control]]
+name        = "the_command_in_flight_goes_unanswered"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''            if let Some(command) = inner.in_flight_command.take() {
+                unanswered.push(command);
+            }'''
+replacement = '''            let _ = inner.in_flight_command.take();'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_executing_at_the_stop_is_answered", "--exact"]
+expect_text = '''a command in flight at the stop got no reply'''
+guard       = "command_in_flight_answered"

@@ -709,6 +709,7 @@ impl<D: DeviceDriver> Worker<D> {
             }
             Work::Execute { target, call, reply } => {
                 let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref(), &call)).await;
+                self.mailbox.command_done();
                 self.answered(target.as_deref(), &call.command, result, reply.into_iter().collect(), true)
             }
             Work::ReadExpired { expired } => {
@@ -725,12 +726,14 @@ impl<D: DeviceDriver> Worker<D> {
                     None
                 });
                 // A failure goes to Error too, as every command's does (review C13).
+                self.mailbox.command_done();
                 self.answered(target.as_deref(), "refresh", result, replies, true)
             }
             Work::Read { key: ReadKey::Command { target, command }, call, replies, expired } => {
                 report_refused(&self.reports, expired, READ_EXPIRED);
                 let call = call.unwrap_or_else(|| crate::driver::CommandCall { command: command.clone(), params: PropertyMap::new() });
                 let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref(), &call)).await;
+                self.mailbox.command_done();
                 self.answered(target.as_deref(), &command, result, replies, true)
             }
         }

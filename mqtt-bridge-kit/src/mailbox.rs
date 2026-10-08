@@ -309,6 +309,9 @@ struct Inner {
     /// later snapshot that holds the change at the device (re-gate R12). Dropped when the Store
     /// retracts the key or writes it live, or a replay of another value replaces it.
     bases: HashMap<(String, String), (Value, Basis)>,
+    /// The command the worker took and has not answered: refused at a stop or a watchdog's end,
+    /// which cancel it mid-operation (re-gate 3 S3).
+    in_flight_command: Option<Unanswered>,
     /// Every key a request was posted for since the start: a restore leaves it to that request.
     requested: std::collections::HashSet<(String, String)>,
 }
@@ -469,6 +472,11 @@ impl Mailbox {
         self.queued(posted)
     }
 
+    /// The command in flight is answered (by the worker). Never waits.
+    pub fn command_done(&self) {
+        self.locked().in_flight_command = None;
+    }
+
     /// A restore (`DriverInfo::restore`): each of `values` — what the previous run assumed, from
     /// the read-back — waits as an ordinary request would, held, checked by the conflict rule
     /// (`RequestWins`, so a device already at the value is satisfied), until `deadline`; but one
@@ -622,6 +630,10 @@ impl Mailbox {
                     inner.pending.push_front(Entry::Config { target, config, held: true });
                 }
             }
+            // The command the worker took and was cut off from answering goes first.
+            if let Some(command) = inner.in_flight_command.take() {
+                unanswered.push(command);
+            }
             let waiting = std::mem::take(&mut inner.pending);
             for entry in waiting {
                 match entry {
@@ -737,6 +749,12 @@ impl Mailbox {
                         if deadline.is_some_and(|d| now >= d) {
                             return Some(Work::Expired { target, call, reply });
                         }
+                        inner.in_flight_command = Some(Unanswered {
+                            target: target.clone(),
+                            command: call.command.clone(),
+                            momentary: true,
+                            replies: reply.clone().into_iter().collect(),
+                        });
                         return Some(Work::Execute { target, call, reply });
                     }
                 }
@@ -759,7 +777,13 @@ impl Mailbox {
                         if live.is_empty() {
                             return Some(Work::ReadExpired { expired });
                         }
-                        let replies = live.into_iter().filter_map(|c| c.reply).collect();
+                        let replies: Vec<ReplyTo> = live.into_iter().filter_map(|c| c.reply).collect();
+                        inner.in_flight_command = Some(Unanswered {
+                            target: target.clone(),
+                            command: command.clone(),
+                            momentary: false,
+                            replies: replies.clone(),
+                        });
                         return Some(Work::Read { key, call, replies, expired });
                     }
                 }
