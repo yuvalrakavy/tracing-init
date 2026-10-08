@@ -17,7 +17,11 @@ const INSTANCE: &str = "proc";
 /// A working directory of the test's own, with a `logging.toml` that keeps the bridge's logs in a
 /// file there.
 fn workdir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("process-{name}"));
+    // One of its own per run, so two runs of the suite at once (two worktrees, one target
+    // directory) never share it (the re-gate 3 S4).
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let run = RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("process-{name}-{}-{run}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("the test's working directory");
     std::fs::write(dir.join("logging.toml"), "[logging]\non_destination_error = \"skip\"\n\n[logging.gelf]\naddress = \"127.0.0.1:9\"\n")
@@ -246,10 +250,13 @@ async fn sigterm_answers_the_commands_waiting_for_the_device() {
     assert_eq!(broker.received_on(&active).last().map(|r| r.payload.clone()).as_deref(), Some(&b"false"[..]));
 }
 
-/// The threads `pid` runs now.
+/// The threads `pid` runs now: `/proc/<pid>/task` on Linux; elsewhere (macOS) `ps -M`, a header
+/// line and one line per thread — on Linux procps `-M` means something else (the re-gate 3 S4).
 fn threads(pid: u32) -> usize {
+    if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+        return tasks.count();
+    }
     let listed = std::process::Command::new("ps").args(["-M", "-p", &pid.to_string()]).output().expect("ps");
-    // A header line, then one line per thread.
     String::from_utf8_lossy(&listed.stdout).lines().count().saturating_sub(1)
 }
 
@@ -281,7 +288,7 @@ async fn repeated_panics_with_a_stderr_nobody_reads_leak_no_threads() {
     signal(&child, "-TERM");
     let _ = exit_within(&mut child, Duration::from_secs(15)).await;
     drop(unread);
-    assert!(early > 0, "no threads listed for the bridge");
+    assert!(early > 1, "{early} thread(s) listed for the bridge: the count does not see its threads, so this test proves nothing");
     assert!(late <= early + 2, "the bridge grew from {early} to {late} threads while its helpers panicked: a thread per panic");
 }
 

@@ -122,16 +122,12 @@ async fn a_broker_that_stops_reading_is_left_for_a_fresh_session() {
 async fn a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_reads_it() {
     let h = Harness::start_with("expiry-arrival", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
     assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
-    h.broker.hold_acks();
-    for i in 0..1000 {
-        assert!(h.send_raw(&h.topics.command(), format!("not json {i}").as_bytes()));
-    }
-    assert!(h.eventually(BOUND, |h| h.broker.held_acks() >= 10).await, "the path is not saturated");
-    h.settle(Duration::from_millis(300)).await;
+    park_the_session(&h).await;
     // One second to live, arriving while the session is parked.
     let command = json!({"target": "t1", "command": "pulse"}).to_string();
     assert!(h.broker.publish(&h.topics.command(), command, &SendOptions::default().expiry(1)));
     h.settle(Duration::from_millis(2000)).await;
+    assert_parked(&h);
     h.broker.release_acks();
     h.settle(Duration::from_millis(1500)).await;
     assert!(h.device.calls_of(Op::Execute).is_empty(), "a command executed past its expiry, counted from when the session read it");
@@ -146,15 +142,11 @@ async fn an_assume_past_its_expiry_is_refused_not_taken() {
     let h = Harness::start_with("assume-expiry", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
     assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
     assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
-    h.broker.hold_acks();
-    for i in 0..1000 {
-        assert!(h.send_raw(&h.topics.command(), format!("not json {i}").as_bytes()));
-    }
-    assert!(h.eventually(BOUND, |h| h.broker.held_acks() >= 10).await, "the path is not saturated");
-    h.settle(Duration::from_millis(300)).await;
+    park_the_session(&h).await;
     let assume = json!({"target": "t1", "command": "assume", "temp": 30}).to_string();
     assert!(h.broker.publish(&h.topics.command(), assume, &SendOptions::default().expiry(1)));
     h.settle(Duration::from_millis(2000)).await;
+    assert_parked(&h);
     h.broker.release_acks();
     assert!(
         h.eventually(Duration::from_secs(5), |h| h.errors_for("refused").iter().any(|e| e["command"] == "assume")).await,
@@ -164,4 +156,28 @@ async fn an_assume_past_its_expiry_is_refused_not_taken() {
     );
     assert_ne!(h.state("t1").map(|s| s["temp"].clone()), Some(json!(30)), "an assume past its expiry overwrote the model");
     assert!(h.stop().await);
+}
+
+/// Stall the broker and park the session on a full request channel: 400 `assume`s, each a State of
+/// its own to publish — never capped or coalesced away — and a barrier: a target-level write for
+/// `barrier`, which a session that is not parked would read and apply (the re-gate 3 S4: these two
+/// scenarios saturated with Errors, a capped queue, and did not always park the session).
+async fn park_the_session(h: &Harness) {
+    h.broker.hold_acks();
+    for i in 0..400 {
+        assert!(h.command(json!({"target": format!("a{i}"), "command": "assume", "level": i}), None));
+    }
+    assert!(h.eventually(BOUND, |h| h.broker.held_acks() >= 10).await, "the path is not saturated");
+    h.settle(Duration::from_millis(300)).await;
+    let barrier = SendOptions::default().expiry(60).user_property("conflict", "RequestWins");
+    assert!(h.broker.publish(&h.topics.desired_target("barrier"), r#"{"x": 1}"#, &barrier));
+    h.settle(Duration::from_millis(300)).await;
+}
+
+/// The barrier was not read: the session stayed parked, so the scenario proves what it says.
+fn assert_parked(h: &Harness) {
+    assert!(
+        h.device.applies().iter().all(|(target, _)| target != "barrier"),
+        "the barrier was read: the session was not parked on a full request channel, so this test proves nothing"
+    );
 }
