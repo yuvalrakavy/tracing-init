@@ -92,3 +92,13 @@ fn shared_for_port() -> Shared {
         subscriptions_pending: std::sync::atomic::AtomicU32::new(u32::MAX),
     }
 }
+
+/// The session's panic seam is off without the feature (the re-gate 3 S5).
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn the_panic_seam_is_off_without_its_feature() {
+    std::env::set_var(TEST_PANIC_TOPIC, "T/seam");
+    let ran = std::panic::catch_unwind(|| panic_for_test("T/seam"));
+    std::env::remove_var(TEST_PANIC_TOPIC);
+    assert!(ran.is_ok(), "the panic seam is on in a build without the test-seams feature");
+}

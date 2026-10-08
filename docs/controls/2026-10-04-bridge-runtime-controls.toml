@@ -2306,3 +2306,65 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_executing_at_the_stop_is_answered", "--exact"]
 expect_text = '''a command in flight at the stop got no reply'''
 guard       = "command_in_flight_answered"
+
+# Re-gate 3 S5: the logging start's seam is behind the feature too.
+[[control]]
+name        = "the_logging_seam_follows_debug_assertions"
+file        = "mqtt-bridge-kit/src/logging.rs"
+anchor      = '''#[cfg(feature = "test-seams")]
+pub(crate) fn hold_for_test() -> bool {
+    match std::env::var_os(TEST_LOGGING_GATE) {
+        Some(gate) => std::fs::read(gate).is_ok_and(|text| text.starts_with(b"fail")),
+        None => false,
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+pub(crate) fn hold_for_test() -> bool {
+    false
+}'''
+replacement = '''#[cfg(debug_assertions)]
+pub(crate) fn hold_for_test() -> bool {
+    match std::env::var_os(TEST_LOGGING_GATE) {
+        Some(gate) => std::fs::read(gate).is_ok_and(|text| text.starts_with(b"fail")),
+        None => false,
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn hold_for_test() -> bool {
+    false
+}'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "process::tests::the_logging_seam_is_off_without_its_feature", "--exact"]
+expect_text = '''the logging seam is on in a build without the test-seams feature'''
+guard       = "test_seams_feature_logging"
+
+# Re-gate 3 S5: the session's panic seam is behind the feature too.
+[[control]]
+name        = "the_panic_seam_follows_debug_assertions"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''#[cfg(feature = "test-seams")]
+fn panic_for_test(topic: &str) {
+    static SEAM: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if SEAM.get_or_init(|| std::env::var(TEST_PANIC_TOPIC).ok()).as_deref() == Some(topic) {
+        panic!("the test seam's panic, on a publish on {topic}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn panic_for_test(_: &str) {}'''
+replacement = '''#[cfg(debug_assertions)]
+fn panic_for_test(topic: &str) {
+    static SEAM: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if SEAM.get_or_init(|| std::env::var(TEST_PANIC_TOPIC).ok()).as_deref() == Some(topic) {
+        panic!("the test seam's panic, on a publish on {topic}");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn panic_for_test(_: &str) {}'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_panic_seam_is_off_without_its_feature", "--exact"]
+expect_text = '''the panic seam is on in a build without the test-seams feature'''
+guard       = "test_seams_feature_panic"

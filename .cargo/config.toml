@@ -1,0 +1,5 @@
+# Builds run from this repository are the Bridge Runtime's own: the conformance suite may compile the
+# kit's test seams (`mqtt-bridge-kit`'s `test-seams` feature; see its build.rs). A bridge built from
+# its own repository has no such setting, and a `test-seams` feature unified into it fails to compile.
+[env]
+MQTT_BRIDGE_TEST_SEAMS = "1"

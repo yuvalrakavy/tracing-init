@@ -47,3 +47,17 @@ async fn the_test_seams_are_off_without_their_feature() {
     std::env::remove_var(TEST_NO_SIGNALS);
     assert!(registered.is_ok(), "the no-signals seam is on in a build without the test-seams feature");
 }
+
+/// The logging start's seam is off without the feature too (the re-gate 3 S5: one row covered the
+/// signals seam alone).
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn the_logging_seam_is_off_without_its_feature() {
+    let gate = std::env::temp_dir().join(format!("logging-gate-{}", std::process::id()));
+    std::fs::write(&gate, b"fail").expect("the gate file");
+    std::env::set_var(crate::logging::TEST_LOGGING_GATE, &gate);
+    let fails = crate::logging::hold_for_test();
+    std::env::remove_var(crate::logging::TEST_LOGGING_GATE);
+    let _ = std::fs::remove_file(&gate);
+    assert!(!fails, "the logging seam is on in a build without the test-seams feature");
+}

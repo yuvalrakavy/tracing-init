@@ -35,6 +35,13 @@
 //! | outage episodes with the fleet's kind names | [`pump`], [`worker`] |
 //! | the process: signals first, the logging start raced against the stop, a bounded end, a panic hook, a watchdog on the device worker | [`process`], [`logging`] |
 
+// The test seams compile only in this repository's own builds (build.rs; re-gate 3 S6): a deployed
+// bridge whose workspace unified the feature in fails here instead of shipping them.
+#[cfg(all(feature = "test-seams", not(mqtt_bridge_test_seams)))]
+compile_error!(
+    "mqtt-bridge-kit's `test-seams` feature is for the Bridge Runtime's conformance suite only: build it from that repository (MQTT_BRIDGE_TEST_SEAMS=1)"
+);
+
 pub mod config;
 pub mod driver;
 pub mod link;

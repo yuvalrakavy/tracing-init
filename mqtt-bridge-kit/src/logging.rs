@@ -57,7 +57,7 @@ fn say_on_stderr(line: String) {
 /// start — never returns until the test lets go, as on a stalled file system; or at a file that
 /// says `fail`, and the start fails. Unset, it does nothing. Returns whether to fail.
 #[cfg(feature = "test-seams")]
-fn hold_for_test() -> bool {
+pub(crate) fn hold_for_test() -> bool {
     match std::env::var_os(TEST_LOGGING_GATE) {
         Some(gate) => std::fs::read(gate).is_ok_and(|text| text.starts_with(b"fail")),
         None => false,
@@ -65,6 +65,6 @@ fn hold_for_test() -> bool {
 }
 
 #[cfg(not(feature = "test-seams"))]
-fn hold_for_test() -> bool {
+pub(crate) fn hold_for_test() -> bool {
     false
 }
