@@ -369,9 +369,13 @@ guard       = "momentary_refused_while_down"
 [[control]]
 name        = "waiting_momentary_commands_survive_a_disconnect"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''                    Entry::Momentary { target, call, reply, .. } => {
-                        unanswered.push(Unanswered { target, command: call.command, momentary: true, replies: reply.into_iter().collect() })
-                    }'''
+anchor      = '''                    Entry::Momentary { target, call, reply, .. } => unanswered.push(Unanswered {
+                        ran: false,
+                        target,
+                        command: call.command,
+                        momentary: true,
+                        replies: reply.into_iter().collect(),
+                    }),'''
 replacement = '''                    Entry::Momentary { target, call, reply, deadline } => inner.pending.push_back(Entry::Momentary { target, call, reply, deadline }),'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::momentary_commands_and_reads", "--exact"]
@@ -1658,7 +1662,7 @@ name        = "an_expired_command_is_dropped_silently"
 file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''                report_refused(
                     &self.reports,
-                    vec![Unanswered { target, command: call.command, momentary: true, replies: reply.into_iter().collect() }],
+                    vec![Unanswered { ran: false, target, command: call.command, momentary: true, replies: reply.into_iter().collect() }],
                     message,
                 );'''
 replacement = '''                let _ = (target, call, reply, message);'''
@@ -1884,7 +1888,7 @@ replacement = '''                    match (polled, self.mailbox.try_take()) {
                     }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_queued_during_a_poll_that_loses_the_link_is_answered", "--exact"]
-expect_text = '''a command queued during a poll that lost the link was neither answered nor executed'''
+expect_text = '''the failed poll took the command off the mailbox'''
 guard       = "poll_keeps_the_mailbox"
 
 # Re-gate minor: two integers compare exactly, never through f64.
@@ -2419,6 +2423,6 @@ file        = "mqtt-bridge-kit/src/process.rs"
 anchor      = '''        if gap > WATCH_TICK + PAUSE_SLACK {'''
 replacement = '''        if false && gap > WATCH_TICK + PAUSE_SLACK {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_paused_process_is_no_dead_worker_when_it_wakes", "--exact"]
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "process::tests::a_pause_starts_a_grace_before_the_watchdog_judges", "--exact"]
 expect_text = '''a pause was taken for a dead worker'''
 guard       = "watchdog_pause"

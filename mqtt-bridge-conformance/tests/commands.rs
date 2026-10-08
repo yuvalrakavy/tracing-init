@@ -408,6 +408,11 @@ async fn a_command_queued_during_a_poll_that_loses_the_link_is_answered() {
         "a command queued during a poll that lost the link was neither answered nor executed: {:?}",
         h.errors()
     );
+    // Refused as waiting, before it ran — not taken off the mailbox by the failed poll, and cut off.
+    if let Some(reply) = h.published(replies).first() {
+        let error = json_of(reply)["error"].as_str().unwrap_or_default().to_owned();
+        assert!(error.contains("before it ran"), "the failed poll took the command off the mailbox: {error}");
+    }
     assert!(h.stop().await);
 }
 

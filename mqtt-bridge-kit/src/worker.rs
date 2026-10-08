@@ -702,7 +702,7 @@ impl<D: DeviceDriver> Worker<D> {
                 debug!(target = target.as_deref(), command = %call.command, "A command expired while it waited");
                 report_refused(
                     &self.reports,
-                    vec![Unanswered { target, command: call.command, momentary: true, replies: reply.into_iter().collect() }],
+                    vec![Unanswered { ran: false, target, command: call.command, momentary: true, replies: reply.into_iter().collect() }],
                     message,
                 );
                 Ok(())
@@ -874,12 +874,17 @@ impl<D: DeviceDriver> Worker<D> {
 /// What a disconnect refuses: a command the device never took.
 pub(crate) const LINK_LOST_BEFORE: &str = "the device link was lost before it ran";
 
+/// What a command the worker was running, and was cut off from answering, is told.
+const CUT_OFF: &str = "the command was cut off while it ran: the device may or may not have done it";
+
 /// What a read's caller past its deadline is told.
 const READ_EXPIRED: &str = "the command reached its expiry while it waited for the device; not executed";
 
 /// What a disconnect refused, or what expired: each command on `Error`, and every reply waited for.
 pub(crate) fn report_refused(reports: &Reports, unanswered: Vec<Unanswered>, message: &str) {
     for u in unanswered {
+        // One the worker was running was cut off, not refused before it ran (re-gate 3 S3).
+        let message = if u.ran { CUT_OFF } else { message };
         // A read refused is a failure too: on Error, as every command's (review C13).
         reports.error(ErrorReport::new(Reason::Refused, message).target(u.target.as_deref()).command(&u.command));
         let answer = Answer::Failed { reason: Reason::Refused, error: message.to_owned() };

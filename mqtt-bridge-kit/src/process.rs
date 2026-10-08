@@ -516,21 +516,10 @@ async fn supervise(
     reports: Arc<Reports>,
     mailbox: Arc<Mailbox>,
 ) -> Died {
-    // A tick that came far later than asked — the process was paused (SIGSTOP, a VM's pause) —
-    // starts a grace: the worker was paused too, and its heartbeat and timers resume with it, so
-    // what the clocks say across the pause is no verdict (re-gate 3 S6).
-    let mut last_tick = std::time::Instant::now();
-    let mut grace_until: Option<std::time::Instant> = None;
+    let mut pause = PauseGrace::new(std::time::Instant::now());
     let cause = loop {
         tokio::time::sleep(WATCH_TICK).await;
-        let now = std::time::Instant::now();
-        let gap = now.saturating_duration_since(last_tick);
-        last_tick = now;
-        if gap > WATCH_TICK + PAUSE_SLACK {
-            grace_until = Some(now + PAUSE_GRACE);
-            continue;
-        }
-        if grace_until.is_some_and(|until| now < until) {
+        if !pause.judging(std::time::Instant::now()) {
             continue;
         }
         if let Some(deadline) = clock.deadline() {
@@ -551,6 +540,31 @@ async fn supervise(
     reports.status(LinkStatus::Unreachable);
     worker::report_refused(&reports, mailbox.disconnected(), worker::LINK_LOST_BEFORE);
     Died { part: "device", cause }
+}
+
+/// Whether a watchdog tick may judge. A tick that came far later than asked — the process was
+/// paused (SIGSTOP, a VM's pause) — starts a grace: the worker was paused too, and its heartbeat
+/// and timers resume with it, so what the clocks say across the pause is no verdict (re-gate 3 S6).
+struct PauseGrace {
+    last_tick: std::time::Instant,
+    grace_until: Option<std::time::Instant>,
+}
+
+impl PauseGrace {
+    fn new(now: std::time::Instant) -> Self {
+        PauseGrace { last_tick: now, grace_until: None }
+    }
+
+    /// The tick at `now`: may it judge the worker?
+    fn judging(&mut self, now: std::time::Instant) -> bool {
+        let gap = now.saturating_duration_since(self.last_tick);
+        self.last_tick = now;
+        if gap > WATCH_TICK + PAUSE_SLACK {
+            self.grace_until = Some(now + PAUSE_GRACE);
+            return false;
+        }
+        !self.grace_until.is_some_and(|until| now < until)
+    }
 }
 
 /// A part of the bridge that ended on its own.

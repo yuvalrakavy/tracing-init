@@ -61,3 +61,21 @@ fn the_logging_seam_is_off_without_its_feature() {
     let _ = std::fs::remove_file(&gate);
     assert!(!fails, "the logging seam is on in a build without the test-seams feature");
 }
+
+/// A pause of the whole process starts a grace; the watchdog judges again only once it is over,
+/// and ordinary ticks judge at once (re-gate 3 S6).
+#[test]
+fn a_pause_starts_a_grace_before_the_watchdog_judges() {
+    let t0 = std::time::Instant::now();
+    let mut pause = PauseGrace::new(t0);
+    assert!(pause.judging(t0 + WATCH_TICK), "an ordinary tick did not judge");
+    let woke = t0 + WATCH_TICK + Duration::from_secs(10);
+    assert!(!pause.judging(woke), "a pause was taken for a dead worker: the tick after it judged");
+    assert!(!pause.judging(woke + WATCH_TICK), "a pause was taken for a dead worker: a tick in its grace judged");
+    let mut tick = woke + WATCH_TICK;
+    while tick < woke + PAUSE_GRACE {
+        tick += WATCH_TICK;
+        pause.judging(tick);
+    }
+    assert!(pause.judging(tick + WATCH_TICK), "the grace never ended");
+}

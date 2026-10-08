@@ -333,7 +333,8 @@ commands are refused, and reads are dropped.
 - **What a stop answers:** the bounded shutdown first stops the worker taking work, refuses every
   command still waiting for the device — and the one the worker had taken and was cut off from
   answering, which the mailbox keeps as in flight until it is answered (re-gate 3 S3; the
-  watchdog's verdict refuses it the same way) — on `Error` and on its response topic — then publishes what
+  watchdog's verdict refuses it the same way; its error says it was cut off while it ran, so the
+  device may or may not have done it, where a waiting one's says it was refused before it ran) — on `Error` and on its response topic — then publishes what
   is pending (`Status`, `Error`, replies; a watchdog's verdict included), then `Active=false` and
   the DISCONNECT, all within the flush's bound (re-gate R15).
 - **Panics:** `Bridge::run` installs a process-global panic hook (`install_panic_hook`, also for

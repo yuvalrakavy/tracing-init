@@ -280,6 +280,8 @@ pub struct Unanswered {
     /// `true` for a momentary command (reported on `Error`); a read is only answered.
     pub momentary: bool,
     pub replies: Vec<ReplyTo>,
+    /// The worker had taken it and was running it when it was cut off.
+    pub ran: bool,
 }
 
 #[derive(Debug, Default)]
@@ -642,14 +644,18 @@ impl Mailbox {
                         inner.pending.push_back(Entry::State { value, held: true });
                     }
                     Entry::Config { target, config, .. } => inner.pending.push_back(Entry::Config { target, config, held: true }),
-                    Entry::Momentary { target, call, reply, .. } => {
-                        unanswered.push(Unanswered { target, command: call.command, momentary: true, replies: reply.into_iter().collect() })
-                    }
+                    Entry::Momentary { target, call, reply, .. } => unanswered.push(Unanswered {
+                        ran: false,
+                        target,
+                        command: call.command,
+                        momentary: true,
+                        replies: reply.into_iter().collect(),
+                    }),
                     // Refused, on `Error` and on any response topic, whether or not it named one.
                     Entry::Read { key, callers, .. } => {
                         let (target, command) = key.names();
                         let replies = callers.into_iter().filter_map(|c| c.reply).collect();
-                        unanswered.push(Unanswered { target, command, momentary: false, replies });
+                        unanswered.push(Unanswered { ran: false, target, command, momentary: false, replies });
                     }
                 }
             }
@@ -750,6 +756,7 @@ impl Mailbox {
                             return Some(Work::Expired { target, call, reply });
                         }
                         inner.in_flight_command = Some(Unanswered {
+                            ran: true,
                             target: target.clone(),
                             command: call.command.clone(),
                             momentary: true,
@@ -768,6 +775,7 @@ impl Mailbox {
                         let expired = late
                             .into_iter()
                             .map(|c| Unanswered {
+                                ran: false,
                                 target: target.clone(),
                                 command: command.clone(),
                                 momentary: false,
@@ -779,6 +787,7 @@ impl Mailbox {
                         }
                         let replies: Vec<ReplyTo> = live.into_iter().filter_map(|c| c.reply).collect();
                         inner.in_flight_command = Some(Unanswered {
+                            ran: true,
                             target: target.clone(),
                             command: command.clone(),
                             momentary: false,
