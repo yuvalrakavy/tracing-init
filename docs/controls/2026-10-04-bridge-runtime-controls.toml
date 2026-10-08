@@ -1616,8 +1616,8 @@ replacement = '''        (topics.desired_target_filter(), true),
         (topics.command(), true),
         (topics.config_filter(), false),'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_targets_config_is_configured_before_its_replayed_values_for_a_device_already_up", "--exact"]
-expect_text = '''the replayed value reached apply before the target's config'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "config_is_subscribed_before_desired", "--exact"]
+expect_text = '''Desired was subscribed before Config'''
 guard       = "config_subscribed_first"
 
 # C7: a request's expiry counts from its arrival at the pump.

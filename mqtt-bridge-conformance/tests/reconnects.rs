@@ -172,3 +172,26 @@ async fn a_read_back_the_broker_refuses_is_said_incomplete() {
     );
     assert!(h.stop().await);
 }
+
+/// `Config` is subscribed before `Desired`, so a target's retained setup is queued ahead of its
+/// retained values on the stream (review M4) — read from the broker's own record of the
+/// subscriptions, in order, not from a race between the replays and the worker.
+#[tokio::test(flavor = "multi_thread")]
+async fn config_is_subscribed_before_desired() {
+    let h = Harness::start("sub-order", acknowledged(), quick_timing()).await;
+    assert!(h.broker.wait_for_subscription(&h.topics.command(), BOUND).await, "the bridge never subscribed");
+    let subscribed: Vec<String> = h
+        .broker
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            BrokerEvent::Subscribed(f) => Some(f.clone()),
+            _ => None,
+        })
+        .collect();
+    let at = |filter: String| subscribed.iter().position(|f| *f == filter);
+    let config = at(h.topics.config_filter()).expect("Config was never subscribed");
+    let desired = at(h.topics.desired_property_filter()).expect("Desired was never subscribed");
+    assert!(config < desired, "Desired was subscribed before Config: {subscribed:?}");
+    assert!(h.stop().await);
+}
