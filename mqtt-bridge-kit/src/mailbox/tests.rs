@@ -370,9 +370,10 @@ fn a_value_retracted_replaced_or_expired_during_a_read_is_dropped() {
 /// replayed after its value reached `apply` second).
 #[test]
 fn a_targets_config_goes_before_its_values() {
+    // Every held config before any held value — another target's too.
     let mailbox = Mailbox::new();
-    mailbox.post_state(value("ir", "power", json!(true)), false);
     mailbox.post_state(value("tv", "power", json!(true)), false);
+    mailbox.post_state(value("ir", "power", json!(true)), false);
     mailbox.post_config("ir", Some(json!({"code_set": "lg"})));
     mailbox.connected();
     let first = mailbox.take_held();

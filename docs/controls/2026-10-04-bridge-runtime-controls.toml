@@ -153,8 +153,8 @@ anchor      = '''        Inbound::State { target } => {
 replacement = '''        Inbound::State { target } => {
             if true {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
-expect_text = '''no Error said the request was superseded'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_live_state_is_not_read_back", "--exact"]
+expect_text = '''a live State was read back'''
 guard       = "read_back_retained_only"
 
 # A malformed payload is answered on Error.
@@ -1076,7 +1076,7 @@ anchor      = '''    let result = tokio::select! {
 replacement = '''    let result = tokio::select! {
         done = tokio::time::timeout_at'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::an_operation_that_completed_wins_over_a_link_lost_at_the_same_moment", "--exact"]
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::a_completion_and_a_loss_ready_together_keep_the_result", "--exact"]
 expect_text = '''a completed operation was turned into a lost link'''
 guard       = "op_result_wins"
 
@@ -1508,7 +1508,7 @@ guard       = "copy_window"
 name        = "requests_are_subscribed_before_the_read_back_is_acknowledged"
 file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''        match read_back_acknowledged(shared, incoming).await {'''
-replacement = '''        match Some(true) {'''
+replacement = '''        match ReadBack::Granted {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "requests_are_subscribed_only_once_the_read_back_is_acknowledged", "--exact"]
 expect_text = '''requests were subscribed before the read-back was acknowledged'''
@@ -2213,8 +2213,8 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        if quiet >= RESTORE_QUIET || now >= cap {'''
 replacement = '''        if quiet >= Duration::ZERO || now >= cap {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_follows_the_targets_config_and_yields_to_a_newer_request", "--exact"]
-expect_text = '''the target was written before its config'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "worker::tests::a_restore_waits_for_the_replays_to_go_quiet", "--exact"]
+expect_text = '''the restore did not wait for the replays to go quiet'''
 guard       = "restore_quiet"
 
 # Re-gate R5: a restore configures every waiting config first.

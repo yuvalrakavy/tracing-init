@@ -50,3 +50,37 @@ async fn a_refused_publish_is_one_message_dropped() {
         "the state after a refused one was never published"
     );
 }
+
+/// Only a retained `State` is read back: a live one — the bridge's own publish coming back on its
+/// read-back subscription, or another client's — is no record of what the previous run knew (the
+/// frozen read-back covers the conflict rule; this guard covers what a restore reads).
+#[test]
+fn a_live_state_is_not_read_back() {
+    let shared = shared_for_port();
+    let topic = shared.topics.state("t1");
+    let live = Publish::new(topic.clone(), QoS::AtLeastOnce, br#"{"temp":1}"#.to_vec(), None);
+    route(&shared, &topic, &live, Instant::now());
+    assert!(shared.reports.read_back_all().is_empty(), "a live State was read back");
+    let mut retained = Publish::new(topic.clone(), QoS::AtLeastOnce, br#"{"temp":2}"#.to_vec(), None);
+    retained.retain = true;
+    route(&shared, &topic, &retained, Instant::now());
+    assert_eq!(shared.reports.read_back_all()["t1"]["temp"], serde_json::json!(2));
+}
+
+/// The shared state of a session that never connects: for routing alone.
+fn shared_for_port() -> Shared {
+    Shared {
+        topics: Topics::new("T", "session").expect("topics"),
+        broker_host: "127.0.0.1".into(),
+        broker_port: 1,
+        timing: MqttTiming::default(),
+        version: "test".into(),
+        commands: Vec::new(),
+        mailbox: Mailbox::new(),
+        reports: Reports::new(),
+        outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
+        read_back_requested: AtomicBool::new(false),
+        read_back_late: std::sync::atomic::AtomicU32::new(0),
+        read_back_next: AtomicBool::new(false),
+    }
+}

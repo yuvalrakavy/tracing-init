@@ -111,6 +111,31 @@ async fn an_operation_that_completed_wins_over_a_link_lost_at_the_same_moment() 
     }
 }
 
+/// An operation that completed and a loss reported while it was pending, both ready when the
+/// operation is next polled: its result wins (item 34, the unbiased race: half the time a lost link).
+#[tokio::test]
+async fn a_completion_and_a_loss_ready_together_keep_the_result() {
+    for _ in 0..64 {
+        let ctx = link_context();
+        let handle = ctx.handle();
+        let (done, wait) = tokio::sync::oneshot::channel::<()>();
+        let operation = op(&handle, Duration::from_secs(5), "apply", async move {
+            let _ = wait.await;
+            Ok::<u32, OpError>(7)
+        });
+        tokio::pin!(operation);
+        // Polled once: admitted while the link is live, and pending.
+        tokio::select! {
+            biased;
+            early = &mut operation => panic!("the operation ended before it was let go: {early:?}"),
+            () = std::future::ready(()) => {}
+        }
+        handle.link_lost("lost meanwhile");
+        let _ = done.send(());
+        assert_eq!(operation.await, Ok(7), "a completed operation was turned into a lost link");
+    }
+}
+
 /// A helper's blocking call has no deadline, even when it starts while an operation runs; the
 /// operation's own blocking calls are held to its deadline (spec §4.2; the R1 re-gate's R14: the
 /// deadline was the link's, so a reader's quiet read that overlapped a probe "overran" and lost
@@ -227,4 +252,24 @@ fn a_device_that_drops_right_after_its_catch_up_is_one_outage() {
     outage.stable();
     let recovered = log.of_kind("device_recovered");
     assert!(recovered.len() == 1 && recovered[0].field("applied") == Some("3"), "{:#?}", log.records());
+}
+
+/// A restore waits for the retained replays to go quiet — a config or a replayed request arriving
+/// after the read-back is done restarts the window — however soon the read-back was done (the R1
+/// re-gate's R5: a SUBACK is no proof they were handled).
+#[tokio::test]
+async fn a_restore_waits_for_the_replays_to_go_quiet() {
+    let reports = Reports::new();
+    let mailbox = Mailbox::new();
+    reports.read_back_complete();
+    let started = Instant::now();
+    let posting = mailbox.clone();
+    let poster = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = posting.post_config("t1", Some(json!({"channel": 1})));
+    });
+    restore_ready(&reports, &mailbox, false).await;
+    let waited = started.elapsed();
+    let _ = poster.await;
+    assert!(waited >= RESTORE_QUIET + Duration::from_millis(90), "the restore did not wait for the replays to go quiet: {waited:?}");
 }
