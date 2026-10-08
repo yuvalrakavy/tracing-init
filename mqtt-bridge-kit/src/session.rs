@@ -410,8 +410,10 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) {
         return;
     }
     let flushed = async {
-        // What is pending first — Status, Errors, the replies to the commands the stop refused —
-        // then the last words (re-gate R15).
+        // What still waits for the device will not run: refused, on Error and on its response
+        // topic; then what is pending — Status, Errors, replies — then the last words (re-gate
+        // R15). Here, in the session's own flush, so nothing else publishes them first by chance.
+        crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);
         publish_changes(shared, client, shared.reports.take()).await;
         emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
         // WAIT: mqtt-request
@@ -640,6 +642,9 @@ fn panic_for_test(topic: &str) {
 
 #[cfg(not(feature = "test-seams"))]
 fn panic_for_test(_: &str) {}
+
+/// What a stop refuses: a command still waiting for the device.
+const STOPPED_BEFORE: &str = "the bridge stopped before it ran";
 
 /// Spawn the MQTT side on the current runtime.
 pub(crate) fn spawn(shared: Arc<Shared>, shutdown: watch::Receiver<bool>, set: &mut tokio::task::JoinSet<()>) {

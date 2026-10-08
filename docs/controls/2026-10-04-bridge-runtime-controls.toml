@@ -2261,9 +2261,9 @@ guard       = "restore_unproven"
 # Re-gate R15: the stop refuses what still waits, and publishes it before its last words.
 [[control]]
 name        = "the_stop_answers_nothing_waiting"
-file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''            worker::report_refused(&self.reports, self.mailbox.disconnected(), STOPPED_BEFORE);'''
-replacement = '''            let _ = STOPPED_BEFORE;'''
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);'''
+replacement = '''        let _ = STOPPED_BEFORE;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_answers_the_commands_waiting_for_the_device", "--exact"]
 expect_text = '''the command waiting at SIGTERM was not answered'''

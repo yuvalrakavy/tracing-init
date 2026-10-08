@@ -480,17 +480,7 @@ impl Bridge {
         let _entered = span.enter();
         session::spawn(shared, shutdown_rx, &mut tasks);
         drop(_entered);
-        Ok(Running {
-            tasks,
-            worker: Some(worker),
-            shutdown,
-            worker_stop,
-            span,
-            supervisor: Some(supervisor),
-            worker_blocked: false,
-            reports,
-            mailbox,
-        })
+        Ok(Running { tasks, worker: Some(worker), shutdown, worker_stop, span, supervisor: Some(supervisor), worker_blocked: false })
     }
 }
 
@@ -505,13 +495,7 @@ pub struct Running {
     supervisor: Option<tokio::task::JoinHandle<Died>>,
     /// Whether the watchdog found the worker's thread blocked: the stop then does not wait for it.
     worker_blocked: bool,
-    /// What the stop answers: the commands still waiting are refused (re-gate R15).
-    reports: Arc<Reports>,
-    mailbox: Arc<Mailbox>,
 }
-
-/// What a stop refuses: a command still waiting for the device.
-const STOPPED_BEFORE: &str = "the bridge stopped before it ran";
 
 /// The watchdog, until the device worker is dead: an operation past its deadline by
 /// [`BLOCKED_GRACE`]; with none running, a heartbeat silent past [`IDLE_BOUND`]; or the blocking
@@ -605,10 +589,10 @@ impl Running {
             if let Some(supervisor) = self.supervisor.take() {
                 supervisor.abort();
             }
-            // The worker takes nothing more; what still waits for it will not run, and is refused —
-            // on Error and on its response topic — before the session's last words (re-gate R15).
+            // The worker takes nothing more; what still waits for it will not run, and the session's
+            // flush refuses it — on Error and on its response topic — before its last words
+            // (re-gate R15).
             let _ = self.worker_stop.send(true);
-            worker::report_refused(&self.reports, self.mailbox.disconnected(), STOPPED_BEFORE);
             let _ = self.shutdown.send(true);
             // A worker whose thread the watchdog found blocked will not stop: not waited for.
             let worker = self.worker.take().filter(|_| !self.worker_blocked);
