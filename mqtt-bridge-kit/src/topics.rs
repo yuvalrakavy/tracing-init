@@ -123,8 +123,15 @@ impl Topics {
     /// request (re-gate R17). The `Event` lane stays open: replies are Event-shaped, and the kit
     /// spec has them arrive there.
     pub fn is_reserved_for_replies(&self, topic: &str) -> bool {
-        let any_instance = ["Desired", "Command", "Config"].iter().any(|lane| topic.starts_with(&format!("{}/{lane}/", self.root)));
-        any_instance || self.on_own_lane(topic, &["Desired", "Command", "Config", "State", "Error", "Status", "Active", "Version"])
+        // Any kit request lane, by its shape — `{Root}/{Desired|Command|Config}/{instance}…` —
+        // under any root: another family's bridge would take a reply there for a request (re-gate
+        // 3 S6: only this bridge's root was guarded).
+        let mut segments = topic.split('/');
+        let any_request_lane = matches!(
+            (segments.next(), segments.next(), segments.next()),
+            (Some(root), Some("Desired" | "Command" | "Config"), Some(instance)) if !root.is_empty() && !instance.is_empty()
+        );
+        any_request_lane || self.on_own_lane(topic, &["State", "Error", "Status", "Active", "Version"])
     }
 
     fn on_own_lane(&self, topic: &str, lanes: &[&str]) -> bool {
@@ -207,6 +214,10 @@ mod tests {
         }
         assert!(!t.is_reserved_for_replies("Aircondition/Replies/ctrl") && !t.is_reserved_for_replies("Store/replies/1"));
         assert!(!t.is_reserved_for_replies("Aircondition/Event/ctrl"), "the Event lane, where replies arrive, was reserved");
+        // Any kit request lane, by its shape, under any root (re-gate 3 S6).
+        for other in ["Lutron/Command/x", "IR/Desired/tv/u1/power", "Dmx/Config/u/1"] {
+            assert!(t.is_reserved_for_replies(other), "another family's request lane `{other}` was not reserved");
+        }
         assert_eq!(t.command(), "Aircondition/Command/ctrl");
         assert_eq!(t.config_filter(), "Aircondition/Config/ctrl/#");
         assert_eq!(t.event(), "Aircondition/Event/ctrl");

@@ -506,6 +506,14 @@ impl Reports {
         }
     }
 
+    /// The Store retracted a request of this key: it saw the assumed State and confirmed it, so the
+    /// assumption stands (re-gate 3 S6). Never waits.
+    pub fn assumption_settled(&self, target: &str, property: &str) {
+        if let Some(model) = self.locked().targets.get_mut(target) {
+            model.unproven.remove(property);
+        }
+    }
+
     /// These writes were proven (a probe or read after them): their assumptions stand. Never waits.
     pub fn assumptions_proven(&self, values: &[crate::mailbox::StateValue]) {
         let mut state = self.locked();

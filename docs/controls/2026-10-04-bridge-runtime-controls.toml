@@ -2389,3 +2389,25 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_late_refusal_stamp_is_cleared_by_the_next_call_that_gets_its_place", "--exact"]
 expect_text = '''a stale refusal stamp stood while calls had their places'''
 guard       = "cap_stamp_cleared"
+
+# Re-gate 3 S6: a retraction settles the key's unproven assumption.
+[[control]]
+name        = "a_retraction_leaves_the_assumption_unproven"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''                    shared.reports.assumption_settled(&target, &property);'''
+replacement = '''                    let _ = &property;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_retraction_settles_the_keys_unproven_assumption", "--exact"]
+expect_text = '''a retraction left the key's assumption unproven'''
+guard       = "retraction_settles"
+
+# Re-gate 3 S6: replies may not go to any kit request lane, by shape, under any root.
+[[control]]
+name        = "another_familys_request_lane_takes_replies"
+file        = "mqtt-bridge-kit/src/topics.rs"
+anchor      = '''            (Some(root), Some("Desired" | "Command" | "Config"), Some(instance)) if !root.is_empty() && !instance.is_empty()'''
+replacement = '''            (Some(root), Some("Desired" | "Command" | "Config"), Some(instance)) if root == self.root && !instance.is_empty()'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "topics::tests::the_lanes_follow_the_grammar", "--exact"]
+expect_text = '''another family's request lane `Lutron/Command/x` was not reserved'''
+guard       = "reply_lanes_any_root"

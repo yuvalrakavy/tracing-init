@@ -102,3 +102,21 @@ fn the_panic_seam_is_off_without_its_feature() {
     std::env::remove_var(TEST_PANIC_TOPIC);
     assert!(ran.is_ok(), "the panic seam is on in a build without the test-seams feature");
 }
+
+/// A retraction settles an unproven assumption of its key: the Store saw the assumed State and
+/// confirmed it, so the conflict rule takes the assumed value, not the one before it (re-gate 3 S6).
+#[test]
+fn a_retraction_settles_the_keys_unproven_assumption() {
+    let shared = shared_for_port();
+    shared.reports.assume_unproven("t1", serde_json::json!({"level": 40}).as_object().unwrap().clone());
+    assert_eq!(shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()), None);
+    let topic = shared.topics.desired("t1", "level");
+    let mut retraction = Publish::new(topic.clone(), QoS::AtLeastOnce, Vec::<u8>::new(), None);
+    retraction.retain = true;
+    route(&shared, &topic, &retraction, Instant::now());
+    assert_eq!(
+        shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
+        Some(serde_json::json!(40)),
+        "a retraction left the key's assumption unproven"
+    );
+}

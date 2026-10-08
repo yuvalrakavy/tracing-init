@@ -493,7 +493,10 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
             let report = blank().target(Some(&target)).property(&property);
             match wire::decode_desired_property(payload) {
                 Err(e) => malformed(e, report),
-                Ok(None) => shared.mailbox.retract(&target, &property),
+                Ok(None) => {
+                    shared.mailbox.retract(&target, &property);
+                    shared.reports.assumption_settled(&target, &property);
+                }
                 Ok(Some(value)) => match wire::request_meta(properties, now) {
                     Err(e) => malformed(e, report),
                     Ok(meta) => {

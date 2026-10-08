@@ -234,8 +234,9 @@ commands are refused, and reads are dropped.
   - A response topic on the bridge's own lanes is refused as `malformed`: on those it reads
     (`Desired`, `Command`, `Config`) the reply would be read back as a request; on those it
     publishes but `Event` (`State`, `Error`, `Status`, `Active`, `Version`) it would pass for the
-    bridge's own report. So is one on any instance's request lane under the same root, where
-    another bridge would take it for a request (re-gate R17). The `Event` lane stays open: replies
+    bridge's own report. So is one on any kit request lane by its shape —
+    `{Root}/{Desired|Command|Config}/{instance}…` under any root — where another bridge would take
+    it for a request (re-gate R17, re-gate 3 S6). The `Event` lane stays open: replies
     are Event-shaped (`"kind":"reply"`), and the kit spec has them arrive there.
   - A target-level write's property copies are skipped for 60 s.
   - `configure` is called only while connected. Configs are held while down and applied first in the
