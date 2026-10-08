@@ -465,6 +465,10 @@ impl Bridge {
             read_back_requested: AtomicBool::new(false),
             read_back_late: std::sync::atomic::AtomicU32::new(0),
             read_back_next: AtomicBool::new(false),
+            restore: info.restore,
+            restored: AtomicBool::new(false),
+            restore_said: AtomicBool::new(false),
+            subscriptions_pending: std::sync::atomic::AtomicU32::new(u32::MAX),
         });
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (worker_stop, worker_stop_rx) = watch::channel(false);

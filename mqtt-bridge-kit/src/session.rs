@@ -107,6 +107,14 @@ pub(crate) struct Shared {
     /// The read-back's packet id plus one, while its SUBACK is late (0: none): a late SUBACK that
     /// grants it completes the read-back.
     pub read_back_late: std::sync::atomic::AtomicU32,
+    /// Whether the driver restores one-way targets from the read-back (`DriverInfo::restore`), and
+    /// whether that was done, or said undone, once.
+    pub restore: bool,
+    pub restored: AtomicBool,
+    pub restore_said: AtomicBool,
+    /// The request subscriptions whose SUBACK has not come yet: behind the last, every retained
+    /// Config and Desired has been read, and a restore can leave them to go first.
+    pub subscriptions_pending: std::sync::atomic::AtomicU32,
     /// The read-back's SUBACK granted it, and the retained `State` it replays follow it: the next
     /// SUBACK — the next subscription's, sent after it — comes behind them, and completes the
     /// read-back.
@@ -206,9 +214,10 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
         let connack = matches!(step, Step::Event(Some(PumpEvent::Connected)));
         accepted |= connack;
         if let Step::Event(Some(PumpEvent::SubAck { pkid, granted })) = &step {
+            let _ = shared.subscriptions_pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
             if shared.read_back_next.swap(false, Ordering::SeqCst) {
                 // The next subscription's SUBACK, behind the read-back's replay.
-                shared.reports.read_back_complete();
+                read_back_complete(shared);
             } else if shared.read_back_late.load(Ordering::SeqCst) == u32::from(*pkid) + 1 {
                 // The read-back's SUBACK, past its wait: its replay follows it, and the SUBACKs of
                 // the subscriptions made after it — sent after it, answered in order — come behind
@@ -220,6 +229,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                 }
             }
         }
+        restore_when_ready(shared);
         let work = async {
             match step {
                 Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client, &mut incoming).await.map(|goes_on| {
@@ -263,7 +273,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                 // there is.
                 shared.read_back_late.store(0, Ordering::SeqCst);
                 if shared.read_back_next.swap(false, Ordering::SeqCst) {
-                    shared.reports.read_back_incomplete();
+                    read_back_incomplete(shared);
                 }
                 return SessionEnd::Ended { connected: accepted };
             }
@@ -297,7 +307,7 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
             // Complete once its replay is in: at the next SUBACK, behind it.
             ReadBack::Granted => shared.read_back_next.store(true, Ordering::SeqCst),
             ReadBack::Refused => {
-                shared.reports.read_back_incomplete();
+                read_back_incomplete(shared);
                 warn!(
                     kind = "read_back_incomplete",
                     refused = true,
@@ -306,7 +316,7 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
             }
             ReadBack::Late(pkid) => {
                 shared.read_back_late.store(pkid.map_or(0, |p| u32::from(p) + 1), Ordering::SeqCst);
-                shared.reports.read_back_incomplete();
+                read_back_incomplete(shared);
                 warn!(
                     kind = "read_back_incomplete",
                     waited_ms = READ_BACK_WAIT.as_millis() as u64,
@@ -321,12 +331,14 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
     // live retained one keeps its flag and is refused like a replayed one. Property writes are
     // retained by design: their subscription clears the flag on a live delivery, so only a replay
     // arrives flagged (review C10).
-    for (filter, retain_as_published) in [
+    let requests = [
         (topics.config_filter(), false),
         (topics.desired_target_filter(), true),
         (topics.desired_property_filter(), false),
         (topics.command(), true),
-    ] {
+    ];
+    shared.subscriptions_pending.store(requests.len() as u32, Ordering::SeqCst);
+    for (filter, retain_as_published) in requests {
         let filter = Filter { preserve_retain: retain_as_published, ..Filter::new(filter, QoS::AtLeastOnce) };
         // WAIT: mqtt-request
         client.subscribe_many(vec![filter]).await?;
@@ -464,7 +476,13 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
         Inbound::State { target } => {
             if publish.retain {
                 match wire::decode_state(payload) {
-                    Ok(values) => shared.reports.read_back(&target, values),
+                    Ok(values) => {
+                        let assumed = serde_json::from_slice::<serde_json::Value>(payload)
+                            .ok()
+                            .and_then(|v| v.get("assumed").and_then(serde_json::Value::as_bool))
+                            .unwrap_or(false);
+                        shared.reports.read_back(&target, values, assumed)
+                    }
                     Err(e) => debug!(target = %target, error = %e, "The retained state read back is not a state; ignored"),
                 }
             }
@@ -642,6 +660,57 @@ fn panic_for_test(topic: &str) {
 
 #[cfg(not(feature = "test-seams"))]
 fn panic_for_test(_: &str) {}
+
+/// How long a restored value may wait for the device: an AC's `RequestExpiry` (kit spec, Q3).
+pub const RESTORE_EXPIRY: Duration = Duration::from_secs(3600);
+
+/// The read-back is complete. With restore on, once per process: each value the previous run
+/// assumed is posted as an ordinary held request — `RequestWins`, within [`RESTORE_EXPIRY`] — but
+/// a key a request was posted for since the start is left to it; from then on the mailbox's rules
+/// apply as to any request (re-gate S1: the restore had machinery of its own, and defects with it).
+fn read_back_complete(shared: &Shared) {
+    shared.reports.read_back_complete();
+    restore_when_ready(shared);
+}
+
+/// The restore, once the read-back is complete and every request subscription is acknowledged —
+/// behind the last SUBACK every retained Config and Desired has been posted, so the configs go
+/// first and a newer request keeps its key (re-gate S1).
+fn restore_when_ready(shared: &Shared) {
+    if !shared.restore || !shared.reports.read_back_is_complete() || shared.subscriptions_pending.load(Ordering::SeqCst) > 0 {
+        return;
+    }
+    if shared.restored.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let values: Vec<StateValue> = shared
+        .reports
+        .read_back_assumed()
+        .into_iter()
+        .flat_map(|(target, values)| {
+            values.into_iter().map(move |(property, value)| StateValue {
+                target: target.clone(),
+                property,
+                value,
+                deadline: None,
+                conflict: crate::wire::Conflict::RequestWins,
+                check: Check::default(),
+                basis: None,
+            })
+        })
+        .collect();
+    let posted = shared.mailbox.post_restore(values, Instant::now() + RESTORE_EXPIRY);
+    info!(values = posted, "Restoring one-way targets from the read-back");
+}
+
+/// The read-back is incomplete. With restore on, nothing is restored unless it completes after
+/// all: said once, and nothing waits for it.
+fn read_back_incomplete(shared: &Shared) {
+    shared.reports.read_back_incomplete();
+    if shared.restore && !shared.restored.load(Ordering::SeqCst) && !shared.restore_said.swap(true, Ordering::SeqCst) {
+        warn!(kind = "restore_incomplete", "The read-back is incomplete: no one-way target is restored unless it completes");
+    }
+}
 
 /// What a stop refuses: a command still waiting for the device.
 const STOPPED_BEFORE: &str = "the bridge stopped before it ran";

@@ -253,23 +253,3 @@ fn a_device_that_drops_right_after_its_catch_up_is_one_outage() {
     let recovered = log.of_kind("device_recovered");
     assert!(recovered.len() == 1 && recovered[0].field("applied") == Some("3"), "{:#?}", log.records());
 }
-
-/// A restore waits for the retained replays to go quiet — a config or a replayed request arriving
-/// after the read-back is done restarts the window — however soon the read-back was done (the R1
-/// re-gate's R5: a SUBACK is no proof they were handled).
-#[tokio::test]
-async fn a_restore_waits_for_the_replays_to_go_quiet() {
-    let reports = Reports::new();
-    let mailbox = Mailbox::new();
-    reports.read_back_complete();
-    let started = Instant::now();
-    let posting = mailbox.clone();
-    let poster = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = posting.post_config("t1", Some(json!({"channel": 1})));
-    });
-    restore_ready(&reports, &mailbox, false).await;
-    let waited = started.elapsed();
-    let _ = poster.await;
-    assert!(waited >= RESTORE_QUIET + Duration::from_millis(90), "the restore did not wait for the replays to go quiet: {waited:?}");
-}

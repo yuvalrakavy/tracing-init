@@ -50,7 +50,6 @@ side.
 | `session-retry` | acyclic | the pause between MQTT sessions, raced against the shutdown | A timer (`poll_retry`, and `retry` after every fifth failed connect in a row) and a watch channel: nothing here waits on the session. |
 | `shutdown-flush` | bounded | `Active=false`, DISCONNECT, and the pump's word that it was written | `FLUSH_BOUND`, 2 s. On expiry one INFO `bridge_shutdown_cut`, and the last will says `Active=false` when the broker notices the connection gone. Skipped at once when the broker is out of reach. |
 | `read-back-suback` | bounded | the read-back's SUBACK, on the pump's queue (`read_back_acknowledged`, the process's first CONNACK) | `READ_BACK_WAIT`, 5 s; publishes that arrive meanwhile are handled as ever. On expiry the requests are subscribed without it, with WARN `read_back_incomplete`; a session that ends meanwhile ends the wait. The pump never waits on the session (`mqtt-pump-queue`), and a broker that acknowledges nothing at all ends the session within `stall_bound` (`mqtt-poll`). |
-| `read-back-ready` | bounded | the read-back's end (`Reports::read_back_completed`, `read_back_reached`, a notify), for a restore (`DriverInfo::restore`) | The session sets it — complete at the SUBACK after the read-back's, behind which every retained `State` has been read, or at a late SUBACK that grants it; incomplete when the read-back's own wait expires, the broker refuses it, or its session ends — and waits on nothing of the worker's. The catch-up's wait (`read_back_completed`) has a zero bound: on expiry — not yet done — the restore is left to the Up loop, which races `read_back_reached` against every other step (`worker-up`), so a read-back that never comes holds up nothing (re-gate R11). |
 | `reports-ready` | acyclic | the next report (`Reports::reported`) | An idle wait for work, the session's. A report never waits — a short lock, then `Notify::notify_one`, which keeps a permit when nobody is waiting — so no reporter waits on the session. The retained model coalesces per target; `Error` and `Event` are capped (64 each), the oldest displaced past it, one WARN per episode. |
 | `reports-lock` | acyclic | the reports' state (`lock-order` mutex, class `reports-lock`) | Held only to change or copy what waits for the session: never across an await, no other lock taken under it, nothing logged under it — the displacement lines are logged after the guard is dropped. |
 | `mailbox-posted` | acyclic | the mailbox, read by the worker (`Mailbox::take`) | An idle wait for work. A post never waits — a short lock, then a notify — so no poster waits on the worker. The worker takes only while the device is up; while it is down nothing takes: state waits (the latest per key, so bounded), momentary commands are refused at once, reads dropped. |
@@ -81,7 +80,7 @@ wait-methods = publish, publish_with_properties, subscribe, subscribe_many, unsu
 not-waits = sleep, sleep_until, yield_now
 # The driver trait's methods, awaited on a driver: this code's own (every call is bounded by its
 # caller, `op`).
-local-methods = read_state, configure, probe, blocking, read_back_completed, read_back_reached
+local-methods = read_state, configure, probe, blocking
 raw-locks = forbid
 ```
 
@@ -117,8 +116,6 @@ mqtt-request src/session.rs emit
 mqtt-request src/session.rs flush
 panic-report src/process.rs PanicReports::report
 panic-report src/process.rs PanicReports::start
-read-back-ready src/reports.rs Reports::read_back_completed
-read-back-ready src/reports.rs Reports::read_back_reached
 read-back-suback src/session.rs read_back_acknowledged
 reports-lock src/reports.rs Reports::locked
 reports-ready src/reports.rs Reports::reported

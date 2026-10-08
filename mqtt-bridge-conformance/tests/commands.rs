@@ -450,8 +450,8 @@ async fn a_restore_waits_for_a_broker_that_comes_up_after_the_device() {
         device.answer(Op::Read, None, Answer::Unsupported);
     })
     .await;
-    // The device is up at once; the broker, for 11 s, is not (past the old 10 s bound).
-    tokio::time::sleep(Duration::from_secs(11)).await;
+    // The device is up at once; the broker, for 3 s, is not.
+    tokio::time::sleep(Duration::from_secs(3)).await;
     h.broker.refuse_connections(false);
     assert!(h.broker.wait_for_subscription(&h.topics.command(), BOUND).await, "the bridge never subscribed");
     assert!(
@@ -544,7 +544,9 @@ async fn a_restore_refused_in_part_keeps_what_it_wrote() {
         "the refused property of the restore was not said: {:#?}",
         h.log.records()
     );
-    assert!(h.errors().is_empty(), "a restore's refusal went to Error, for a request nobody made: {:?}", h.errors());
+    // A restore is an ordinary request now (re-gate S1): the refused property alone goes to Error.
+    let refused: Vec<_> = h.errors().iter().filter_map(|e| e["property"].as_str().map(str::to_owned)).collect();
+    assert_eq!(refused, ["color"], "the Error of a restore refused in part named more than the refused property");
     assert!(h.stop().await);
 }
 
@@ -571,29 +573,6 @@ async fn an_unproven_restore_is_applied_again_when_the_link_dies_before_proof() 
     assert!(h.stop().await);
 }
 
-/// A restore in the catch-up configures first a config that came while it waited for the replays
-/// to go quiet — one that came after the device was proven waits as not held, and nothing else
-/// takes it while the catch-up runs (the R1 re-gate's R5).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_restore_in_the_catch_up_configures_a_config_that_came_meanwhile() {
-    let h = Harness::start_with("restore-catchup-config", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
-        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
-        device.answer(Op::Read, None, Answer::Unsupported);
-        device.set_up(false);
-    })
-    .await;
-    // The read-back is in long before the device comes up.
-    h.settle(Duration::from_millis(500)).await;
-    let probes = h.device.calls_of(Op::Probe).len();
-    h.device.set_up(true);
-    assert!(h.eventually(BOUND, |h| h.device.calls_of(Op::Probe).len() > probes).await, "the device was never proven");
-    assert!(h.broker.publish(&h.topics.config("dimmer"), json!({"channel": 7}).to_string(), &SendOptions::default().retained()));
-    assert!(h.eventually(BOUND, |h| h.device.get("dimmer", "level") == Some(json!(40))).await, "the target was never restored");
-    let ops: Vec<Op> = h.device.calls().iter().filter(|c| c.target.as_deref() == Some("dimmer")).map(|c| c.op).collect();
-    assert_eq!(ops.first(), Some(&Op::Configure), "the restore wrote before a config that came while it waited: {ops:?}");
-    assert!(h.stop().await);
-}
-
 /// An `assume` naming a property that cannot stand as a topic segment is the Store's malformed
 /// input: refused as `malformed` and answered — not a driver's contract violation, and not
 /// answered `done` (Claude's re-gate minor 6).
@@ -605,5 +584,92 @@ async fn an_assume_with_a_bad_property_name_is_malformed() {
     assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the assume was not answered");
     assert_eq!(json_of(&h.published("Store/r")[0])["reason"], "malformed", "a bad assume was not refused as malformed");
     assert!(h.log.of_kind("driver_contract_violation").is_empty(), "the Store's input was taken for a driver bug");
+    assert!(h.stop().await);
+}
+
+/// With no read-back — the broker refuses it — nothing is restored: one WARN `restore_incomplete`,
+/// and nothing waits for it: a request is applied at once (re-gate S1: the old restore waited for
+/// a read-back that never came, and held up the catch-up for good).
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_read_back_nothing_is_restored_and_nothing_waits() {
+    let h = Harness::start_with("restore-none", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        broker.deny_subscriptions(&format!("{}/State/", topics.root()));
+        device.answer(Op::Read, None, Answer::Unsupported);
+    })
+    .await;
+    assert!(connected(&h).await);
+    assert!(h.desire("t1", "temp", json!(22), Req { expiry: Some(60), conflict: Some("RequestWins") }));
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await,
+        "a request waited behind a restore with no read-back"
+    );
+    // A device outage, and the next catch-up: nothing waits there either (the re-gate's RG3-4).
+    h.device.set_up(false);
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    h.device.set_up(true);
+    assert!(connected(&h).await);
+    assert!(h.desire("t1", "temp", json!(23), Req { expiry: Some(60), conflict: Some("RequestWins") }));
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(23))).await,
+        "the catch-up after an outage waited on the restore"
+    );
+    assert_eq!(h.device.get("dimmer", "level"), None, "restored without a read-back");
+    assert_eq!(h.log.of_kind("restore_incomplete").len(), 1, "no restore without a read-back was not said once");
+    assert!(h.stop().await);
+}
+
+/// The restore runs however busy the worker is — a 200 ms poll, and a request every 100 ms — as
+/// it is an ordinary request waiting in the mailbox (re-gate S1; the re-gate's RG3-1: a restore
+/// waiting for a quiet moment in the Up loop never ran).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_runs_under_a_fast_poll_and_a_stream_of_requests() {
+    let timing = mqtt_bridge_kit::TimingOverrides { poll: Some(Some(Duration::from_millis(200))), ..quick_timing() };
+    let h = Harness::start_unwaited("restore-busy", restoring(Writes::Acknowledged), timing, |broker, topics, _| {
+        broker.cap_connections(10_000);
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        broker.refuse_connections(true);
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    h.broker.refuse_connections(false);
+    assert!(h.broker.wait_for_subscription(&h.topics.command(), BOUND).await, "never subscribed");
+    let started = std::time::Instant::now();
+    let mut i = 0;
+    while started.elapsed() < Duration::from_secs(3) && h.device.get("dimmer", "level") != Some(json!(40)) {
+        let _ = h.desire("t1", "temp", json!(i), Req { expiry: Some(60), conflict: Some("RequestWins") });
+        i += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(h.device.get("dimmer", "level"), Some(json!(40)), "the restore never ran under a fast poll and a stream of requests");
+    assert!(h.stop().await);
+}
+
+/// After a read-back the broker refused, a device outage's catch-up does not wait on a restore: a
+/// held request and a command are served (the re-gate's RG3-4: the old restore waited there, with
+/// no bound, for a read-back that could not come).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_up_after_a_refused_read_back_does_not_wait() {
+    let timing = mqtt_bridge_kit::TimingOverrides { poll: Some(Some(Duration::from_millis(500))), ..quick_timing() };
+    let info = mqtt_bridge_kit::DriverInfo { restore: true, ..acknowledged() };
+    let h = Harness::start_with("restore-refused-catchup", info, timing, |broker, topics, device| {
+        device.set("t1", "temp", json!(20));
+        broker.deny_subscriptions(&format!("{}/State/", topics.root()));
+    })
+    .await;
+    assert!(connected(&h).await);
+    assert!(h.eventually(Duration::from_secs(5), |h| !h.log.of_kind("restore_incomplete").is_empty()).await, "no restore was said undone");
+    h.device.set_up(false);
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "the outage was never seen");
+    h.device.set_up(true);
+    assert!(connected(&h).await, "never reconnected");
+    assert!(h.desire("t1", "temp", json!(22), Req { expiry: Some(60), conflict: Some("RequestWins") }));
+    let replies = "Store/replies/refused-catchup";
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"h-1"))));
+    assert!(
+        h.eventually(Duration::from_secs(8), |h| h.device.get("t1", "temp") == Some(json!(22))).await,
+        "after a refused read-back, the next catch-up waited: the request was never applied"
+    );
+    assert!(h.eventually(BOUND, |h| !h.published(replies).is_empty()).await, "the command was never answered");
     assert!(h.stop().await);
 }

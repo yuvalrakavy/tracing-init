@@ -42,39 +42,6 @@ pub const BUSY_PROBE: Duration = Duration::from_secs(2);
 /// The bound on `disconnect` at shutdown.
 pub const DISCONNECT_BOUND: Duration = Duration::from_secs(2);
 
-/// A restore (`DriverInfo::restore`) waits for the read-back, however long, and then for the
-/// retained replays — configs, requests — to go quiet this long: a SUBACK is no proof they were
-/// handled (re-gate R5, R11).
-pub const RESTORE_QUIET: Duration = Duration::from_millis(300);
-/// The longest a restore waits for the replays to go quiet, once the read-back is done.
-pub const RESTORE_QUIET_CAP: Duration = Duration::from_secs(3);
-
-/// Where a write comes from: a request, whose failure goes to `Error`, or a restore, whose failure
-/// is said in the log — no request was made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Origin {
-    Request,
-    Restore,
-}
-
-/// Until a restore can run: the read-back done — complete, after a restore that ran on an
-/// incomplete one — and the retained replays quiet for [`RESTORE_QUIET`] (at most
-/// [`RESTORE_QUIET_CAP`] after the read-back). Cancellation-safe.
-async fn restore_ready(reports: &Reports, mailbox: &Mailbox, complete: bool) {
-    reports.read_back_reached(complete).await;
-    let done = Instant::now();
-    let cap = done + RESTORE_QUIET_CAP;
-    loop {
-        // Quiet since the read-back was done at the least: the replays come behind it.
-        let quiet = mailbox.quiet_for().unwrap_or(Duration::MAX).min(done.elapsed());
-        let now = Instant::now();
-        if quiet >= RESTORE_QUIET || now >= cap {
-            return;
-        }
-        tokio::time::sleep((RESTORE_QUIET - quiet).min(cap - now)).await;
-    }
-}
-
 /// The device's reachability as the worker sees it. The worker outlives every link, so an outage
 /// is one episode however many attempts it takes (the logging policy, and the owner's device-down
 /// policy).
@@ -299,8 +266,6 @@ enum Step {
     Stable,
     Probe,
     Poll,
-    /// The read-back is in, and the replays quiet: the restore runs.
-    Restore,
     Work(Work),
 }
 
@@ -331,26 +296,11 @@ pub(crate) struct Worker<D: DeviceDriver> {
     configured: HashMap<String, Option<Value>>,
     /// Whether the driver's `Unsupported` probe was said (once per process).
     unsupported_probe_said: bool,
-    /// Whether the one-way targets are still to be restored from the read-back
-    /// (`DriverInfo::restore`): until a restore ran on the whole read-back, and each of its writes
-    /// was made or refused for good.
-    restore_due: bool,
-    /// Whether a restore ran on an incomplete read-back (said once): the next waits for the whole.
-    restore_partial: bool,
-    /// The keys a request wrote since the start, and those a restore wrote or had refused: a
-    /// restore leaves them alone.
-    written_keys: std::collections::HashSet<(String, String)>,
-    restored_keys: std::collections::HashSet<(String, String)>,
 }
 
 impl<D: DeviceDriver> Worker<D> {
     pub(crate) fn new(driver: D, info: DriverInfo, instance: &str, mailbox: Arc<Mailbox>, reports: Arc<Reports>) -> Worker<D> {
-        let restore_due = info.restore;
         Worker {
-            restore_due,
-            restore_partial: false,
-            written_keys: Default::default(),
-            restored_keys: Default::default(),
             driver,
             outage: DeviceOutage::new(info.timing.outage_warn, info.timing.stable),
             info,
@@ -483,15 +433,9 @@ impl<D: DeviceDriver> Worker<D> {
             proving.entry(state.target).or_default().extend(state.values);
         }
         let mut applied = 0;
-        // A target's setup first; then a one-way device's restore, if it is due and its read-back is
-        // in (else the Up loop runs it when it is); then the held values.
+        // A target's setup first, then the held values.
         while let Some((target, config)) = self.mailbox.take_held_config() {
             self.configure(handle, &target, config).await?;
-        }
-        if self.restore_due && self.reports.read_back_completed(Duration::ZERO).await {
-            let (reports, mailbox) = (self.reports.clone(), self.mailbox.clone());
-            restore_ready(&reports, &mailbox, self.restore_partial).await;
-            applied += self.restore(handle).await?;
         }
         loop {
             match self.mailbox.take_held() {
@@ -499,7 +443,7 @@ impl<D: DeviceDriver> Worker<D> {
                 Some(Held::Config { target, config }) => self.configure(handle, &target, config).await?,
                 Some(Held::Values(held)) => {
                     let apply = self.decide(handle, &held.target, held.values, &proving).await?;
-                    applied += self.write_values(handle, &held.target, apply, Origin::Request).await?;
+                    applied += self.write_values(handle, &held.target, apply).await?;
                 }
             }
         }
@@ -507,68 +451,6 @@ impl<D: DeviceDriver> Worker<D> {
             self.probe(handle).await?;
         }
         Ok(applied)
-    }
-
-    /// Restore a one-way device (`DriverInfo::restore`, review M8): each target with assumed
-    /// feedback gets the read-back's values — what the previous run said it had set — written as
-    /// any write is (its outcome, `Partial` included, its assumption and its proof shared with a
-    /// request's; review R7), but for a property a request wrote since the start or still waits
-    /// for. Every config waiting goes first. Done once on the whole read-back; on an incomplete one
-    /// it restores what came, says so once, and stays due for the rest (review R11). Returns how
-    /// many values were written; a lost link leaves what is left to the next link.
-    async fn restore(&mut self, handle: &LinkHandle) -> Result<usize, LinkError> {
-        while let Some((target, config)) = self.mailbox.take_config() {
-            self.configure(handle, &target, config).await?;
-        }
-        let complete = self.reports.read_back_is_complete();
-        let (mut restored, mut targets) = (0, 0);
-        for (target, values) in self.reports.read_back_all() {
-            if self.mailbox.feedback(&target, self.info.feedback) != Feedback::Assumed {
-                continue;
-            }
-            let values: Vec<StateValue> = values
-                .into_iter()
-                .filter(|(property, _)| {
-                    let key = (target.clone(), property.clone());
-                    !self.written_keys.contains(&key)
-                        && !self.restored_keys.contains(&key)
-                        && !self.mailbox.waits_for_key(&target, property)
-                })
-                .map(|(property, value)| StateValue {
-                    target: target.clone(),
-                    property,
-                    value,
-                    deadline: None,
-                    conflict: Conflict::RequestWins,
-                    check: Default::default(),
-                    basis: None,
-                })
-                .collect();
-            if values.is_empty() {
-                continue;
-            }
-            let keys: Vec<(String, String)> = values.iter().map(|v| (v.target.clone(), v.property.clone())).collect();
-            self.mailbox.begin_restore(values.clone());
-            let written = self.write_values(handle, &target, values, Origin::Restore).await?;
-            // Each key is done: written, or refused for good and said.
-            self.restored_keys.extend(keys);
-            restored += written;
-            targets += usize::from(written > 0);
-        }
-        if targets > 0 {
-            info!(targets, values = restored, "Restored one-way targets from the read-back");
-        }
-        if complete {
-            self.restore_due = false;
-        } else if !std::mem::replace(&mut self.restore_partial, true) {
-            warn!(
-                kind = "restore_incomplete",
-                targets,
-                values = restored,
-                "The read-back is incomplete: one-way targets were restored from what came, and will be from the rest if it comes"
-            );
-        }
-        Ok(restored)
     }
 
     /// Requests a change at the device won (`unknown`: whose current value is unknown, under
@@ -594,13 +476,7 @@ impl<D: DeviceDriver> Worker<D> {
 
     /// Apply one target's values together. A failure of the request alone is reported and the
     /// request passed over; only a lost link is an error.
-    async fn write_values(
-        &mut self,
-        handle: &LinkHandle,
-        target: &str,
-        values: Vec<StateValue>,
-        origin: Origin,
-    ) -> Result<usize, LinkError> {
+    async fn write_values(&mut self, handle: &LinkHandle, target: &str, values: Vec<StateValue>) -> Result<usize, LinkError> {
         if values.is_empty() {
             self.mailbox.failed();
             return Ok(0);
@@ -612,9 +488,6 @@ impl<D: DeviceDriver> Worker<D> {
         match op(handle, timing.operation, "apply", self.driver.apply(target, &map)).await {
             Ok(()) => {
                 self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
-                if origin == Origin::Request {
-                    self.written_keys.extend(values.iter().map(|v| (v.target.clone(), v.property.clone())));
-                }
                 if self.info.writes == Writes::Acknowledged {
                     // What the device acknowledged is what the bridge knows (the lead's F2).
                     self.reports.written(target, &map, reported_before);
@@ -639,9 +512,6 @@ impl<D: DeviceDriver> Worker<D> {
                 if self.info.writes == Writes::Acknowledged {
                     self.reports.written(target, &applied, reported_before);
                 }
-                if origin == Origin::Request {
-                    self.written_keys.extend(applied.keys().map(|p| (target.to_owned(), p.clone())));
-                }
                 if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before && !applied.is_empty() {
                     self.assume(target, applied);
                 }
@@ -651,10 +521,6 @@ impl<D: DeviceDriver> Worker<D> {
                         FailureClass::Unusable => Reason::Unusable,
                         FailureClass::Unsupported => Reason::Unsupported,
                     };
-                    if origin == Origin::Restore {
-                        warn!(kind = "command_rejected", target, property = %failure.property, error = %failure.error, "The device refused a property of a restore from the read-back");
-                        continue;
-                    }
                     if reason == Reason::Rejected {
                         warn!(kind = "command_rejected", target, property = %failure.property, error = %failure.error, "The device rejected a property of a request");
                     } else {
@@ -668,16 +534,6 @@ impl<D: DeviceDriver> Worker<D> {
                 self.mailbox.failed();
                 let properties: Vec<&str> = values.iter().map(|v| v.property.as_str()).collect();
                 let (reason, message) = classify(&failure);
-                if origin == Origin::Restore {
-                    warn!(
-                        kind = "command_rejected",
-                        target,
-                        ?properties,
-                        error = message,
-                        "The device refused a restore from the read-back"
-                    );
-                    return Ok(0);
-                }
                 match reason {
                     Reason::Rejected => {
                         warn!(kind = "command_rejected", target, ?properties, error = message, "The device rejected a request")
@@ -777,7 +633,6 @@ impl<D: DeviceDriver> Worker<D> {
         let mut last_read = Instant::now();
         let mut last_heard = Instant::now();
         let mailbox = self.mailbox.clone();
-        let reports = self.reports.clone();
         loop {
             let poll_at = timing.poll.map(|p| last_read + p);
             let probe_at = self.probe_due(last_heard);
@@ -789,8 +644,6 @@ impl<D: DeviceDriver> Worker<D> {
                 () = sleep_until(stable_at) => Step::Stable,
                 () = sleep_until(probe_at) => Step::Probe,
                 () = sleep_until(poll_at) => Step::Poll,
-                // A restore whose read-back was not in at the catch-up, when it is (review R11).
-                () = restore_ready(&reports, &mailbox, self.restore_partial), if self.restore_due => Step::Restore,
                 work = mailbox.take() => Step::Work(work),
             };
             let outcome = match step {
@@ -829,7 +682,6 @@ impl<D: DeviceDriver> Worker<D> {
                     }
                 }
                 Step::Work(work) => self.work(handle, work).await,
-                Step::Restore => self.restore(handle).await.map(drop),
             };
             if let Err(e) = outcome {
                 return e;
@@ -842,7 +694,7 @@ impl<D: DeviceDriver> Worker<D> {
         match work {
             Work::Apply { target, values } => {
                 let values = self.decide(handle, &target, values, &BTreeMap::new()).await?;
-                self.write_values(handle, &target, values, Origin::Request).await.map(drop)
+                self.write_values(handle, &target, values).await.map(drop)
             }
             Work::Configure { target, config } => self.configure(handle, &target, config).await,
             Work::Expired { target, call, reply } => {

@@ -309,9 +309,8 @@ struct Inner {
     /// later snapshot that holds the change at the device (re-gate R12). Dropped when the Store
     /// retracts the key or writes it live, or a replay of another value replaces it.
     bases: HashMap<(String, String), (Value, Basis)>,
-    /// When a retained request last arrived — a config, or a replayed value: a restore waits for
-    /// them to go quiet.
-    last_retained: Option<Instant>,
+    /// Every key a request was posted for since the start: a restore leaves it to that request.
+    requested: std::collections::HashSet<(String, String)>,
 }
 
 impl Inner {
@@ -422,8 +421,8 @@ impl Mailbox {
                 _ => {
                     let held = !inner.connected;
                     value.check = Check { replayed: replay, held };
+                    inner.requested.insert(key.clone());
                     if replay {
-                        inner.last_retained = Some(now);
                         match inner.bases.get(&key) {
                             Some((first, basis)) if *first == value.value => value.basis = Some(basis.clone()),
                             _ => {
@@ -456,6 +455,7 @@ impl Mailbox {
             let mut inner = self.locked();
             let held = !inner.connected;
             for mut value in values {
+                inner.requested.insert((value.target.clone(), value.property.clone()));
                 inner.copies.insert((value.target.clone(), value.property.clone()), (value.value.clone(), until));
                 value.check = Check { replayed: false, held };
                 inner.replace_state(value, held);
@@ -467,6 +467,35 @@ impl Mailbox {
             }
         };
         self.queued(posted)
+    }
+
+    /// A restore (`DriverInfo::restore`): each of `values` — what the previous run assumed, from
+    /// the read-back — waits as an ordinary request would, held, checked by the conflict rule
+    /// (`RequestWins`, so a device already at the value is satisfied), until `deadline`; but one
+    /// whose key a request was posted for since the start is left to that request (re-gate S1).
+    /// Returns how many were posted. Never waits.
+    pub fn post_restore(&self, values: Vec<StateValue>, deadline: Instant) -> usize {
+        let (posted, any) = {
+            let mut inner = self.locked();
+            let held = !inner.connected;
+            let mut posted = 0;
+            for mut value in values {
+                let key = (value.target.clone(), value.property.clone());
+                if inner.requested.contains(&key) {
+                    continue;
+                }
+                value.deadline = Some(deadline);
+                value.conflict = Conflict::RequestWins;
+                value.check = Check { replayed: false, held: true };
+                inner.replace_state(value, held);
+                posted += 1;
+            }
+            (posted, posted > 0 && !held)
+        };
+        if any {
+            self.posted.notify_one();
+        }
+        posted
     }
 
     /// A property's request was retracted: nothing of it is applied or held again any more.
@@ -485,7 +514,6 @@ impl Mailbox {
     pub fn post_config(&self, target: &str, config: Option<Value>) -> Posted {
         let posted = {
             let mut inner = self.locked();
-            inner.last_retained = Some(Instant::now());
             inner.pending.retain(|e| !matches!(e, Entry::Config { target: t, .. } if t == target));
             let held = !inner.connected;
             inner.pending.push_back(Entry::Config { target: target.to_owned(), config, held });
@@ -807,30 +835,6 @@ impl Mailbox {
             }
             _ => None,
         }
-    }
-
-    /// The next config waiting, held or not. Never waits.
-    pub fn take_config(&self) -> Option<(String, Option<Value>)> {
-        let mut inner = self.locked();
-        let i = inner.pending.iter().position(|e| matches!(e, Entry::Config { .. }))?;
-        match inner.pending.remove(i) {
-            Some(Entry::Config { target, config, .. }) => {
-                inner.in_flight_config = Some((target.clone(), config.clone()));
-                Some((target, config))
-            }
-            _ => None,
-        }
-    }
-
-    /// A restore's values go to the device: in flight, as a request's, so that their outcome and
-    /// proof are accounted the same way (re-gate R7). Never waits.
-    pub fn begin_restore(&self, values: Vec<StateValue>) {
-        self.locked().in_flight = values;
-    }
-
-    /// How long since a retained request last arrived; `None`, none has. Never waits.
-    pub fn quiet_for(&self) -> Option<Duration> {
-        self.locked().last_retained.map(|at| at.elapsed())
     }
 
     /// Whether a value for `target` and `property` waits — one past its deadline will be dropped,

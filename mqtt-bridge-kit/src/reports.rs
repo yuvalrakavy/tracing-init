@@ -155,6 +155,8 @@ struct State {
     /// "before" values, which a retained State arriving later does not change in mid-process
     /// (Claude's re-gate minor 11). `readback` itself goes on taking late arrivals, for a restore.
     readback_frozen: Option<BTreeMap<String, PropertyMap>>,
+    /// The read-back's targets whose `State` was marked assumed.
+    readback_assumed: std::collections::BTreeSet<String>,
     /// The model when the MQTT connection was last lost, and when.
     broker_lost: Option<(Instant, BTreeMap<String, PropertyMap>)>,
     /// The names a driver reported that cannot stand as a topic segment, each said once.
@@ -175,9 +177,8 @@ pub struct Reports {
     /// When the bridge started: the read-back is what the bridge knew then.
     epoch: Instant,
     /// Whether the read-back is in: 0 not yet, 1 incomplete (no SUBACK in time, or refused), 2
-    /// complete; and its waiters.
+    /// complete. Nothing waits for it.
     read_back_done: std::sync::atomic::AtomicU8,
-    read_back_in: Notify,
 }
 
 /// What changed since the session last took it.
@@ -224,6 +225,7 @@ impl Reports {
                     events: Capped::new(EVENT_CAP),
                     readback: BTreeMap::new(),
                     readback_frozen: None,
+                    readback_assumed: std::collections::BTreeSet::new(),
                     broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
                     removed: std::collections::BTreeSet::new(),
@@ -233,7 +235,6 @@ impl Reports {
             ready: Notify::new(),
             epoch: Instant::now(),
             read_back_done: std::sync::atomic::AtomicU8::new(0),
-            read_back_in: Notify::new(),
         })
     }
 
@@ -579,23 +580,6 @@ impl Reports {
                     state.readback_frozen = Some(state.readback.clone());
                 }
             }
-            self.read_back_in.notify_waiters();
-        }
-    }
-
-    /// Wait until the read-back is done — or, with `complete`, complete. Cancellation-safe.
-    pub async fn read_back_reached(&self, complete: bool) {
-        let level = if complete { 2 } else { 1 };
-        loop {
-            // WAIT: read-back-ready
-            let notified = self.read_back_in.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.read_back_done.load(std::sync::atomic::Ordering::SeqCst) >= level {
-                return;
-            }
-            // WAIT: read-back-ready
-            notified.await;
         }
     }
 
@@ -604,28 +588,21 @@ impl Reports {
         self.read_back_done.load(std::sync::atomic::Ordering::SeqCst) >= 2
     }
 
-    /// Wait until the read-back is in, at most `within`; whether it is.
-    pub async fn read_back_completed(&self, within: std::time::Duration) -> bool {
-        let wait = async {
-            loop {
-                // WAIT: read-back-ready
-                let notified = self.read_back_in.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if self.read_back_done.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                    return;
-                }
-                // WAIT: read-back-ready
-                notified.await;
-            }
-        };
-        // WAIT: read-back-ready
-        tokio::time::timeout(within, wait).await.is_ok()
+    /// A target's state as the bridge's retained `State` held it at start.
+    pub fn read_back(&self, target: &str, values: PropertyMap, assumed: bool) {
+        let mut state = self.locked();
+        if assumed {
+            state.readback_assumed.insert(target.to_owned());
+        } else {
+            state.readback_assumed.remove(target);
+        }
+        state.readback.insert(target.to_owned(), values);
     }
 
-    /// A target's state as the bridge's retained `State` held it at start.
-    pub fn read_back(&self, target: &str, values: PropertyMap) {
-        self.locked().readback.insert(target.to_owned(), values);
+    /// The read-back's targets whose `State` said `"assumed": true`: what a restore restores.
+    pub fn read_back_assumed(&self) -> BTreeMap<String, PropertyMap> {
+        let state = self.locked();
+        state.readback.iter().filter(|(t, _)| state.readback_assumed.contains(*t)).map(|(t, v)| (t.clone(), v.clone())).collect()
     }
 
     /// A property's value in the read-back, if it had one.
