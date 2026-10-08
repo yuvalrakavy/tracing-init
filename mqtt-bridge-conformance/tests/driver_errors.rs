@@ -455,19 +455,18 @@ async fn a_helper_that_blocks_the_worker_thread_while_idle_is_a_dead_worker() {
     assert!(h.stop().await, "the bridge did not stop within its bound with its worker blocked");
 }
 
-/// Blocking calls that fill their cap and stay stuck — readers whose synchronous reads never return
-/// — make every later call a refusal, for good: past twice the operation bound, that is a dead
-/// worker, and the restart the only way out (the R1 re-gate's R13: nothing escalated).
+/// Operations' blocking calls that fill their cap and stay stuck — synchronous calls that never
+/// return, abandoned at their deadlines — make every later call a refusal, for good: past twice the
+/// operation bound, that is a dead worker, and the restart the only way out (the R1 re-gate's R13).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blocking_cap_that_stays_full_is_a_dead_worker() {
-    let mut h = Harness::start_with("cap-full", acknowledged(), quick_timing(), |_, _, device| {
+    let mut h = Harness::start_unwaited("cap-full", acknowledged(), quick_timing(), |_, _, device| {
         device.set("t1", "temp", json!(20));
-        device.helper(Helper::HoldBlocking);
+        device.stick_connects();
     })
     .await;
-    assert!(connected(&h).await);
-    let died = tokio::time::timeout(Duration::from_secs(8), h.running().ended()).await;
-    let died = died.unwrap_or_else(|_| panic!("a blocking cap full for good went unseen for 8 s; Status {:?}", h.status()));
+    let died = tokio::time::timeout(Duration::from_secs(15), h.running().ended()).await;
+    let died = died.unwrap_or_else(|_| panic!("a blocking cap full for good went unseen for 15 s; Status {:?}", h.status()));
     assert_eq!(died.part, "device", "{died:?}");
     assert!(died.cause.contains("cap"), "{died:?}");
     assert!(h.stop().await);
@@ -536,5 +535,23 @@ async fn an_unproven_write_to_an_assumed_target_under_device_wins_is_applied_aga
         "the bridge's own unproven write was not applied again: {:?}",
         h.errors()
     );
+    assert!(h.stop().await);
+}
+
+/// Helpers' long-lived blocking reads — more than the operations' cap — leave it free: a helper's
+/// calls have a budget of their own, so the bridge serves requests and no "full cap" ends it (the
+/// re-gate 3 S7: four helper reads crash-looped the process).
+#[tokio::test(flavor = "multi_thread")]
+async fn long_helper_reads_do_not_end_the_bridge() {
+    let mut h = Harness::start_with("helper-reads", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.helper(Helper::HoldBlocking);
+    })
+    .await;
+    assert!(connected(&h).await);
+    assert!(h.desire("t1", "temp", json!(22), REQ));
+    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await, "a request waited behind the helpers' reads");
+    let died = tokio::time::timeout(Duration::from_secs(3), h.running().ended()).await;
+    assert!(died.is_err(), "the helpers' long reads ended the bridge: {died:?}");
     assert!(h.stop().await);
 }

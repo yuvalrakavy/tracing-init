@@ -93,9 +93,12 @@ async fn a_blocking_call_whose_future_is_dropped_stays_counted_until_its_thread_
     let (release, held) = std::sync::mpsc::channel::<()>();
     let dropped = tokio::time::timeout(
         Duration::from_millis(50),
-        ctx.blocking(move || {
-            let _ = held.recv();
-        }),
+        under_deadline(
+            Instant::now() + Duration::from_secs(10),
+            ctx.blocking(move || {
+                let _ = held.recv();
+            }),
+        ),
     )
     .await;
     assert!(dropped.is_err(), "the call ended on its own, so this test proves nothing");
@@ -118,7 +121,7 @@ async fn a_helpers_blocking_calls_count_towards_the_cap() {
     let handle = ctx.handle();
     let mut releases = Vec::new();
     let mut calls = Vec::new();
-    for _ in 0..ABANDONED_CAP {
+    for _ in 0..HELPER_CAP {
         let (release, held) = std::sync::mpsc::channel::<()>();
         releases.push(release);
         let handle = handle.clone();
@@ -131,8 +134,8 @@ async fn a_helpers_blocking_calls_count_towards_the_cap() {
         }));
     }
     let deadline = Instant::now() + Duration::from_secs(5);
-    while abandoned.running.load(Ordering::SeqCst) < ABANDONED_CAP {
-        assert!(Instant::now() < deadline, "the helper's calls were never counted: {}", abandoned.running.load(Ordering::SeqCst));
+    while abandoned.helpers.load(Ordering::SeqCst) < HELPER_CAP {
+        assert!(Instant::now() < deadline, "the helper's calls were never counted: {}", abandoned.helpers.load(Ordering::SeqCst));
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let started = Instant::now();
@@ -236,7 +239,7 @@ fn racing_calls_never_reserve_past_the_cap() {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    Slot::reserve(&abandoned)
+                    Slot::reserve(&abandoned, Kind::Operation)
                 })
             })
             .collect();
@@ -270,4 +273,54 @@ async fn a_transient_helper_that_returns_keeps_the_link() {
             assert!(handle.is_lost(), "a transient helper's panic kept the link");
         })
         .await;
+}
+
+/// Long-lived helper reads — four ports, a reader per zone — do not fill the operations' cap: a
+/// helper's blocking calls have a budget of their own, so a driver's operation still gets its
+/// thread, and no cap stays "full" to end the process (the re-gate 3 S7).
+#[tokio::test(flavor = "multi_thread")]
+async fn four_long_helper_reads_leave_the_operations_cap_free() {
+    let abandoned = Arc::new(Abandoned::default());
+    let ctx = LinkContext::new(1, "i", Reports::new(), abandoned.clone(), Arc::new(OpClock::new()));
+    let handle = ctx.handle();
+    let mut releases = Vec::new();
+    let mut readers = Vec::new();
+    for _ in 0..ABANDONED_CAP {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        releases.push(release);
+        let handle = handle.clone();
+        readers.push(tokio::spawn(async move {
+            handle
+                .blocking(move || {
+                    let _ = held.recv();
+                })
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let operation = under_deadline(Instant::now() + Duration::from_secs(2), ctx.blocking(|| 7)).await;
+    assert_eq!(operation, Ok(7), "four helper reads filled the operations' cap");
+    assert!(abandoned.full_for().is_none(), "four helper reads made the cap full");
+    drop(releases);
+    for reader in readers {
+        let _ = reader.await;
+    }
+}
+
+/// A refusal stamped late — just after a place was freed — does not leave the cap "full" once a
+/// call has its place again (the re-gate 3 S6: a stale stamp could end the process as stuck).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_refusal_stamp_is_cleared_by_the_next_call_that_gets_its_place() {
+    let abandoned = Arc::new(Abandoned::default());
+    let ctx = LinkContext::new(1, "i", Reports::new(), abandoned.clone(), Arc::new(OpClock::new()));
+    // The stamp of a refusal that lost the race with a place's release.
+    abandoned.refused();
+    assert!(abandoned.full_for().is_some());
+    let held = under_deadline(Instant::now() + Duration::from_secs(2), ctx.blocking(|| std::thread::sleep(Duration::from_millis(300))));
+    let checking = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        abandoned.full_for()
+    };
+    let (_, during) = tokio::join!(held, checking);
+    assert!(during.is_none(), "a stale refusal stamp stood while calls had their places");
 }

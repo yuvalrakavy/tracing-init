@@ -95,8 +95,10 @@ lost link, never a hang.
   under that operation's deadline (a task-local, set around each operation and the disconnect);
   called from a helper, a task of its own, with none, even while an operation runs (re-gate R14). An
   overrun abandons the thread and counts as a lost link. Every call's thread is counted from before
-  it starts until it ends — in use or abandoned, a helper's or a cancelled caller's too — and at
-  most four run at once; past that a call is refused as a lost link.
+  it starts until it ends — in use or abandoned, a cancelled caller's too — against a budget by
+  kind: four for operations' calls, sixteen for helpers' (long-lived reads, a reader per port or
+  zone, never fill the operations' cap; re-gate 3 S7). Past a budget a call is refused as a lost
+  link; only the operations' cap, full for twice the operation bound, is a dead worker.
 - `ctx.handle()`: a cloneable `LinkHandle` (`report()`, `link_lost()`, `is_lost()`, `blocking()`, `spawn()`) to
   keep for later calls, since the context itself is only handed to `connect`. `ctx.report` is a
   cloneable `Reporter`.

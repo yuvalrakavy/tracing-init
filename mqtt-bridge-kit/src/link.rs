@@ -40,10 +40,22 @@ pub(crate) async fn under_deadline<F: Future>(deadline: Instant, operation: F) -
     OP_DEADLINE.scope(deadline, operation).await
 }
 
-/// Blocking calls whose threads may run at once — in use, or abandoned (past their deadline, or
-/// their caller cancelled) and still running; past it, `blocking` refuses with a lost link until
-/// one of them ends.
+/// Operations' blocking calls whose threads may run at once — in use, or abandoned (past their
+/// deadline, or their caller cancelled) and still running; past it, `blocking` refuses with a lost
+/// link until one of them ends, and a cap that stays full is a dead worker.
 pub const ABANDONED_CAP: usize = 4;
+
+/// Helpers' blocking calls whose threads may run at once: a budget of their own, so long-lived
+/// reads (a reader per port or zone) never fill the operations' cap (re-gate 3 S7). Past it a
+/// helper's call is refused with a lost link; it does not end the process.
+pub const HELPER_CAP: usize = 16;
+
+/// Whose a blocking call is: an operation's (its task has a deadline) or a helper's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Operation,
+    Helper,
+}
 
 /// Reports from a driver or its helpers, handed over without waiting.
 #[derive(Debug, Clone)]
@@ -94,6 +106,8 @@ impl Reporter {
 #[derive(Debug)]
 pub(crate) struct Abandoned {
     running: AtomicUsize,
+    /// Helpers' calls running, under [`HELPER_CAP`].
+    helpers: AtomicUsize,
     epoch: Instant,
     /// Since when a call was refused for want of a place, in milliseconds since `epoch` plus one;
     /// 0 once a place is free again. A cap that stays full is a dead worker (re-gate R13).
@@ -102,7 +116,7 @@ pub(crate) struct Abandoned {
 
 impl Default for Abandoned {
     fn default() -> Abandoned {
-        Abandoned { running: AtomicUsize::new(0), epoch: Instant::now(), full_since: AtomicU64::new(0) }
+        Abandoned { running: AtomicUsize::new(0), helpers: AtomicUsize::new(0), epoch: Instant::now(), full_since: AtomicU64::new(0) }
     }
 }
 
@@ -125,17 +139,25 @@ impl Abandoned {
 /// by the thread until it ends — whatever becomes of the future that started it, so a call whose
 /// caller was cancelled stays counted while its thread runs (review C3). Released on the thread's
 /// end, its panic included, and at once if the thread never starts.
-struct Slot(Arc<Abandoned>);
+struct Slot(Arc<Abandoned>, Kind);
 
 impl Slot {
-    fn reserve(abandoned: &Arc<Abandoned>) -> Option<Slot> {
-        let slot = abandoned
-            .running
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| (running < ABANDONED_CAP).then_some(running + 1))
+    fn reserve(abandoned: &Arc<Abandoned>, kind: Kind) -> Option<Slot> {
+        let (count, cap) = match kind {
+            Kind::Operation => (&abandoned.running, ABANDONED_CAP),
+            Kind::Helper => (&abandoned.helpers, HELPER_CAP),
+        };
+        let slot = count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| (running < cap).then_some(running + 1))
             .ok()
-            .map(|_| Slot(abandoned.clone()));
-        if slot.is_none() {
-            abandoned.refused();
+            .map(|_| Slot(abandoned.clone(), kind));
+        if kind == Kind::Operation {
+            match slot {
+                // A place had: the operations' cap is not full, whatever a refusal that lost the race
+                // with a release stamped (re-gate 3 S6).
+                Some(_) => abandoned.full_since.store(0, Ordering::SeqCst),
+                None => abandoned.refused(),
+            }
         }
         slot
     }
@@ -143,8 +165,15 @@ impl Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.0.running.fetch_sub(1, Ordering::SeqCst);
-        self.0.full_since.store(0, Ordering::SeqCst);
+        match self.1 {
+            Kind::Operation => {
+                self.0.running.fetch_sub(1, Ordering::SeqCst);
+                self.0.full_since.store(0, Ordering::SeqCst);
+            }
+            Kind::Helper => {
+                self.0.helpers.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
     }
 }
 
@@ -324,9 +353,11 @@ impl LinkHandle {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let Some(slot) = Slot::reserve(&self.shared.abandoned) else {
+        let kind = if OP_DEADLINE.try_with(|_| ()).is_ok() { Kind::Operation } else { Kind::Helper };
+        let Some(slot) = Slot::reserve(&self.shared.abandoned, kind) else {
             self.link_lost("too many blocking calls are still running");
-            return Err(LinkError::new(format!("{ABANDONED_CAP} blocking calls are still running")));
+            let cap = if kind == Kind::Operation { ABANDONED_CAP } else { HELPER_CAP };
+            return Err(LinkError::new(format!("{cap} blocking calls of the kind are still running")));
         };
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let spawned = std::thread::Builder::new().name("bridge-blocking".into()).spawn(move || {

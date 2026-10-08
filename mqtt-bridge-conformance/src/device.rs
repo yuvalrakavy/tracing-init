@@ -97,6 +97,9 @@ struct State {
     rules: Vec<Rule>,
     link: Option<LinkHandle>,
     connect_cap: Option<usize>,
+    /// Each connect makes a synchronous call that never returns in the test's time, past its
+    /// deadline: an operation's thread left stuck.
+    stuck_connects: bool,
     helper: Option<Helper>,
     /// A helper started on every link, after `helper`'s one.
     every_link: Option<Helper>,
@@ -208,6 +211,12 @@ impl Device {
     /// Start `helper` at the next connect (once).
     pub fn helper(&self, helper: Helper) {
         self.locked().helper = Some(helper);
+    }
+
+    /// Make every connect leave a synchronous call stuck past its deadline (an operation's thread
+    /// that never ends): four fill the operations' cap.
+    pub fn stick_connects(&self) {
+        self.locked().stuck_connects = true;
     }
 
     /// Start `helper` on every link from now on (a reader that panics at each connect).
@@ -341,6 +350,9 @@ impl DeviceDriver for FakeDevice {
             OpError::Link(e) => e,
             other => LinkError::new(other.to_string()),
         })?;
+        if self.locked().stuck_connects {
+            ctx.handle().blocking(|| std::thread::sleep(Duration::from_secs(60))).await?;
+        }
         let mut state = self.locked();
         let connects = state.calls.iter().filter(|c| c.op == Op::Connect).count();
         if state.connect_cap.is_some_and(|cap| connects > cap) {
