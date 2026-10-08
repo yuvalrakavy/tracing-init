@@ -19,11 +19,13 @@ async fn the_device_side_works_while_the_broker_is_stalled() {
     assert!(h.desire("t1", "temp", json!(22), Req { expiry: Some(60), conflict: Some("RequestWins") }));
     h.settle(Duration::from_millis(300)).await;
 
-    // Stall the broker, and fill the session's path to it: each malformed command is an Error to
-    // publish, and past the in-flight limit and the request channel the session waits.
+    // Stall the broker, and fill the session's path to it: each `assume` of a target of its own is
+    // a retained State to publish — never capped or coalesced away, unlike Errors (a capped queue
+    // of 64 could fit in the request channel, and the session then did not park) — and past the
+    // in-flight limit and the request channel the session waits.
     h.broker.hold_acks();
-    for i in 0..1000 {
-        assert!(h.send_raw(&h.topics.command(), format!("not json {i}").as_bytes()));
+    for i in 0..400 {
+        assert!(h.command(json!({"target": format!("a{i}"), "command": "assume", "level": i}), None));
     }
     assert!(
         h.eventually(BOUND, |h| h.broker.held_acks() >= 10).await,
