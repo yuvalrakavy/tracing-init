@@ -6,7 +6,16 @@ use super::*;
 use crate::test_support::Capture;
 
 fn request(value: Value, conflict: Conflict) -> StateValue {
-    StateValue { target: "u1".into(), property: "temp".into(), value, deadline: None, conflict, check: Default::default(), basis: None }
+    StateValue {
+        target: "u1".into(),
+        property: "temp".into(),
+        value,
+        deadline: None,
+        conflict,
+        check: Default::default(),
+        basis: None,
+        restored: false,
+    }
 }
 
 /// The outage conflict rule (Store kit spec §4.5), every row: unchanged → applied; changed and

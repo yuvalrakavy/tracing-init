@@ -403,16 +403,17 @@ async fn a_command_queued_during_a_poll_that_loses_the_link_is_answered() {
     let replies = "Store/replies/poll-lost";
     let options = SendOptions::default().expiry(30).response_topic(replies).correlation_data(b"p-1".to_vec());
     assert!(h.broker.publish(&h.topics.command(), json!({"target": "t1", "command": "pulse"}).to_string(), &options));
+    // The poll hangs to its deadline and the link is lost with the command still waiting: it is
+    // refused as waiting, before it ran — not taken off the mailbox by the failed poll and cut off
+    // (re-gate 4: the wording was checked only if a reply came).
     assert!(
-        h.eventually(BOUND, |h| !h.published(replies).is_empty() || !h.device.calls_of(Op::Execute).is_empty()).await,
-        "a command queued during a poll that lost the link was neither answered nor executed: {:?}",
+        h.eventually(BOUND, |h| !h.published(replies).is_empty()).await,
+        "a command queued during a poll that lost the link was not answered: {:?}",
         h.errors()
     );
-    // Refused as waiting, before it ran — not taken off the mailbox by the failed poll, and cut off.
-    if let Some(reply) = h.published(replies).first() {
-        let error = json_of(reply)["error"].as_str().unwrap_or_default().to_owned();
-        assert!(error.contains("before it ran"), "the failed poll took the command off the mailbox: {error}");
-    }
+    let error = json_of(&h.published(replies)[0])["error"].as_str().unwrap_or_default().to_owned();
+    assert!(error.contains("before it ran"), "the failed poll took the command off the mailbox: {error}");
+    assert!(h.device.calls_of(Op::Execute).is_empty(), "a command waiting when the link was lost was executed");
     assert!(h.stop().await);
 }
 
@@ -549,9 +550,14 @@ async fn a_restore_refused_in_part_keeps_what_it_wrote() {
         "the refused property of the restore was not said: {:#?}",
         h.log.records()
     );
-    // A restore is an ordinary request now (re-gate S1): the refused property alone goes to Error.
-    let refused: Vec<_> = h.errors().iter().filter_map(|e| e["property"].as_str().map(str::to_owned)).collect();
-    assert_eq!(refused, ["color"], "the Error of a restore refused in part named more than the refused property");
+    // The refused property alone fails, and as a WARN: a restore is no one's request, so its own
+    // failures are not the Store's Error (re-gate 4 minor 10).
+    assert!(
+        h.eventually(BOUND, |h| h.log.of_kind("restore_failed").iter().any(|r| r.field("property") == Some("color"))).await,
+        "the refused property of the restore was not a WARN restore_failed: {:#?}",
+        h.log.records()
+    );
+    assert!(h.errors().is_empty(), "a restore's own failure went to the Store's Error: {:?}", h.errors());
     assert!(h.stop().await);
 }
 
@@ -713,7 +719,170 @@ async fn a_command_executing_at_the_stop_is_answered() {
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-2"))));
     assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
     assert!(h.stop_bridge().await);
-    let answered: Vec<_> = h.published(replies).iter().map(|r| r.correlation_data().map(|c| c.to_vec())).collect();
-    assert_eq!(answered.len(), 2, "a command in flight at the stop got no reply: {answered:?}");
+    let answers = answers_by_correlation(&h, replies);
+    assert_eq!(answers.len(), 2, "a command in flight at the stop got no reply: {answers:?}");
+    for (id, errors) in &answers {
+        assert_eq!(errors.len(), 1, "command {id} was answered {} times: {errors:?}", errors.len());
+    }
+    assert!(answers["c-1"][0].contains("cut off"), "the command cut off at the stop was not said cut off: {answers:?}");
+    assert!(answers["c-2"][0].contains("before it ran"), "the command waiting at the stop was not said refused before it ran: {answers:?}");
     assert_eq!(h.errors_for("refused").len(), 2, "a command in flight at the stop was not refused on Error: {:?}", h.errors());
+}
+
+/// Each correlation id answered on `replies`, with the error of each of its answers (`""`: a
+/// success).
+fn answers_by_correlation(h: &Harness, replies: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut answers: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for reply in h.published(replies) {
+        let id = reply.correlation_data().map(|c| String::from_utf8_lossy(c).into_owned()).unwrap_or_default();
+        let error = json_of(&reply)["error"].as_str().unwrap_or_default().to_owned();
+        answers.entry(id).or_default().push(error);
+    }
+    answers
+}
+
+/// A command whose operation blocks its thread past the watchdog's verdict is answered once: the
+/// verdict says it was cut off, and the worker, unblocked later, does not answer it again (re-gate 4
+/// F3, its RG4-3: two contradictory answers to one command).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_cut_off_by_the_watchdog_is_answered_once() {
+    let h = Harness::start_with("watchdog-in-flight", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Execute, None, Answer::Block(Duration::from_millis(3200)), 1);
+    let replies = "Store/replies/watchdog-in-flight";
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"w-1"))));
+    assert!(h.eventually(BOUND, |h| !h.published(replies).is_empty()).await, "the command the watchdog cut off was not answered");
+    // The blocked call returns at 3.2 s; its result must not be a second answer.
+    h.settle(Duration::from_secs(2)).await;
+    let answers = answers_by_correlation(&h, replies);
+    assert_eq!(answers.get("w-1").map(Vec::len), Some(1), "one command answered more than once: {answers:?}");
+    assert!(answers["w-1"][0].contains("cut off"), "the command the watchdog cut off was not said cut off: {answers:?}");
+    assert!(h.stop().await);
+}
+
+/// The restore's fixture: a retained assumed State, and a newer retained request for the same key
+/// behind 150 others sorted ahead of it — their replay keeps the session busy after the restore's
+/// post, so a restore posted too early is taken before the request's own replay.
+fn a_restore_and_a_newer_request(broker: &FakeBroker, topics: &mqtt_bridge_kit::topics::Topics, device: &Device, hold: bool) {
+    broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+    for i in 0..150 {
+        broker.retain(
+            &topics.desired(&format!("aaa{i:03}"), "p"),
+            "1",
+            &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"),
+        );
+    }
+    broker.retain(&topics.desired("dimmer", "level"), "70", &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"));
+    device.answer(Op::Read, None, Answer::Unsupported);
+    if hold {
+        broker.hold_subacks();
+    }
+}
+
+/// Every level the dimmer was written, once the newer request has reached it.
+async fn dimmer_levels(h: &Harness) -> Vec<Value> {
+    assert!(
+        h.eventually(BOUND, |h| h.device.get("dimmer", "level") == Some(json!(70))).await,
+        "the newer request never reached the device"
+    );
+    h.settle(Duration::from_millis(500)).await;
+    h.device.applies().iter().filter(|(t, _)| t == "dimmer").filter_map(|(_, v)| v.get("level").cloned()).collect()
+}
+
+/// On the late read-back path, the restore waits for the last request subscription's SUBACK too —
+/// the late read-back's own is not counted as one — so a newer retained request keeps its key
+/// (re-gate 4 F1, its RG4-1: the old level was written first, then the request).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_read_back_restore_yields_to_a_newer_retained_request() {
+    let h = Harness::start_unwaited("restore-late-yields", restoring(Writes::Acknowledged), quick_timing(), |b, t, d| {
+        a_restore_and_a_newer_request(b, t, d, true)
+    })
+    .await;
+    assert!(h.eventually(Duration::from_secs(8), |h| !h.log.of_kind("restore_incomplete").is_empty()).await, "the read-back was not late");
+    h.broker.release_subacks();
+    assert_eq!(dimmer_levels(&h).await, [json!(70)], "the restore wrote the old level over a newer retained request");
+    assert!(h.stop().await);
+}
+
+/// The same, the read-back on time: the control of the one above.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_on_time_read_back_restore_yields_to_a_newer_retained_request() {
+    let h = Harness::start_with("restore-on-time-yields", restoring(Writes::Acknowledged), quick_timing(), |b, t, d| {
+        a_restore_and_a_newer_request(b, t, d, false)
+    })
+    .await;
+    assert_eq!(dimmer_levels(&h).await, [json!(70)], "the restore wrote the old level over a newer retained request");
+    assert!(h.stop().await);
+}
+
+/// A target the previous run assumed, whose Config now says it reports, is not restored: its
+/// feedback when the restore is taken decides (re-gate 4 F2, its RG4-4: an IR unit replaced by a
+/// wired one was set back to the IR unit's last assumed value).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_now_reported_is_not_restored() {
+    let info = mqtt_bridge_kit::DriverInfo { restore: true, ..acknowledged() };
+    let h = Harness::start_with("restore-now-reported", info, quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("t1"), json!({"temp": 18, "assumed": true}).to_string(), &SendOptions::default());
+        broker.retain(&topics.config("t1"), json!({"feedback": "reported"}).to_string(), &SendOptions::default());
+        device.set("t1", "temp", json!(25));
+    })
+    .await;
+    assert!(connected(&h).await);
+    h.settle(Duration::from_millis(1500)).await;
+    assert_eq!(
+        h.device.get("t1", "temp"),
+        Some(json!(25)),
+        "a target now reported was restored over the device's own value: {:?}",
+        h.device.applies()
+    );
+    assert!(h.stop().await);
+}
+
+/// A key the restore left to a request that is then superseded — a DeviceWins request meets the
+/// one-way device's unknown value — gets the restore's value after all (re-gate 4 F6, its RG4-2:
+/// neither was applied, and the device stayed dark on that key).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_superseded_on_an_unknown_value_gives_its_key_back_to_the_restore() {
+    let h = Harness::start_with("restore-after-superseded", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        broker.retain(
+            &topics.desired("dimmer", "level"),
+            "70",
+            &SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins"),
+        );
+        device.answer(Op::Read, None, Answer::Unsupported);
+    })
+    .await;
+    assert!(
+        h.eventually(Duration::from_secs(5), |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
+        "the dimmer came back dark: neither the restore nor the request set its level: {:?}",
+        h.errors()
+    );
+    assert_eq!(h.errors_for("superseded").len(), 1, "the superseded request was not said: {:?}", h.errors());
+    assert!(h.stop().await);
+}
+
+/// A read-back the session's connection cut short — its SUBACK held, then the connection dropped —
+/// is subscribed again on the next connection, and the restore done from it (re-gate 4 F5: the
+/// State subscription went with the first session, and nothing was ever restored).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_back_cut_short_by_a_lost_connection_is_read_again() {
+    let h = Harness::start_unwaited("restore-read-again", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        device.answer(Op::Read, None, Answer::Unsupported);
+        broker.hold_subacks();
+    })
+    .await;
+    assert!(h.eventually(Duration::from_secs(8), |h| !h.log.of_kind("restore_incomplete").is_empty()).await, "the read-back was not late");
+    let accepted = h.broker.accepted();
+    h.broker.drop_connection();
+    assert!(h.broker.wait_until(BOUND, |b| b.accepted() > accepted).await, "the bridge did not reconnect");
+    // The new connection's SUBACKs, held too, go out now — the old connection's went with it.
+    h.settle(Duration::from_millis(300)).await;
+    h.broker.release_subacks();
+    assert!(
+        h.eventually(Duration::from_secs(8), |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
+        "a read-back cut short by a lost connection was never read again: nothing restored"
+    );
+    assert!(h.stop().await);
 }

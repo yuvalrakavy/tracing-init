@@ -104,8 +104,10 @@ pub(crate) struct Shared {
     pub outage: Arc<BrokerOutage>,
     /// The read-back's subscription has been made (once per process).
     pub read_back_requested: AtomicBool,
-    /// The read-back's packet id plus one, while its SUBACK is late (0: none): a late SUBACK that
-    /// grants it completes the read-back.
+    /// The read-back's packet id plus one, while its SUBACK is late (0: none; [`LATE_UNSENT`]: late,
+    /// and its SUBSCRIBE not yet written): a late SUBACK that grants it completes the read-back.
+    /// It is no request subscription's, and does not count down `subscriptions_pending` (re-gate 4
+    /// F1).
     pub read_back_late: std::sync::atomic::AtomicU32,
     /// Whether the driver restores one-way targets from the read-back (`DriverInfo::restore`), and
     /// whether that was done, or said undone, once.
@@ -121,11 +123,15 @@ pub(crate) struct Shared {
     pub read_back_next: AtomicBool,
 }
 
+/// `read_back_late` while the read-back's SUBSCRIBE was not written within its wait: the next
+/// SUBSCRIBE written is the read-back's.
+const LATE_UNSENT: u32 = u32::MAX;
+
 /// How a session ended.
 enum SessionEnd {
-    /// Its connection failed, or never came (`connected`: whether the broker accepted it); a new
-    /// session follows.
-    Ended { connected: bool },
+    /// Its connection failed, or never came (`connected`: when the broker accepted it, if it did);
+    /// a new session follows.
+    Ended { connected: Option<Instant> },
     /// The shutdown.
     Shutdown,
 }
@@ -136,7 +142,6 @@ enum SessionEnd {
 pub(crate) async fn run(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     let mut failed: u32 = 0;
     loop {
-        let started = Instant::now();
         let connected = match session(&shared, &mut shutdown).await {
             SessionEnd::Shutdown => return,
             SessionEnd::Ended { connected } => connected,
@@ -144,7 +149,9 @@ pub(crate) async fn run(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>
         // A connection lost after it held is the first failure of what follows; a connect refused,
         // or a connection dropped before `stable_after` (two bridges sharing a client id), one more
         // (Claude's re-gate minor 12: every accepted connection reset the count).
-        failed = if connected && started.elapsed() >= shared.timing.stable_after { 1 } else { failed + 1 };
+        // Its age counts from the CONNACK: a slow one is no time the connection held (re-gate 4
+        // minor 9).
+        failed = if connected.is_some_and(|at| at.elapsed() >= shared.timing.stable_after) { 1 } else { failed + 1 };
         let pause = if failed % MAX_CONSECUTIVE_ERRORS == 0 { shared.timing.retry } else { shared.timing.poll_retry };
         debug!(pause_ms = pause.as_millis() as u64, failed, "MQTT session ended; starting a new one");
         // WAIT: session-retry
@@ -199,8 +206,8 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
     // first, and a state published ahead of the read-back's subscription would overwrite the
     // retained state it is there to read.
     let mut announced = false;
-    // Whether the broker accepted this session's connection.
-    let mut accepted = false;
+    // When the broker accepted this session's connection, if it did.
+    let mut accepted: Option<Instant> = None;
     loop {
         // WAIT: session-events
         // The stop first: its flush publishes what is pending anyway (re-gate R15). Then what is
@@ -214,13 +221,25 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
             event = incoming.recv() => Step::Event(event),
         };
         let connack = matches!(step, Step::Event(Some(PumpEvent::Connected)));
-        accepted |= connack;
+        if connack && accepted.is_none() {
+            accepted = Some(Instant::now());
+        }
+        if let Step::Event(Some(PumpEvent::Subscribing(pkid))) = &step {
+            // The read-back's SUBSCRIBE, written past its wait: its packet id, to tell its SUBACK.
+            let _ = shared.read_back_late.compare_exchange(LATE_UNSENT, u32::from(*pkid) + 1, Ordering::SeqCst, Ordering::SeqCst);
+        }
         if let Step::Event(Some(PumpEvent::SubAck { pkid, granted })) = &step {
-            let _ = shared.subscriptions_pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            // Only a request subscription's SUBACK counts down: the late read-back's comes ahead of
+            // theirs, and counted it would post the restore before the last one's retained replay
+            // (re-gate 4 F1).
+            let late_read_back = shared.read_back_late.load(Ordering::SeqCst) == u32::from(*pkid) + 1;
+            if !late_read_back {
+                let _ = shared.subscriptions_pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            }
             if shared.read_back_next.swap(false, Ordering::SeqCst) {
                 // The next subscription's SUBACK, behind the read-back's replay.
                 read_back_complete(shared);
-            } else if shared.read_back_late.load(Ordering::SeqCst) == u32::from(*pkid) + 1 {
+            } else if late_read_back {
                 // The read-back's SUBACK, past its wait: its replay follows it, and the SUBACKs of
                 // the subscriptions made after it — sent after it, answered in order — come behind
                 // the replay; the next completes the read-back.
@@ -238,7 +257,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                     if goes_on {
                         None
                     } else {
-                        Some(SessionEnd::Ended { connected: false })
+                        Some(SessionEnd::Ended { connected: None })
                     }
                 }),
                 Step::Event(Some(PumpEvent::Publish(publish, received))) => {
@@ -246,14 +265,14 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                     Ok(None)
                 }
                 Step::Event(Some(PumpEvent::Disconnected | PumpEvent::SubAck { .. } | PumpEvent::Subscribing(_))) => Ok(None),
-                Step::Event(Some(PumpEvent::Ended(_))) => Ok(Some(SessionEnd::Ended { connected: false })),
+                Step::Event(Some(PumpEvent::Ended(_))) => Ok(Some(SessionEnd::Ended { connected: None })),
                 // The pump went without a word — it panicked — so it never said the connection was
                 // lost: the broker snapshot is taken here (Claude's re-gate minor 14).
                 Step::Event(None) => {
-                    if accepted {
+                    if accepted.is_some() {
                         shared.reports.broker_lost();
                     }
-                    Ok(Some(SessionEnd::Ended { connected: false }))
+                    Ok(Some(SessionEnd::Ended { connected: None }))
                 }
                 Step::Reported => {
                     publish_changes(shared, &client, shared.reports.take()).await;
@@ -273,9 +292,17 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
             Ok(Some(SessionEnd::Ended { .. })) => {
                 // A late SUBACK cannot come on another connection; a replay cut short is what
                 // there is.
-                shared.read_back_late.store(0, Ordering::SeqCst);
-                if shared.read_back_next.swap(false, Ordering::SeqCst) {
+                let late = shared.read_back_late.swap(0, Ordering::SeqCst) != 0;
+                let replaying = shared.read_back_next.swap(false, Ordering::SeqCst);
+                if replaying {
                     read_back_incomplete(shared);
+                }
+                // A read-back cut short — its SUBACK late, or its replay under way — with a restore
+                // still to do is subscribed again on the next connection: the State subscription
+                // went with this one, and nothing else would complete it (re-gate 4 F5). One the
+                // broker refused is not asked again. The frozen "before" values stay as they were.
+                if (late || replaying) && shared.restore && !shared.restored.load(Ordering::SeqCst) {
+                    shared.read_back_requested.store(false, Ordering::SeqCst);
                 }
                 return SessionEnd::Ended { connected: accepted };
             }
@@ -317,7 +344,7 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
                 );
             }
             ReadBack::Late(pkid) => {
-                shared.read_back_late.store(pkid.map_or(0, |p| u32::from(p) + 1), Ordering::SeqCst);
+                shared.read_back_late.store(pkid.map_or(LATE_UNSENT, |p| u32::from(p) + 1), Ordering::SeqCst);
                 read_back_incomplete(shared);
                 warn!(
                     kind = "read_back_incomplete",
@@ -494,8 +521,11 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
             match wire::decode_desired_property(payload) {
                 Err(e) => malformed(e, report),
                 Ok(None) => {
-                    shared.mailbox.retract(&target, &property);
-                    shared.reports.assumption_settled(&target, &property);
+                    // The key's assumption is settled — unless a write of it is still unproven: the
+                    // probe proves it, or the link's loss holds it again (re-gate 4 minor 7).
+                    if !shared.mailbox.retract(&target, &property) {
+                        shared.reports.assumption_settled(&target, &property);
+                    }
                 }
                 Ok(Some(value)) => match wire::request_meta(properties, now) {
                     Err(e) => malformed(e, report),
@@ -510,6 +540,7 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                             conflict: meta.conflict,
                             check: Check::default(),
                             basis,
+                            restored: false,
                         };
                         shared.mailbox.post_state(value, publish.retain);
                     }
@@ -534,6 +565,7 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                             conflict: meta.conflict,
                             check: Check::default(),
                             basis: None,
+                            restored: false,
                         })
                         .collect();
                     shared.mailbox.post_target(values);
@@ -701,6 +733,7 @@ fn restore_when_ready(shared: &Shared) {
                 conflict: crate::wire::Conflict::RequestWins,
                 check: Check::default(),
                 basis: None,
+                restored: true,
             })
         })
         .collect();

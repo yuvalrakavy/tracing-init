@@ -56,6 +56,9 @@ use crate::worker::{self, Worker, WorkerEnd};
 
 /// How long the bridge's parts get to stop before the process ends anyway.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// How long the stop waits for the device worker to stop — its driver's disconnect, bounded by
+/// [`worker::DISCONNECT_BOUND`], and its runtime's end — before the session's flush goes ahead.
+const WORKER_STOP_BOUND: Duration = Duration::from_millis(2500);
 /// How long the runtime's threads get, once the bridge has stopped, before the process exits.
 pub const RUNTIME_GRACE: Duration = Duration::from_secs(1);
 /// Past its operation's deadline by this much, a device worker is blocked: its thread is in a
@@ -499,23 +502,28 @@ pub struct Running {
     shutdown: watch::Sender<bool>,
     worker_stop: watch::Sender<bool>,
     span: Span,
-    /// The watchdog: a task of its own, its verdict kept until it is read; `None` once read.
-    supervisor: Option<tokio::task::JoinHandle<Died>>,
+    /// The watchdog: a task of its own, its verdict — and whether it found the worker's thread
+    /// blocked — kept until it is read; `None` once read.
+    supervisor: Option<tokio::task::JoinHandle<(Died, bool)>>,
     /// Whether the watchdog found the worker's thread blocked: the stop then does not wait for it.
     worker_blocked: bool,
 }
 
 /// The watchdog, until the device worker is dead: an operation past its deadline by
-/// [`BLOCKED_GRACE`]; with none running, a heartbeat silent past [`IDLE_BOUND`]; or the blocking
-/// calls' cap full for `cap_bound`. Then the device is unreachable and the momentary commands
-/// waiting are refused — at once, whether or not anyone reads the verdict yet.
+/// [`BLOCKED_GRACE`]; with none running, a heartbeat silent past [`IDLE_BOUND`]; or a blocking
+/// budget — the operations' or the helpers' — full for `cap_bound`. A worker whose thread is
+/// blocked will not answer: the device is said unreachable and what waits refused — at once,
+/// whether or not anyone reads the verdict yet. A full budget leaves a worker that still runs: it
+/// is stopped, and what waits refused, by the stop that follows (re-gate 4 minor 8: refused here,
+/// the mailbox was marked disconnected under a live worker). Returns the verdict, and whether the
+/// worker's thread is blocked.
 async fn supervise(
     clock: Arc<OpClock>,
     abandoned: Arc<Abandoned>,
     cap_bound: Duration,
     reports: Arc<Reports>,
     mailbox: Arc<Mailbox>,
-) -> Died {
+) -> (Died, bool) {
     let mut pause = PauseGrace::new(std::time::Instant::now());
     let cause = loop {
         tokio::time::sleep(WATCH_TICK).await;
@@ -525,21 +533,27 @@ async fn supervise(
         if let Some(deadline) = clock.deadline() {
             let over = std::time::Instant::now().saturating_duration_since(deadline);
             if over > BLOCKED_GRACE {
-                break format!("the device worker blocked its thread {} ms past its operation's deadline", over.as_millis());
+                break (format!("the device worker blocked its thread {} ms past its operation's deadline", over.as_millis()), true);
             }
         } else if let Some(quiet) = clock.since_beat().filter(|quiet| *quiet > IDLE_BOUND) {
-            break format!("the device worker's thread was blocked for {} ms with no operation running", quiet.as_millis());
+            break (format!("the device worker's thread was blocked for {} ms with no operation running", quiet.as_millis()), true);
         }
-        if let Some(full) = abandoned.full_for().filter(|full| *full > cap_bound) {
-            break format!(
-                "the device worker's blocking calls have filled their cap for {} ms: threads stuck in synchronous calls",
-                full.as_millis()
+        if let Some((full, whose)) = abandoned.full_for().filter(|(full, _)| *full > cap_bound) {
+            break (
+                format!(
+                    "the device worker's {whose} blocking calls have filled their cap for {} ms: threads stuck in synchronous calls",
+                    full.as_millis()
+                ),
+                false,
             );
         }
     };
-    reports.status(LinkStatus::Unreachable);
-    worker::report_refused(&reports, mailbox.disconnected(), worker::LINK_LOST_BEFORE);
-    Died { part: "device", cause }
+    let (cause, blocked) = cause;
+    if blocked {
+        reports.status(LinkStatus::Unreachable);
+        worker::report_refused(&reports, mailbox.disconnected(), worker::LINK_LOST_BEFORE);
+    }
+    (Died { part: "device", cause }, blocked)
 }
 
 /// Whether a watchdog tick may judge. A tick that came far later than asked — the process was
@@ -591,8 +605,13 @@ impl Running {
                 }
             } => {
                 self.supervisor = None;
-                self.worker_blocked = true;
-                verdict.unwrap_or_else(|e| Died { part: "device", cause: format!("the watchdog ended: {e}") })
+                match verdict {
+                    Ok((died, blocked)) => {
+                        self.worker_blocked = blocked;
+                        died
+                    }
+                    Err(e) => Died { part: "device", cause: format!("the watchdog ended: {e}") },
+                }
             }
             Some(joined) = self.tasks.join_next() => Died { part: "mqtt", cause: match joined {
                 Ok(()) => "returned".to_owned(),
@@ -624,20 +643,37 @@ impl Running {
         let span = self.span.clone();
         async move {
             if let Some(supervisor) = self.supervisor.take() {
-                supervisor.abort();
+                if supervisor.is_finished() {
+                    // A verdict reached and not read: a worker it found blocked will not stop, and
+                    // is not waited for (re-gate 4 minor 4).
+                    // WAIT: shutdown
+                    if let Ok((_, blocked)) = supervisor.await {
+                        self.worker_blocked |= blocked;
+                    }
+                } else {
+                    supervisor.abort();
+                }
             }
-            // The worker takes nothing more; what still waits for it will not run, and the session's
-            // flush refuses it — on Error and on its response topic — before its last words
-            // (re-gate R15).
+            // The worker first: it takes nothing more, and what it runs is cut off. Then the
+            // session: its flush refuses what the worker left — the command it was cut off from
+            // answering included — on Error and on its response topic, before its last words
+            // (re-gate R15). In that order, nothing the worker answers races the flush's refusals
+            // (re-gate 4 F3, minor 2). A worker whose thread the watchdog found blocked will not
+            // stop: not waited for.
             let _ = self.worker_stop.send(true);
-            let _ = self.shutdown.send(true);
-            // A worker whose thread the watchdog found blocked will not stop: not waited for.
-            let worker = self.worker.take().filter(|_| !self.worker_blocked);
+            let mut worker = self.worker.take().filter(|_| !self.worker_blocked);
+            let shutdown = &self.shutdown;
             let tasks = &mut self.tasks;
             let all = async move {
+                let mut worker_ended = false;
+                if let Some(worker) = worker.as_mut() {
+                    // WAIT: shutdown
+                    worker_ended = tokio::time::timeout(WORKER_STOP_BOUND, worker).await.is_ok();
+                }
+                let _ = shutdown.send(true);
                 // WAIT: shutdown
                 while tasks.join_next().await.is_some() {}
-                if let Some(worker) = worker {
+                if let Some(worker) = worker.filter(|_| !worker_ended) {
                     // WAIT: shutdown
                     let _ = worker.await;
                 }

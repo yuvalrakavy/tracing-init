@@ -296,6 +296,8 @@ pub(crate) struct Worker<D: DeviceDriver> {
     configured: HashMap<String, Option<Value>>,
     /// Whether the driver's `Unsupported` probe was said (once per process).
     unsupported_probe_said: bool,
+    /// The stop, once the worker runs on its thread: asked, no more work is taken.
+    stopping: Option<watch::Receiver<bool>>,
 }
 
 impl<D: DeviceDriver> Worker<D> {
@@ -315,7 +317,13 @@ impl<D: DeviceDriver> Worker<D> {
             recovered: false,
             configured: HashMap::new(),
             unsupported_probe_said: false,
+            stopping: None,
         }
+    }
+
+    /// Whether the stop has been asked: no more work is taken.
+    fn stopping(&self) -> bool {
+        self.stopping.as_ref().is_some_and(|stop| *stop.borrow())
     }
 
     /// The runtime assumes what it wrote to a target with assumed feedback: proven at once for an
@@ -437,7 +445,8 @@ impl<D: DeviceDriver> Worker<D> {
         while let Some((target, config)) = self.mailbox.take_held_config() {
             self.configure(handle, &target, config).await?;
         }
-        loop {
+        // Nothing more is taken once the stop is asked (re-gate 4 minor 1).
+        while !self.stopping() {
             match self.mailbox.take_held() {
                 None => break,
                 Some(Held::Config { target, config }) => self.configure(handle, &target, config).await?,
@@ -526,7 +535,11 @@ impl<D: DeviceDriver> Worker<D> {
                     } else {
                         info!(target, property = %failure.property, error = %failure.error, ?reason, "A property of a request failed");
                     }
-                    self.reports.error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property));
+                    let restored = values.iter().any(|v| v.restored && v.property == failure.property);
+                    self.request_failed(
+                        restored,
+                        ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property),
+                    );
                 }
                 Ok(count)
             }
@@ -544,10 +557,26 @@ impl<D: DeviceDriver> Worker<D> {
                     _ => debug!(target, ?properties, error = message, "The device's answer to a request was unusable; passed over"),
                 }
                 for value in &values {
-                    self.reports.error(ErrorReport::new(reason, message).target(Some(target)).property(&value.property));
+                    self.request_failed(value.restored, ErrorReport::new(reason, message).target(Some(target)).property(&value.property));
                 }
                 Ok(0)
             }
+        }
+    }
+
+    /// A value's failure: on `Error` for a request; for a restored value, which no one requested, a
+    /// WARN `restore_failed` (re-gate 4 minor 10).
+    fn request_failed(&self, restored: bool, report: ErrorReport) {
+        if restored {
+            warn!(
+                kind = "restore_failed",
+                target = report.target.as_deref(),
+                property = report.property.as_deref(),
+                error = %report.error,
+                "A restored value failed at the device"
+            );
+        } else {
+            self.reports.error(report);
         }
     }
 
@@ -644,7 +673,7 @@ impl<D: DeviceDriver> Worker<D> {
                 () = sleep_until(stable_at) => Step::Stable,
                 () = sleep_until(probe_at) => Step::Probe,
                 () = sleep_until(poll_at) => Step::Poll,
-                work = mailbox.take() => Step::Work(work),
+                work = mailbox.take(), if !self.stopping() => Step::Work(work),
             };
             let outcome = match step {
                 Step::Stable => {
@@ -674,7 +703,7 @@ impl<D: DeviceDriver> Worker<D> {
                     // A poll that lost the link takes nothing off the mailbox: what waits there is
                     // the disconnect's to hold or refuse, and answer (review R4).
                     match polled {
-                        Ok(()) => match self.mailbox.try_take() {
+                        Ok(()) => match (!self.stopping()).then(|| self.mailbox.try_take()).flatten() {
                             Some(work) => self.work(handle, work).await,
                             None => Ok(()),
                         },
@@ -709,8 +738,7 @@ impl<D: DeviceDriver> Worker<D> {
             }
             Work::Execute { target, call, reply } => {
                 let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref(), &call)).await;
-                self.mailbox.command_done();
-                self.answered(target.as_deref(), &call.command, result, reply.into_iter().collect(), true)
+                self.answer_once(target.as_deref(), &call.command, result, reply.into_iter().collect())
             }
             Work::ReadExpired { expired } => {
                 report_refused(&self.reports, expired, READ_EXPIRED);
@@ -726,15 +754,13 @@ impl<D: DeviceDriver> Worker<D> {
                     None
                 });
                 // A failure goes to Error too, as every command's does (review C13).
-                self.mailbox.command_done();
-                self.answered(target.as_deref(), "refresh", result, replies, true)
+                self.answer_once(target.as_deref(), "refresh", result, replies)
             }
             Work::Read { key: ReadKey::Command { target, command }, call, replies, expired } => {
                 report_refused(&self.reports, expired, READ_EXPIRED);
                 let call = call.unwrap_or_else(|| crate::driver::CommandCall { command: command.clone(), params: PropertyMap::new() });
                 let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref(), &call)).await;
-                self.mailbox.command_done();
-                self.answered(target.as_deref(), &command, result, replies, true)
+                self.answer_once(target.as_deref(), &command, result, replies)
             }
         }
     }
@@ -753,6 +779,7 @@ impl<D: DeviceDriver> Worker<D> {
         values: Vec<StateValue>,
         proving: &BTreeMap<String, PropertyMap>,
     ) -> Result<Vec<StateValue>, LinkError> {
+        let values = self.restorable(target, values);
         if !values.iter().any(|v| v.check.any()) {
             return Ok(values);
         }
@@ -802,7 +829,45 @@ impl<D: DeviceDriver> Worker<D> {
         self.mailbox.retain_in_flight(|v| apply.iter().any(|a| a.target == v.target && a.property == v.property));
         self.superseded(&superseded, false);
         self.superseded(&unknown, true);
+        let restored = self.mailbox.restore_deferred(&unknown);
+        if restored > 0 {
+            info!(target, values = restored, "Keys whose request was superseded on an unknown value are restored");
+        }
         Ok(apply)
+    }
+
+    /// A target's values less the restored ones, unless its feedback — its config's, taken before
+    /// its values — is still `Assumed`: a restore is for a target the bridge cannot read, not one
+    /// that now reports (re-gate 4 F2: a target reported since was restored over the device's own
+    /// value). What is dropped leaves the in-flight set.
+    fn restorable(&self, target: &str, values: Vec<StateValue>) -> Vec<StateValue> {
+        if !values.iter().any(|v| v.restored) || self.mailbox.feedback(target, self.info.feedback) == Feedback::Assumed {
+            return values;
+        }
+        let (kept, dropped): (Vec<StateValue>, Vec<StateValue>) = values.into_iter().partition(|v| !v.restored);
+        info!(target, values = dropped.len(), "A target no longer assumed is not restored");
+        self.mailbox.retain_in_flight(|v| kept.contains(v));
+        kept
+    }
+
+    /// The outcome of the command the worker took: answered if it is still the worker's to answer
+    /// ([`Mailbox::command_done`]) — exactly one answer per command — and a lost link returned
+    /// either way.
+    fn answer_once(
+        &self,
+        target: Option<&str>,
+        command: &str,
+        result: Result<Option<Value>, OpError>,
+        replies: Vec<ReplyTo>,
+    ) -> Result<(), LinkError> {
+        if self.mailbox.command_done() {
+            return self.answered(target, command, result, replies, true);
+        }
+        debug!(target, command, "A command answered as cut off finished after all; not answered again");
+        match result {
+            Err(OpError::Link(e)) => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// A command's outcome: replied to, a failure reported on `Error` (`error_lane`), and a lost
@@ -949,10 +1014,13 @@ pub(crate) fn spawn<D: DeviceDriver>(
                 async {
                     // The heartbeat the watchdog reads: a blocked thread stops it (re-gate R1).
                     tokio::task::spawn_local(heartbeat(clock));
+                    // The stop first: once it is asked, nothing more is started (re-gate 4 minor 1).
+                    worker.stopping = Some(stop.clone());
                     // WAIT: worker-stop
                     tokio::select! {
-                        () = worker.run() => {}
+                        biased;
                         _ = stop.wait_for(|stop| *stop) => {}
+                        () = worker.run() => {}
                     }
                     // WAIT: device-disconnect
                     let _ = tokio::time::timeout(DISCONNECT_BOUND, worker.driver.disconnect()).await;

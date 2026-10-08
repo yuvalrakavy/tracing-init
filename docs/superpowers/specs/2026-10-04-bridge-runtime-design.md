@@ -98,7 +98,11 @@ lost link, never a hang.
   it starts until it ends — in use or abandoned, a cancelled caller's too — against a budget by
   kind: four for operations' calls, sixteen for helpers' (long-lived reads, a reader per port or
   zone, never fill the operations' cap; re-gate 3 S7). Past a budget a call is refused as a lost
-  link; only the operations' cap, full for twice the operation bound, is a dead worker.
+  link; either budget refusing calls, with no place freed, for twice the operation bound is a dead
+  worker — the helpers' too, since a reader whose synchronous reads never return leaks a thread at
+  each link loss, and once its budget is full every link is lost at its first call, for good
+  (re-gate 4 F4). A refusal stamped when a place is free again leaves no stamp (re-gate 4 minor 3),
+  and a call whose thread cannot start is a lost link too (minor 5).
 - `ctx.handle()`: a cloneable `LinkHandle` (`report()`, `link_lost()`, `is_lost()`, `blocking()`, `spawn()`) to
   keep for later calls, since the context itself is only handed to `connect`. `ctx.report` is a
   cloneable `Reporter`.
@@ -138,13 +142,29 @@ capped queue whose overflow is counted and logged once per episode.
   every request subscription's SUBACK has come — behind the last, every retained `Config` and
   `Desired` has been posted — the session posts each value of the read-back's assumed targets into
   the mailbox as an ordinary held request: `RequestWins`, expiring after `RESTORE_EXPIRY` (an AC's
-  `RequestExpiry`, 1 h). A key a request was posted for since the start is left to that request;
-  a request posted later replaces a restored value still waiting. From then on nothing is special:
-  configs first, the conflict rule (a device already at the value is satisfied), `Partial` (its
-  `Error`s, as any request's), proof and re-hold for unacknowledged writes, expiry. If the
-  read-back never completes, nothing is restored: one WARN `restore_incomplete`, and nothing
-  waits. (Re-gate S1: the restore had waits of its own — for the read-back, for the replays to go
-  quiet — and a defect in each round; it is now requests.)
+  `RequestExpiry`, 1 h). Only the request subscriptions' SUBACKs count: a late read-back's own
+  SUBACK, which comes ahead of theirs, does not (re-gate 4 F1: counted, the restore went before the
+  last subscription's retained replay, and wrote the old value over a newer request). A key a
+  request was posted for since the start is left to that request; a request posted later replaces
+  a restored value still waiting. If the request a key was left to is then superseded because the
+  device's current value is unknown (a `DeviceWins` replay to a one-way device), the key goes back
+  to the restore: its restore value is posted then, as the restore would have posted it — or, when
+  the request was superseded before the restore was posted, by the restore itself (re-gate 4 F6, a
+  decision: otherwise neither is applied and the device stays dark on that key). A request applied
+  keeps its key. A restored
+  value is marked: it is applied only while its target's feedback — its config's, taken before its
+  values — is still `Assumed` when it is taken (re-gate 4 F2: a target whose config now says it
+  reports was restored over the device's own value). From then on nothing is special: configs
+  first, the conflict rule (a device already at the value is satisfied), proof and re-hold for
+  unacknowledged writes, expiry — except that a restored value's own failures (a `Partial`'s, a
+  refusal, its expiry) are a WARN `restore_failed`, not the Store's `Error`: no one requested it
+  (re-gate 4 minor 10). If the read-back never completes, nothing is restored: one WARN
+  `restore_incomplete`, and nothing waits. A read-back cut short by the session's end — its SUBACK
+  late, or its replay under way — with the restore still to do is subscribed again on the next
+  connection, its frozen "before" values kept (re-gate 4 F5: the `State` subscription went with
+  the session, and nothing was ever restored); one the broker refused is not asked again.
+  (Re-gate S1: the restore had waits of its own — for the read-back, for the replays to go quiet —
+  and a defect in each round; it is now requests.)
 
 ## 5. What the runtime owns
 
@@ -210,7 +230,11 @@ commands are refused, and reads are dropped.
     current values and snapshots leave it out — they keep the value before it — until a probe or
     read proves that write (a report of the key settles it too). An unproven write held again
     when the link dies is then not satisfied by, nor superseded by, its own assumption, under
-    either conflict policy (re-gate R3).
+    either conflict policy (re-gate R3). A retraction of the key settles its assumption only when
+    no write of it is unproven; an unproven one stays unproven, held again if the link dies before
+    proof — the Store retracts once it has seen the assumed `State`, before any proof, so a
+    retraction that dropped it would leave the re-hold off in the normal confirm flow (re-gate 4
+    minor 7).
   - **What the snapshots hold:** the reported model, and over it what an acknowledged `apply`
     (`Writes::Acknowledged`) wrote since — for a `Partial`, only the values it did not name. A
     report of the key replaces a written value, and a key the driver reported during the `apply`
@@ -272,7 +296,10 @@ commands are refused, and reads are dropped.
   - `read_back_incomplete` (WARN): the read-back's SUBACK did not come within 5 s, or refused the
     subscription (an ACL; `refused`); the requests were subscribed without it;
   - `restore_incomplete` (WARN): the read-back is incomplete, so nothing is restored unless it
-    completes after all; once.
+    completes after all; once;
+  - `restore_failed` (WARN): a restored value failed at the device (`target`, `property`,
+    `error`), or restored values reached their expiry unapplied (`values`); in place of the
+    `Error` a request's failure publishes.
 
 ### 5.2 Bounds and repairs from the R1 gate (2026-10-04)
 
@@ -284,7 +311,8 @@ commands are refused, and reads are dropped.
   request while its pings succeed; a broker that stops reading holds rumqttc in its flush,
   inside the poll, where its keep-alive cannot fire. Reconnects are paced by `poll_retry`, and by
   `retry` after every fifth failed connect in a row — a connection dropped before `stable_after`
-  (two bridges sharing a client id) counting as a failed one (Claude's re-gate minor 12).
+  (two bridges sharing a client id) counting as a failed one (Claude's re-gate minor 12); a
+  connection's age counts from its CONNACK, so a slow one is no time it held (re-gate 4 minor 9).
 - **No operation on a lost link:** an operation is refused at once, the driver not called, on a
   link already reported lost; one admitted while the link was live and completed keeps its result
   over a loss noticed at the same moment (re-gate R6).
@@ -300,16 +328,21 @@ commands are refused, and reads are dropped.
   - an operation (or the disconnect) is past its deadline and a 2 s grace;
   - no operation runs and the worker runtime's heartbeat — a ticker on the worker's thread, every
     250 ms — has been silent for 5 s: a helper blocking the thread with a synchronous call;
-  - the blocking calls' cap has refused calls, with no place freed, for twice the operation bound:
-    threads stuck in synchronous calls for good, so every later call would be refused.
+  - a blocking budget — the operations' or the helpers' — has refused calls, with no place freed,
+    for twice the operation bound: threads stuck in synchronous calls for good, so every later
+    call would be refused. The worker itself still runs: the verdict refuses nothing and says
+    nothing of the device — the stop that follows stops the worker, and its flush refuses what
+    waits (re-gate 4 minor 8: refused at the verdict, a live worker served a mailbox marked
+    disconnected).
 
   A watchdog tick that comes more than 1 s late is a pause of the whole process (SIGSTOP, a VM's
   pause): the worker was paused too, so for 2 s after it the watchdog judges nothing (re-gate 3 S6).
 
-  Then: ERROR `worker_died`, `Status=unreachable`, the momentary commands waiting refused, and the
-  dead-part path — the bounded shutdown (which does not wait for the blocked worker) and a failure
-  exit, so the supervisor restarts the process. A thread cannot be cancelled; the restart is the
-  recovery (re-gate R1, R13).
+  Then: ERROR `worker_died`, for a blocked thread `Status=unreachable` and what waits refused —
+  the command the worker was running among them, "cut off" — and the dead-part path: the bounded
+  shutdown (which does not wait for a blocked worker, whether or not the verdict was read; re-gate
+  4 minor 4) and a failure exit, so the supervisor restarts the process. A thread cannot be
+  cancelled; the restart is the recovery (re-gate R1, R13).
 
   The deadline stays on the clock while `op()` drops an operation's future that ran out its
   bound, so a driver whose future's synchronous `Drop` takes longer than the 2 s grace — or a
@@ -330,13 +363,26 @@ commands are refused, and reads are dropped.
 - **Best effort at the end:** the reports a session had taken for a publish when the shutdown cut
   that publish short are not put back: the flush publishes what is pending after them, and what
   was taken and cut is lost (re-gate 3 S6: documented, not counted).
-- **What a stop answers:** the bounded shutdown first stops the worker taking work, refuses every
-  command still waiting for the device — and the one the worker had taken and was cut off from
-  answering, which the mailbox keeps as in flight until it is answered (re-gate 3 S3; the
-  watchdog's verdict refuses it the same way; its error says it was cut off while it ran, so the
-  device may or may not have done it, where a waiting one's says it was refused before it ran) — on `Error` and on its response topic — then publishes what
-  is pending (`Status`, `Error`, replies; a watchdog's verdict included), then `Active=false` and
-  the DISCONNECT, all within the flush's bound (re-gate R15).
+- **What a stop answers:** the bounded shutdown first stops the worker — it takes nothing more,
+  the stop checked before every take, and what it runs is cut off — and waits for it (2.5 s at
+  most: its driver's disconnect and its runtime's end); only then does the session's flush refuse
+  every command still waiting for the device, and the one the worker had taken and was cut off
+  from answering, which the mailbox keeps as in flight until it is answered (re-gate 3 S3) — on
+  `Error` and on its response topic — then publish what is pending (`Status`, `Error`, replies; a
+  watchdog's verdict included), then `Active=false` and the DISCONNECT, all within the flush's
+  bound (re-gate R15). A cut-off command's error says it was cut off while it ran, so the device
+  may or may not have done it; a waiting one's, that it was refused before it ran. **Exactly one
+  answer per command:** whoever takes the command out of flight answers it — the worker when its
+  operation ends (`Mailbox::command_done` says whether it still may), else the flush or the
+  watchdog's verdict — so a command a verdict answered "cut off" is not answered again when its
+  blocked call returns, and the worker, stopped before the flush, cannot answer between the
+  flush's refusals and its publish (re-gate 4 F3, minors 1 and 2).
+- **Reports before reads:** the session's select takes the stop, then what is pending to publish,
+  then the next incoming event. `reported` fires only with something queued, so reports cannot
+  starve the reads while publishing keeps up; a steady report stream (a fade, a meter) to a broker
+  slow to acknowledge can keep it always ready, and then incoming requests and SUBACKs wait behind
+  the publishes, bounded by the MQTT progress bound. Not bounded per read in R1 (re-gate 4 minor 6:
+  noted, not changed).
 - **Panics:** `Bridge::run` installs a process-global panic hook (`install_panic_hook`, also for
   in-process users of `Bridge::start`): ERROR `panic` through tracing (lossy), and the report for
   stderr handed to the process's one reporter thread through a bounded, lossy queue (16; full, the

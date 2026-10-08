@@ -555,3 +555,45 @@ async fn long_helper_reads_do_not_end_the_bridge() {
     assert!(died.is_err(), "the helpers' long reads ended the bridge: {died:?}");
     assert!(h.stop().await);
 }
+
+/// A reader whose synchronous reads never return leaks its helper threads at each link loss; once
+/// the helpers' budget stays full — every new link lost at its reader's first call — the worker is
+/// dead, and the bridge ends for its restart (re-gate 4 F4, its RG4-5: it flapped for good, never
+/// judged). The single link's long reads above do not end it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_helpers_budget_full_across_link_losses_is_a_dead_worker() {
+    let mut h = Harness::start_with("helper-budget-full", acknowledged(), quick_timing(), |_, _, device| {
+        device.set("t1", "temp", json!(20));
+        device.helper_every_link(Helper::HoldBlocking);
+    })
+    .await;
+    assert!(connected(&h).await);
+    for i in 0..4 {
+        let connects = h.device.calls_of(Op::Connect).len();
+        h.device.answer_times(Op::Execute, None, Answer::Link, 1);
+        assert!(h.command(json!({"target": "t1", "command": "pulse"}), None));
+        assert!(h.eventually(BOUND, |h| h.device.calls_of(Op::Connect).len() > connects).await, "loss {i}: no reconnect");
+        h.settle(Duration::from_millis(400)).await;
+    }
+    let died = tokio::time::timeout(Duration::from_secs(8), h.running().ended()).await;
+    let died = died.expect("a full helpers' budget left every link lost for good, and no dead worker");
+    assert!(died.cause.contains("helpers'"), "the bridge ended for another reason: {died:?}");
+    assert!(h.stop().await);
+}
+
+/// A stop after a verdict no one read — the watchdog found the worker's thread blocked — does not
+/// wait out its grace for that worker: the verdict says it will not stop (re-gate 4 minor 4: the
+/// stop aborted the finished watchdog, waited the whole grace, and said `shutdown_timeout`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_after_an_unread_verdict_does_not_wait_for_the_blocked_worker() {
+    let mut h = Harness::start_with("stop-after-verdict", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Execute, None, Answer::Block(Duration::from_secs(15)), 1);
+    assert!(h.command(json!({"target": "t1", "command": "pulse"}), None));
+    // The verdict comes at the deadline plus the grace (about 2.5 s); it is not read.
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "the watchdog did not judge the blocked worker");
+    let stopping = std::time::Instant::now();
+    assert!(h.stop_bridge().await, "the stop did not end in time");
+    assert!(stopping.elapsed() < Duration::from_secs(4), "the stop waited for a worker the verdict said blocked: {:?}", stopping.elapsed());
+    assert!(h.log.of_kind("shutdown_timeout").is_empty(), "the stop ran out its grace for a worker the verdict said blocked");
+}

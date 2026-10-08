@@ -17,6 +17,7 @@ fn value(target: &str, property: &str, v: Value) -> StateValue {
         conflict: Conflict::DeviceWins,
         check: Check::default(),
         basis: None,
+        restored: false,
     }
 }
 
@@ -166,7 +167,7 @@ fn the_property_copies_of_a_target_write_are_skipped() {
     assert_eq!(mailbox.post_state(value("tv", "power", json!(true)), false), Posted::Queued, "a copy is skipped once only");
 }
 
-/// A retraction removes the request wherever it is: waiting, held, in flight, unproven.
+/// A retraction removes the request wherever it is: waiting, held, in flight.
 #[test]
 fn a_retraction_removes_the_request_everywhere() {
     let mailbox = Mailbox::new();
@@ -515,5 +516,62 @@ fn a_targets_config_goes_before_its_held_values_whatever_its_held_flag() {
     match mailbox.take_held() {
         Some(Held::Config { target, config }) => assert_eq!((target.as_str(), config), ("b", Some(json!({"port": 2})))),
         other => panic!("b's held value went before its config: {other:?}"),
+    }
+}
+
+/// A retraction leaves a write the device has not proven unproven: the link's loss before proof
+/// holds it again (re-gate 4 minor 7: the Store retracts on the assumed State, before any proof,
+/// and the re-hold was off).
+#[test]
+fn a_retraction_keeps_an_unproven_write_held_again() {
+    let mailbox = up();
+    mailbox.post_state(value("u1", "temp", json!(22)), false);
+    assert!(mailbox.try_take().is_some());
+    mailbox.applied(true);
+    assert!(mailbox.retract("u1", "temp"), "the retraction did not see the unproven write");
+    mailbox.disconnected();
+    mailbox.connected();
+    assert_eq!(held_values(&mailbox).len(), 1, "a retraction dropped an unproven write: it was not held again");
+}
+
+/// A key the restore leaves to a request goes back to the restore when that request is superseded
+/// on an unknown value — whether the supersession comes before the restore is posted or after —
+/// and stays the request's when it was applied (re-gate 4 F6).
+#[test]
+fn a_key_superseded_on_an_unknown_value_goes_back_to_the_restore_in_either_order() {
+    let restored_now = |mailbox: &Mailbox| match mailbox.try_take() {
+        Some(Work::Apply { values, .. }) => values.iter().filter(|v| v.restored).map(|v| v.value.clone()).collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // Superseded first, the restore after.
+    let mailbox = up();
+    mailbox.post_state(value("u1", "level", json!(70)), true);
+    let request = held_or_taken(&mailbox);
+    mailbox.restore_deferred(&request);
+    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
+    assert_eq!(restored_now(&mailbox), [json!(40)], "a key superseded before the restore came stayed dark");
+    // The restore first, superseded after.
+    let mailbox = up();
+    mailbox.post_state(value("u1", "level", json!(70)), true);
+    let request = held_or_taken(&mailbox);
+    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
+    assert_eq!(mailbox.restore_deferred(&request), 1, "a key superseded after the restore was not given back");
+    assert_eq!(restored_now(&mailbox), [json!(40)]);
+    // Applied first: the request keeps its key.
+    let mailbox = up();
+    mailbox.post_state(value("u1", "level", json!(70)), true);
+    let _ = held_or_taken(&mailbox);
+    mailbox.applied(false);
+    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
+    assert_eq!(mailbox.restore_deferred(&[value("u1", "level", json!(70))]), 0, "an applied request's key went to the restore");
+    assert!(restored_now(&mailbox).is_empty());
+}
+
+/// The values the worker takes next.
+fn held_or_taken(mailbox: &Mailbox) -> Vec<StateValue> {
+    match mailbox.try_take() {
+        Some(Work::Apply { values, .. }) => values,
+        other => panic!("no values taken: {other:?}"),
     }
 }

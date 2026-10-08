@@ -314,7 +314,7 @@ async fn a_late_refusal_stamp_is_cleared_by_the_next_call_that_gets_its_place() 
     let abandoned = Arc::new(Abandoned::default());
     let ctx = LinkContext::new(1, "i", Reports::new(), abandoned.clone(), Arc::new(OpClock::new()));
     // The stamp of a refusal that lost the race with a place's release.
-    abandoned.refused();
+    abandoned.full_since.store(1, Ordering::SeqCst);
     assert!(abandoned.full_for().is_some());
     let held = under_deadline(Instant::now() + Duration::from_secs(2), ctx.blocking(|| std::thread::sleep(Duration::from_millis(300))));
     let checking = async {
@@ -323,4 +323,24 @@ async fn a_late_refusal_stamp_is_cleared_by_the_next_call_that_gets_its_place() 
     };
     let (_, during) = tokio::join!(held, checking);
     assert!(during.is_none(), "a stale refusal stamp stood while calls had their places");
+}
+
+/// A refusal stamped once a place is free again leaves no stamp: a release just before it would
+/// otherwise leave the cap "full" until the next call, and end a quiet worker (re-gate 4 minor 3).
+#[test]
+fn a_refusal_with_a_place_free_leaves_no_stamp() {
+    let abandoned = Abandoned::default();
+    abandoned.refused(Kind::Operation);
+    abandoned.refused(Kind::Helper);
+    assert!(abandoned.full_for().is_none(), "a refusal stamped the budget full with every place free");
+}
+
+/// A helpers' budget that stays full is a budget full, as the operations' (re-gate 4 F4).
+#[test]
+fn a_full_helpers_budget_is_seen_full() {
+    let abandoned = Abandoned::default();
+    abandoned.helpers.store(HELPER_CAP, Ordering::SeqCst);
+    abandoned.refused(Kind::Helper);
+    let (_, whose) = abandoned.full_for().expect("a full helpers' budget was not seen full");
+    assert_eq!(whose, "helpers'");
 }

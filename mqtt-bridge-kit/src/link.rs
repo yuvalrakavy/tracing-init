@@ -109,29 +109,56 @@ pub(crate) struct Abandoned {
     /// Helpers' calls running, under [`HELPER_CAP`].
     helpers: AtomicUsize,
     epoch: Instant,
-    /// Since when a call was refused for want of a place, in milliseconds since `epoch` plus one;
-    /// 0 once a place is free again. A cap that stays full is a dead worker (re-gate R13).
+    /// Since when an operation's call was refused for want of a place, in milliseconds since
+    /// `epoch` plus one; 0 once a place is free again. A cap that stays full is a dead worker
+    /// (re-gate R13).
     full_since: AtomicU64,
+    /// The same, for the helpers' budget: one full that long is a dead worker too — every link is
+    /// lost at its reader's first call, for good (re-gate 4 F4).
+    helpers_full_since: AtomicU64,
 }
 
 impl Default for Abandoned {
     fn default() -> Abandoned {
-        Abandoned { running: AtomicUsize::new(0), helpers: AtomicUsize::new(0), epoch: Instant::now(), full_since: AtomicU64::new(0) }
+        Abandoned {
+            running: AtomicUsize::new(0),
+            helpers: AtomicUsize::new(0),
+            epoch: Instant::now(),
+            full_since: AtomicU64::new(0),
+            helpers_full_since: AtomicU64::new(0),
+        }
     }
 }
 
 impl Abandoned {
-    /// How long calls have been refused for want of a place, with none freed since.
-    pub(crate) fn full_for(&self) -> Option<Duration> {
-        match self.full_since.load(Ordering::SeqCst) {
+    /// How long calls of a kind have been refused for want of a place, with none freed since —
+    /// the longer of the two budgets' — and whose budget it is.
+    pub(crate) fn full_for(&self) -> Option<(Duration, &'static str)> {
+        let since = |stamp: &AtomicU64| match stamp.load(Ordering::SeqCst) {
             0 => None,
             stamp => Some(self.epoch.elapsed().saturating_sub(Duration::from_millis(stamp - 1))),
+        };
+        let operations = since(&self.full_since).map(|full| (full, "operations'"));
+        let helpers = since(&self.helpers_full_since).map(|full| (full, "helpers'"));
+        operations.into_iter().chain(helpers).max_by_key(|(full, _)| *full)
+    }
+
+    /// A kind's count, cap and stamp.
+    fn budget(&self, kind: Kind) -> (&AtomicUsize, usize, &AtomicU64) {
+        match kind {
+            Kind::Operation => (&self.running, ABANDONED_CAP, &self.full_since),
+            Kind::Helper => (&self.helpers, HELPER_CAP, &self.helpers_full_since),
         }
     }
 
-    fn refused(&self) {
+    /// A call of `kind` was refused for want of a place: stamped, unless a place was freed since —
+    /// a release just before the stamp would leave it standing with places free (re-gate 4 minor 3).
+    fn refused(&self, kind: Kind) {
+        let (count, cap, full_since) = self.budget(kind);
         let stamp = self.epoch.elapsed().as_millis() as u64 + 1;
-        let _ = self.full_since.compare_exchange(0, stamp, Ordering::SeqCst, Ordering::SeqCst);
+        if full_since.compare_exchange(0, stamp, Ordering::SeqCst, Ordering::SeqCst).is_ok() && count.load(Ordering::SeqCst) < cap {
+            let _ = full_since.compare_exchange(stamp, 0, Ordering::SeqCst, Ordering::SeqCst);
+        }
     }
 }
 
@@ -143,21 +170,16 @@ struct Slot(Arc<Abandoned>, Kind);
 
 impl Slot {
     fn reserve(abandoned: &Arc<Abandoned>, kind: Kind) -> Option<Slot> {
-        let (count, cap) = match kind {
-            Kind::Operation => (&abandoned.running, ABANDONED_CAP),
-            Kind::Helper => (&abandoned.helpers, HELPER_CAP),
-        };
+        let (count, cap, full_since) = abandoned.budget(kind);
         let slot = count
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| (running < cap).then_some(running + 1))
             .ok()
             .map(|_| Slot(abandoned.clone(), kind));
-        if kind == Kind::Operation {
-            match slot {
-                // A place had: the operations' cap is not full, whatever a refusal that lost the race
-                // with a release stamped (re-gate 3 S6).
-                Some(_) => abandoned.full_since.store(0, Ordering::SeqCst),
-                None => abandoned.refused(),
-            }
+        match slot {
+            // A place had: the budget is not full, whatever a refusal that lost the race with a
+            // release stamped (re-gate 3 S6).
+            Some(_) => full_since.store(0, Ordering::SeqCst),
+            None => abandoned.refused(kind),
         }
         slot
     }
@@ -165,15 +187,9 @@ impl Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        match self.1 {
-            Kind::Operation => {
-                self.0.running.fetch_sub(1, Ordering::SeqCst);
-                self.0.full_since.store(0, Ordering::SeqCst);
-            }
-            Kind::Helper => {
-                self.0.helpers.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
+        let (count, _, full_since) = self.0.budget(self.1);
+        count.fetch_sub(1, Ordering::SeqCst);
+        full_since.store(0, Ordering::SeqCst);
     }
 }
 
@@ -366,6 +382,9 @@ impl LinkHandle {
             let _ = tx.send(value);
         });
         if let Err(e) = spawned {
+            // The call cannot run: the link is lost, as for any blocking call refused (re-gate 4
+            // minor 5).
+            self.link_lost("a blocking call's thread could not start");
             return Err(LinkError::new(format!("a blocking call's thread could not start: {e}")));
         }
         let outcome = match OP_DEADLINE.try_with(|deadline| *deadline).ok() {

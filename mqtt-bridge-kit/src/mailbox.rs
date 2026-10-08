@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 use lock_order::sync::Mutex;
 use serde_json::Value;
 use tokio::sync::Notify;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::driver::{CommandCall, Feedback};
 use crate::replies::ReplyTo;
@@ -82,6 +82,10 @@ pub struct StateValue {
     /// replay of a value already replayed, the one captured then — and kept through reads,
     /// re-holds and later disconnects (re-gate R2, R12).
     pub basis: Option<Basis>,
+    /// Posted by the restore (`DriverInfo::restore`), not requested: applied only while its target's
+    /// feedback is `Assumed` when it is taken, and its failures are a WARN, not the Store's `Error`
+    /// (re-gate 4 F2, minor 10).
+    pub restored: bool,
 }
 
 /// A replayed value's "before" basis: the bridge's knowledge of the key when it stopped listening
@@ -316,6 +320,16 @@ struct Inner {
     in_flight_command: Option<Unanswered>,
     /// Every key a request was posted for since the start: a restore leaves it to that request.
     requested: std::collections::HashSet<(String, String)>,
+    /// The restore's value of each key it left to a request, until that request is applied: one
+    /// superseded for an unknown current value gives the key back to the restore (re-gate 4 F6).
+    deferred_restore: HashMap<(String, String), StateValue>,
+    /// Whether the restore has been posted.
+    restore_posted: bool,
+    /// Before the restore is posted, how each key's request was last settled: `true` superseded on
+    /// an unknown value (the key goes to the restore), `false` applied (the request keeps it).
+    settled_before_restore: HashMap<(String, String), bool>,
+    /// Restored values dropped at their deadline, said once the lock is released (minor 10).
+    restore_expired: u32,
 }
 
 impl Inner {
@@ -369,10 +383,26 @@ impl Inner {
     /// Drop the values past their deadline, counting them.
     fn drop_expired(&mut self, values: &mut Vec<StateValue>, now: Instant) -> usize {
         let before = values.len();
+        let restored = values.iter().filter(|v| v.restored && v.expired(now)).count();
         values.retain(|v| !v.expired(now));
         let dropped = before - values.len();
-        self.expired += dropped as u32;
+        // A restored value is no one's request: its expiry is said apart (minor 10).
+        self.restore_expired += restored as u32;
+        self.expired += (dropped - restored) as u32;
         dropped
+    }
+
+    /// Restored values dropped at their deadline since the last call.
+    fn take_restore_expired(&mut self) -> u32 {
+        std::mem::take(&mut self.restore_expired)
+    }
+}
+
+/// Restored values that waited past their deadline: a WARN, the Store's `Error` being for its own
+/// requests (minor 10). Called with the mailbox's lock released.
+fn log_restore_expired(count: u32) {
+    if count > 0 {
+        warn!(kind = "restore_failed", values = count, "Restored values reached their expiry before the device took them; not applied");
     }
 }
 
@@ -474,9 +504,11 @@ impl Mailbox {
         self.queued(posted)
     }
 
-    /// The command in flight is answered (by the worker). Never waits.
-    pub fn command_done(&self) {
-        self.locked().in_flight_command = None;
+    /// The worker's command is done: whether it was still in flight — the worker's to answer. One
+    /// a stop or a watchdog's verdict took meanwhile was answered by them, "cut off", and is not
+    /// answered again (re-gate 4 F3). Never waits.
+    pub fn command_done(&self) -> bool {
+        self.locked().in_flight_command.take().is_some()
     }
 
     /// A restore (`DriverInfo::restore`): each of `values` — what the previous run assumed, from
@@ -489,14 +521,22 @@ impl Mailbox {
             let mut inner = self.locked();
             let held = !inner.connected;
             let mut posted = 0;
+            inner.restore_posted = true;
+            let settled = std::mem::take(&mut inner.settled_before_restore);
             for mut value in values {
                 let key = (value.target.clone(), value.property.clone());
-                if inner.requested.contains(&key) {
-                    continue;
-                }
                 value.deadline = Some(deadline);
                 value.conflict = Conflict::RequestWins;
                 value.check = Check { replayed: false, held: true };
+                value.restored = true;
+                // A key left to a request: kept by it if it was applied, the restore's again if it
+                // was superseded on an unknown value — before the restore came, or after.
+                if inner.requested.contains(&key) && settled.get(&key) != Some(&true) {
+                    if !settled.contains_key(&key) {
+                        inner.deferred_restore.insert(key, value);
+                    }
+                    continue;
+                }
                 inner.replace_state(value, held);
                 posted += 1;
             }
@@ -508,14 +548,47 @@ impl Mailbox {
         posted
     }
 
-    /// A property's request was retracted: nothing of it is applied or held again any more.
-    pub fn retract(&self, target: &str, property: &str) {
+    /// Requests superseded because the device's current value is unknown: each key the restore left
+    /// to one gets the restore's value back, posted as the restore would have (re-gate 4 F6: the
+    /// key was left dark). Returns how many were posted. Never waits.
+    pub fn restore_deferred(&self, superseded: &[StateValue]) -> usize {
+        let (posted, any) = {
+            let mut inner = self.locked();
+            let held = !inner.connected;
+            let mut posted = 0;
+            for value in superseded {
+                let key = (value.target.clone(), value.property.clone());
+                if let Some(restore) = inner.deferred_restore.remove(&key) {
+                    if !inner.waits_for(&restore) {
+                        inner.replace_state(restore, held);
+                        posted += 1;
+                    }
+                } else if !inner.restore_posted {
+                    // The restore has not come yet: it takes the key when it does.
+                    inner.settled_before_restore.insert(key, true);
+                }
+            }
+            (posted, posted > 0 && !held)
+        };
+        if any {
+            self.posted.notify_one();
+        }
+        posted
+    }
+
+    /// A property's request was retracted: what of it waits or is in flight is not applied. A write
+    /// of it the device has not proven taken stays unproven — held again if the link dies before
+    /// proof — for the Store retracts once it has seen the assumed `State`, before any proof
+    /// (re-gate 4 minor 7: dropped, the re-hold was off in the normal confirm flow). Returns
+    /// whether the key has such a write.
+    pub fn retract(&self, target: &str, property: &str) -> bool {
         let mut inner = self.locked();
         inner.pending.retain(|e| !matches!(e, Entry::State { value, .. } if value.is_key(target, property)));
         inner.in_flight.retain(|v| !v.is_key(target, property));
-        inner.unproven.retain(|(v, _)| !v.is_key(target, property));
+        let unproven = inner.unproven.iter().any(|(v, _)| v.is_key(target, property));
         inner.copies.remove(&(target.to_owned(), property.to_owned()));
         inner.bases.remove(&(target.to_owned(), property.to_owned()));
+        unproven
     }
 
     /// A target's setup, or (`None`) its retraction; the latest per target. Its `feedback`, if it
@@ -679,7 +752,7 @@ impl Mailbox {
     /// in flight only what it applies ([`retain_in_flight`](Self::retain_in_flight)). Never waits.
     pub fn take_held(&self) -> Option<Held> {
         let now = Instant::now();
-        let (held, expired) = {
+        let (held, expired, restore_expired) = {
             let mut inner = self.locked();
             let mut expired = 0;
             let held = loop {
@@ -710,8 +783,10 @@ impl Mailbox {
                 inner.in_flight = values.clone();
                 break Some(Held::Values(HeldValues { target, values }));
             };
-            (held, expired)
+            let restore_expired = inner.take_restore_expired();
+            (held, expired, restore_expired)
         };
+        log_restore_expired(restore_expired);
         if expired > 0 {
             debug!(expired, "Held requests dropped at their deadline");
         }
@@ -803,10 +878,12 @@ impl Mailbox {
     /// The next work, if any waits. Never waits.
     pub fn try_take(&self) -> Option<Work> {
         let mut dropped = 0;
-        let work = {
+        let (work, restore_expired) = {
             let mut inner = self.locked();
-            Mailbox::next(&mut inner, Instant::now(), &mut dropped)
+            let work = Mailbox::next(&mut inner, Instant::now(), &mut dropped);
+            (work, inner.take_restore_expired())
         };
+        log_restore_expired(restore_expired);
         if dropped > 0 {
             debug!(dropped, "Requests dropped at their deadline");
         }
@@ -894,6 +971,14 @@ impl Mailbox {
         let mut inner = self.locked();
         let applied = std::mem::take(&mut inner.in_flight);
         inner.in_flight_config = None;
+        // A request applied keeps its key: the restore's deferred value is moot.
+        for value in &applied {
+            let key = (value.target.clone(), value.property.clone());
+            inner.deferred_restore.remove(&key);
+            if !inner.restore_posted && !value.restored {
+                inner.settled_before_restore.insert(key, false);
+            }
+        }
         if unacknowledged {
             for value in applied {
                 let at = match inner.unproven.iter().position(|(v, _)| v.same_key(&value)) {

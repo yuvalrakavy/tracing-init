@@ -120,3 +120,27 @@ fn a_retraction_settles_the_keys_unproven_assumption() {
         "a retraction left the key's assumption unproven"
     );
 }
+
+/// A retraction of a key whose write the mailbox holds unproven settles nothing: the probe proves
+/// it, or the link's loss holds it again (re-gate 4 minor 7).
+#[test]
+fn a_retraction_of_an_unproven_write_leaves_its_assumption_unproven() {
+    let shared = shared_for_port();
+    shared.mailbox.connected();
+    let level = serde_json::json!({"level": 40}).as_object().unwrap().clone();
+    let topic = shared.topics.desired("t1", "level");
+    let mut request = Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), None);
+    request.retain = false;
+    route(&shared, &topic, &request, Instant::now());
+    assert!(shared.mailbox.try_take().is_some());
+    shared.mailbox.applied(true);
+    shared.reports.assume_unproven("t1", level);
+    let mut retraction = Publish::new(topic.clone(), QoS::AtLeastOnce, Vec::<u8>::new(), None);
+    retraction.retain = true;
+    route(&shared, &topic, &retraction, Instant::now());
+    assert_eq!(
+        shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
+        None,
+        "a retraction proved a write the device never proved taken"
+    );
+}

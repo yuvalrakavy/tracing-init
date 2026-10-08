@@ -170,6 +170,7 @@ fn an_unproven_assumption_is_left_out_until_proven() {
         conflict: crate::wire::Conflict::DeviceWins,
         check: Default::default(),
         basis: None,
+        restored: false,
     };
     reports.assumptions_proven(&[written]);
     assert_eq!(reports.values_of("u1").unwrap()["level"], json!(50), "a proven assumption was left out");
