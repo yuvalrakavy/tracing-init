@@ -52,7 +52,7 @@
 //!   retained, if the will is retained — as a broker publishes it.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -209,6 +209,8 @@ struct Shared {
     hold_acks: AtomicBool,
     /// Packet ids of the PUBACKs held on the current connection.
     held: Mutex<Vec<u16>>,
+    /// How long each QoS 1 ack is delayed, in milliseconds (0: none): a broker slow but steady.
+    ack_delay_ms: AtomicU64,
     /// The current connection's writer, taking encoded packets.
     to_client: Mutex<Option<mpsc::UnboundedSender<BytesMut>>>,
     /// Any change a test may wait for: a publish received, a subscription, a connection.
@@ -239,8 +241,6 @@ struct Shared {
     max_packet: Mutex<Option<(usize, u32)>>,
     /// Whether SUBACKs (and their replays) are held, and those held, in order.
     holding_subacks: AtomicBool,
-    /// Filters whose SUBACK is held whatever `holding_subacks` says ([`FakeBroker::hold_subacks_on`]).
-    holding_prefixes: Mutex<Vec<String>>,
     held_subacks: Mutex<Vec<BytesMut>>,
     /// Filters starting with one of these are refused, `NotAuthorized` (an ACL).
     denied: Mutex<Vec<String>>,
@@ -276,6 +276,7 @@ impl FakeBroker {
             connections: AtomicUsize::new(0),
             hold_acks: AtomicBool::new(false),
             held: Mutex::new(Vec::new()),
+            ack_delay_ms: AtomicU64::new(0),
             to_client: Mutex::new(None),
             changed: Notify::new(),
             retained: Mutex::new(BTreeMap::new()),
@@ -291,7 +292,6 @@ impl FakeBroker {
             will: Mutex::new(None),
             max_packet: Mutex::new(None),
             holding_subacks: AtomicBool::new(false),
-            holding_prefixes: Mutex::new(Vec::new()),
             held_subacks: Mutex::new(Vec::new()),
             denied: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -416,6 +416,13 @@ impl FakeBroker {
         self.shared.accepted.load(Ordering::SeqCst)
     }
 
+    /// Acknowledge each of the client's QoS 1 publishes `delay` after it arrives, from now on (zero:
+    /// at once): a broker slow but steady — the acks keep coming, so nothing stalls, but a client
+    /// whose in-flight window fills publishes no faster than they do.
+    pub fn delay_acks(&self, delay: Duration) {
+        self.shared.ack_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
     /// Stop acknowledging the client's QoS 1 publishes (see the module documentation). QoS 2
     /// publishes are still acknowledged.
     pub fn hold_acks(&self) {
@@ -443,14 +450,6 @@ impl FakeBroker {
         self.shared.holding_subacks.store(true, Ordering::SeqCst);
     }
 
-    /// Hold the SUBACK — and its replay — of every subscription to a filter starting with `prefix`
-    /// from now on, the others answered: a broker slow on one subscription. Released with the rest
-    /// by [`release_subacks`](Self::release_subacks); a SUBACK after a held one is answered out of
-    /// order, so hold only the last subscription a client makes.
-    pub fn hold_subacks_on(&self, prefix: &str) {
-        self.shared.holding_prefixes.lock().unwrap().push(prefix.to_owned());
-    }
-
     /// Refuse every subscription to a filter starting with `prefix` from now on, with the reason
     /// code `NotAuthorized`: no subscription is made and nothing replayed (a broker's ACL).
     pub fn deny_subscriptions(&self, prefix: &str) {
@@ -459,14 +458,13 @@ impl FakeBroker {
 
     /// Send the SUBACKs held, and their replays, in order, and hold none from now on.
     pub fn release_subacks(&self) {
-        let held = {
-            let mut held = self.shared.held_subacks.lock().unwrap();
-            self.shared.holding_subacks.store(false, Ordering::SeqCst);
-            self.shared.holding_prefixes.lock().unwrap().clear();
-            std::mem::take(&mut *held)
-        };
+        // Sent under the lock a SUBSCRIBE takes to decide whether to hold its SUBACK: one coming
+        // meanwhile goes out after these, as the broker answers in order (Codex final gate).
+        let mut held = self.shared.held_subacks.lock().unwrap();
+        self.shared.holding_subacks.store(false, Ordering::SeqCst);
+        let packets = std::mem::take(&mut *held);
         if let Some(tx) = &*self.shared.to_client.lock().unwrap() {
-            for packet in held {
+            for packet in packets {
                 let _ = tx.send(packet);
             }
         }
@@ -783,8 +781,15 @@ fn lock_held(shared: &Shared) -> std::sync::MutexGuard<'_, Vec<u16>> {
 /// acks before this one joined them, and strand it (review finding X-7).
 fn ack_or_hold(shared: &Shared, tx: &mpsc::UnboundedSender<BytesMut>, pkid: u16) {
     let mut held = lock_held(shared);
+    let delay = shared.ack_delay_ms.load(Ordering::SeqCst);
     if shared.hold_acks.load(Ordering::SeqCst) {
         held.push(pkid);
+    } else if delay > 0 {
+        let (tx, protocol) = (tx.clone(), shared.protocol);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            let _ = tx.send(puback(protocol, pkid));
+        });
     } else {
         let _ = tx.send(puback(shared.protocol, pkid));
     }
@@ -887,11 +892,7 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
                 packets.extend(replay(shared, &f.path));
             }
             let mut held = shared.held_subacks.lock().unwrap();
-            let held_filter = {
-                let prefixes = shared.holding_prefixes.lock().unwrap();
-                s.filters.iter().any(|f| prefixes.iter().any(|p| f.path.starts_with(p.as_str())))
-            };
-            if shared.holding_subacks.load(Ordering::SeqCst) || held_filter {
+            if shared.holding_subacks.load(Ordering::SeqCst) {
                 held.extend(packets);
             } else {
                 for packet in packets {

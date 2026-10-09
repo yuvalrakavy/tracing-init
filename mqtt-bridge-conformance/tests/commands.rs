@@ -498,3 +498,69 @@ async fn a_command_cut_off_by_the_watchdog_is_answered_once() {
     assert!(answers["w-1"][0].contains("cut off"), "the command the watchdog cut off was not said cut off: {answers:?}");
     assert!(h.stop().await);
 }
+
+/// A device that reports without pause — a fade, a meter — to a broker slow but steady to
+/// acknowledge keeps a batch of reports ready at every pass of the session; a command arriving
+/// meanwhile is still read and answered: one ready incoming event goes before the next batch
+/// (Codex final gate 1: the reports went first every time, and the command waited for good).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_is_answered_under_a_steady_stream_of_reports() {
+    let h = Harness::start_with("report-stream", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    // Each ack 200 ms after its publish: the in-flight window fills, and a batch of 50 states takes
+    // far longer to publish than the reports take to come.
+    h.broker.delay_acks(Duration::from_millis(200));
+    let reporting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let reporter = {
+        let (device, reporting) = (h.device.clone(), reporting.clone());
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            while reporting.load(std::sync::atomic::Ordering::SeqCst) {
+                for t in 0..50 {
+                    let values: PropertyMap = [("n".to_owned(), json!(n))].into_iter().collect();
+                    device.report(&format!("m{t:03}"), values);
+                }
+                n += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    h.settle(Duration::from_secs(1)).await;
+    let replies = "Store/replies/report-stream";
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"r-1"))));
+    let answered = h.eventually(Duration::from_secs(15), |h| !h.published(replies).is_empty()).await;
+    reporting.store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = reporter.join();
+    h.broker.delay_acks(Duration::ZERO);
+    assert!(answered, "a command under a steady stream of reports was never read: the reports went first every time");
+    assert!(h.stop().await);
+}
+
+/// A stop with the mailbox full — one command executing and 64 waiting, each with a response
+/// topic — answers every one, once: the stop's refusals are published directly, not through the
+/// reports' capped queues (Codex final gate 2: 65 refusals into 64-entry queues dropped the
+/// executing command's answer).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_with_a_full_mailbox_answers_every_command() {
+    let timing = mqtt_bridge_kit::TimingOverrides { operation: Some(Duration::from_secs(3)), ..quick_timing() };
+    let mut h = Harness::start_with("stop-full", acknowledged(), timing, up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(2500)), 1);
+    let replies = "Store/replies/stop-full";
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-0"))));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
+    for i in 1..=64 {
+        let id = format!("c-{i}");
+        assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, id.as_bytes()))));
+    }
+    // Every one of them waits in the mailbox before the stop.
+    h.settle(Duration::from_millis(500)).await;
+    assert!(h.stop_bridge().await);
+    let answers = answers_by_correlation(&h, replies);
+    let missing: Vec<String> = (0..=64).map(|i| format!("c-{i}")).filter(|id| !answers.contains_key(id)).collect();
+    assert!(missing.is_empty(), "a stop with a full mailbox left commands unanswered: {missing:?}");
+    for (id, errors) in &answers {
+        assert_eq!(errors.len(), 1, "command {id} was answered {} times", errors.len());
+    }
+    assert!(answers["c-0"][0].contains("cut off"), "the executing command was not said cut off: {:?}", answers["c-0"]);
+}

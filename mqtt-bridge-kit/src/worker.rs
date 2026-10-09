@@ -919,20 +919,35 @@ const READ_EXPIRED: &str = "the command reached its expiry while it waited for t
 
 /// What a disconnect refused, or what expired: each command on `Error`, and every reply waited for.
 pub(crate) fn report_refused(reports: &Reports, unanswered: Vec<Unanswered>, message: &str) {
+    let (errors, replies) = refusals(unanswered, message);
+    for error in errors {
+        reports.error(error);
+    }
+    for reply in replies {
+        reports.event(reply);
+    }
+}
+
+/// The same, as the messages themselves — for the stop's flush, which publishes them directly
+/// rather than through the reports' capped queues: one command executing and 64 waiting are 65
+/// refusals, and the queues would drop the oldest (Codex final gate 2).
+pub(crate) fn refusals(unanswered: Vec<Unanswered>, message: &str) -> (Vec<ErrorReport>, Vec<Outbound>) {
+    let (mut errors, mut replies) = (Vec::new(), Vec::new());
     for u in unanswered {
         // One the worker was running was cut off, not refused before it ran (re-gate 3 S3).
         let message = if u.ran { CUT_OFF } else { message };
         // A read refused is a failure too: on Error, as every command's (review C13).
-        reports.error(ErrorReport::new(Reason::Refused, message).target(u.target.as_deref()).command(&u.command));
+        errors.push(ErrorReport::new(Reason::Refused, message).target(u.target.as_deref()).command(&u.command));
         let answer = Answer::Failed { reason: Reason::Refused, error: message.to_owned() };
         for reply in u.replies {
-            reports.event(Outbound {
+            replies.push(Outbound {
                 topic: Some(reply.topic),
                 payload: reply_payload(u.target.as_deref(), &u.command, &answer),
                 correlation: reply.correlation,
             });
         }
     }
+    (errors, replies)
 }
 
 /// A connect's error as the link's.

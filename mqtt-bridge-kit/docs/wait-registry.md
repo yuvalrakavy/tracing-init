@@ -114,6 +114,7 @@ mqtt-pump-queue src/session.rs flush
 mqtt-request src/session.rs connected
 mqtt-request src/session.rs emit
 mqtt-request src/session.rs flush
+mqtt-request src/session.rs session
 panic-report src/process.rs PanicReports::report
 panic-report src/process.rs PanicReports::start
 read-back-suback src/session.rs read_back_acknowledged

@@ -346,7 +346,9 @@ commands are refused, and reads are dropped.
   most: its driver's disconnect and its runtime's end); only then does the session's flush refuse
   every command still waiting for the device, and the one the worker had taken and was cut off
   from answering, which the mailbox keeps as in flight until it is answered (re-gate 3 S3) — on
-  `Error` and on its response topic — then publish what is pending (`Status`, `Error`, replies; a
+  `Error` and on its response topic, published directly rather than through the reports' capped
+  queues, which a full mailbox (one command executing, 64 waiting) would overflow (Codex final
+  gate 2) — then publish what is pending (`Status`, `Error`, replies; a
   watchdog's verdict included), then `Active=false` and the DISCONNECT, all within the flush's
   bound (re-gate R15). A cut-off command's error says it was cut off while it ran, so the device
   may or may not have done it; a waiting one's, that it was refused before it ran. **Exactly one
@@ -361,12 +363,16 @@ commands are refused, and reads are dropped.
   re-gate 5: a verdict just after a check made the stop wait out its 2.5 s). After a
   full-budget verdict the worker still runs, and nothing is refused until the stop: an embedder
   that reads the verdict late keeps serving meanwhile, with its blocking budget full.
-- **Reports before reads:** the session's select takes the stop, then what is pending to publish,
-  then the next incoming event. `reported` fires only with something queued, so reports cannot
-  starve the reads while publishing keeps up; a steady report stream (a fade, a meter) to a broker
-  slow to acknowledge can keep it always ready, and then incoming requests and SUBACKs wait behind
-  the publishes, bounded by the MQTT progress bound. Not bounded per read in R1 (re-gate 4 minor 6:
-  noted, not changed).
+- **Reports before reads, and a read after every batch:** the session's select takes the stop
+  first, then what is pending to publish, then the next incoming event — the reads polled first
+  would drain a backlog before a publish and displace its replies past the event cap (re-gate 3
+  S2). But after a batch of reports, one incoming event that is ready goes before the next batch: a
+  steady report stream (a fade, a meter) to a broker slow but steady to acknowledge keeps
+  `reported` ready at every pass, and the requests, commands and SUBACKs would otherwise wait for
+  good, the acknowledgements keeping the progress bound from firing (Codex final gate 1). The
+  read-back's subscription is dropped once the read-back is done — complete, or late — since its
+  frozen copy is all the conflict rule reads: kept, it brought each `State` the bridge publishes
+  back as an incoming publish, queued ahead of every request.
 - **Panics:** `Bridge::run` installs a process-global panic hook (`install_panic_hook`, also for
   in-process users of `Bridge::start`): ERROR `panic` through tracing (lossy), and the report for
   stderr handed to the process's one reporter thread through a bounded, lossy queue (16; full, the

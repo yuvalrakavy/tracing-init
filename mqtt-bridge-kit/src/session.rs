@@ -191,24 +191,41 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
     let mut announced = false;
     // When the broker accepted this session's connection, if it did.
     let mut accepted: Option<Instant> = None;
+    // Whether the last pass published a batch of reports.
+    let mut reported_last = false;
     loop {
-        // WAIT: session-events
         // The stop first: its flush publishes what is pending anyway (re-gate R15). Then what is
-        // pending before the next read: `reported` fires only with something queued, so it cannot
-        // starve the reads, while the reads polled first would drain a whole backlog before a
-        // publish and displace its replies past the event cap (re-gate 3 S2, RG3-3).
-        let step = tokio::select! {
-            biased;
-            _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
-            () = shared.reports.reported(), if announced => Step::Reported,
-            event = incoming.recv() => Step::Event(event),
+        // pending before the next read: the reads polled first would drain a whole backlog before a
+        // publish and displace its replies past the event cap (re-gate 3 S2, RG3-3). But after a
+        // batch of reports, one incoming event that is ready goes first: a steady stream of reports
+        // to a broker slow to acknowledge keeps `reported` ready at every pass, and the requests,
+        // commands and SUBACKs behind it would wait for good (Codex final gate 1).
+        let step = if reported_last {
+            // WAIT: session-events
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
+                event = incoming.recv() => Step::Event(event),
+                () = shared.reports.reported(), if announced => Step::Reported,
+            }
+        } else {
+            // WAIT: session-events
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
+                () = shared.reports.reported(), if announced => Step::Reported,
+                event = incoming.recv() => Step::Event(event),
+            }
         };
+        reported_last = matches!(step, Step::Reported);
         let connack = matches!(step, Step::Event(Some(PumpEvent::Connected)));
         if connack && accepted.is_none() {
             accepted = Some(Instant::now());
         }
         // The next subscription's SUBACK, behind the read-back's replay, completes it.
-        if matches!(step, Step::Event(Some(PumpEvent::SubAck { .. }))) && shared.read_back_next.swap(false, Ordering::SeqCst) {
+        let read_back_done =
+            matches!(step, Step::Event(Some(PumpEvent::SubAck { .. }))) && shared.read_back_next.swap(false, Ordering::SeqCst);
+        if read_back_done {
             shared.reports.read_back_complete();
         }
         let work = async {
@@ -223,6 +240,12 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                 Step::Event(Some(PumpEvent::Publish(publish, received))) => {
                     handle(shared, &publish, received);
                     Ok(None)
+                }
+                // The read-back is done: its subscription would only bring the bridge's own State
+                // back, a publish for each one it makes, ahead of every request (Codex final gate 1).
+                Step::Event(Some(PumpEvent::SubAck { .. })) if read_back_done => {
+                    // WAIT: mqtt-request
+                    client.unsubscribe(shared.topics.state_filter()).await.map(|()| None)
                 }
                 Step::Event(Some(PumpEvent::Disconnected | PumpEvent::SubAck { .. } | PumpEvent::Subscribing(_))) => Ok(None),
                 Step::Event(Some(PumpEvent::Ended(_))) => Ok(Some(SessionEnd::Ended { connected: None })),
@@ -295,6 +318,10 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
             }
             ReadBack::Late => {
                 shared.reports.read_back_incomplete();
+                // Done, as far as the conflict rule goes: its own State coming back would only
+                // queue ahead of the requests (Codex final gate 1).
+                // WAIT: mqtt-request
+                client.unsubscribe(topics.state_filter()).await?;
                 warn!(
                     kind = "read_back_incomplete",
                     waited_ms = READ_BACK_WAIT.as_millis() as u64,
@@ -402,7 +429,10 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) {
         // What still waits for the device will not run: refused, on Error and on its response
         // topic; then what is pending — Status, Errors, replies — then the last words (re-gate
         // R15). Here, in the session's own flush, so nothing else publishes them first by chance.
-        crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);
+        // Published directly, not through the reports' capped queues, which a full mailbox would
+        // overflow (Codex final gate 2).
+        let (errors, replies) = crate::worker::refusals(shared.mailbox.disconnected(), STOPPED_BEFORE);
+        publish_changes(shared, client, Changes { errors, events: replies, ..Changes::default() }).await;
         publish_changes(shared, client, shared.reports.take()).await;
         emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
         // WAIT: mqtt-request
