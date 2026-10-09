@@ -384,17 +384,18 @@ commands are refused, and reads are dropped.
 - **Reports before reads, and a read after every batch:** the session's select takes the stop
   first, then what is pending to publish, then the next incoming event — the reads polled first
   would drain a backlog before a publish and displace its replies past the event cap (re-gate 3
-  S2). But after a batch of reports, one incoming event that is ready goes before the next batch: a
-  steady report stream (a fade, a meter) to a broker slow but steady to acknowledge keeps
+  S2). But after a batch of reports, the incoming events that are ready — up to 64 — go before the
+  next batch: a steady report stream (a fade, a meter) to a broker slow but steady to acknowledge keeps
   `reported` ready at every pass, and the requests, commands and SUBACKs would otherwise wait for
   good, the acknowledgements keeping the progress bound from firing (Codex final gate 1). The
   read-back's subscription is dropped once the read-back is done — complete, or late — since its
   frozen copy is all the conflict rule reads: kept, it brought each `State` the bridge publishes
-  back as an incoming publish, queued ahead of every request. A backlog of incoming events drains
-  at one per report batch, so under a steady stream N queued commands wait N batches: latency,
-  bounded, not a hang — a command past its expiry meanwhile is answered as expired (the second
-  final gate's minor 3: documented, not changed).
-- **Answers are never displaced, and go first:** every reply to a request (an outbound message with
+  back as an incoming publish, queued ahead of every request. Some still come: what the first
+  batch published before the broker took the UNSUBSCRIBE. Read at one per batch, those drained at
+  a read a second, and a command behind them waited past its expiry (the second confirming
+  review's minor 5, a flake under load); up to 64 per batch, a backlog drains in a pass or two.
+  Answers being uncapped, a backlog read first displaces none of them.
+- **Answers are never displaced:** every reply to a request (an outbound message with
   a response topic) and every terminal `Error` of one — a refusal (a stop's, a link loss's, a
   watchdog's, an expired read caller's, one on arrival), a failure (`Rejected`, `Unusable`,
   `Unsupported`, each of a `Partial`'s properties, a command's), a supersession — go to an uncapped

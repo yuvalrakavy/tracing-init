@@ -112,6 +112,9 @@ pub(crate) struct Shared {
     pub read_back_next: AtomicBool,
 }
 
+/// After a batch of reports, how many ready incoming events go before the next batch.
+const READS_PER_BATCH: u32 = 64;
+
 /// How a session ended.
 enum SessionEnd {
     /// Its connection failed, or never came (`connected`: when the broker accepted it, if it did);
@@ -199,16 +202,19 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
     let mut announced = false;
     // When the broker accepted this session's connection, if it did.
     let mut accepted: Option<Instant> = None;
-    // Whether the last pass published a batch of reports.
-    let mut reported_last = false;
+    // How many ready incoming events still go before the next batch of reports.
+    let mut reads_owed: u32 = 0;
     loop {
-        // The stop first: its flush publishes what is pending anyway (re-gate R15). Then what is
-        // pending before the next read: the reads polled first would drain a whole backlog before a
-        // publish and displace its replies past the event cap (re-gate 3 S2, RG3-3). But after a
-        // batch of reports, one incoming event that is ready goes first: a steady stream of reports
-        // to a broker slow to acknowledge keeps `reported` ready at every pass, and the requests,
-        // commands and SUBACKs behind it would wait for good (Codex final gate 1).
-        let step = if reported_last {
+        // The stop first: its flush publishes what is pending anyway (re-gate R15). Then, after a
+        // batch of reports, the incoming events that are ready — up to READS_PER_BATCH — before the
+        // next batch: a steady stream of reports to a broker slow to acknowledge keeps `reported`
+        // ready at every pass, and the requests, commands and SUBACKs behind it would wait for good
+        // (Codex final gate 1); one read per batch drained a backlog — the bridge's own State coming
+        // back before the read-back's subscription was dropped — at a read a second, and a command
+        // behind it waited past its expiry (the second confirming review's minor 5). With no read
+        // owed, what is pending goes first: answers are uncapped, so no backlog drained first can
+        // displace them (re-gate 3 S2).
+        let step = if reads_owed > 0 {
             // WAIT: session-events
             tokio::select! {
                 biased;
@@ -225,7 +231,11 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                 event = incoming.recv() => Step::Event(event),
             }
         };
-        reported_last = matches!(step, Step::Reported);
+        reads_owed = match step {
+            Step::Reported => READS_PER_BATCH,
+            _ => reads_owed.saturating_sub(1),
+        };
+
         let connack = matches!(step, Step::Event(Some(PumpEvent::Connected)));
         if connack && accepted.is_none() {
             accepted = Some(Instant::now());

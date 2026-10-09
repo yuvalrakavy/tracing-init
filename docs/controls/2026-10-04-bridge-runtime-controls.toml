@@ -178,7 +178,7 @@ guard       = "connack_republish"
 [[control]]
 name        = "reports_are_published_before_the_connack"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        let step = if reported_last {
+anchor      = '''        let step = if reads_owed > 0 {
             // WAIT: session-events
             tokio::select! {
                 biased;
@@ -195,7 +195,7 @@ anchor      = '''        let step = if reported_last {
                 event = incoming.recv() => Step::Event(event),
             }
         };'''
-replacement = '''        let step = if reported_last {
+replacement = '''        let step = if reads_owed > 0 {
             // WAIT: session-events
             tokio::select! {
                 biased;
@@ -2548,8 +2548,8 @@ guard       = "reheld_unsettled"
 [[control]]
 name        = "reports_starve_the_reads"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        let step = if reported_last {'''
-replacement = '''        let step = if false && reported_last {'''
+anchor      = '''        let step = if reads_owed > 0 {'''
+replacement = '''        let step = if false && reads_owed > 0 {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_is_answered_under_a_steady_stream_of_reports", "--exact"]
 expect_text = '''a command under a steady stream of reports was never read'''

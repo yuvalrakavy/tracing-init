@@ -537,11 +537,25 @@ async fn a_command_is_answered_under_a_steady_stream_of_reports() {
     h.settle(Duration::from_secs(1)).await;
     let replies = "Store/replies/report-stream";
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"r-1"))));
+    let sent = std::time::Instant::now();
+    let read = h.eventually(Duration::from_secs(15), |h| !h.device.calls_of(Op::Execute).is_empty()).await;
+    let read_after = sent.elapsed();
     let answered = h.eventually(Duration::from_secs(15), |h| !h.published(replies).is_empty()).await;
+    let answered_after = sent.elapsed();
+    let state_lane = h.topics.state("m");
+    let states = h.broker.received().iter().filter(|r| r.topic.starts_with(&state_lane)).count();
+    let connections = h.broker.accepted();
+    let reply = h.published(replies).first().map(|r| String::from_utf8_lossy(&r.payload).into_owned());
+    let kinds: Vec<String> = h.log.records().iter().filter(|r| !r.kind.is_empty()).map(|r| r.kind.clone()).collect();
     reporting.store(false, std::sync::atomic::Ordering::SeqCst);
     let _ = reporter.join();
     h.broker.delay_acks(Duration::ZERO);
-    assert!(answered, "a command under a steady stream of reports was never read: the reports went first every time");
+    assert!(
+        read && answered,
+        "a command under a steady stream of reports was never read: the reports went first every time \
+         (read {read} after {read_after:?}, answered {answered} after {answered_after:?}, {states} States published, \
+         {connections} connections, reply {reply:?}, kinds {kinds:?})"
+    );
     assert!(h.stop().await);
 }
 
