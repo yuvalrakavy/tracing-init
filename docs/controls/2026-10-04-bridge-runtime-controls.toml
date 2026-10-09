@@ -67,6 +67,14 @@
 # uncapped answers had made blind, given assertions that see their guards, or retired, in 8ec2850;
 # the four rows that commit touched RED there.
 #
+# The confirming reviews (Codex and Claude, 2026-10-09): 5 rows added, 1 retired
+# (`the_reads_starve_the_reports`: with every answer uncapped, reading first loses nothing it can
+# see), 2 retargeted, 4 re-anchored; 191 in all. The new rows plus `--touched 0cc961c` at 7ca2ed2:
+# 150 rows, 147 RED, 3 GREEN — the two reply rows mutated the unsolicited-events loop, retargeted
+# to the answers loop, and the retired row. `--touched 7ca2ed2` at 174f6ab: 105 rows, all RED. The
+# shutdown reset (N1) is probabilistic and has no row: each stop scenario run 30 times alone, on
+# 7ca2ed2 under load 2 of 30 failed, on 174f6ab 30 of 30 passed, loaded and not.
+#
 # Failing first, beyond these rows: the read-back scenario
 # (`the_outage_conflict_after_a_bridge_restart_uses_the_read_back`) failed against the first
 # build — "no Error said the request was superseded: []" — because the session published the
