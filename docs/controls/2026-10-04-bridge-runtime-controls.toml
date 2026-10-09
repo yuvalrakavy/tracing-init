@@ -41,6 +41,11 @@
 # `a_restore_is_never_unproven`, re-run at f3208c3 (same code): all RED. Every one of the 176
 # rows is RED.
 #
+# The fourth re-gate's fixes (F1-F6 and the minors, 2026-10-09): 12 rows added, 9 re-anchored, 188
+# in all. The new and re-anchored rows first as a batch at 2ad7414: 20 RED. The whole table at
+# 2ad7414: 187 RED, 1 ANCHOR-MISS (`a_retraction_leaves_the_assumption_unproven`, whose line minor
+# 7 moved one level deeper; re-anchored in 2816b96, RED). Every one of the 188 rows is RED.
+#
 # Failing first, beyond these rows: the read-back scenario
 # (`the_outage_conflict_after_a_bridge_restart_uses_the_read_back`) failed against the first
 # build — "no Error said the request was superseded: []" — because the session published the
