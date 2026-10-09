@@ -320,8 +320,9 @@ struct Inner {
     /// The command the worker took and has not answered: refused at a stop or a watchdog's end,
     /// which cancel it mid-operation (re-gate 3 S3).
     in_flight_command: Option<Unanswered>,
-    /// Writes held again before proof that reached their deadline unapplied: their assumptions are
-    /// withdrawn ([`take_abandoned`](Mailbox::take_abandoned)).
+    /// Writes held again before proof that reached their deadline unapplied, in the worker's takes:
+    /// their assumptions are withdrawn by the worker ([`take_abandoned`](Mailbox::take_abandoned)).
+    /// One a post replaces is withdrawn by the post itself.
     abandoned: Vec<(String, String)>,
 }
 
@@ -425,8 +426,13 @@ impl Mailbox {
     }
 
     /// A property's requested value; `replay`: the broker delivered it as retained, so it was made
-    /// while the bridge was not listening, and is checked like a held one. Never waits.
-    pub fn post_state(&self, mut value: StateValue, replay: bool) -> Posted {
+    /// while the bridge was not listening, and is checked like a held one. A write held again
+    /// before proof that it replaces is `withdraw`n — its assumption — under the mailbox's lock, in
+    /// the same step as the replacement, so the worker cannot take the replacement and assume it
+    /// first (third confirming reviews, Codex 2: withdrawn after, it reverted the replacement's own
+    /// assumption). `withdraw` may take the reports' lock (mailbox, then reports: the one order),
+    /// and must not wait or log. Never waits.
+    pub fn post_state_then(&self, mut value: StateValue, replay: bool, mut withdraw: impl FnMut(&str, &str)) -> Posted {
         let now = Instant::now();
         let posted = {
             let mut inner = self.locked();
@@ -456,7 +462,7 @@ impl Mailbox {
                     // A request replacing a write held again before proof ends that write: its
                     // assumption goes with it (second confirming review 1).
                     if inner.pending.iter().any(|e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld)) {
-                        inner.abandoned.push(key.clone());
+                        withdraw(&key.0, &key.1);
                     }
                     if replay {
                         match inner.bases.get(&key) {
@@ -483,16 +489,23 @@ impl Mailbox {
         self.queued(posted)
     }
 
+    /// (tests) [`post_state_then`](Self::post_state_then), withdrawing nothing.
+    #[cfg(test)]
+    pub fn post_state(&self, value: StateValue, replay: bool) -> Posted {
+        self.post_state_then(value, replay, |_, _| {})
+    }
+
     /// A target-level write: its values, applied together; their property copies, expected next,
-    /// are skipped. Never waits.
-    pub fn post_target(&self, values: Vec<StateValue>) -> Posted {
+    /// are skipped. Each write held again before proof that it replaces is `withdraw`n as
+    /// [`post_state_then`](Self::post_state_then) does. Never waits.
+    pub fn post_target_then(&self, values: Vec<StateValue>, mut withdraw: impl FnMut(&str, &str)) -> Posted {
         let until = Instant::now() + COPY_WINDOW;
         let posted = {
             let mut inner = self.locked();
             let held = !inner.connected;
             for mut value in values {
                 if inner.pending.iter().any(|e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld)) {
-                    inner.abandoned.push((value.target.clone(), value.property.clone()));
+                    withdraw(&value.target, &value.property);
                 }
                 inner.copies.insert((value.target.clone(), value.property.clone()), (value.value.clone(), until));
                 // A live write of the key, as `post_state`'s: the replay pin goes (second final gate 3).
@@ -507,6 +520,12 @@ impl Mailbox {
             }
         };
         self.queued(posted)
+    }
+
+    /// (tests) [`post_target_then`](Self::post_target_then), withdrawing nothing.
+    #[cfg(test)]
+    pub fn post_target(&self, values: Vec<StateValue>) -> Posted {
+        self.post_target_then(values, |_, _| {})
     }
 
     /// The worker's command is done: whether it was still in flight — the worker's to answer. One

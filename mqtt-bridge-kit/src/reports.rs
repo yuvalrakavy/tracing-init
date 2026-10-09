@@ -559,6 +559,15 @@ impl Reports {
     /// back to what it was before the write, and `State` says so (second final gate, Claude's
     /// minor 1: the assumed value stood, unproven, for good). Never waits.
     pub fn assumption_abandoned(&self, target: &str, property: &str) {
+        if self.withdraw_assumption(target, property) {
+            info!(target, property, "A write the device never proved taken left unapplied; its assumed value is withdrawn");
+        }
+    }
+
+    /// The same, said by the caller: whether there was an unproven assumption to withdraw. Logs
+    /// nothing, so a caller under the mailbox's lock may call it (third confirming reviews, Codex
+    /// 2). Never waits.
+    pub fn withdraw_assumption(&self, target: &str, property: &str) -> bool {
         let reverted = {
             let mut state = self.locked();
             let reverted = match state.targets.get_mut(target) {
@@ -581,9 +590,9 @@ impl Reports {
             reverted
         };
         if reverted {
-            info!(target, property, "A write the device never proved taken left unapplied; its assumed value is withdrawn");
             self.ready.notify_one();
         }
+        reverted
     }
 
     /// These writes were proven (a probe or read after them): their assumptions stand. Never waits.

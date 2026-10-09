@@ -250,6 +250,36 @@ fn a_live_replacement_of_a_re_held_write_withdraws_its_assumption() {
     );
 }
 
+/// The replaced write's assumption is withdrawn in the same step as the replacement, before the
+/// worker can take the replacement: a withdrawal after the worker applied it would revert the
+/// replacement's own assumption (third confirming reviews, Codex 2: proven 20, re-held 40, live
+/// 60 applied — and the withdrawal put the model back at 20, the device at 60).
+#[test]
+fn a_replacements_withdrawal_never_reverts_the_replacement() {
+    let shared = shared_for_port();
+    shared.reports.state("t1", serde_json::json!({"level": 20}).as_object().unwrap().clone(), false);
+    let topic = re_held_assumption(&shared);
+    // The worker's turn, as soon as the live request is posted: it takes the replacement, applies
+    // it, and assumes it.
+    AFTER_POST.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|shared: &Shared| {
+            if let Some(crate::mailbox::Work::Apply { .. }) = shared.mailbox.try_take() {
+                shared.mailbox.applied(true);
+                shared.reports.assume_unproven("t1", serde_json::json!({"level": 60}).as_object().unwrap().clone());
+            }
+        }))
+    });
+    route(&shared, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"60".to_vec(), None), Instant::now());
+    AFTER_POST.with(|hook| hook.borrow_mut().take());
+    let model = shared.reports.model();
+    let state = model.states.iter().find(|(t, _)| t == "t1").map(|(_, d)| crate::wire::decode_state(d).expect("a state"));
+    assert_eq!(
+        state.and_then(|s| s.get("level").cloned()),
+        Some(serde_json::json!(60)),
+        "the replaced write's withdrawal reverted the replacement the worker had applied"
+    );
+}
+
 /// The same when the live replacement expires before the retraction.
 #[test]
 fn an_expired_live_replacement_of_a_re_held_write_withdraws_its_assumption() {

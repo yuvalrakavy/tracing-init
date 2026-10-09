@@ -2727,7 +2727,7 @@ guard       = "fake_undelayed_acks_ordered"
 [[control]]
 name        = "a_replaced_re_held_write_stays_assumed"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''                        inner.abandoned.push(key.clone());'''
+anchor      = '''                        withdraw(&key.0, &key.1);'''
 replacement = '''                        let _ = &key;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_live_replacement_of_a_re_held_write_withdraws_its_assumption", "--exact"]
@@ -2827,3 +2827,25 @@ argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.
 expect_text = '''a read-back read as complete with a partial map'''
 guard       = "read_back_one_snapshot"
 
+# Third confirming reviews (Codex 2): the replaced write's withdrawal is one step with the post.
+[[control]]
+name        = "the_replacements_withdrawal_comes_after"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    post(&mut |target, property| {
+        if shared.reports.withdraw_assumption(target, property) {
+            withdrawn.push((target.to_owned(), property.to_owned()));
+        }
+    });
+    after_post(shared);'''
+replacement = '''    let mut keys: Vec<(String, String)> = Vec::new();
+    post(&mut |target, property| keys.push((target.to_owned(), property.to_owned())));
+    after_post(shared);
+    for (target, property) in keys {
+        if shared.reports.withdraw_assumption(&target, &property) {
+            withdrawn.push((target, property));
+        }
+    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_replacements_withdrawal_never_reverts_the_replacement", "--exact"]
+expect_text = '''the replaced write's withdrawal reverted the replacement the worker had applied'''
+guard       = "replacement_withdrawal_atomic"

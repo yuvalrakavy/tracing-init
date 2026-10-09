@@ -597,8 +597,9 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                             basis,
                             reheld: false,
                         };
-                        shared.mailbox.post_state(value, publish.retain);
-                        withdraw_abandoned(shared);
+                        withdrawing(shared, |withdraw| {
+                            shared.mailbox.post_state_then(value, publish.retain, withdraw);
+                        });
                     }
                 },
             }
@@ -624,8 +625,9 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                             reheld: false,
                         })
                         .collect();
-                    shared.mailbox.post_target(values);
-                    withdraw_abandoned(shared);
+                    withdrawing(shared, |withdraw| {
+                        shared.mailbox.post_target_then(values, withdraw);
+                    });
                 }
             }
         }
@@ -755,13 +757,45 @@ fn panic_for_test(topic: &str) {
 #[cfg(not(feature = "test-seams"))]
 fn panic_for_test(_: &str) {}
 
-/// A live request replaced writes held again before proof: their assumptions are withdrawn now,
-/// before a retraction of the new request could settle them as proven (second confirming review
-/// 1).
-fn withdraw_abandoned(shared: &Shared) {
-    for (target, property) in shared.mailbox.take_abandoned() {
-        shared.reports.assumption_abandoned(&target, &property);
+/// A request's `post`, given the withdrawal of the assumption of each write held again before
+/// proof that it replaces: withdrawn at once, before a retraction of the new request could settle
+/// it as proven (second confirming review 1), and in the same step as the replacement, under the
+/// mailbox's lock — mailbox, then reports, the one order — before the worker can take the
+/// replacement and assume it (third confirming reviews, Codex 2: withdrawn after, it reverted the
+/// replacement's own assumption). Logged once both locks are released. The worker withdraws the
+/// writes its own takes drop at their deadline.
+fn withdrawing(shared: &Shared, post: impl FnOnce(&mut dyn FnMut(&str, &str))) {
+    let mut withdrawn: Vec<(String, String)> = Vec::new();
+    post(&mut |target, property| {
+        if shared.reports.withdraw_assumption(target, property) {
+            withdrawn.push((target.to_owned(), property.to_owned()));
+        }
+    });
+    after_post(shared);
+    for (target, property) in withdrawn {
+        info!(target, property, "A write the device never proved taken was replaced before proof; its assumed value is withdrawn");
     }
+}
+
+/// (tests) What runs after a post.
+#[cfg(test)]
+type AfterPost = Option<Box<dyn FnMut(&Shared)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// (tests) Run on the session's thread right after a request's post returns: the worker's turn,
+    /// placed deterministically.
+    pub(crate) static AFTER_POST: std::cell::RefCell<AfterPost> = const { std::cell::RefCell::new(None) };
+}
+
+/// The test seam after a post (tests only; nothing otherwise).
+fn after_post(_shared: &Shared) {
+    #[cfg(test)]
+    AFTER_POST.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(_shared);
+        }
+    });
 }
 
 /// What a stop refuses: a command still waiting for the device.

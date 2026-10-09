@@ -230,7 +230,9 @@ commands are refused, and reads are dropped.
     the held one is kept, with its obligation; a different value, or a live request — whatever its
     value — replaces it, with its own deadline and policy, and the replaced write's assumption is
     withdrawn at once, before a retraction of the new request could settle it as proven (second
-    final gate 2; confirming reviews 1).
+    final gate 2; confirming reviews 1) — in the same step as the replacement, under the
+    mailbox's lock, so the worker cannot take the replacement and assume it first (third
+    confirming reviews, Codex 2: withdrawn after, it reverted the replacement's own assumption).
     One that leaves without being applied — expired, superseded, failed — withdraws its assumed
     value: the key goes back to what it was before the write, and `State` says so, for the device
     may never have taken it (the second final gate's minor 1).
