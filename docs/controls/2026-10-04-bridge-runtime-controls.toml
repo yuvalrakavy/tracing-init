@@ -2425,8 +2425,8 @@ guard       = "cap_stamp_cleared"
 [[control]]
 name        = "a_retraction_leaves_the_assumption_unproven"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                    shared.reports.assumption_settled(&target, &property);'''
-replacement = '''                    let _ = &property;'''
+anchor      = '''                        shared.reports.assumption_settled(&target, &property);'''
+replacement = '''                        let _ = &property;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_retraction_settles_the_keys_unproven_assumption", "--exact"]
 expect_text = '''a retraction left the key's assumption unproven'''
