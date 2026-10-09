@@ -598,6 +598,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "rumqttc",
+ "socket2 0.6.5",
  "tokio",
 ]
 

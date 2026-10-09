@@ -593,6 +593,13 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
     }));
     let mut buf = BytesMut::with_capacity(8 * 1024);
     'read: loop {
+        if *wedged.borrow() == Some(number) {
+            // The receive buffer pinned at its size: an operating system that auto-tunes it (macOS
+            // does) would otherwise grow it under a zero window, and the client's blocked write
+            // would go on after its persist probe, about 5 s later — no broker that stopped reading
+            // (the pump test that ended at 15 s instead of 10).
+            let _ = socket2::SockRef::from(rd.as_ref()).set_recv_buffer_size(WEDGED_RECV_BUFFER);
+        }
         while *wedged.borrow_and_update() == Some(number) {
             // Wedged (`stop_reading`): nothing more of this connection is read or handled.
             tokio::select! {
@@ -625,6 +632,9 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
     publish_will(&shared, number);
     shared.changed.notify_waiters();
 }
+
+/// The receive buffer a wedged connection is pinned to (see `connection`).
+const WEDGED_RECV_BUFFER: usize = 64 * 1024;
 
 /// A clean DISCONNECT: the connection's will is not published.
 fn clear_will(shared: &Shared, number: usize) {
