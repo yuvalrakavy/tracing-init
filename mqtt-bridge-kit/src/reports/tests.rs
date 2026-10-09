@@ -193,3 +193,46 @@ fn a_late_state_does_not_change_the_read_back_basis() {
     assert!(reports.read_back_is_complete());
     assert_eq!(reports.read_back_before().1["u1"]["level"], json!(10), "completing it late changed the frozen read-back");
 }
+
+/// A driver's read of the read-back is one snapshot: never `complete` with a map the completion
+/// had not frozen yet (third confirming reviews, Codex 3 and Claude F1: the map and the flag were
+/// read apart, and the flag set before the freeze — 7 torn reads in 20000). The reviewer's probe:
+/// a reader spinning on `read_back()` while the last State lands and the read-back completes.
+#[test]
+fn a_read_back_is_never_complete_with_a_partial_map() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const N: usize = 40;
+    let mut torn = 0usize;
+    for _ in 0..20000 {
+        let reports = Reports::new();
+        for i in 0..N - 1 {
+            reports.read_back(&format!("t{i}"), values(&[("p", json!(i))]));
+        }
+        let reader = crate::link::Reporter::new(reports.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let go = Arc::new(AtomicBool::new(false));
+        let (stopped, started) = (stop.clone(), go.clone());
+        let spinning = std::thread::spawn(move || {
+            let mut bad = 0usize;
+            started.store(true, Ordering::SeqCst);
+            while !stopped.load(Ordering::SeqCst) {
+                let read = reader.read_back();
+                if read.complete && read.targets.len() < N {
+                    bad += 1;
+                }
+            }
+            bad
+        });
+        while !go.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        reports.read_back("last", values(&[("p", json!(1))]));
+        reports.read_back_complete();
+        for _ in 0..3000 {
+            std::hint::spin_loop();
+        }
+        stop.store(true, Ordering::SeqCst);
+        torn += spinning.join().expect("the reader panicked");
+    }
+    assert_eq!(torn, 0, "a read-back read as complete with a partial map: {torn} torn reads");
+}

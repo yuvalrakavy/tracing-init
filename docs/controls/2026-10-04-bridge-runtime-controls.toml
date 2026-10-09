@@ -2793,8 +2793,8 @@ guard       = "flush_disconnect_best_effort"
 [[control]]
 name        = "a_pending_read_back_reads_complete"
 file        = "mqtt-bridge-kit/src/link.rs"
-anchor      = '''        ReadBack { complete: self.reports.read_back_is_complete(), targets }'''
-replacement = '''        ReadBack { complete: true, targets }'''
+anchor      = '''        ReadBack { complete, targets }'''
+replacement = '''        ReadBack { complete: complete || true, targets }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_driver_reads_the_start_up_read_back", "--exact"]
 expect_text = '''a pending read-back read as done'''
@@ -2810,3 +2810,20 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_answers_before_state", "--exact"]
 expect_text = '''the refusal was not published within the flush'''
 guard       = "flush_answers_first"
+
+# Third confirming reviews (Codex 3, Claude F1): the read-back's flag and map are one snapshot.
+[[control]]
+name        = "the_read_back_is_read_apart"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''        let state = self.locked();
+        (state.readback_level >= 2, state.readback_frozen.clone().unwrap_or_else(|| state.readback.clone()))'''
+replacement = '''        let targets = {
+            let state = self.locked();
+            state.readback_frozen.clone().unwrap_or_else(|| state.readback.clone())
+        };
+        (self.read_back_is_complete(), targets)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::a_read_back_is_never_complete_with_a_partial_map", "--exact"]
+expect_text = '''a read-back read as complete with a partial map'''
+guard       = "read_back_one_snapshot"
+

@@ -78,8 +78,8 @@ pub struct ReadBack {
 impl Reporter {
     /// The start-up read-back (see [`ReadBack`]). Never waits.
     pub(crate) fn read_back(&self) -> ReadBack {
-        let (_, targets) = self.reports.read_back_before();
-        ReadBack { complete: self.reports.read_back_is_complete(), targets }
+        let (complete, targets) = self.reports.read_back_view();
+        ReadBack { complete, targets }
     }
 
     pub(crate) fn new(reports: Arc<Reports>) -> Reporter {

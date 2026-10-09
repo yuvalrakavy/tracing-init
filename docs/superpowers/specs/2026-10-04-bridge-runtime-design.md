@@ -111,7 +111,9 @@ lost link, never a hang.
   retained `State` — `ReadBack { complete, targets }`, frozen as the conflict rule reads it. Its
   values are what the previous run last published (its reports and assumptions, as the broker
   retained them), not device evidence; `complete` is `false` while the read-back is pending, and for
-  good when the broker refused it or it came late. At the first `connect` it may not be done yet:
+  good when the broker refused it or it came late. The two are one snapshot: the read-back is
+  frozen and marked done under one lock, and read under it, so `complete` never vouches for a map
+  read before the completion (third confirming reviews). At the first `connect` it may not be done yet:
   a driver that needs it (mqtt_ac v2 seeds its known units, and which were `powered:false`) reads
   it again from its handle.
 - `ctx.handle()`: a cloneable `LinkHandle` (`report()`, `link_lost()`, `is_lost()`, `blocking()`, `spawn()`) to

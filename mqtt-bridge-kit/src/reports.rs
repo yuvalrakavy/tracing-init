@@ -160,6 +160,11 @@ struct State {
     /// "before" values, which a retained State arriving later does not change in mid-process
     /// (Claude's re-gate minor 11).
     readback_frozen: Option<BTreeMap<String, PropertyMap>>,
+    /// Whether the read-back is in: 0 not yet, 1 incomplete (no SUBACK in time, or refused), 2
+    /// complete. Set with the freeze, under the same lock, so a reader takes the flag and the map
+    /// in one snapshot (third confirming reviews: an atomic set before the freeze, read apart from
+    /// the map, said "complete" of a partial one). Nothing waits for it.
+    readback_level: u8,
     /// The model when the MQTT connection was last lost, and when.
     broker_lost: Option<(Instant, BTreeMap<String, PropertyMap>)>,
     /// The names a driver reported that cannot stand as a topic segment, each said once.
@@ -179,9 +184,6 @@ pub struct Reports {
     ready: Notify,
     /// When the bridge started: the read-back is what the bridge knew then.
     epoch: Instant,
-    /// Whether the read-back is in: 0 not yet, 1 incomplete (no SUBACK in time, or refused), 2
-    /// complete. Nothing waits for it.
-    read_back_done: std::sync::atomic::AtomicU8,
 }
 
 /// What changed since the session last took it.
@@ -234,6 +236,7 @@ impl Reports {
                     events: Capped::new(EVENT_CAP),
                     readback: BTreeMap::new(),
                     readback_frozen: None,
+                    readback_level: 0,
                     broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
                     answers: (Vec::new(), Vec::new()),
@@ -243,7 +246,6 @@ impl Reports {
             ),
             ready: Notify::new(),
             epoch: Instant::now(),
-            read_back_done: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -650,20 +652,23 @@ impl Reports {
     }
 
     fn read_back_reaches(&self, level: u8) {
-        let before = self.read_back_done.fetch_max(level, std::sync::atomic::Ordering::SeqCst);
-        if before < level {
-            {
-                let mut state = self.locked();
-                if state.readback_frozen.is_none() {
-                    state.readback_frozen = Some(state.readback.clone());
-                }
-            }
+        let mut state = self.locked();
+        if state.readback_frozen.is_none() {
+            state.readback_frozen = Some(state.readback.clone());
         }
+        state.readback_level = state.readback_level.max(level);
     }
 
     /// Whether the read-back is complete (not merely done).
     pub fn read_back_is_complete(&self) -> bool {
-        self.read_back_done.load(std::sync::atomic::Ordering::SeqCst) >= 2
+        self.locked().readback_level >= 2
+    }
+
+    /// The read-back as a driver reads it: whether it is complete, and the map — frozen once done —
+    /// in one snapshot, under one lock. Never waits.
+    pub fn read_back_view(&self) -> (bool, BTreeMap<String, PropertyMap>) {
+        let state = self.locked();
+        (state.readback_level >= 2, state.readback_frozen.clone().unwrap_or_else(|| state.readback.clone()))
     }
 
     /// A target's state as the bridge's retained `State` held it at start.
