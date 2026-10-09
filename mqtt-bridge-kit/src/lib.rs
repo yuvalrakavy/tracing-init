@@ -55,6 +55,7 @@ pub mod config;
 mod devices;
 pub mod driver;
 pub mod host;
+mod lifecycle;
 pub mod link;
 pub mod logging;
 pub mod mailbox;

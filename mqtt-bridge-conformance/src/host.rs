@@ -160,10 +160,7 @@ impl HostHarness {
     pub async fn join(broker: Arc<FakeBroker>, bridge: &str, fleet: Fleet, tune: impl FnOnce(Host) -> Host) -> HostHarness {
         let harness = HostHarness::join_unwaited(broker, bridge, fleet, tune);
         let configs = format!("{ROOT}/Config/+");
-        assert!(
-            harness.broker.wait_until(BOUND, |b| b.subscriptions().iter().any(|f| *f == configs)).await,
-            "the host never subscribed to {configs}"
-        );
+        assert!(harness.broker.wait_until(BOUND, |b| b.subscriptions().contains(&configs)).await, "the host never subscribed to {configs}");
         harness
     }
 

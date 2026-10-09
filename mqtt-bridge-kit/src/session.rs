@@ -1,42 +1,60 @@
 //! The MQTT side (lifted from mqtt_ac's `service.rs`, `mqtt_subscriber.rs` and
-//! `mqtt_publisher.rs`; Store no-hang §14.3, §14.8–§14.9).
+//! `mqtt_publisher.rs`; Store no-hang §14.3, §14.8–§14.9), for a fixed bridge's one device and for
+//! a multi-device host's many (multi-device spec §4.1).
 //!
 //! One session per connection, each with a client of its own: the pump polls in a task of its own
-//! and forwards what arrives; the session reads it, posts requests to the device's mailbox — a post
-//! never waits — and publishes what [`Reports`] holds. It may wait on rumqttc's request channel:
-//! back-pressure, which the pump's polling keeps moving, and which the pump bounds (a broker that
-//! acknowledges nothing, or stops reading, ends the session). It never waits on the device, so
-//! every CONNACK is read and answered whatever the device is doing (no-hang 3b, review B3).
+//! and forwards what arrives; the session reads it, posts requests to a device's mailbox — a post
+//! never waits — and publishes what each device's [`Reports`] holds. It may wait on rumqttc's
+//! request channel: back-pressure, which the pump's polling keeps moving, and which the pump bounds
+//! (a broker that acknowledges nothing, or stops reading, ends the session). It never waits on a
+//! device, so every CONNACK is read and answered whatever the devices are doing (no-hang 3b, review
+//! B3).
 //!
-//! **On every CONNACK** (the broker keeps no session): subscribe, then `Active=true`, then the
-//! version, then the whole retained model again from the bridge's own state — a broker restarted
-//! without persistence lost the retained messages (the fleet's F4). Nothing a previous connection
-//! queued goes out: its client went with it. A publish rumqttc refuses is that one message
-//! dropped.
+//! **The session part and the device part** (multi-device spec §4.1): [`Shared`] is the
+//! session's — the broker, the bridge's own `Active` and `Version`, the outage episode, the
+//! publication rotation's readiness signal; [`Device`] is one device's — its lanes, mailbox and
+//! reports, and, for a host's configured instance, the `via` tag its `Status` and `State` carry.
+//! A fixed bridge ([`Mode::Fixed`]) has one device, untagged, and R1's CONNACK duties; a host
+//! ([`Mode::Host`]) has the per-instance lifecycle of [`crate::host`].
 //!
-//! **The start-up read-back:** the process's first CONNACK subscribes to the bridge's own retained
-//! `State` before anything else, and subscribes to its requests only once that subscription is
-//! acknowledged (within [`READ_BACK_WAIT`]): the broker queues a subscription's retained messages
-//! behind its SUBACK, so the retained `State` is on the one stream ahead of every retained request
-//! (review C9). It is kept as the outage conflict rule's "before" values after a restart (Store
-//! kit spec §4.5). Only retained deliveries count: the bridge's own later publishes come back
-//! unflagged, and are ignored. A session that ends before the SUBACK leaves the read-back to the
-//! next.
+//! **On every CONNACK** (the broker keeps no session) of a fixed bridge: subscribe, then
+//! `Active=true`, then the version, then the whole retained model again from the bridge's own
+//! state — a broker restarted without persistence lost the retained messages (the fleet's F4).
+//! Nothing a previous connection queued goes out: its client went with it. A publish rumqttc
+//! refuses is that one message dropped. (A host's CONNACK is its own: [`crate::host`].)
 //!
-//! **Shutdown:** `Active=false`, then DISCONNECT, polling until it is written — within
-//! [`FLUSH_BOUND`]; past it the last will says `Active=false` instead (INFO `bridge_shutdown_cut`).
+//! **The start-up read-back** (a fixed bridge): the process's first CONNACK subscribes to the
+//! bridge's own retained `State` before anything else, and subscribes to its requests only once
+//! that subscription is acknowledged (within [`READ_BACK_WAIT`]): the broker queues a
+//! subscription's retained messages behind its SUBACK, so the retained `State` is on the one
+//! stream ahead of every retained request (review C9). It is kept as the outage conflict rule's
+//! "before" values after a restart (Store kit spec §4.5). Only retained deliveries count: the
+//! bridge's own later publishes come back unflagged, and are ignored. A session that ends before
+//! the SUBACK leaves the read-back to the next.
+//!
+//! **Publication and fairness** (multi-device spec §4.7): each device's output is R1's
+//! cancellation-safe [`Batch`], *sealed* when taken — later State goes to the next batch — so a
+//! reply follows the State its command produced and is never starved by later State. Devices are
+//! served round-robin with a persistent cursor, at most [`QUANTUM`] messages per device per turn,
+//! then the ready inbound and lifecycle work, then the next device.
+//!
+//! **Shutdown:** what waits refused, every device's answers first, then the rest; `Active=false`,
+//! then DISCONNECT, polling until it is written — within [`FLUSH_BOUND`]; past it the last will says
+//! `Active=false` instead (INFO `bridge_shutdown_cut`).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use lock_order::sync::Mutex;
 use rumqttc::v5::mqttbytes::v5::{Filter, LastWill, Publish, PublishProperties};
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, MqttOptions};
-use tokio::sync::watch;
-use tracing::{debug, info, warn, Instrument};
+use tokio::sync::{mpsc, watch, Notify};
+use tracing::{debug, info, warn, Instrument, Span};
 
+use crate::devices::Event;
 use crate::driver::{CommandClass, CommandSpec};
 use crate::mailbox::{Check, Mailbox, Posted, ReadKey, StateValue};
 use crate::pump::{stall_bound, BrokerOutage, Incoming, Pump, PumpEvent, MAX_CONSECUTIVE_ERRORS};
@@ -67,6 +85,10 @@ pub const READ_BACK_WAIT: Duration = Duration::from_secs(5);
 /// payloads the fleet expects (IR code sets, DMX arrays and effects: tens of KiB) many times over,
 /// matches the stdio plugin protocol's line cap (spec §7), and bounds what one message can cost.
 pub const MAX_PACKET_SIZE: u32 = 1024 * 1024;
+
+/// At most this many messages of one device per turn of the publication rotation (multi-device
+/// spec §4.7); then the ready inbound and lifecycle work, then the next device.
+pub const QUANTUM: usize = 32;
 
 /// The test seam's environment variable (with the `test-seams` feature only): see `panic_for_test`.
 pub const TEST_PANIC_TOPIC: &str = "MQTT_BRIDGE_TEST_PANIC_TOPIC";
@@ -100,28 +122,58 @@ impl Default for MqttTiming {
     }
 }
 
-/// What every session shares, for the life of the bridge.
+/// The session part (multi-device spec §4.1): what every session shares, for the life of the
+/// bridge or host.
 pub(crate) struct Shared {
+    /// The process's own lanes — `Active/{bridge id}` (and its last will) and `Version/{bridge
+    /// id}` — and its MQTT client id. A fixed bridge's bridge id is its instance.
     pub topics: Topics,
     pub broker_host: String,
     pub broker_port: u16,
     pub timing: MqttTiming,
+    /// The text of the retained `Version`.
     pub version: String,
-    pub commands: Vec<CommandSpec>,
-    pub mailbox: Arc<Mailbox>,
-    pub reports: Arc<Reports>,
     pub outage: Arc<BrokerOutage>,
-    /// The read-back's subscription has been made (once per process).
-    pub read_back_requested: AtomicBool,
     /// The QoS 1 publishes this session has enqueued; the pump counts those it wrote.
     pub enqueued: std::sync::atomic::AtomicU64,
-    /// The read-back's SUBACK granted it, and the retained `State` it replays follow it: the next
-    /// SUBACK — the next subscription's, sent after it — comes behind them, and completes the
-    /// read-back.
-    pub read_back_next: AtomicBool,
+    /// Told by every device's reports: one wait serves them all.
+    pub ready: Arc<Notify>,
+    /// Every device's reports, by device id, for the broker-loss snapshot the pump takes at once.
+    pub devices: Mutex<Vec<(u64, Arc<Reports>)>>,
 }
 
-/// After a batch of reports, how many ready incoming events go before the next batch.
+impl Shared {
+    /// The MQTT connection was lost: every device's model as it stands is what it knew when it
+    /// stopped listening (review B1). Never waits; called by the pump.
+    fn broker_lost(&self) {
+        let devices: Vec<Arc<Reports>> = {
+            // WAIT: session-devices
+            let devices = self.devices.lock().unwrap_or_else(|p| p.into_inner());
+            devices.iter().map(|(_, reports)| reports.clone()).collect()
+        };
+        for reports in devices {
+            reports.broker_lost();
+        }
+    }
+}
+
+/// The device part (multi-device spec §4.1): one device's lanes, commands, mailbox and reports.
+pub(crate) struct Device {
+    pub topics: Topics,
+    /// The commands its driver declares, once its driver is known (a host's device runtime may
+    /// receive requests before its construction is done).
+    pub commands: std::sync::OnceLock<Vec<CommandSpec>>,
+    pub mailbox: Arc<Mailbox>,
+    pub reports: Arc<Reports>,
+    /// A configured instance's: every `Status` and `State` it publishes carries the MQTT v5 user
+    /// property `via` = this bridge id (multi-device spec §4.5). A fixed device: `None`, never
+    /// tagged.
+    pub tag: Option<String>,
+    /// The device's span: its instance (and the host's bridge id, from its parent).
+    pub span: Span,
+}
+
+/// After a turn of the rotation, how many ready incoming events go before the next turn.
 const READS_PER_BATCH: u32 = 64;
 
 /// How a session ended.
@@ -133,13 +185,189 @@ enum SessionEnd {
     Shutdown,
 }
 
+/// What a session's handler says: go on, or end the session (a subscription refused or overdue).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flow {
+    Continue,
+    End,
+}
+
+/// What a handler acts on: the session part and this connection's client.
+pub(crate) struct Ctx<'a> {
+    pub shared: &'a Shared,
+    pub client: &'a AsyncClient,
+}
+
+/// What the session serves.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Mode {
+    /// A fixed bridge (`Bridge`): one device, untagged, R1's CONNACK duties and read-back.
+    Fixed(Fixed),
+    /// A multi-device host (`Host`): instances acquired and released by their Configs.
+    Host(Box<crate::lifecycle::Lifecycle>),
+}
+
+/// A fixed bridge's read-back, once per process.
+#[derive(Default)]
+pub(crate) struct Fixed {
+    /// The read-back's subscription has been made.
+    read_back_requested: bool,
+    /// The read-back's SUBACK granted it, and the retained `State` it replays follow it: the next
+    /// SUBACK — the next subscription's, sent after it — comes behind them, and completes the
+    /// read-back.
+    read_back_next: bool,
+}
+
+impl Mode {
+    /// When a timer of the mode's falls due: none for a fixed bridge.
+    fn next_wake(&self) -> Option<Instant> {
+        match self {
+            Mode::Fixed(_) => None,
+            Mode::Host(host) => host.next_wake(),
+        }
+    }
+}
+
+/// One device's place in the publication rotation.
+pub(crate) struct Slot {
+    pub id: u64,
+    pub device: Arc<Device>,
+    /// What was taken from its reports and is not published yet: sealed until it is.
+    pub batch: Batch,
+    /// Its output may go out on this connection: a fixed bridge's CONNACK duties are done, or a
+    /// host instance's read-back is granted (published sooner, a State would overwrite the retained
+    /// one its read-back is there to read) — or it is stopping, when its read-back no longer
+    /// matters.
+    pub announced: bool,
+}
+
+/// The publication rotation (multi-device spec §4.7): every device's sealed batch, served
+/// round-robin with a persistent cursor, at most [`QUANTUM`] messages per turn; and the outbox, the
+/// messages of no device (a host's instance-level `Error`s, its cleanup's retractions).
+pub(crate) struct Outputs {
+    pub slots: Vec<Slot>,
+    cursor: usize,
+    pub outbox: Batch,
+    /// The outbox may go out: the connection's root subscriptions are made.
+    pub outbox_open: bool,
+    /// A turn may find more without a new report: the last one found something, or the session is
+    /// new.
+    owed: bool,
+}
+
+impl Outputs {
+    pub(crate) fn new() -> Outputs {
+        Outputs { slots: Vec::new(), cursor: 0, outbox: Batch::default(), outbox_open: false, owed: true }
+    }
+
+    /// A device joins the rotation (and the broker-loss snapshot).
+    pub(crate) fn add(&mut self, shared: &Shared, id: u64, device: Arc<Device>) {
+        {
+            // WAIT: session-devices
+            let mut devices = shared.devices.lock().unwrap_or_else(|p| p.into_inner());
+            devices.push((id, device.reports.clone()));
+        }
+        self.slots.push(Slot { id, device, batch: Batch::default(), announced: false });
+        self.owed = true;
+    }
+
+    /// A device leaves the rotation; what its batch held goes with it.
+    pub(crate) fn remove(&mut self, shared: &Shared, id: u64) -> Option<Slot> {
+        {
+            // WAIT: session-devices
+            let mut devices = shared.devices.lock().unwrap_or_else(|p| p.into_inner());
+            devices.retain(|(d, _)| *d != id);
+        }
+        let i = self.slots.iter().position(|s| s.id == id)?;
+        let slot = self.slots.remove(i);
+        if self.cursor > i {
+            self.cursor -= 1;
+        }
+        if self.cursor >= self.slots.len() {
+            self.cursor = 0;
+        }
+        Some(slot)
+    }
+
+    /// A message of no device, queued in the outbox — published at the next turn.
+    pub(crate) fn queue_outbox(&mut self, part: Part, out: Out) {
+        self.outbox.push(part, out);
+        self.owed = true;
+    }
+
+    /// Device `id`'s slot.
+    pub(crate) fn slot(&mut self, id: u64) -> Option<&mut Slot> {
+        self.slots.iter_mut().find(|s| s.id == id)
+    }
+
+    /// A new connection: nothing is announced on it yet, and nothing a previous connection's batch
+    /// held goes out (its client went with it; the model is republished).
+    fn session_started(&mut self) {
+        for slot in &mut self.slots {
+            slot.announced = false;
+            slot.batch = Batch::default();
+        }
+        self.outbox = Batch::default();
+        self.outbox_open = false;
+        self.owed = true;
+    }
+
+    /// Whether anything may be published now.
+    fn open(&self) -> bool {
+        self.slots.iter().any(|s| s.announced) || (self.outbox_open && !self.outbox.is_empty())
+    }
+
+    /// One turn of the rotation: the outbox if it holds anything, else the next device after the
+    /// cursor with output — its sealed batch, or a new one taken from its reports when it is empty
+    /// — at most [`QUANTUM`] messages. Returns the device served, if any. Cancellation-safe: what is
+    /// taken stays in the slot's batch.
+    async fn turn(&mut self, shared: &Shared, client: &AsyncClient) -> Option<u64> {
+        if self.outbox_open && !self.outbox.is_empty() {
+            // WAIT: mqtt-request
+            self.outbox.publish(shared, client, &IN_TURN, QUANTUM).await;
+            self.owed = true;
+            return None;
+        }
+        let n = self.slots.len();
+        for k in 0..n {
+            let i = (self.cursor + k) % n;
+            let slot = &mut self.slots[i];
+            if !slot.announced {
+                continue;
+            }
+            // Sealed: a new batch only once the last one is published.
+            if slot.batch.is_empty() {
+                slot.batch.add(&slot.device, slot.device.reports.take());
+            }
+            if slot.batch.is_empty() {
+                continue;
+            }
+            let id = slot.id;
+            // WAIT: mqtt-request
+            slot.batch.publish(shared, client, &IN_TURN, QUANTUM).await;
+            self.cursor = (i + 1) % n;
+            self.owed = true;
+            return Some(id);
+        }
+        self.owed = false;
+        None
+    }
+}
+
 /// The MQTT side, for the life of the bridge: sessions one after another, one per connection,
 /// until `shutdown` turns true. The pause before the next is `poll_retry`, and `retry` after every
-/// `MAX_CONSECUTIVE_ERRORS`th failed connect in a row.
-pub(crate) async fn run(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
+/// `MAX_CONSECUTIVE_ERRORS`th failed connect in a row. A host's lifecycle events go on between
+/// sessions.
+pub(crate) async fn run(
+    shared: Arc<Shared>,
+    mut mode: Mode,
+    mut outputs: Outputs,
+    mut events: mpsc::UnboundedReceiver<Event>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut failed: u32 = 0;
     loop {
-        let connected = match session(&shared, &mut shutdown).await {
+        let connected = match session(&shared, &mut mode, &mut outputs, &mut events, &mut shutdown).await {
             SessionEnd::Shutdown => return,
             SessionEnd::Ended { connected } => connected,
         };
@@ -151,10 +379,17 @@ pub(crate) async fn run(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>
         failed = if connected.is_some_and(|at| at.elapsed() >= shared.timing.stable_after) { 1 } else { failed + 1 };
         let pause = if failed % MAX_CONSECUTIVE_ERRORS == 0 { shared.timing.retry } else { shared.timing.poll_retry };
         debug!(pause_ms = pause.as_millis() as u64, failed, "MQTT session ended; starting a new one");
-        // WAIT: session-retry
-        tokio::select! {
-            () = tokio::time::sleep(pause) => {}
-            _ = shutdown.wait_for(|stop| *stop) => return,
+        let resume = tokio::time::Instant::now() + pause;
+        loop {
+            // WAIT: session-retry
+            let event = tokio::select! {
+                () = tokio::time::sleep_until(resume) => break,
+                _ = shutdown.wait_for(|stop| *stop) => return,
+                Some(event) = events.recv() => event,
+            };
+            if let Mode::Host(host) = &mut mode {
+                host.on_event_offline(&mut outputs, event).await;
+            }
         }
     }
 }
@@ -169,7 +404,7 @@ fn client(shared: &Shared) -> (AsyncClient, rumqttc::v5::EventLoop) {
 }
 
 /// Outbound publishes carry the current trace's `traceparent`, if a trace is active.
-fn properties() -> PublishProperties {
+pub(crate) fn properties() -> PublishProperties {
     let mut properties = PublishProperties::default();
     if let Some(traceparent) = tracing_init::traceparent::current() {
         properties.user_properties.push(("traceparent".into(), traceparent));
@@ -177,12 +412,28 @@ fn properties() -> PublishProperties {
     properties
 }
 
-type Failed = rumqttc::v5::ClientError;
+/// [`properties`], with a configured instance's `via` tag when it has one (multi-device spec §4.5).
+pub(crate) fn tagged(tag: Option<&str>) -> PublishProperties {
+    let mut properties = properties();
+    if let Some(tag) = tag {
+        properties.user_properties.push(("via".into(), tag.to_owned()));
+    }
+    properties
+}
+
+pub(crate) type Failed = rumqttc::v5::ClientError;
 
 /// Publish one message. A refusal — a topic rumqttc does not publish to, or the event loop gone —
 /// is that one message dropped, said at DEBUG; the caller goes on with the rest (review B2: the
 /// first refusal ended the CONNACK duties, and the session never published a report again).
-async fn emit(shared: &Shared, client: &AsyncClient, topic: String, retain: bool, payload: Vec<u8>, properties: PublishProperties) {
+pub(crate) async fn emit(
+    shared: &Shared,
+    client: &AsyncClient,
+    topic: String,
+    retain: bool,
+    payload: Vec<u8>,
+    properties: PublishProperties,
+) {
     let refused_topic = topic.clone();
     // WAIT: mqtt-request
     let sent = client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await;
@@ -202,50 +453,64 @@ fn enqueued(shared: &Shared, topic: &str, sent: Result<(), Failed>) {
 }
 
 /// One session: a fresh client and its pump, for one connection, until it ends or the shutdown.
-async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> SessionEnd {
-    let (client, events) = client(shared);
+async fn session(
+    shared: &Arc<Shared>,
+    mode: &mut Mode,
+    outputs: &mut Outputs,
+    events: &mut mpsc::UnboundedReceiver<Event>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> SessionEnd {
+    let (client, pump_events) = client(shared);
     shared.enqueued.store(0, Ordering::SeqCst);
     // Polling first, so every request below has an event loop draining it.
     // When the connection is lost, what the bridge knew then is the conflict rule's "before" values
     // for what the broker replays on the next one (review B1).
-    let reports = shared.reports.clone();
+    let lost = shared.clone();
     let (_pump, mut incoming) =
-        Pump::start(events, shared.outage.clone(), stall_bound(shared.timing.keep_alive), move || reports.broker_lost());
+        Pump::start(pump_events, shared.outage.clone(), stall_bound(shared.timing.keep_alive), move || lost.broker_lost());
     // Nothing is published before the first CONNACK's duties are done: the subscriptions come
     // first, and a state published ahead of the read-back's subscription would overwrite the
     // retained state it is there to read.
-    let mut announced = false;
+    outputs.session_started();
     // When the broker accepted this session's connection, if it did.
     let mut accepted: Option<Instant> = None;
-    // How many ready incoming events still go before the next batch of reports.
+    // How many ready incoming events still go before the next turn of the rotation.
     let mut reads_owed: u32 = 0;
-    // The batch being published: outside the work a stop cuts short, for the flush.
-    let mut batch = Batch::default();
+    let ctx = Ctx { shared, client: &client };
     loop {
+        let wake = mode.next_wake();
+        let open = outputs.open();
+        let owed = open && outputs.owed;
         // The stop first: its flush publishes what is pending anyway (re-gate R15). Then, after a
-        // batch of reports, the incoming events that are ready — up to READS_PER_BATCH — before the
-        // next batch: a steady stream of reports to a broker slow to acknowledge keeps `reported`
-        // ready at every pass, and the requests, commands and SUBACKs behind it would wait for good
-        // (Codex final gate 1); one read per batch drained a backlog — the bridge's own State coming
-        // back before the read-back's subscription was dropped — at a read a second, and a command
-        // behind it waited past its expiry (the second confirming review's minor 5). With no read
-        // owed, what is pending goes first: answers are uncapped, so no backlog drained first can
-        // displace them (re-gate 3 S2).
+        // turn of the rotation, the incoming events that are ready — up to READS_PER_BATCH — and
+        // the lifecycle's, before the next turn: a steady stream of reports to a broker slow to
+        // acknowledge keeps the rotation ready at every pass, and the requests, commands and
+        // SUBACKs behind it would wait for good (Codex final gate 1); one read per batch drained a
+        // backlog — the bridge's own State coming back before the read-back's subscription was
+        // dropped — at a read a second, and a command behind it waited past its expiry (the second
+        // confirming review's minor 5). With no read owed, what is pending goes first: answers are
+        // uncapped, so no backlog drained first can displace them (re-gate 3 S2).
         let step = if reads_owed > 0 {
             // WAIT: session-events
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
                 event = incoming.recv() => Step::Event(event),
-                () = shared.reports.reported(), if announced => Step::Reported,
+                Some(event) = events.recv() => Step::Lifecycle(event),
+                () = std::future::ready(()), if owed => Step::Reported,
+                () = shared.ready.notified(), if open => Step::Reported,
+                () = sleep_until(wake) => Step::Tick,
             }
         } else {
             // WAIT: session-events
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
-                () = shared.reports.reported(), if announced => Step::Reported,
+                () = std::future::ready(()), if owed => Step::Reported,
+                () = shared.ready.notified(), if open => Step::Reported,
                 event = incoming.recv() => Step::Event(event),
+                Some(event) = events.recv() => Step::Lifecycle(event),
+                () = sleep_until(wake) => Step::Tick,
             }
         };
         reads_owed = match step {
@@ -257,54 +522,91 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
         if connack && accepted.is_none() {
             accepted = Some(Instant::now());
         }
-        // The next subscription's SUBACK, behind the read-back's replay, completes it.
-        let read_back_done =
-            matches!(step, Step::Event(Some(PumpEvent::SubAck { .. }))) && shared.read_back_next.swap(false, Ordering::SeqCst);
-        if read_back_done {
-            shared.reports.read_back_complete();
-        }
+        // A fixed bridge: the next subscription's SUBACK, behind the read-back's replay, completes
+        // it.
+        let read_back_done = match mode {
+            Mode::Fixed(ref mut fixed) => {
+                let done = matches!(step, Step::Event(Some(PumpEvent::SubAck { .. }))) && std::mem::take(&mut fixed.read_back_next);
+                if done {
+                    outputs.slots[0].device.reports.read_back_complete();
+                }
+                done
+            }
+            Mode::Host(_) => false,
+        };
         let work = async {
-            match step {
-                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client, &mut incoming).await.map(|goes_on| {
-                    if goes_on {
-                        None
-                    } else {
-                        Some(SessionEnd::Ended { connected: None })
-                    }
-                }),
-                Step::Event(Some(PumpEvent::Publish(publish, received))) => {
-                    handle(shared, &publish, received);
+            match (step, &mut *mode) {
+                (Step::Event(Some(PumpEvent::Connected)), Mode::Fixed(fixed)) => {
+                    let device = outputs.slots[0].device.clone();
+                    connected(&ctx, fixed, &device, &mut incoming).await.map(|goes_on| {
+                        if goes_on {
+                            outputs.slots[0].announced = true;
+                            None
+                        } else {
+                            Some(SessionEnd::Ended { connected: None })
+                        }
+                    })
+                }
+                (Step::Event(Some(PumpEvent::Connected)), Mode::Host(host)) => host.on_connack(&ctx, outputs).await.map(|_| None),
+                (Step::Event(Some(PumpEvent::Publish(publish, received))), Mode::Fixed(_)) => {
+                    let device = &outputs.slots[0].device;
+                    let (topic, span) = traced(&publish);
+                    span.in_scope(|| route(device, &topic, &publish, received));
                     Ok(None)
+                }
+                (Step::Event(Some(PumpEvent::Publish(publish, received))), Mode::Host(host)) => {
+                    let (topic, span) = traced(&publish);
+                    let flow = host.on_publish(&ctx, outputs, &topic, &publish, received).instrument(span).await;
+                    flow.map(ended)
                 }
                 // The read-back is done: its subscription would only bring the bridge's own State
                 // back, a publish for each one it makes, ahead of every request (Codex final gate 1).
-                Step::Event(Some(PumpEvent::SubAck { .. })) if read_back_done => {
+                (Step::Event(Some(PumpEvent::SubAck { .. })), Mode::Fixed(_)) if read_back_done => {
                     // WAIT: mqtt-request
-                    client.unsubscribe(shared.topics.state_filter()).await.map(|()| None)
+                    client.unsubscribe(outputs.slots[0].device.topics.state_filter()).await.map(|()| None)
                 }
-                Step::Event(Some(
-                    PumpEvent::Disconnected
-                    | PumpEvent::SubAck { .. }
-                    | PumpEvent::Subscribing(_)
-                    | PumpEvent::Unsubscribing(_)
-                    | PumpEvent::UnsubAck { .. },
-                )) => Ok(None),
-                Step::Event(Some(PumpEvent::Ended(_))) => Ok(Some(SessionEnd::Ended { connected: None })),
+                (
+                    Step::Event(Some(
+                        PumpEvent::Disconnected
+                        | PumpEvent::SubAck { .. }
+                        | PumpEvent::Subscribing(_)
+                        | PumpEvent::Unsubscribing(_)
+                        | PumpEvent::UnsubAck { .. },
+                    )),
+                    Mode::Fixed(_),
+                ) => Ok(None),
+                (Step::Event(Some(PumpEvent::Disconnected)), Mode::Host(_)) => Ok(None),
+                (
+                    Step::Event(Some(
+                        event @ (PumpEvent::SubAck { .. }
+                        | PumpEvent::Subscribing(_)
+                        | PumpEvent::Unsubscribing(_)
+                        | PumpEvent::UnsubAck { .. }),
+                    )),
+                    Mode::Host(host),
+                ) => host.on_ack(&ctx, outputs, event).await.map(ended),
+                (Step::Event(Some(PumpEvent::Ended(_))), _) => Ok(Some(SessionEnd::Ended { connected: None })),
                 // The pump went without a word — it panicked — so it never said the connection was
                 // lost: the broker snapshot is taken here (Claude's re-gate minor 14).
-                Step::Event(None) => {
+                (Step::Event(None), _) => {
                     if accepted.is_some() {
-                        shared.reports.broker_lost();
+                        shared.broker_lost();
                     }
                     Ok(Some(SessionEnd::Ended { connected: None }))
                 }
-                Step::Reported => {
-                    batch.add(shared, shared.reports.take());
-                    // WAIT: mqtt-request
-                    batch.publish(shared, &client, false).await;
+                (Step::Lifecycle(event), Mode::Host(host)) => host.on_event(&ctx, outputs, event).await.map(ended),
+                (Step::Lifecycle(_), Mode::Fixed(_)) => Ok(None),
+                (Step::Tick, Mode::Host(host)) => host.on_timer(&ctx, outputs).await.map(ended),
+                (Step::Tick, Mode::Fixed(_)) => Ok(None),
+                (Step::Reported, Mode::Fixed(_)) => {
+                    outputs.turn(shared, &client).await;
                     Ok(None)
                 }
-                Step::Shutdown => Ok(Some(SessionEnd::Shutdown)),
+                (Step::Reported, Mode::Host(host)) => {
+                    outputs.turn(shared, &client).await;
+                    host.on_turn_done(&ctx, outputs).await.map(ended)
+                }
+                (Step::Shutdown, _) => Ok(Some(SessionEnd::Shutdown)),
             }
         };
         // A publish waits while the broker stalls; the shutdown does not wait behind it.
@@ -314,16 +616,21 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
             _ = shutdown.wait_for(|stop| *stop) => Ok(Some(SessionEnd::Shutdown)),
         };
         match done {
-            Ok(None) => announced |= connack,
+            Ok(None) => {}
             Ok(Some(SessionEnd::Ended { .. })) => {
-                // A replay cut short is what there is.
-                if shared.read_back_next.swap(false, Ordering::SeqCst) {
-                    shared.reports.read_back_incomplete();
+                match mode {
+                    // A replay cut short is what there is.
+                    Mode::Fixed(fixed) => {
+                        if std::mem::take(&mut fixed.read_back_next) {
+                            outputs.slots[0].device.reports.read_back_incomplete();
+                        }
+                    }
+                    Mode::Host(host) => host.on_session_lost(outputs).await,
                 }
                 return SessionEnd::Ended { connected: accepted };
             }
             Ok(Some(SessionEnd::Shutdown)) => {
-                flush(shared, &client, &mut incoming, batch).await;
+                flush(shared, &client, &mut incoming, outputs).await;
                 return SessionEnd::Shutdown;
             }
             // The event loop is gone (the pump ended): the next event says so.
@@ -332,30 +639,50 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
     }
 }
 
+/// A handler's flow, as the session's step.
+fn ended(flow: Flow) -> Option<SessionEnd> {
+    match flow {
+        Flow::Continue => None,
+        Flow::End => Some(SessionEnd::Ended { connected: None }),
+    }
+}
+
+/// Sleep until `at`, or for good when there is none.
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        // WAIT: session-events
+        None => std::future::pending::<()>().await,
+    }
+}
+
 // Transient: one per pass of the session's loop, never stored.
 #[allow(clippy::large_enum_variant)]
 enum Step {
     Event(Option<PumpEvent>),
+    Lifecycle(Event),
     Reported,
+    Tick,
     Shutdown,
 }
 
-/// The CONNACK duties, in order: the subscriptions (the read-back's first, once per process), then
-/// `Active=true`, the version, and the whole retained model.
+/// A fixed bridge's CONNACK duties, in order: the subscriptions (the read-back's first, once per
+/// process), then `Active=true`, the version, and the whole retained model.
 // The error is rumqttc's `ClientError` (it carries the refused request), returned once per CONNACK;
 // boxing it buys nothing on a path this cold.
 #[allow(clippy::result_large_err)]
-async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) -> Result<bool, Failed> {
-    let topics = &shared.topics;
-    if !shared.read_back_requested.load(Ordering::SeqCst) {
+async fn connected(ctx: &Ctx<'_>, fixed: &mut Fixed, device: &Device, incoming: &mut Incoming) -> Result<bool, Failed> {
+    let (shared, client) = (ctx.shared, ctx.client);
+    let topics = &device.topics;
+    if !fixed.read_back_requested {
         // WAIT: mqtt-request
         client.subscribe(topics.state_filter(), QoS::AtLeastOnce).await?;
-        match read_back_acknowledged(shared, incoming).await {
+        match read_back_acknowledged(device, incoming).await {
             ReadBack::Ended => return Ok(false),
             // Complete once its replay is in: at the next SUBACK, behind it.
-            ReadBack::Granted => shared.read_back_next.store(true, Ordering::SeqCst),
+            ReadBack::Granted => fixed.read_back_next = true,
             ReadBack::Refused => {
-                shared.reports.read_back_incomplete();
+                device.reports.read_back_incomplete();
                 warn!(
                     kind = "read_back_incomplete",
                     refused = true,
@@ -363,7 +690,7 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
                 );
             }
             ReadBack::Late => {
-                shared.reports.read_back_incomplete();
+                device.reports.read_back_incomplete();
                 // Done, as far as the conflict rule goes: its own State coming back would only
                 // queue ahead of the requests (Codex final gate 1).
                 // WAIT: mqtt-request
@@ -375,7 +702,7 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
                 );
             }
         }
-        shared.read_back_requested.store(true, Ordering::SeqCst);
+        fixed.read_back_requested = true;
     }
     // Configs first, so a target's retained setup is queued ahead of its retained values (review
     // M4). Target-level writes and commands are never retained: subscribed retain-as-published, a
@@ -393,9 +720,9 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
         // WAIT: mqtt-request
         client.subscribe_many(vec![filter]).await?;
     }
-    emit(shared, client, topics.active(), true, b"true".to_vec(), properties()).await;
-    emit(shared, client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
-    republish(shared, client, shared.reports.model()).await;
+    emit(shared, client, shared.topics.active(), true, b"true".to_vec(), properties()).await;
+    emit(shared, client, shared.topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
+    republish(shared, client, device, device.reports.model()).await;
     Ok(true)
 }
 
@@ -413,7 +740,7 @@ enum ReadBack {
 
 /// The read-back's SUBACK — told by its packet id — within [`READ_BACK_WAIT`], handling what
 /// arrives meanwhile.
-async fn read_back_acknowledged(shared: &Shared, incoming: &mut Incoming) -> ReadBack {
+async fn read_back_acknowledged(device: &Device, incoming: &mut Incoming) -> ReadBack {
     let deadline = Instant::now() + READ_BACK_WAIT;
     let mut read_back: Option<u16> = None;
     loop {
@@ -434,25 +761,30 @@ async fn read_back_acknowledged(shared: &Shared, incoming: &mut Incoming) -> Rea
                 | PumpEvent::Unsubscribing(_)
                 | PumpEvent::UnsubAck { .. },
             )) => {}
-            Ok(Some(PumpEvent::Publish(publish, received))) => handle(shared, &publish, received),
+            Ok(Some(PumpEvent::Publish(publish, received))) => {
+                let (topic, span) = traced(&publish);
+                span.in_scope(|| route(device, &topic, &publish, received));
+            }
             Ok(Some(PumpEvent::Ended(_)) | None) => return ReadBack::Ended,
         }
     }
 }
 
-/// Everything known, again. A message refused is dropped alone.
-async fn republish(shared: &Shared, client: &AsyncClient, model: Model) {
+/// Everything a device knows, again — tagged, for a configured instance. A message refused is
+/// dropped alone.
+pub(crate) async fn republish(shared: &Shared, client: &AsyncClient, device: &Device, model: Model) {
     debug!(targets = model.states.len(), "Publishing the retained model again after a CONNACK");
+    let tag = device.tag.as_deref();
     if let Some(status) = model.status {
-        emit(shared, client, shared.topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await;
+        emit(shared, client, device.topics.status(), true, status.as_str().as_bytes().to_vec(), tagged(tag)).await;
     }
     for (target, document) in model.states {
-        emit(shared, client, shared.topics.state(&target), true, document, properties()).await;
+        emit(shared, client, device.topics.state(&target), true, document, tagged(tag)).await;
     }
 }
 
 /// One message of a batch, ready to publish.
-struct Out {
+pub(crate) struct Out {
     topic: String,
     retain: bool,
     payload: Vec<u8>,
@@ -460,8 +792,9 @@ struct Out {
 }
 
 impl Out {
-    fn new(topic: String, retain: bool, payload: Vec<u8>, correlation: Option<bytes::Bytes>) -> Out {
-        let mut properties = properties();
+    /// A message; `tag`, a configured instance's `via` for its `Status` and `State`.
+    pub(crate) fn new(topic: String, retain: bool, payload: Vec<u8>, correlation: Option<bytes::Bytes>, tag: Option<&str>) -> Out {
+        let mut properties = tagged(tag);
         properties.correlation_data = correlation;
         Out { topic, retain, payload, properties }
     }
@@ -470,13 +803,29 @@ impl Out {
 /// A publish under way: its topic, for the refusal's line, and rumqttc's request.
 type Sending = std::pin::Pin<Box<dyn std::future::Future<Output = (String, Result<(), Failed>)> + Send>>;
 
-/// What the device side reported, taken from the reports, and how far its publication has got —
-/// the session's, outside the work a stop cuts short: a stop in the middle of a batch hands the
-/// flush what the batch has not enqueued, its answers first, and nothing enqueued goes twice
-/// (third confirming reviews, Codex 1: the batch was taken out of the reports whole, and the
-/// stop dropped what it had not published — a `refresh`'s reply among it, owned by nobody).
+/// A part of a batch, in the order a publication takes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Part {
+    /// Every terminal `Error` of a request, then every reply.
+    Answers,
+    /// `Status`, then each changed `State`.
+    Model,
+    /// The capped `Error`s and `Event`s.
+    Unsolicited,
+}
+
+/// In normal operation a reply follows the State its command produced — a `refresh`'s reply says
+/// its State is current — so Status and State go first, then the answers (the second confirming
+/// review's F1); the unsolicited reports last.
+pub(crate) const IN_TURN: [Part; 3] = [Part::Model, Part::Answers, Part::Unsolicited];
+
+/// What one device reported, taken from its reports, and how far its publication has got — the
+/// session's, outside the work a stop cuts short: a stop in the middle of a batch hands the flush
+/// what the batch has not enqueued, its answers first, and nothing enqueued goes twice (third
+/// confirming reviews, Codex 1: the batch was taken out of the reports whole, and the stop dropped
+/// what it had not published — a `refresh`'s reply among it, owned by nobody).
 #[derive(Default)]
-struct Batch {
+pub(crate) struct Batch {
     /// Every terminal `Error` of a request, then every reply.
     answers: VecDeque<Out>,
     /// `Status`, then each changed `State`.
@@ -490,41 +839,72 @@ struct Batch {
 }
 
 impl Batch {
-    /// Add what the reports gave, behind what is still waiting.
-    fn add(&mut self, shared: &Shared, changes: Changes) {
-        let topics = &shared.topics;
+    /// Add what a device's reports gave, behind what is still waiting.
+    pub(crate) fn add(&mut self, device: &Device, changes: Changes) {
+        let topics = &device.topics;
+        let tag = device.tag.as_deref();
         let Changes { answer_errors, replies, status, states, errors, events } = changes;
-        self.answers.extend(answer_errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None)));
-        self.answers
-            .extend(replies.into_iter().map(|r| Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation)));
-        self.model.extend(status.map(|s| Out::new(topics.status(), true, s.as_str().as_bytes().to_vec(), None)));
-        self.model.extend(states.into_iter().map(|(target, document)| Out::new(topics.state(&target), true, document, None)));
-        self.unsolicited.extend(errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None)));
+        self.answers.extend(answer_errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None, None)));
+        self.answers.extend(
+            replies.into_iter().map(|r| Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation, None)),
+        );
+        self.model.extend(status.map(|s| Out::new(topics.status(), true, s.as_str().as_bytes().to_vec(), None, tag)));
+        self.model.extend(states.into_iter().map(|(target, document)| Out::new(topics.state(&target), true, document, None, tag)));
+        self.unsolicited.extend(errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None, None)));
         self.unsolicited
-            .extend(events.into_iter().map(|e| Out::new(e.topic.unwrap_or_else(|| topics.event()), false, e.payload, e.correlation)));
+            .extend(events.into_iter().map(|e| Out::new(e.topic.unwrap_or_else(|| topics.event()), false, e.payload, e.correlation, None)));
     }
 
-    /// Publish what waits, the publish under way first. In normal operation a reply follows the
-    /// State its command produced — a `refresh`'s reply says its State is current — so Status and
-    /// State go first, then the answers (the second confirming review's F1). At the stop, answers
-    /// go first: the flush is bounded, and they are what must not be cut (confirming review 3).
-    /// The unsolicited reports last. A message refused is dropped alone. Cancellation-safe: a
-    /// message leaves the batch only into `sending`, which is kept.
-    async fn publish(&mut self, shared: &Shared, client: &AsyncClient, answers_first: bool) {
+    /// Queue `out` in `part`, behind what waits there.
+    pub(crate) fn push(&mut self, part: Part, out: Out) {
+        self.queue(part).push_back(out);
+    }
+
+    fn queue(&mut self, part: Part) -> &mut VecDeque<Out> {
+        match part {
+            Part::Answers => &mut self.answers,
+            Part::Model => &mut self.model,
+            Part::Unsolicited => &mut self.unsolicited,
+        }
+    }
+
+    /// Whether nothing waits: no message, and no publish under way.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sending.is_none() && self.answers.is_empty() && self.model.is_empty() && self.unsolicited.is_empty()
+    }
+
+    /// How many messages wait, the one under way included.
+    pub(crate) fn len(&self) -> usize {
+        usize::from(self.sending.is_some()) + self.answers.len() + self.model.len() + self.unsolicited.len()
+    }
+
+    /// Publish what waits, the publish under way first, then `parts` in their order, until `limit`
+    /// messages have been handed over. At the stop, answers go first: the flush is bounded, and they
+    /// are what must not be cut (confirming review 3). A message refused is dropped alone.
+    /// Cancellation-safe: a message leaves the batch only into `sending`, which is kept. Returns how
+    /// many were handed over.
+    pub(crate) async fn publish(&mut self, shared: &Shared, client: &AsyncClient, parts: &[Part], limit: usize) -> usize {
+        let mut handed = 0;
         loop {
             if let Some(sending) = self.sending.as_mut() {
                 // WAIT: mqtt-request
                 let (topic, sent) = sending.await;
                 self.sending = None;
                 enqueued(shared, &topic, sent);
+                handed += 1;
             }
-            let next = if answers_first {
-                self.answers.pop_front().or_else(|| self.model.pop_front())
-            } else {
-                self.model.pop_front().or_else(|| self.answers.pop_front())
-            };
-            let Some(out) = next.or_else(|| self.unsolicited.pop_front()) else {
-                return;
+            if handed >= limit {
+                return handed;
+            }
+            let mut next = None;
+            for part in parts {
+                if let Some(out) = self.queue(*part).pop_front() {
+                    next = Some(out);
+                    break;
+                }
+            }
+            let Some(out) = next else {
+                return handed;
             };
             let client = client.clone();
             self.sending = Some(Box::pin(async move {
@@ -539,8 +919,9 @@ impl Batch {
 
 /// The shutdown's flush: `Active=false` and DISCONNECT, polling until it is written, within
 /// [`FLUSH_BOUND`]. Skipped when the session holds no connection: the last will says it then.
-/// `batch` is what the stop cut short of the session's last batch: published with what is pending.
-async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, mut batch: Batch) {
+/// `outputs` holds what the stop cut short of each device's last batch: published with what is
+/// pending.
+async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, outputs: &mut Outputs) {
     // A connection the broker accepted is one to flush on, whether or not its recovery has lasted
     // long enough to close the outage episode (second confirming review 2: a stop within the
     // stability window skipped every answer). The pump's word, not the session's: a CONNACK the
@@ -553,17 +934,26 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, m
     // The ack wait's deadline leaves the DISCONNECT and the close their part of the bound.
     let ack_deadline = Instant::now() + FLUSH_BOUND - DISCONNECT_PART;
     let flushed = async {
-        // What still waits for the device will not run: refused, on Error and on its response
+        // What still waits for each device will not run: refused, on Error and on its response
         // topic; then what is pending — Status, Errors, replies — then the last words (re-gate
         // R15). Here, in the session's own flush, so nothing else publishes them first by chance.
         // Refusals go to the reports' uncapped answers, which `take` gives first: a full mailbox
         // cannot overflow them (Codex final gate 2). Behind what the stop cut short of the last
         // batch — its publish under way finished first, then its answers, then these (third
-        // confirming reviews, Codex 1).
-        crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);
-        batch.add(shared, shared.reports.take());
-        // WAIT: mqtt-request
-        batch.publish(shared, client, true).await;
+        // confirming reviews, Codex 1). Every device's answers before any device's model, the
+        // outbox's with them.
+        for slot in &mut outputs.slots {
+            crate::worker::report_refused(&slot.device.reports, slot.device.mailbox.disconnected(), STOPPED_BEFORE);
+            slot.batch.add(&slot.device, slot.device.reports.take());
+        }
+        for part in [Part::Answers, Part::Model, Part::Unsolicited] {
+            // WAIT: mqtt-request
+            outputs.outbox.publish(shared, client, &[part], usize::MAX).await;
+            for slot in &mut outputs.slots {
+                // WAIT: mqtt-request
+                slot.batch.publish(shared, client, &[part], usize::MAX).await;
+            }
+        }
         emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
         // Before the DISCONNECT, until the ack wait's deadline: every publish this session enqueued
         // written by the pump — a watermark, so the pump's count cannot be read stale before it
@@ -623,9 +1013,9 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, m
     }
 }
 
-/// An incoming publish, received at `received`, handled without waiting: requests go to the
-/// mailbox, what must be answered to the reports.
-fn handle(shared: &Shared, publish: &Publish, received: Instant) {
+/// An incoming publish's topic, and the span it is handled in (its trace's remote parent, if it
+/// carries one). The test seam's panic, if armed for the topic.
+pub(crate) fn traced(publish: &Publish) -> (String, Span) {
     let topic = String::from_utf8_lossy(&publish.topic).into_owned();
     panic_for_test(&topic);
     let traceparent =
@@ -634,23 +1024,24 @@ fn handle(shared: &Shared, publish: &Publish, received: Instant) {
     if let Some(tp) = &traceparent {
         tracing_init::traceparent::set_remote_parent(&span, tp);
     }
-    span.in_scope(|| route(shared, &topic, publish, received));
+    (topic, span)
 }
 
-/// `now` is when the publish arrived: every deadline counts from it.
-fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
+/// An incoming publish for `device`, received at `now`, handled without waiting: requests go to the
+/// mailbox, what must be answered to the reports. Every deadline counts from `now`.
+pub(crate) fn route(device: &Device, topic: &str, publish: &Publish, now: Instant) {
     let properties = publish.properties.as_ref();
     let payload = &publish.payload[..];
     let malformed = |error: String, report: ErrorReport| {
         info!(kind = "validation_rejected", topic, error = %error, "A request was malformed; answered on Error");
-        shared.reports.error(ErrorReport { error, ..report });
+        device.reports.error(ErrorReport { error, ..report });
     };
     let blank = || ErrorReport::new(Reason::Malformed, "");
-    match shared.topics.parse(topic) {
+    match device.topics.parse(topic) {
         Inbound::State { target } => {
             if publish.retain {
                 match wire::decode_state(payload) {
-                    Ok(values) => shared.reports.read_back(&target, values),
+                    Ok(values) => device.reports.read_back(&target, values),
                     Err(e) => debug!(target = %target, error = %e, "The retained state read back is not a state; ignored"),
                 }
             }
@@ -662,15 +1053,15 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                 Ok(None) => {
                     // The key's assumption is settled — unless a write of it is still unproven: the
                     // probe proves it, or the link's loss holds it again (re-gate 4 minor 7).
-                    if !shared.mailbox.retract(&target, &property) {
-                        shared.reports.assumption_settled(&target, &property);
+                    if !device.mailbox.retract(&target, &property) {
+                        device.reports.assumption_settled(&target, &property);
                     }
                 }
                 Ok(Some(value)) => match wire::request_meta(properties, now) {
                     Err(e) => malformed(e, report),
                     Ok(meta) => {
                         // A replay's "before" basis, as of its arrival (re-gate R2).
-                        let basis = publish.retain.then(|| shared.reports.broker_basis(&target, &property));
+                        let basis = publish.retain.then(|| device.reports.broker_basis(&target, &property));
                         let value = StateValue {
                             target,
                             property,
@@ -681,8 +1072,8 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                             basis,
                             reheld: false,
                         };
-                        withdrawing(shared, |withdraw| {
-                            shared.mailbox.post_state_then(value, publish.retain, withdraw);
+                        withdrawing(device, |withdraw| {
+                            device.mailbox.post_state_then(value, publish.retain, withdraw);
                         });
                     }
                 },
@@ -709,20 +1100,20 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                             reheld: false,
                         })
                         .collect();
-                    withdrawing(shared, |withdraw| {
-                        shared.mailbox.post_target_then(values, withdraw);
+                    withdrawing(device, |withdraw| {
+                        device.mailbox.post_target_then(values, withdraw);
                     });
                 }
             }
         }
         Inbound::Command => {
-            let reply = ReplyTo::from_properties(properties, &shared.topics);
+            let reply = ReplyTo::from_properties(properties, &device.topics);
             // A command refused as it arrives still answers on its response topic, if it named
             // one the bridge can publish to (review C13).
             let refuse = |error: String| {
                 if let Ok(Some(reply)) = &reply {
                     let (target, command) = wire::command_names(payload);
-                    shared.reports.event(Outbound {
+                    device.reports.event(Outbound {
                         topic: Some(reply.topic.clone()),
                         payload: reply_payload(
                             target.as_deref(),
@@ -746,7 +1137,7 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                 Ok(decoded) => decoded,
             };
             command(
-                shared,
+                device,
                 target,
                 call,
                 reply,
@@ -756,7 +1147,7 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
         Inbound::Config { target } => match wire::decode_config(payload) {
             Err(e) => malformed(e, blank().target(Some(&target))),
             Ok(config) => {
-                shared.mailbox.post_config(&target, config);
+                device.mailbox.post_config(&target, config);
             }
         },
         // A fixed bridge never subscribes to its `Status`: one arriving is no topic it reads.
@@ -765,10 +1156,10 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
 }
 
 /// A command: the standard `refresh` and `assume`, or one the driver declares.
-fn command(shared: &Shared, target: Option<String>, call: crate::driver::CommandCall, reply: Option<ReplyTo>, deadline: Option<Instant>) {
+fn command(device: &Device, target: Option<String>, call: crate::driver::CommandCall, reply: Option<ReplyTo>, deadline: Option<Instant>) {
     let answer = |answer: Answer| {
         if let Some(reply) = &reply {
-            shared.reports.event(Outbound {
+            device.reports.event(Outbound {
                 topic: Some(reply.topic.clone()),
                 payload: reply_payload(target.as_deref(), &call.command, &answer),
                 correlation: reply.correlation.clone(),
@@ -776,7 +1167,7 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
         }
     };
     let refused = |reason: Reason, error: &str| {
-        shared.reports.request_error(ErrorReport::new(reason, error).target(target.as_deref()).command(&call.command));
+        device.reports.request_error(ErrorReport::new(reason, error).target(target.as_deref()).command(&call.command));
         answer(Answer::Failed { reason, error: error.to_owned() });
     };
     // Past its expiry when the session reads it — it waited behind a stalled broker — a command
@@ -787,7 +1178,7 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
     }
     match call.command.as_str() {
         "refresh" => {
-            let posted = shared.mailbox.post_read(ReadKey::Refresh(target.clone()), None, reply.clone(), deadline);
+            let posted = device.mailbox.post_read(ReadKey::Refresh(target.clone()), None, reply.clone(), deadline);
             if posted == Posted::Dropped {
                 refused(Reason::Refused, "the device is not connected");
             }
@@ -800,7 +1191,7 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
                 refused(Reason::Malformed, "`assume` names a property that cannot stand as a topic segment");
             }
             Some(t) if !call.params.is_empty() => {
-                shared.reports.state(t, call.params.clone(), true);
+                device.reports.state(t, call.params.clone(), true);
                 answer(Answer::Done(None));
             }
             _ => {
@@ -808,19 +1199,21 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
                 refused(Reason::Malformed, "`assume` names a target and the values to assume");
             }
         },
-        name => match shared.commands.iter().find(|c| c.name == name).map(|c| c.class) {
+        // A device whose driver is not built yet takes no command: as one not connected.
+        _ if device.commands.get().is_none() => refused(Reason::Refused, "the device is not connected"),
+        name => match device.commands.get().into_iter().flatten().find(|c| c.name == name).map(|c| c.class) {
             None => {
                 info!(command = name, "A command the driver does not declare; answered on Error");
                 refused(Reason::Unsupported, "no such command");
             }
             Some(CommandClass::Read) => {
                 let key = ReadKey::Command { target: target.clone(), command: name.to_owned() };
-                if shared.mailbox.post_read(key, Some(call.clone()), reply.clone(), deadline) == Posted::Dropped {
+                if device.mailbox.post_read(key, Some(call.clone()), reply.clone(), deadline) == Posted::Dropped {
                     refused(Reason::Refused, "the device is not connected");
                 }
             }
             Some(CommandClass::Momentary | CommandClass::WithReply) => {
-                if let Posted::Refused(why) = shared.mailbox.post_command(target.clone(), call.clone(), reply.clone(), deadline) {
+                if let Posted::Refused(why) = device.mailbox.post_command(target.clone(), call.clone(), reply.clone(), deadline) {
                     refused(Reason::Refused, why.as_str());
                 }
             }
@@ -849,14 +1242,14 @@ fn panic_for_test(_: &str) {}
 /// replacement and assume it (third confirming reviews, Codex 2: withdrawn after, it reverted the
 /// replacement's own assumption). Logged once both locks are released. The worker withdraws the
 /// writes its own takes drop at their deadline.
-fn withdrawing(shared: &Shared, post: impl FnOnce(&mut dyn FnMut(&str, &str))) {
+fn withdrawing(device: &Device, post: impl FnOnce(&mut dyn FnMut(&str, &str))) {
     let mut withdrawn: Vec<(String, String)> = Vec::new();
     post(&mut |target, property| {
-        if shared.reports.withdraw_assumption(target, property) {
+        if device.reports.withdraw_assumption(target, property) {
             withdrawn.push((target.to_owned(), property.to_owned()));
         }
     });
-    after_post(shared);
+    after_post(device);
     for (target, property) in withdrawn {
         info!(target, property, "A write the device never proved taken was replaced before proof; its assumed value is withdrawn");
     }
@@ -864,7 +1257,7 @@ fn withdrawing(shared: &Shared, post: impl FnOnce(&mut dyn FnMut(&str, &str))) {
 
 /// (tests) What runs after a post.
 #[cfg(test)]
-type AfterPost = Option<Box<dyn FnMut(&Shared)>>;
+type AfterPost = Option<Box<dyn FnMut(&Device)>>;
 
 #[cfg(test)]
 thread_local! {
@@ -874,21 +1267,28 @@ thread_local! {
 }
 
 /// The test seam after a post (tests only; nothing otherwise).
-fn after_post(_shared: &Shared) {
+fn after_post(_device: &Device) {
     #[cfg(test)]
     AFTER_POST.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
-            hook(_shared);
+            hook(_device);
         }
     });
 }
 
 /// What a stop refuses: a command still waiting for the device.
-const STOPPED_BEFORE: &str = "the bridge stopped before it ran";
+pub(crate) const STOPPED_BEFORE: &str = "the bridge stopped before it ran";
 
 /// Spawn the MQTT side on the current runtime.
-pub(crate) fn spawn(shared: Arc<Shared>, shutdown: watch::Receiver<bool>, set: &mut tokio::task::JoinSet<()>) {
-    set.spawn(run(shared, shutdown).in_current_span());
+pub(crate) fn spawn(
+    shared: Arc<Shared>,
+    mode: Mode,
+    outputs: Outputs,
+    events: mpsc::UnboundedReceiver<Event>,
+    shutdown: watch::Receiver<bool>,
+    set: &mut tokio::task::JoinSet<()>,
+) {
+    set.spawn(run(shared, mode, outputs, events, shutdown).in_current_span());
 }
 
 #[cfg(test)]

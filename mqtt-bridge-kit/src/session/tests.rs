@@ -1,6 +1,5 @@
 //! The session on its own, against FakeBroker: what it does with a publish rumqttc refuses.
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,22 +10,43 @@ use crate::mailbox::Mailbox;
 use crate::pump::BrokerOutage;
 use crate::reports::Reports;
 
-/// The MQTT side's shared state, for `broker`.
-fn shared_for(broker: &FakeBroker) -> Shared {
-    Shared {
-        topics: Topics::new("T", "session").expect("topics"),
+/// A fixed bridge's session parts on `port`: the session part, its one device, the rotation and
+/// the mode.
+struct Rig {
+    shared: Arc<Shared>,
+    device: Arc<Device>,
+    outputs: Outputs,
+    mode: Mode,
+    events: tokio::sync::mpsc::UnboundedReceiver<crate::devices::Event>,
+    _events: tokio::sync::mpsc::UnboundedSender<crate::devices::Event>,
+}
+
+fn rig_on(port: u16) -> Rig {
+    let topics = Topics::new("T", "session").expect("topics");
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let shared = Arc::new(Shared {
+        topics: topics.clone(),
         broker_host: "127.0.0.1".into(),
-        broker_port: broker.port(),
+        broker_port: port,
         timing: MqttTiming::default(),
         version: "test".into(),
-        commands: Vec::new(),
-        mailbox: Mailbox::new(),
-        reports: Reports::new(),
         outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
-        read_back_requested: AtomicBool::new(false),
-        read_back_next: AtomicBool::new(false),
         enqueued: std::sync::atomic::AtomicU64::new(0),
-    }
+        ready: ready.clone(),
+        devices: lock_order::sync::Mutex::new("session-devices", Vec::new()),
+    });
+    let device = Arc::new(Device {
+        topics,
+        commands: Vec::new().into(),
+        mailbox: Mailbox::new(),
+        reports: Reports::with_ready(ready),
+        tag: None,
+        span: tracing::Span::none(),
+    });
+    let mut outputs = Outputs::new();
+    outputs.add(&shared, 0, device.clone());
+    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    Rig { shared, device, outputs, mode: Mode::Fixed(Fixed::default()), events, _events: events_tx }
 }
 
 /// A publish rumqttc refuses (a topic holding a wildcard) is one message dropped: the ones after it
@@ -36,13 +56,14 @@ fn shared_for(broker: &FakeBroker) -> Shared {
 async fn a_refused_publish_is_one_message_dropped() {
     let broker = FakeBroker::start().await;
     broker.cap_connections(5);
-    let shared = shared_for(&broker);
+    let rig = rig_on(broker.port());
+    let (shared, device) = (rig.shared.clone(), rig.device.clone());
     let (client, events) = client(&shared);
     let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     let model = Model { status: None, states: vec![("a#b".to_owned(), b"{}".to_vec()), ("t1".to_owned(), br#"{"x":1}"#.to_vec())] };
-    let republished = tokio::time::timeout(Duration::from_secs(5), republish(&shared, &client, model)).await;
+    let republished = tokio::time::timeout(Duration::from_secs(5), republish(&shared, &client, &device, model)).await;
     assert!(republished.is_ok(), "the republish did not end");
     let t1 = shared.topics.state("t1");
     assert!(
@@ -56,33 +77,16 @@ async fn a_refused_publish_is_one_message_dropped() {
 /// no "before" value for the conflict rule.
 #[test]
 fn a_live_state_is_not_read_back() {
-    let shared = shared_for_port();
-    let topic = shared.topics.state("t1");
+    let rig = rig_on(1);
+    let (_shared, device) = (rig.shared.clone(), rig.device.clone());
+    let topic = device.topics.state("t1");
     let live = Publish::new(topic.clone(), QoS::AtLeastOnce, br#"{"temp":1}"#.to_vec(), None);
-    route(&shared, &topic, &live, Instant::now());
-    assert!(shared.reports.read_back_before().1.is_empty(), "a live State was read back");
+    route(&device, &topic, &live, Instant::now());
+    assert!(device.reports.read_back_before().1.is_empty(), "a live State was read back");
     let mut retained = Publish::new(topic.clone(), QoS::AtLeastOnce, br#"{"temp":2}"#.to_vec(), None);
     retained.retain = true;
-    route(&shared, &topic, &retained, Instant::now());
-    assert_eq!(shared.reports.read_back_before().1["t1"]["temp"], serde_json::json!(2));
-}
-
-/// The shared state of a session that never connects: for routing alone.
-fn shared_for_port() -> Shared {
-    Shared {
-        topics: Topics::new("T", "session").expect("topics"),
-        broker_host: "127.0.0.1".into(),
-        broker_port: 1,
-        timing: MqttTiming::default(),
-        version: "test".into(),
-        commands: Vec::new(),
-        mailbox: Mailbox::new(),
-        reports: Reports::new(),
-        outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
-        read_back_requested: AtomicBool::new(false),
-        read_back_next: AtomicBool::new(false),
-        enqueued: std::sync::atomic::AtomicU64::new(0),
-    }
+    route(&device, &topic, &retained, Instant::now());
+    assert_eq!(device.reports.read_back_before().1["t1"]["temp"], serde_json::json!(2));
 }
 
 /// The session's panic seam is off without the feature (the re-gate 3 S5).
@@ -99,15 +103,16 @@ fn the_panic_seam_is_off_without_its_feature() {
 /// confirmed it, so the conflict rule takes the assumed value, not the one before it (re-gate 3 S6).
 #[test]
 fn a_retraction_settles_the_keys_unproven_assumption() {
-    let shared = shared_for_port();
-    shared.reports.assume_unproven("t1", serde_json::json!({"level": 40}).as_object().unwrap().clone());
-    assert_eq!(shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()), None);
-    let topic = shared.topics.desired("t1", "level");
+    let rig = rig_on(1);
+    let (_shared, device) = (rig.shared.clone(), rig.device.clone());
+    device.reports.assume_unproven("t1", serde_json::json!({"level": 40}).as_object().unwrap().clone());
+    assert_eq!(device.reports.values_of("t1").and_then(|v| v.get("level").cloned()), None);
+    let topic = device.topics.desired("t1", "level");
     let mut retraction = Publish::new(topic.clone(), QoS::AtLeastOnce, Vec::<u8>::new(), None);
     retraction.retain = true;
-    route(&shared, &topic, &retraction, Instant::now());
+    route(&device, &topic, &retraction, Instant::now());
     assert_eq!(
-        shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
+        device.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
         Some(serde_json::json!(40)),
         "a retraction left the key's assumption unproven"
     );
@@ -117,21 +122,22 @@ fn a_retraction_settles_the_keys_unproven_assumption() {
 /// it, or the link's loss holds it again (re-gate 4 minor 7).
 #[test]
 fn a_retraction_of_an_unproven_write_leaves_its_assumption_unproven() {
-    let shared = shared_for_port();
-    shared.mailbox.connected();
+    let rig = rig_on(1);
+    let (_shared, device) = (rig.shared.clone(), rig.device.clone());
+    device.mailbox.connected();
     let level = serde_json::json!({"level": 40}).as_object().unwrap().clone();
-    let topic = shared.topics.desired("t1", "level");
+    let topic = device.topics.desired("t1", "level");
     let mut request = Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), None);
     request.retain = false;
-    route(&shared, &topic, &request, Instant::now());
-    assert!(shared.mailbox.try_take().is_some());
-    shared.mailbox.applied(true);
-    shared.reports.assume_unproven("t1", level);
+    route(&device, &topic, &request, Instant::now());
+    assert!(device.mailbox.try_take().is_some());
+    device.mailbox.applied(true);
+    device.reports.assume_unproven("t1", level);
     let mut retraction = Publish::new(topic.clone(), QoS::AtLeastOnce, Vec::<u8>::new(), None);
     retraction.retain = true;
-    route(&shared, &topic, &retraction, Instant::now());
+    route(&device, &topic, &retraction, Instant::now());
     assert_eq!(
-        shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
+        device.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
         None,
         "a retraction proved a write the device never proved taken"
     );
@@ -141,21 +147,22 @@ fn a_retraction_of_an_unproven_write_leaves_its_assumption_unproven() {
 /// settles nothing (Codex final gate 5).
 #[test]
 fn a_retraction_after_the_re_hold_leaves_its_assumption_unproven() {
-    let shared = shared_for_port();
-    shared.mailbox.connected();
+    let rig = rig_on(1);
+    let (_shared, device) = (rig.shared.clone(), rig.device.clone());
+    device.mailbox.connected();
     let level = serde_json::json!({"level": 40}).as_object().unwrap().clone();
-    let topic = shared.topics.desired("t1", "level");
+    let topic = device.topics.desired("t1", "level");
     let request = Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), None);
-    route(&shared, &topic, &request, Instant::now());
-    assert!(shared.mailbox.try_take().is_some());
-    shared.mailbox.applied(true);
-    shared.reports.assume_unproven("t1", level);
-    let _ = shared.mailbox.disconnected();
+    route(&device, &topic, &request, Instant::now());
+    assert!(device.mailbox.try_take().is_some());
+    device.mailbox.applied(true);
+    device.reports.assume_unproven("t1", level);
+    let _ = device.mailbox.disconnected();
     let mut retraction = Publish::new(topic.clone(), QoS::AtLeastOnce, Vec::<u8>::new(), None);
     retraction.retain = true;
-    route(&shared, &topic, &retraction, Instant::now());
+    route(&device, &topic, &retraction, Instant::now());
     assert_eq!(
-        shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
+        device.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
         None,
         "a confirmation after the re-hold proved a write the device never took"
     );
@@ -168,13 +175,14 @@ fn a_retraction_after_the_re_hold_leaves_its_assumption_unproven() {
 async fn the_flush_publishes_what_is_pending_before_its_last_words() {
     let broker = FakeBroker::start().await;
     broker.cap_connections(5);
-    let shared = shared_for(&broker);
+    let mut rig = rig_on(broker.port());
+    let (shared, device) = (rig.shared.clone(), rig.device.clone());
     let (client, events) = client(&shared);
     let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
-    shared.reports.error(crate::wire::ErrorReport::new(crate::wire::Reason::Rejected, "pending at the stop").target(Some("t1")));
-    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, Batch::default())).await;
+    device.reports.error(crate::wire::ErrorReport::new(crate::wire::Reason::Rejected, "pending at the stop").target(Some("t1")));
+    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs)).await;
     assert!(flushed.is_ok(), "the flush did not end");
     let (error, active) = (shared.topics.error(), shared.topics.active());
     assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&active).is_empty()).await, "the flush never said Active=false");
@@ -192,7 +200,8 @@ async fn the_flush_publishes_what_is_pending_before_its_last_words() {
 async fn the_flush_publishes_answers_before_state() {
     let broker = FakeBroker::start().await;
     broker.cap_connections(5);
-    let shared = shared_for(&broker);
+    let mut rig = rig_on(broker.port());
+    let (shared, device) = (rig.shared.clone(), rig.device.clone());
     let (client, events) = client(&shared);
     let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
@@ -200,12 +209,12 @@ async fn the_flush_publishes_answers_before_state() {
     broker.delay_acks(Duration::from_millis(500));
     for t in 0..1000 {
         let values = serde_json::json!({"n": t}).as_object().unwrap().clone();
-        shared.reports.state(&format!("m{t:04}"), values, false);
+        device.reports.state(&format!("m{t:04}"), values, false);
     }
     let refusal = crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop").target(Some("t1"));
     let reply = Outbound { topic: Some("Store/replies/flush".into()), payload: b"{}".to_vec(), correlation: None };
-    shared.reports.refused(vec![refusal], vec![reply]);
-    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, Batch::default())).await;
+    device.reports.refused(vec![refusal], vec![reply]);
+    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs)).await;
     let error = shared.topics.error();
     assert!(
         broker
@@ -220,14 +229,14 @@ async fn the_flush_publishes_answers_before_state() {
 }
 
 /// A write of level 40 held again before proof, its assumption published.
-fn re_held_assumption(shared: &Shared) -> String {
-    shared.mailbox.connected();
-    let topic = shared.topics.desired("t1", "level");
-    route(shared, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), None), Instant::now());
-    assert!(shared.mailbox.try_take().is_some());
-    shared.mailbox.applied(true);
-    shared.reports.assume_unproven("t1", serde_json::json!({"level": 40}).as_object().unwrap().clone());
-    let _ = shared.mailbox.disconnected();
+fn re_held_assumption(device: &Device) -> String {
+    device.mailbox.connected();
+    let topic = device.topics.desired("t1", "level");
+    route(device, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), None), Instant::now());
+    assert!(device.mailbox.try_take().is_some());
+    device.mailbox.applied(true);
+    device.reports.assume_unproven("t1", serde_json::json!({"level": 40}).as_object().unwrap().clone());
+    let _ = device.mailbox.disconnected();
     topic
 }
 
@@ -237,14 +246,15 @@ fn re_held_assumption(shared: &Shared) -> String {
 /// 40 became the proven value, and the later request was dropped as satisfied).
 #[test]
 fn a_live_replacement_of_a_re_held_write_withdraws_its_assumption() {
-    let shared = shared_for_port();
-    let topic = re_held_assumption(&shared);
-    route(&shared, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), None), Instant::now());
+    let rig = rig_on(1);
+    let (_shared, device) = (rig.shared.clone(), rig.device.clone());
+    let topic = re_held_assumption(&device);
+    route(&device, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), None), Instant::now());
     let mut retraction = Publish::new(topic.clone(), QoS::AtLeastOnce, Vec::<u8>::new(), None);
     retraction.retain = true;
-    route(&shared, &topic, &retraction, Instant::now());
+    route(&device, &topic, &retraction, Instant::now());
     assert_eq!(
-        shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
+        device.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
         None,
         "a live replacement left the re-held write's assumption standing, proven by the retraction"
     );
@@ -256,22 +266,23 @@ fn a_live_replacement_of_a_re_held_write_withdraws_its_assumption() {
 /// 60 applied — and the withdrawal put the model back at 20, the device at 60).
 #[test]
 fn a_replacements_withdrawal_never_reverts_the_replacement() {
-    let shared = shared_for_port();
-    shared.reports.state("t1", serde_json::json!({"level": 20}).as_object().unwrap().clone(), false);
-    let topic = re_held_assumption(&shared);
+    let rig = rig_on(1);
+    let (_shared, device) = (rig.shared.clone(), rig.device.clone());
+    device.reports.state("t1", serde_json::json!({"level": 20}).as_object().unwrap().clone(), false);
+    let topic = re_held_assumption(&device);
     // The worker's turn, as soon as the live request is posted: it takes the replacement, applies
     // it, and assumes it.
     AFTER_POST.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(|shared: &Shared| {
-            if let Some(crate::mailbox::Work::Apply { .. }) = shared.mailbox.try_take() {
-                shared.mailbox.applied(true);
-                shared.reports.assume_unproven("t1", serde_json::json!({"level": 60}).as_object().unwrap().clone());
+        *hook.borrow_mut() = Some(Box::new(|device: &Device| {
+            if let Some(crate::mailbox::Work::Apply { .. }) = device.mailbox.try_take() {
+                device.mailbox.applied(true);
+                device.reports.assume_unproven("t1", serde_json::json!({"level": 60}).as_object().unwrap().clone());
             }
         }))
     });
-    route(&shared, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"60".to_vec(), None), Instant::now());
+    route(&device, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"60".to_vec(), None), Instant::now());
     AFTER_POST.with(|hook| hook.borrow_mut().take());
-    let model = shared.reports.model();
+    let model = device.reports.model();
     let state = model.states.iter().find(|(t, _)| t == "t1").map(|(_, d)| crate::wire::decode_state(d).expect("a state"));
     assert_eq!(
         state.and_then(|s| s.get("level").cloned()),
@@ -283,16 +294,17 @@ fn a_replacements_withdrawal_never_reverts_the_replacement() {
 /// The same when the live replacement expires before the retraction.
 #[test]
 fn an_expired_live_replacement_of_a_re_held_write_withdraws_its_assumption() {
-    let shared = shared_for_port();
-    let topic = re_held_assumption(&shared);
+    let rig = rig_on(1);
+    let (_shared, device) = (rig.shared.clone(), rig.device.clone());
+    let topic = re_held_assumption(&device);
     let properties = rumqttc::v5::mqttbytes::v5::PublishProperties { message_expiry_interval: Some(1), ..Default::default() };
-    route(&shared, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), Some(properties)), Instant::now());
+    route(&device, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), Some(properties)), Instant::now());
     std::thread::sleep(Duration::from_millis(1100));
     let mut retraction = Publish::new(topic.clone(), QoS::AtLeastOnce, Vec::<u8>::new(), None);
     retraction.retain = true;
-    route(&shared, &topic, &retraction, Instant::now());
+    route(&device, &topic, &retraction, Instant::now());
     assert_eq!(
-        shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
+        device.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
         None,
         "an expired live replacement left the re-held write's assumption standing"
     );
@@ -305,18 +317,19 @@ fn an_expired_live_replacement_of_a_re_held_write_withdraws_its_assumption() {
 async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
     let broker = FakeBroker::start().await;
     broker.cap_connections(5);
-    let shared = shared_for(&broker);
+    let mut rig = rig_on(broker.port());
+    let (shared, device) = (rig.shared.clone(), rig.device.clone());
     let (client, events) = client(&shared);
     let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     broker.hold_acks();
-    shared.reports.refused(
+    device.reports.refused(
         vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")],
         vec![Outbound { topic: Some("Store/replies/held".into()), payload: b"{}".to_vec(), correlation: None }],
     );
     let disconnected = |b: &FakeBroker| b.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Disconnected));
-    let flushing = flush(&shared, &client, &mut incoming, Batch::default());
+    let flushing = flush(&shared, &client, &mut incoming, &mut rig.outputs);
     tokio::pin!(flushing);
     // Half a second in, the acks still held: no DISCONNECT yet.
     let early = tokio::time::timeout(Duration::from_millis(500), flushing.as_mut()).await;
@@ -339,12 +352,13 @@ async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
 async fn a_stop_mid_batch_still_publishes_the_batchs_reply() {
     let broker = FakeBroker::start().await;
     broker.cap_connections(5);
-    let shared = Arc::new(shared_for(&broker));
+    let rig = rig_on(broker.port());
+    let (shared, device) = (rig.shared.clone(), rig.device.clone());
     let (stop, mut stopped) = watch::channel(false);
-    let running = {
-        let shared = shared.clone();
-        tokio::spawn(async move { session(&shared, &mut stopped).await })
-    };
+    let running = tokio::spawn(async move {
+        let mut rig = rig;
+        session(&rig.shared, &mut rig.mode, &mut rig.outputs, &mut rig.events, &mut stopped).await
+    });
     let active = shared.topics.active();
     assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&active).is_empty()).await, "the session never announced itself");
     // One batch (the session does not run between these): 400 States, then a reply. The broker
@@ -353,9 +367,9 @@ async fn a_stop_mid_batch_still_publishes_the_batchs_reply() {
     broker.hold_acks();
     for t in 0..400 {
         let values = serde_json::json!({"n": t}).as_object().unwrap().clone();
-        shared.reports.state(&format!("m{t:04}"), values, false);
+        device.reports.state(&format!("m{t:04}"), values, false);
     }
-    shared.reports.event(Outbound { topic: Some("Store/replies/mid-batch".into()), payload: b"{}".to_vec(), correlation: None });
+    device.reports.event(Outbound { topic: Some("Store/replies/mid-batch".into()), payload: b"{}".to_vec(), correlation: None });
     assert!(broker.wait_until(Duration::from_secs(5), |b| b.held_acks() >= 10).await, "the States never filled the window");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(broker.received_on("Store/replies/mid-batch").is_empty(), "the reply went out before the States had backed up");
@@ -384,9 +398,11 @@ async fn a_stop_mid_batch_still_publishes_the_batchs_reply() {
 async fn a_stop_ahead_of_a_connack_the_pump_has_read_still_flushes() {
     let broker = FakeBroker::start().await;
     broker.cap_connections(5);
-    let shared = shared_for(&broker);
+    let mut rig = rig_on(broker.port());
+    let (shared, _device) = (rig.shared.clone(), rig.device.clone());
     let (stop, mut stopped) = watch::channel(false);
-    let running = session(&shared, &mut stopped);
+    let Rig { shared: ref session_shared, ref mut mode, ref mut outputs, ref mut events, .. } = rig;
+    let running = session(session_shared, mode, outputs, events, &mut stopped);
     tokio::pin!(running);
     // Polled once: the pump starts, and the session waits on it. Not polled again until the stop,
     // so the CONNACK the pump reads meanwhile waits on the session's queue.
@@ -419,20 +435,21 @@ async fn a_stop_ahead_of_a_connack_the_pump_has_read_still_flushes() {
 async fn the_ack_wait_ends_with_the_connection() {
     let broker = FakeBroker::start().await;
     broker.cap_connections(5);
-    let shared = shared_for(&broker);
+    let mut rig = rig_on(broker.port());
+    let (shared, device) = (rig.shared.clone(), rig.device.clone());
     let (client, events) = client(&shared);
     let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     broker.hold_acks();
-    shared.reports.refused(vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")], Vec::new());
+    device.reports.refused(vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")], Vec::new());
     let started = Instant::now();
     let dropping = async {
         tokio::time::sleep(Duration::from_millis(200)).await;
         broker.drop_connection();
     };
     let (flushed, ()) =
-        tokio::join!(tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, Batch::default())), dropping);
+        tokio::join!(tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs)), dropping);
     assert!(flushed.is_ok(), "the flush did not end");
     let took = started.elapsed();
     assert!(took < Duration::from_millis(800), "the ack wait outlived its connection, to its deadline: the flush took {took:?}");
@@ -446,15 +463,16 @@ async fn the_ack_wait_ends_with_the_connection() {
 async fn the_ack_wait_and_the_linger_fit_in_the_flushs_bound() {
     let broker = FakeBroker::start().await;
     broker.cap_connections(5);
-    let shared = shared_for(&broker);
+    let mut rig = rig_on(broker.port());
+    let (shared, device) = (rig.shared.clone(), rig.device.clone());
     let (client, events) = client(&shared);
     let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     let capture = crate::test_support::Capture::start();
     broker.stop_reading();
-    shared.reports.refused(vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")], Vec::new());
-    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, Batch::default())).await;
+    device.reports.refused(vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")], Vec::new());
+    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs)).await;
     assert!(flushed.is_ok(), "the flush did not end");
     let cut = capture.records().into_iter().filter_map(|r| r.field("message").map(str::to_owned)).find(|m| m.contains("ran out its bound"));
     assert!(cut.is_none(), "the flush ran out its bound: its ack wait and linger do not fit in it ({cut:?})");

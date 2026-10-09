@@ -89,10 +89,8 @@ async fn a_broker_outage_is_one_episode_recovered_only_on_a_connection_that_hold
         warn_after: Duration::from_millis(600),
         stable_after: Duration::from_millis(400),
     };
-    let shared = shared_through(&relay, timing);
-    let command = shared.topics.command();
     let (stop, stopped) = tokio::sync::watch::channel(false);
-    let mqtt = tokio::spawn(crate::session::run(shared, stopped));
+    let (command, mqtt) = mqtt_side_through(&relay, timing, stopped);
     assert!(broker.wait_for_subscription(&command, Duration::from_secs(5)).await, "the MQTT side never subscribed");
 
     // The broker accepts each connection and drops it 100 ms later, for a second.
@@ -139,10 +137,8 @@ async fn connections_dropped_at_once_are_paced_as_failures() {
         warn_after: Duration::from_secs(30),
         stable_after: Duration::from_millis(400),
     };
-    let shared = shared_through(&relay, timing);
-    let command = shared.topics.command();
     let (stop, stopped) = tokio::sync::watch::channel(false);
-    let mqtt = tokio::spawn(crate::session::run(shared, stopped));
+    let (command, mqtt) = mqtt_side_through(&relay, timing, stopped);
     assert!(broker.wait_for_subscription(&command, Duration::from_secs(5)).await, "the MQTT side never subscribed");
     relay.drop_connections_after(Some(Duration::from_millis(100)));
     let before = relay.accepted();
@@ -155,23 +151,35 @@ async fn connections_dropped_at_once_are_paced_as_failures() {
     let _ = tokio::time::timeout(Duration::from_secs(5), mqtt).await;
 }
 
-/// The MQTT side's shared state, for a broker reached through `relay`.
-fn shared_through(relay: &Relay, timing: MqttTiming) -> Arc<crate::session::Shared> {
+/// The MQTT side of a fixed bridge, for a broker reached through `relay`: its loop, until `stop`.
+fn mqtt_side_through(relay: &Relay, timing: MqttTiming, stop: tokio::sync::watch::Receiver<bool>) -> (String, tokio::task::JoinHandle<()>) {
     let (host, port) = relay.address.rsplit_once(':').expect("the relay's host and port");
-    Arc::new(crate::session::Shared {
-        topics: crate::topics::Topics::new("T", "outage").expect("topics"),
+    let topics = crate::topics::Topics::new("T", "outage").expect("topics");
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let shared = Arc::new(crate::session::Shared {
+        topics: topics.clone(),
         broker_host: host.to_owned(),
         broker_port: port.parse().expect("the relay's port"),
         timing,
         version: "test".into(),
-        commands: Vec::new(),
-        mailbox: crate::mailbox::Mailbox::new(),
-        reports: crate::reports::Reports::new(),
         outage: Arc::new(BrokerOutage::new(timing.warn_after, timing.stable_after)),
-        read_back_requested: AtomicBool::new(false),
-        read_back_next: AtomicBool::new(false),
         enqueued: std::sync::atomic::AtomicU64::new(0),
-    })
+        ready: ready.clone(),
+        devices: lock_order::sync::Mutex::new("session-devices", Vec::new()),
+    });
+    let device = Arc::new(crate::session::Device {
+        topics: topics.clone(),
+        commands: Vec::new().into(),
+        mailbox: crate::mailbox::Mailbox::new(),
+        reports: crate::reports::Reports::with_ready(ready),
+        tag: None,
+        span: tracing::Span::none(),
+    });
+    let mut outputs = crate::session::Outputs::new();
+    outputs.add(&shared, 0, device);
+    let (_events, events) = tokio::sync::mpsc::unbounded_channel();
+    let mode = crate::session::Mode::Fixed(crate::session::Fixed::default());
+    (topics.command(), tokio::spawn(crate::session::run(shared, mode, outputs, events, stop)))
 }
 
 fn direct_client(broker: &FakeBroker, id: &str, capacity: usize) -> (AsyncClient, rumqttc::v5::EventLoop) {

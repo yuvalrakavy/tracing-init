@@ -55,10 +55,17 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::{watch, Notify};
+use tokio::task::JoinSet;
+
 use crate::config::{self, Problem, Settings, TimingOverrides};
-use crate::driver::{DeviceDriver, PropertyMap};
+use crate::devices::Spawner;
+use crate::driver::{DeviceDriver, PropertyMap, Timing};
+use crate::lifecycle::{self, Lifecycle};
 use crate::process::Running;
-use crate::session::MqttTiming;
+use crate::pump::BrokerOutage;
+use crate::session::{self, MqttTiming};
+use crate::topics::Topics;
 
 /// An instance's Config as the factory gets it: the instance's name and its driver fields — every
 /// field of `Config/{instance}` but the host's own (`bridge`, `via`, `disabled`).
@@ -355,6 +362,50 @@ impl Host {
                 Problem::Usage(m) => m.clone(),
             });
         }
-        Err("the multi-device host is not built yet".to_owned())
+        let factory = self.factory.clone().ok_or("no factory: `device` names one before the host starts")?;
+        // The bridge id stands where a fixed bridge's instance does: `Active/{bridge id}`, the
+        // client id.
+        let id = self.settings.name.clone().unwrap_or_else(|| self.kind.clone());
+        let topics = Topics::new(&self.settings.root, &id)?;
+        let (broker_host, broker_port) = config::broker_host_port(self.settings.broker.as_deref().ok_or("no broker")?)?;
+        // Each device's timing is checked once its driver says it; the MQTT side's, and the
+        // overrides on a default timing, now.
+        config::check_timing(&self.settings.timing.apply(Timing::default()), &self.settings.mqtt)?;
+        let span = tracing::info_span!("host", root = %topics.root(), bridge = %id);
+        let version =
+            format!("{} {}", self.kind, self.version.clone().unwrap_or_else(|| format!("(mqtt-bridge-kit {})", env!("CARGO_PKG_VERSION"))));
+        let ready = Arc::new(Notify::new());
+        let shared = Arc::new(session::Shared {
+            topics,
+            broker_host,
+            broker_port,
+            timing: self.settings.mqtt,
+            version,
+            outage: Arc::new(BrokerOutage::new(self.settings.mqtt.warn_after, self.settings.mqtt.stable_after)),
+            enqueued: std::sync::atomic::AtomicU64::new(0),
+            ready: ready.clone(),
+            devices: lock_order::sync::Mutex::new("session-devices", Vec::new()),
+        });
+        let (spawner, deaths, events) = Spawner::new();
+        let registry = spawner.registry.clone();
+        let settings = lifecycle::Settings {
+            kind: self.kind.clone(),
+            id,
+            root: self.settings.root.clone(),
+            factory,
+            factory_timeout: self.settings.factory_timeout.unwrap_or(config::FACTORY_TIMEOUT),
+            // A failed construction is retried at the reconnect pacing: `--retry`, or the default.
+            retry: self.settings.timing.retry.unwrap_or(Timing::default().retry),
+            overrides: self.settings.timing,
+            device_stable: self.settings.device_stable,
+            mqtt: self.settings.mqtt,
+        };
+        let lifecycle = Lifecycle::new(settings, shared.clone(), spawner, span.clone(), ready);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let mut tasks = JoinSet::new();
+        let _entered = span.enter();
+        session::spawn(shared, session::Mode::Host(Box::new(lifecycle)), session::Outputs::new(), events, shutdown_rx, &mut tasks);
+        drop(_entered);
+        Ok(Running::new(tasks, shutdown, span, registry, deaths))
     }
 }

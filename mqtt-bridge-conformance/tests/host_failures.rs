@@ -92,7 +92,8 @@ async fn an_exhausted_blocking_budget_ends_the_process() {
     within(DEADLINE, async {
         let fleet = Fleet::new(acknowledged());
         let (calm, greedy) = (instance_name("Calm"), instance_name("Greedy"));
-        fleet.prepare(&greedy, |d| d.helper(Helper::HoldBlocking));
+        // Each connect leaves a synchronous call stuck past its deadline: four fill the operations' cap.
+        fleet.prepare(&greedy, |d| d.stick_connects());
         let mut h = HostHarness::start("budget", fleet).await;
         assert!(h.configure(&calm, json!({})) && h.configure(&greedy, json!({})));
         let died = died_within(&mut h, Duration::from_secs(15)).await.expect("an exhausted budget did not end the process");

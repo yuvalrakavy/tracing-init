@@ -23,8 +23,8 @@ every new waiting function a reviewed diff. Regenerate it after a change, from t
 cargo run --manifest-path wait-lint/Cargo.toml -- --root mqtt-bridge-kit --src src --registry docs/wait-registry.md --write
 ```
 
-**The graph, in one paragraph.** `Bridge::run` runs `serve` on an explicit runtime and then shuts
-the runtime down within a bound. `serve` takes the stop signals first, starts the logging on a
+**The graph, in one paragraph.** `Bridge::run` (and `Host::run`) runs `serve` on an explicit
+runtime and then shuts the runtime down within a bound. `serve` takes the stop signals first, starts the logging on a
 blocking thread raced against them, then starts the bridge and waits for a stop signal or the death
 of one of its parts, and its bounded shutdown. The pump (`Pump::run`) polls rumqttc's event loop, one
 connection per event loop, each poll bounded, and waits on nothing else in this process: its one
@@ -36,7 +36,11 @@ driver one operation at a time under a deadline, and hands what it learns to `Re
 waits. Every edge leads toward the pump or the driver; the pump waits on nothing here, and every
 driver call is bounded — no cycle. Nothing waits on the worker, so a device that is down holds up
 nothing but its own requests, and a broker that is down or stalled holds up nothing on the device's
-side.
+side. A multi-device host has one session and a worker per device, each with its keeper: the keeper
+waits on its worker's end, its watchdog's verdict and a stop request — none of which waits on the
+keeper — and a factory runs on a thread of its own, its watcher bounded by `--factory-timeout`. The
+session never waits on a keeper or a factory: their outcomes are events on an unbounded channel it
+selects on, and a death goes to a channel `Running::ended` reads.
 
 ## The rows
 
@@ -44,10 +48,10 @@ side.
 |---|---|---|---|
 | `mqtt-poll` | bounded | the broker, over the network | The pump waits on nothing in this process: it has no client, and its one send is to an unbounded queue. Its wait is on the broker alone, bounded at `stall_bound`, twice the keep-alive (10 s at the default 5 s): one poll may take no longer — rumqttc writes and flushes inside `poll` with no timeout of its own, so a broker that stops reading would hold it until the kernel gives the connection up, and keep-alive cannot fire meanwhile — and requests may stay outstanding no longer with nothing acknowledged, which covers a broker that answers PINGREQ but withholds its acknowledgements. A poll returns at least once a keep-alive while connected (its ping); a connect is bounded by rumqttc's connection timeout (5 s). On expiry, or a failed poll, the pump ends the session: the event loop is dropped, never polled again, a request waiting on its channel fails, the outage episode is advanced, and the MQTT worker makes a fresh client after its pause (`session-retry`). |
 | `mqtt-pump-queue` | acyclic | the pump's forward queue | Unbounded (no-hang §14.6), with a high-water WARN (`mqtt_backlog_high`): the pump never waits on the session, so the session's wait ends with the next event, or with `Ended` when the connection has failed five times running — the session returns and a new one starts. If the pump task is gone the queue closes and the wait returns `None`. The flush's ack wait waits on the pump's progress signal (`Incoming::progress`, told after every event the pump takes, and at its end — however it ends — so the wait also ends when the pump does) the same way, and under the `shutdown-flush` bound. Its depth and high-water flag are atomics: nobody waits on them, nothing is logged under a lock. |
-| `mqtt-request` | acyclic | rumqttc's request channel (`publish`, `subscribe`, `subscribe_many`, `disconnect`) | The channel drains only while the event loop is polled, and the pump polls it in a task of its own. So a full channel is back-pressure on the session, never a cycle: with the broker stalled the session waits until it recovers, the pump reading its acks meanwhile; nothing on the device's side waits behind it (`reports` never waits). The CONNACK duties are the session's, not the pump's. When the pump ends, the event loop is dropped and a waiting request fails; what it was publishing is still in the model, for the next session's CONNACK. A batch's publish (`Batch::publish`) that the stop cuts short is kept, not dropped — whether the channel took its message cannot be told from outside — and the flush finishes it first, under its own bound (`shutdown-flush`). Each connection has a client of its own (the pump ends the session on the first failed poll), so nothing handed to one channel goes out on a later connection, and rumqttc's packet-id collision cannot outlive its connection. |
-| `session-events` | acyclic | the pump's queue, `Reports`, the shutdown (`select!`) | An idle wait for work: the pump never waits on the session (`mqtt-pump-queue`), a report never waits (`reports-ready`), the shutdown is a watch channel the stop sets. |
+| `mqtt-request` | acyclic | rumqttc's request channel (`publish`, `subscribe`, `subscribe_many`, `unsubscribe`, `disconnect`) | The channel drains only while the event loop is polled, and the pump polls it in a task of its own. So a full channel is back-pressure on the session, never a cycle: with the broker stalled the session waits until it recovers, the pump reading its acks meanwhile; nothing on the device's side waits behind it (`reports` never waits). The CONNACK duties are the session's, not the pump's. When the pump ends, the event loop is dropped and a waiting request fails; what it was publishing is still in the model, for the next session's CONNACK. A batch's publish (`Batch::publish`) that the stop cuts short is kept, not dropped — whether the channel took its message cannot be told from outside — and the flush finishes it first, under its own bound (`shutdown-flush`). Each connection has a client of its own (the pump ends the session on the first failed poll), so nothing handed to one channel goes out on a later connection, and rumqttc's packet-id collision cannot outlive its connection. A host's lifecycle (`Lifecycle::request_subscription`, `request_unsubscription`) and the publication rotation's turn (`Outputs::turn`) wait on the same channel, from the session's own task: the same back-pressure; a subscription's acknowledgement is not waited for here — it comes as a pump event, its packet id matched, bounded by `GRANT_BOUND` (`session-events`). |
+| `session-events` | acyclic | the pump's queue, every device's `Reports` (one shared signal), a host's lifecycle events, its timers, the shutdown (`select!`) | An idle wait for work: the pump never waits on the session (`mqtt-pump-queue`), a report never waits (`reports-ready`), a keeper or a construction's watcher sends its event on an unbounded channel and goes on (`device-keeper`, `device-factory`), a timer is a timer — a host's grant bound (`GRANT_BOUND`, 10 s: an overdue SUBACK or UNSUBACK ends the session), its replay fallback (5 s), a failed instance's retry, the sweep — and the shutdown is a watch channel the stop sets. |
 | `session-work` | acyclic | one event's handling, raced against the shutdown (`select!`) | The handling waits only on the request channel (`mqtt-request`); the race lets a stop through while the broker stalls a publish, so the shutdown never waits behind it. |
-| `session-retry` | acyclic | the pause between MQTT sessions, raced against the shutdown | A timer (`poll_retry`, and `retry` after every fifth failed connect in a row) and a watch channel: nothing here waits on the session. |
+| `session-retry` | acyclic | the pause between MQTT sessions, raced against the shutdown and a host's lifecycle events | A timer (`poll_retry`, and `retry` after every fifth failed connect in a row), a watch channel and an unbounded channel: nothing here waits on the session. A lifecycle event taken meanwhile is handled with no client (`Lifecycle::on_event_offline`): nothing is subscribed, nothing waits, and the pause goes on. |
 | `shutdown-flush` | bounded | `Active=false`, every publish of the session written and acknowledged, DISCONNECT, and the pump's word that it was written | `FLUSH_BOUND`, 2 s; the acknowledgement wait ends 750 ms before it (INFO `bridge_shutdown_cut`), or when the pump ends, and the DISCONNECT goes anyway, best effort; the DISCONNECT's write and the pump's linger after it (`LINGER_BOUND`, 500 ms) fit in what is left. On expiry one INFO `bridge_shutdown_cut`, and the last will says `Active=false` when the broker notices the connection gone. Skipped at once when the broker is out of reach. |
 | `read-back-suback` | bounded | the read-back's SUBACK, on the pump's queue (`read_back_acknowledged`, the process's first CONNACK) | `READ_BACK_WAIT`, 5 s; publishes that arrive meanwhile are handled as ever. On expiry the requests are subscribed without it, with WARN `read_back_incomplete`; a session that ends meanwhile ends the wait. The pump never waits on the session (`mqtt-pump-queue`), and a broker that acknowledges nothing at all ends the session within `stall_bound` (`mqtt-poll`). |
 | `reports-ready` | acyclic | the next report (`Reports::reported`) | An idle wait for work, the session's. A report never waits — a short lock, then `Notify::notify_one`, which keeps a permit when nobody is waiting — so no reporter waits on the session. The retained model coalesces per target; `Error` and `Event` are capped (64 each), the oldest displaced past it, one WARN per episode. |
@@ -62,14 +66,18 @@ side.
 | `blocking-call` | bounded | a synchronous call on a thread of its own (`LinkHandle::blocking`) | The current operation's deadline. On expiry the thread is abandoned (it cannot be cancelled) and the link is lost. Every call's thread holds a slot under `ABANDONED_CAP` (4) from before it starts until it ends — in use or abandoned, cancelled callers' and helpers' calls included — so at most four run at once, and past that `blocking` refuses at once. With no operation running (a helper's call) it waits for the call, as the helper chose; the helper is cancelled with its link. |
 | `worker-thread` | acyclic | the worker's own runtime (`block_on` on the worker's thread) | It runs the worker until the stop, then the bounded disconnect. Nothing waits on this thread: its end is a oneshot the bridge selects on (`bridge-parts`) and, at shutdown, waits for within `SHUTDOWN_GRACE`. |
 | `worker-stop` | acyclic | the worker's life, raced against the stop (`select!`) | The stop is a watch channel; the worker waits on nothing that waits on it. |
-| `bridge-parts` | acyclic | the MQTT task's end, the worker thread's, or the watchdog's verdict (`Running::ended`) | None waits on the caller; none ends on its own, so the wait ends only with a death — or is dropped when a stop comes first. The watchdog (`supervise`) is a task of its own, a timer that reads atomics only — the worker's operation deadline, its runtime's heartbeat (a timer on the worker's thread, which a blocked thread stops), the blocking calls' cap — and on a verdict says the device unreachable and refuses the momentary commands waiting (the mailbox's lock, `mailbox-lock`, held by nobody across a wait); its verdict is the task's end, kept until read, so a read that ends restarts nothing. The stop aborts it. |
+| `bridge-parts` | acyclic | the MQTT task's end, or a death on the devices' channel (`Running::ended`) | None waits on the caller; none ends on its own, so the wait ends only with a death — or is dropped when a stop comes first. Each device's keeper sends its death — its watchdog's verdict, its worker's end nobody asked for — and a construction's watcher its factory's overrun; each is kept on the unbounded channel until read. The watchdog (`supervise`) is a task of its own per device, a timer that reads atomics only — the worker's operation deadline, its runtime's heartbeat (a timer on the worker's thread, which a blocked thread stops), the blocking calls' cap — and on a verdict says the device unreachable and refuses the momentary commands waiting (the mailbox's lock, `mailbox-lock`, held by nobody across a wait); its verdict is the task's end, which its keeper reads. The keeper aborts it when it ends. |
 | `bridge-end` | acyclic | a stop signal, or a part's end (`select!`) | Neither waits on the caller (`stop-signal`, `bridge-parts`); the first ends the wait, and the bounded shutdown follows. A part's end is one ERROR `worker_died` naming it and a failure status. |
-| `shutdown` | bounded | the bridge's parts stopping (`Running::stop`, `stop_within`) | `SHUTDOWN_GRACE`, 5 s: the MQTT side's flush (itself bounded at 2 s) and the worker's disconnect (2 s). On expiry one WARN `shutdown_timeout`, the MQTT tasks aborted, the worker thread abandoned; `run` then shuts the runtime down within its own bound (`runtime`). |
+| `shutdown` | bounded | the bridge's parts stopping (`Running::stop`, `stop_within`) | `SHUTDOWN_GRACE`, 5 s: every device's keeper asked to stop its worker and waited for at most `WORKER_STOP_BOUND` (2.5 s; a keeper ends at once on a verdict that its worker's thread is blocked), the MQTT side's flush (itself bounded at 2 s), then what is left of the keepers. On expiry one WARN `shutdown_timeout`, the MQTT tasks aborted, the worker threads abandoned; `run` then shuts the runtime down within its own bound (`runtime`). |
 | `runtime` | bounded | `serve`, on the runtime (`Runtime::block_on`); then the runtime's threads (`Runtime::shutdown_timeout`) | `serve` ends with a stop signal or a death and the bounded shutdown (`bridge-end`, `shutdown`), or at once on a stop during the logging start (`logging-start`). Then `RUNTIME_GRACE`, 1 s; on expiry the threads still in a synchronous call — a DNS lookup of the broker's name, tracing-init's start — are abandoned and the process exits (the fleet's F1). |
 | `logging-start` | bounded | tracing-init's start, on a blocking thread | It reads its configuration, opens today's log file and resolves the GELF host, synchronously; tracing-init bounds the open and the lookup at 5 s each; on expiry it starts without that destination (WARN `log_destination_skipped`) and abandons the thread stuck in it. Raced against the stop signals: a stop ends the wait at once, and the thread is abandoned within `runtime`'s grace (F1, F3). Without the signals (they could not be taken, and the bridge will not start) it waits on the start alone, within `SHUTDOWN_GRACE` (5 s), only to log why; on expiry the bridge ends with a failure status and nothing logged. The logging's own failure is written to stderr by a thread of its own, never joined, so a stderr nobody drains holds neither the start nor the stop. With the `test-seams` feature only (the conformance suite), the start first reads the file `MQTT_BRIDGE_TEST_LOGGING_GATE` names, if set — the test seam that holds the start for as long as a test likes. |
 | `driver-info` | acyclic | the driver's `info()`, on a blocking thread | The thread runs only the driver's `info()`, which takes nothing of this process's and so cannot wait on `serve`; it should be pure and return at once, and one that blocks breaks the driver contract. Raced against the stop signals: a stop ends the wait at once — the bridge exits 0, never having started — and the thread is abandoned within `runtime`'s grace (Codex, `process.rs:251`). Without a stop it is waited for: no bridge can start without its driver's description. |
 | `panic-report` | bounded | the panic hook's report reaching stderr, written by the process's one reporter thread (`std::sync::mpsc` `recv_timeout`); and that thread's own wait for the next report | `PANIC_REPORT_BOUND`, 200 ms, on the panicking thread, which hands its report over with `try_send` to a queue of 16 (full, the report is dropped). On expiry the panic goes on to its `catch_unwind` or task end; a stderr nobody drains holds the one reporter thread, never a panicking thread, and never a second one (re-gate R8). The reporter waits for reports and writes stderr; nothing waits on it but the bounded handover. The ERROR `panic` before it goes through tracing, which is lossy and never waits. |
 | `stop-signal` | acyclic | the operating system's SIGINT or SIGTERM | Nothing in this process is waited on. Both are registered first thing in `serve`, before the logging starts (F3). |
+| `session-devices` | acyclic | the broker-loss list, every device's reports (`lock-order` mutex, class `session-devices`) | Held only to push, remove or copy the list: never across an await, no other lock taken under it, nothing logged under it. The pump's loss callback copies the list out, releases it, and only then snapshots each device's model (`reports-lock`). |
+| `devices-registry` | acyclic | the running devices' keepers (`lock-order` mutex, class `devices-registry`) | Held only to insert, look up, remove or close: never across an await, no other lock taken under it, nothing logged under it. A stop request under it is a watch channel's send, which never waits. |
+| `device-keeper` | bounded | a device's worker end, its watchdog's verdict, a stop request, the stop's deadline (the keeper's `select!`); and the process's stop waiting for each keeper's end (`all_ended`) | With no stop asked, an idle wait for a death: the worker's end and the watchdog's verdict never wait on the keeper. Once a stop is asked, `DEVICE_STOP_BOUND` (10 s): the worker's cooperative stop (its disconnect within 2 s), or the watchdog's verdict that its thread is blocked (within its heartbeat's 5 s), comes first; on expiry the device is dead — a death on the channel, and the process ends (D4 = a). The process's stop waits for the keepers within `WORKER_STOP_BOUND` and `SHUTDOWN_GRACE` (`shutdown`). |
+| `device-factory` | bounded | a construction's progress, on its watcher's channel: the factory's return, then the driver's `info()` | Each within `--factory-timeout` (10 s by default); the factory and `info()` run on a thread of their own, which cannot be cancelled. On expiry a death on the channel — D4 = a: the process ends, for the supervisor's restart frees the thread. The thread sends and goes on; nothing waits on the watcher. |
 
 ## Settings
 
@@ -81,6 +89,9 @@ not-waits = sleep, sleep_until, yield_now
 # The driver trait's methods, awaited on a driver: this code's own (every call is bounded by its
 # caller, `op`).
 local-methods = read_state, configure, probe, blocking
+# The host lifecycle's handlers and the publication rotation's turn, awaited by the session: this
+# code's own; the waits inside them are tagged.
+local-methods = on_connack, on_ack, on_event, on_event_offline, on_timer, on_turn_done, on_session_lost, on_publish, turn
 raw-locks = forbid
 ```
 
@@ -92,6 +103,10 @@ bridge-end src/process.rs serve
 bridge-parts src/process.rs Running::ended
 device-disconnect src/worker.rs Worker::down
 device-disconnect src/worker.rs spawn
+device-factory src/devices.rs Spawner::build
+device-keeper src/devices.rs all_ended
+device-keeper src/devices.rs keeper
+device-keeper src/devices.rs sleep_until
 device-op src/link.rs under_deadline
 device-op src/worker.rs Worker::configure
 device-op src/worker.rs Worker::decide
@@ -101,18 +116,22 @@ device-op src/worker.rs Worker::prove
 device-op src/worker.rs Worker::serve
 device-op src/worker.rs Worker::work
 device-op src/worker.rs op
-driver-info src/process.rs Bridge::serve
+devices-registry src/devices.rs Registry::locked
+driver-info src/process.rs serve_with
 link-helpers src/link.rs <LinkContext as Drop>::drop
 link-helpers src/link.rs spawn_helper
 link-lost src/link.rs LinkHandle::lost
-logging-start src/process.rs Bridge::serve
+logging-start src/process.rs serve_with
 mailbox-lock src/mailbox.rs Mailbox::locked
 mailbox-posted src/mailbox.rs Mailbox::take
 mqtt-poll src/pump.rs Pump::run
 mqtt-poll src/pump.rs linger
 mqtt-pump-queue src/pump.rs Incoming::recv
 mqtt-pump-queue src/session.rs flush
+mqtt-request src/lifecycle.rs Lifecycle::request_subscription
+mqtt-request src/lifecycle.rs Lifecycle::request_unsubscription
 mqtt-request src/session.rs Batch::publish
+mqtt-request src/session.rs Outputs::turn
 mqtt-request src/session.rs connected
 mqtt-request src/session.rs emit
 mqtt-request src/session.rs flush
@@ -122,8 +141,12 @@ panic-report src/process.rs PanicReports::start
 read-back-suback src/session.rs read_back_acknowledged
 reports-lock src/reports.rs Reports::locked
 reports-ready src/reports.rs Reports::reported
-runtime src/process.rs Bridge::run
+runtime src/process.rs run_with
+session-devices src/session.rs Outputs::add
+session-devices src/session.rs Outputs::remove
+session-devices src/session.rs Shared::broker_lost
 session-events src/session.rs session
+session-events src/session.rs sleep_until
 session-retry src/session.rs run
 session-work src/session.rs session
 shutdown src/process.rs Running::stop

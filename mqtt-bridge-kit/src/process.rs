@@ -36,15 +36,15 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn, Instrument, Span};
 
 use crate::config::{self, Problem, Settings, TimingOverrides};
+use crate::devices::{all_ended, Built, Registry, Spawner};
 use crate::driver::{DeviceDriver, DriverInfo};
 use crate::link::{Abandoned, OpClock};
 use crate::mailbox::Mailbox;
@@ -52,7 +52,7 @@ use crate::pump::BrokerOutage;
 use crate::reports::{LinkStatus, Reports};
 use crate::session::{self, MqttTiming};
 use crate::topics::Topics;
-use crate::worker::{self, Worker, WorkerEnd};
+use crate::worker;
 
 /// How long the bridge's parts get to stop before the process ends anyway.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -527,52 +527,66 @@ impl Bridge {
         timing.stable = self.settings.device_stable.unwrap_or(timing.stable);
         let info = DriverInfo { timing, ..info };
         config::check_timing(&info.timing, &self.settings.mqtt)?;
+        // The host with one fixed device (multi-device spec §4.1): untagged, R1's CONNACK duties.
+        let ready = Arc::new(Notify::new());
         let mailbox = Mailbox::new();
-        let reports = Reports::new();
+        let reports = Reports::with_ready(ready.clone());
+        let device = Arc::new(session::Device {
+            topics: topics.clone(),
+            commands: info.commands.clone().into(),
+            mailbox: mailbox.clone(),
+            reports: reports.clone(),
+            tag: None,
+            span: span.clone(),
+        });
         let shared = Arc::new(session::Shared {
             topics,
             broker_host,
             broker_port,
             timing: self.settings.mqtt,
             version: self.version.clone().unwrap_or_else(|| format!("{} (mqtt-bridge-kit {})", self.app(), env!("CARGO_PKG_VERSION"))),
-            commands: info.commands.clone(),
-            mailbox: mailbox.clone(),
-            reports: reports.clone(),
             outage: Arc::new(BrokerOutage::new(self.settings.mqtt.warn_after, self.settings.mqtt.stable_after)),
-            read_back_requested: AtomicBool::new(false),
-            read_back_next: AtomicBool::new(false),
             enqueued: std::sync::atomic::AtomicU64::new(0),
+            ready,
+            devices: lock_order::sync::Mutex::new("session-devices", Vec::new()),
         });
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let (worker_stop, worker_stop_rx) = watch::channel(false);
-        let operation_bound = info.timing.operation;
-        let worker = Worker::new(driver, info, &instance, mailbox.clone(), reports.clone());
-        let clock = worker.clock();
-        let abandoned = worker.abandoned();
-        let worker = worker::spawn(worker, worker_stop_rx, span.clone()).map_err(|e| format!("the device worker's thread: {e}"))?;
-        // The watchdog runs on its own, from now, whoever reads it (re-gate R1).
-        let supervisor =
-            tokio::spawn(supervise(clock, abandoned, operation_bound * 2, reports.clone(), mailbox.clone()).instrument(span.clone()));
+        let (spawner, deaths, events) = Spawner::new();
+        let registry = spawner.registry.clone();
+        spawner.start(0, &instance, false, Box::new(Built(driver)), info, mailbox, reports, span.clone())?;
+        let mut outputs = session::Outputs::new();
+        outputs.add(&shared, 0, device);
         let mut tasks = JoinSet::new();
         let _entered = span.enter();
-        session::spawn(shared, shutdown_rx, &mut tasks);
+        session::spawn(shared, session::Mode::Fixed(session::Fixed::default()), outputs, events, shutdown_rx, &mut tasks);
         drop(_entered);
-        Ok(Running { tasks, worker: Some(worker), shutdown, worker_stop, span, supervisor: Some(supervisor), worker_blocked: false })
+        Ok(Running { tasks, shutdown, span, registry, deaths })
     }
 }
 
-/// A running bridge (see [`Bridge::start`]).
+/// A running bridge or host (see [`Bridge::start`], [`Host::start`](crate::Host::start)).
 pub struct Running {
     tasks: JoinSet<()>,
-    worker: Option<oneshot::Receiver<WorkerEnd>>,
     shutdown: watch::Sender<bool>,
-    worker_stop: watch::Sender<bool>,
     span: Span,
-    /// The watchdog: a task of its own, its verdict — and whether it found the worker's thread
-    /// blocked — kept until it is read; `None` once read.
-    supervisor: Option<tokio::task::JoinHandle<(Died, bool)>>,
-    /// Whether the watchdog found the worker's thread blocked: the stop then does not wait for it.
-    worker_blocked: bool,
+    /// Every running device's keeper: the stop asks them all.
+    registry: Arc<Registry>,
+    /// The devices' deaths — a watchdog's verdict, a worker's end nobody asked for, a factory that
+    /// did not return — each kept until read.
+    deaths: mpsc::UnboundedReceiver<Died>,
+}
+
+impl Running {
+    /// The parts of a running bridge or host, for [`Host::start`](crate::Host::start).
+    pub(crate) fn new(
+        tasks: JoinSet<()>,
+        shutdown: watch::Sender<bool>,
+        span: Span,
+        registry: Arc<Registry>,
+        deaths: mpsc::UnboundedReceiver<Died>,
+    ) -> Running {
+        Running { tasks, shutdown, span, registry, deaths }
+    }
 }
 
 /// The watchdog, until the device worker is dead: an operation past its deadline by
@@ -583,7 +597,7 @@ pub struct Running {
 /// is stopped, and what waits refused, by the stop that follows (re-gate 4 minor 8: refused here,
 /// the mailbox was marked disconnected under a live worker). Returns the verdict, and whether the
 /// worker's thread is blocked.
-async fn supervise(
+pub(crate) async fn supervise(
     clock: Arc<OpClock>,
     abandoned: Arc<Abandoned>,
     cap_bound: Duration,
@@ -658,99 +672,48 @@ pub struct Died {
 
 impl Running {
     /// The first part of the bridge to end — none ends on its own, so it is a death: the MQTT side
-    /// (`mqtt`) or the device worker (`device`), also a device worker blocked past its operation's
+    /// (`mqtt`) or a device (`device`) — its worker's end, a worker blocked past its operation's
     /// deadline (then the device is said unreachable and the momentary commands waiting are
-    /// refused first). Cancellation-safe.
+    /// refused first), a blocking budget full for good, and for a host a device's factory or
+    /// `info()` that did not return in time (multi-device spec §4.1, D4 = a: each ends the
+    /// process). Each death is kept until read. Cancellation-safe.
     pub async fn ended(&mut self) -> Died {
         // WAIT: bridge-parts
         tokio::select! {
-            verdict = async {
-                match self.supervisor.as_mut() {
-                    // WAIT: bridge-parts
-                    Some(supervisor) => supervisor.await,
-                    // WAIT: bridge-parts
-                    None => std::future::pending().await,
-                }
-            } => {
-                self.supervisor = None;
-                match verdict {
-                    Ok((died, blocked)) => {
-                        self.worker_blocked = blocked;
-                        died
-                    }
-                    Err(e) => Died { part: "device", cause: format!("the watchdog ended: {e}") },
-                }
-            }
+            Some(died) = self.deaths.recv() => died,
             Some(joined) = self.tasks.join_next() => Died { part: "mqtt", cause: match joined {
                 Ok(()) => "returned".to_owned(),
                 Err(e) => e.to_string(),
             }},
-            end = async {
-                match self.worker.as_mut() {
-                    // WAIT: bridge-parts
-                    Some(worker) => worker.await,
-                    // WAIT: bridge-parts
-                    None => std::future::pending().await,
-                }
-            } => {
-                self.worker = None;
-                Died { part: "device", cause: match end {
-                    Ok(WorkerEnd::Died(cause)) => cause,
-                    Ok(WorkerEnd::Stopped) => "stopped".to_owned(),
-                    Err(_) => "its thread ended without a word".to_owned(),
-                }}
-            }
         }
     }
 
-    /// The bounded shutdown: the commands still waiting refused, the reports pending published,
-    /// `Active=false` and DISCONNECT, the device worker stopped and its driver disconnected, within
-    /// [`SHUTDOWN_GRACE`]. Past it, one WARN `shutdown_timeout`, and
-    /// what is left is abandoned. Returns whether it ended in time.
+    /// The bounded shutdown: every device worker stopped and its driver disconnected, then the
+    /// commands still waiting refused, the reports pending published, `Active=false` and
+    /// DISCONNECT, within [`SHUTDOWN_GRACE`]. Past it, one WARN `shutdown_timeout`, and what is
+    /// left is abandoned. Returns whether it ended in time.
     pub async fn stop(mut self) -> bool {
         let span = self.span.clone();
         async move {
-            // The watchdog, if its verdict is not read yet: it is watched while the stop waits for the
-            // worker — a verdict, reached before or during that wait, that the worker's thread is
-            // blocked ends the wait (re-gate 4 minor 4; re-gate 5: a verdict just after a check
-            // made the stop wait out the bound).
-            let mut supervisor = self.supervisor.take();
-            // The worker first: it takes nothing more, and what it runs is cut off. Then the
-            // session: its flush refuses what the worker left — the command it was cut off from
+            // The workers first: each takes nothing more, and what it runs is cut off. Then the
+            // session: its flush refuses what the workers left — the command each was cut off from
             // answering included — on Error and on its response topic, before its last words
-            // (re-gate R15). In that order, nothing the worker answers races the flush's refusals
-            // (re-gate 4 F3, minor 2). A worker whose thread the watchdog found blocked will not
-            // stop: not waited for.
-            let _ = self.worker_stop.send(true);
-            let mut worker = self.worker.take().filter(|_| !self.worker_blocked);
+            // (re-gate R15). In that order, nothing a worker answers races the flush's refusals
+            // (re-gate 4 F3, minor 2). Each device's keeper watches its watchdog while it waits: a
+            // verdict that a worker's thread is blocked, reached before the stop or during its wait,
+            // ends that keeper's wait at once (re-gate 4 minor 4; re-gate 5) — a blocked worker
+            // will not stop, and is not waited for. No device starts once the stop has begun.
+            let mut dones = self.registry.close();
             let shutdown = &self.shutdown;
             let tasks = &mut self.tasks;
             let all = async move {
-                let mut worker_ended = false;
-                let mut worker_blocked = false;
-                if let Some(worker) = worker.as_mut() {
-                    // WAIT: shutdown
-                    tokio::select! {
-                        ended = tokio::time::timeout(WORKER_STOP_BOUND, worker) => worker_ended = ended.is_ok(),
-                        Ok((_, true)) = async {
-                            match supervisor.as_mut() {
-                                // WAIT: shutdown
-                                Some(supervisor) => supervisor.await,
-                                // WAIT: shutdown
-                                None => std::future::pending().await,
-                            }
-                        } => worker_blocked = true,
-                    }
-                }
-                if let Some(supervisor) = supervisor {
-                    supervisor.abort();
-                }
+                // WAIT: shutdown
+                let workers_ended = tokio::time::timeout(WORKER_STOP_BOUND, all_ended(&mut dones)).await.is_ok();
                 let _ = shutdown.send(true);
                 // WAIT: shutdown
                 while tasks.join_next().await.is_some() {}
-                if let Some(worker) = worker.filter(|_| !worker_ended && !worker_blocked) {
-                    // WAIT: shutdown
-                    let _ = worker.await;
+                if !workers_ended {
+                    all_ended(&mut dones).await;
                 }
             };
             let ended = stop_within(SHUTDOWN_GRACE, all).await;
