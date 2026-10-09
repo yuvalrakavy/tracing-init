@@ -100,6 +100,8 @@
 # lock, the probe cannot see it. The minor-3 row mutates the ack wait's deadline, not the linger:
 # a const assertion keeps `LINGER_BOUND` inside the flush's part, so a longer linger does not
 # compile. `--touched f106c94` plus the 8 new rows at 8259fc5: 121 rows, all RED (17 min).
+#
+# The landing check (2026-10-10): the whole table at afbc133, no --touched: 206 rows, all RED (33 min).
 
 # The forward queue's high-water WARN (`mqtt_backlog_high`).
 [[control]]
