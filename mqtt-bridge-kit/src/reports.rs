@@ -150,11 +150,11 @@ struct State {
     changed: Vec<String>,
     errors: Capped<ErrorReport>,
     events: Capped<Outbound>,
-    /// Answers to requests: every reply (an `Outbound` with a response topic), and the refusals'
-    /// `Error`s — uncapped, bounded by what the mailbox holds and the Store asks, and taken first:
-    /// the capped queues displace only unsolicited reports, never an answer (Codex final gate 2,
-    /// second final gate 1).
-    refusals: (Vec<ErrorReport>, Vec<Outbound>),
+    /// Answers to requests: every reply (an `Outbound` with a response topic), and every terminal
+    /// `Error` of a request — uncapped, bounded by what the mailbox holds and the Store asks: the
+    /// capped queues displace only unsolicited reports, never an answer (Codex final gate 2, second
+    /// final gate 1, confirming review 2).
+    answers: (Vec<ErrorReport>, Vec<Outbound>),
     readback: BTreeMap<String, PropertyMap>,
     /// The read-back as it stood when it was first done, complete or not: the conflict rule's
     /// "before" values, which a retained State arriving later does not change in mid-process
@@ -235,7 +235,7 @@ impl Reports {
                     readback_frozen: None,
                     broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
-                    refusals: (Vec::new(), Vec::new()),
+                    answers: (Vec::new(), Vec::new()),
                     removed: std::collections::BTreeSet::new(),
                     written: BTreeMap::new(),
                 },
@@ -401,7 +401,7 @@ impl Reports {
     /// goes; a reply — it has a response topic — is an answer, and is never displaced.
     pub fn event(&self, message: Outbound) {
         if message.topic.is_some() {
-            self.locked().refusals.1.push(message);
+            self.locked().answers.1.push(message);
             self.ready.notify_one();
             return;
         }
@@ -416,7 +416,7 @@ impl Reports {
     /// first and past every cap; the capped queue keeps only unsolicited reports (confirming
     /// review 2). Never waits.
     pub fn request_error(&self, report: ErrorReport) {
-        self.locked().refusals.0.push(report);
+        self.locked().answers.0.push(report);
         self.ready.notify_one();
     }
 
@@ -425,8 +425,8 @@ impl Reports {
     pub fn refused(&self, errors: Vec<ErrorReport>, replies: Vec<Outbound>) {
         {
             let mut state = self.locked();
-            state.refusals.0.extend(errors);
-            state.refusals.1.extend(replies);
+            state.answers.0.extend(errors);
+            state.answers.1.extend(replies);
         }
         self.ready.notify_one();
     }
@@ -445,7 +445,7 @@ impl Reports {
                     None => None,
                 })
                 .collect();
-            let (answer_errors, replies) = std::mem::take(&mut state.refusals);
+            let (answer_errors, replies) = std::mem::take(&mut state.answers);
             let errors = state.errors.items.drain(..).collect();
             let events = state.events.items.drain(..).collect();
             (
@@ -683,8 +683,8 @@ impl Reports {
             || !state.changed.is_empty()
             || !state.errors.items.is_empty()
             || !state.events.items.is_empty()
-            || !state.refusals.0.is_empty()
-            || !state.refusals.1.is_empty()
+            || !state.answers.0.is_empty()
+            || !state.answers.1.is_empty()
     }
 }
 

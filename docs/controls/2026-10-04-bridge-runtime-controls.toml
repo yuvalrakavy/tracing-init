@@ -2662,7 +2662,7 @@ guard       = "live_request_replaces_reheld"
 [[control]]
 name        = "a_requests_error_is_capped"
 file        = "mqtt-bridge-kit/src/reports.rs"
-anchor      = '''        self.locked().refusals.0.push(report);
+anchor      = '''        self.locked().answers.0.push(report);
         self.ready.notify_one();
     }'''
 replacement = '''        self.error(report);
@@ -2676,10 +2676,10 @@ guard       = "request_errors_uncapped"
 [[control]]
 name        = "answers_go_after_state"
 file        = "mqtt-bridge-kit/src/reports.rs"
-anchor      = '''            let (answer_errors, replies) = std::mem::take(&mut state.refusals);
+anchor      = '''            let (answer_errors, replies) = std::mem::take(&mut state.answers);
             let errors = state.errors.items.drain(..).collect();
             let events = state.events.items.drain(..).collect();'''
-replacement = '''            let (mut errors, mut events) = std::mem::take(&mut state.refusals);
+replacement = '''            let (mut errors, mut events) = std::mem::take(&mut state.answers);
             errors.extend(state.errors.items.drain(..));
             events.extend(state.events.items.drain(..));
             let (answer_errors, replies) = (Vec::new(), Vec::new());'''
