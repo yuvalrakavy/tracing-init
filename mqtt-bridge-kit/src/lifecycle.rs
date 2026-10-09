@@ -347,7 +347,12 @@ impl Lifecycle {
     /// When a timer falls due: an outstanding grant's bound, the replay's fallback, a failed
     /// instance's retry, the sweep.
     pub(crate) fn next_wake(&self) -> Option<Instant> {
-        let fallback = (!self.conn.active).then_some(self.conn.configs_granted.map(|at| at + REPLAY_FALLBACK)).flatten();
+        // The fallback is a timer only until it passes: then `Active=true` waits for the grants
+        // still pending, each SUBACK checking it — a wake at a past instant would spin.
+        let fallback = (!self.conn.active)
+            .then_some(self.conn.configs_granted.map(|at| at + REPLAY_FALLBACK))
+            .flatten()
+            .filter(|at| *at > Instant::now());
         let retries = self.instances.values().filter_map(|i| i.retry_at);
         [self.conn.next_deadline(), fallback, self.next_sweep].into_iter().flatten().chain(retries).min()
     }
@@ -511,9 +516,7 @@ impl Lifecycle {
                 self.set_sub(&instance, |rt| rt.read = Sub::Granted);
                 // Its slot is read: its output may go out, its current Status and State first —
                 // before `Active=true` (multi-device spec §4.6).
-                if let Some(slot) = outputs.slot(rt) {
-                    slot.announced = true;
-                }
+                outputs.announce(rt);
                 session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;
                 if self.current(&instance, rt).is_some_and(|rt| rt.phase == Phase::Live) {
                     self.request_setup(Some(ctx), &instance).await?;
@@ -1143,9 +1146,8 @@ impl Lifecycle {
         }
         let (id, read) = (rt.id, rt.read);
         if connected && read == Sub::Granted {
-            if let (Some(slot), Some(ctx)) = (outputs.slot(id), ctx) {
-                slot.announced = true;
-                let device = slot.device.clone();
+            let device = rt.device.clone();
+            if let (true, Some(ctx)) = (outputs.announce(id), ctx) {
                 session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;
             }
             self.request_setup(ctx, name).await?;
@@ -1259,9 +1261,7 @@ impl Lifecycle {
         rt.phase = Phase::Stopping { step: Step::Worker, then };
         // Its output may go out now: the read-back no longer matters.
         if connected {
-            if let Some(slot) = outputs.slot(rt.id) {
-                slot.announced = true;
-            }
+            outputs.announce(rt.id);
         }
         if rt.worker && self.spawner.registry.stop(rt.id) {
             return Ok(());
@@ -1307,6 +1307,9 @@ impl Lifecycle {
         let id = rt.id;
         let device = rt.device.clone();
         if connected {
+            // A stopping device's output may go out on any connection — this one may be newer than
+            // the stop, and began with nothing announced.
+            outputs.announce(id);
             let pending = outputs.slot(id).is_some_and(|slot| !slot.batch.is_empty()) || device.reports.has_untaken();
             if pending {
                 return Ok(());

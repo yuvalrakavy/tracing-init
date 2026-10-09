@@ -1,8 +1,52 @@
-//! The lifecycle's pure parts: how a `Config/{instance}` is read (multi-device spec §3, §4.2).
+//! The lifecycle's pure parts: how a `Config/{instance}` is read (multi-device spec §3, §4.2), and
+//! when its timers fall due.
 
 use serde_json::json;
 
 use super::*;
+
+/// A lifecycle with no instance, for its timers.
+fn lifecycle() -> Lifecycle {
+    let ready = Arc::new(Notify::new());
+    let shared = Arc::new(session::Shared {
+        topics: Topics::new("T", "host").expect("topics"),
+        broker_host: "127.0.0.1".into(),
+        broker_port: 1,
+        timing: MqttTiming::default(),
+        version: "kind test".into(),
+        outage: Arc::new(crate::pump::BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
+        enqueued: std::sync::atomic::AtomicU64::new(0),
+        ready: ready.clone(),
+        devices: lock_order::sync::Mutex::new("session-devices", Vec::new()),
+    });
+    let factory: Factory = Arc::new(|_: &DeviceConfig| Err(FactoryError::Unusable("no driver in this test".into())));
+    let settings = Settings {
+        kind: "kind".into(),
+        id: "host".into(),
+        root: "T".into(),
+        factory,
+        factory_timeout: Duration::from_secs(10),
+        retry: Duration::from_secs(5),
+        overrides: TimingOverrides::default(),
+        device_stable: None,
+        mqtt: MqttTiming::default(),
+    };
+    let (spawner, _, _) = Spawner::new();
+    Lifecycle::new(settings, shared, spawner, Span::none(), ready)
+}
+
+/// The replay's fallback is a timer only until it passes: past it, with a grant still pending,
+/// `Active=true` waits for that grant's SUBACK — a wake at the past instant would have the session
+/// spin until then.
+#[test]
+fn a_passed_fallback_is_no_timer() {
+    let mut host = lifecycle();
+    host.conn.connected = true;
+    host.conn.configs_granted = Some(Instant::now() - REPLAY_FALLBACK - Duration::from_secs(1));
+    assert_eq!(host.next_wake(), None, "a passed fallback woke the session again and again");
+    host.conn.configs_granted = Some(Instant::now());
+    assert!(host.next_wake().is_some_and(|at| at > Instant::now()), "the fallback to come was no timer");
+}
 
 fn read(config: serde_json::Value) -> Verdict {
     classify(config.to_string().as_bytes(), "gc", "gc-lan1")

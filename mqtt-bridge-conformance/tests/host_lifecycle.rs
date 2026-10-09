@@ -35,6 +35,50 @@ async fn serving_tuned(
     h
 }
 
+/// A device's stop that spans a reconnect: the worker stops on the new connection, and its output —
+/// the reply of the command it was cut off from — still retires through the rotation there, then the
+/// successor bootstraps (a new connection begins with nothing announced).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_that_spans_a_reconnect_still_retires_its_output() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| {
+            d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(1500)));
+            d.answer(Op::Execute, None, Answer::Delay(Duration::from_secs(5)));
+        });
+        let h = serving_tuned("stop-reconnect", &lamp, fleet, |host| {
+            host.timing(mqtt_bridge_kit::TimingOverrides { operation: Some(Duration::from_secs(10)), ..quick_timing() })
+        })
+        .await;
+        let old = h.fleet.device(&lamp).expect("built");
+        let reply = "Store/replies/stop-reconnect";
+        assert!(h.command(&lamp, json!({"command": "learn"}), Some((reply, b"r"))));
+        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Execute).is_empty()).await, "the old device never ran the command");
+        assert!(h.configure(&lamp, json!({"address": "b"})));
+        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the old device was never stopped");
+        // The connection goes while the old worker's disconnect still blocks.
+        let before = h.broker.connections();
+        h.broker.refuse_connections(true);
+        h.broker.drop_connection();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.broker.refuse_connections(false);
+        assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
+        assert!(
+            h.eventually(BOUND, |h| h.replies(reply).iter().any(|r| r["error"].as_str().is_some_and(|e| e.contains("cut off")))).await,
+            "the stopped device's output never retired on the new connection: {:?}",
+            h.replies(reply)
+        );
+        assert!(
+            h.eventually(BOUND, |h| h.fleet.devices(&lamp).len() == 2 && h.status(&lamp).as_deref() == Some("connected")).await,
+            "the successor never bootstrapped after the stop spanned a reconnect: {:?}",
+            h.statuses(&lamp)
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// Whether `filter` was subscribed after `unsubscribed` was unsubscribed, in the broker's events.
 fn subscribed_since(h: &HostHarness, filter: &str, unsubscribed: &str) -> bool {
     let labels = h.labels();

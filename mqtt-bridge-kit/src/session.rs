@@ -300,6 +300,20 @@ impl Outputs {
         self.slots.iter_mut().find(|s| s.id == id)
     }
 
+    /// Device `id`'s output may go out on this connection: announced, and a turn owed — what its
+    /// reports hold may have rung the readiness signal while nothing could be published. Whether
+    /// the device is in the rotation.
+    pub(crate) fn announce(&mut self, id: u64) -> bool {
+        match self.slot(id) {
+            Some(slot) => {
+                slot.announced = true;
+                self.owed = true;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A new connection: nothing is announced on it yet, and nothing a previous connection's batch
     /// held goes out (its client went with it; the model is republished).
     fn session_started(&mut self) {
