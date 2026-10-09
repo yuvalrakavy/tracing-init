@@ -22,3 +22,7 @@ tracing-core = "0.1"
 [[bin]]
 name = "fake-bridge"
 path = "src/bin/fake-bridge.rs"
+
+[[bin]]
+name = "fake-host"
+path = "src/bin/fake-host.rs"

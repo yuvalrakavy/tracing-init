@@ -176,6 +176,12 @@ impl Topics {
         format!("{}/+", self.lane("State"))
     }
 
+    /// `{Root}/Config/{instance}/+`: a configured instance's target Configs (multi-device spec
+    /// §4.3, S2). A fixed bridge subscribes [`config_filter`](Self::config_filter).
+    pub fn config_target_filter(&self) -> String {
+        format!("{}/+", self.lane("Config"))
+    }
+
     /// `{Root}/Desired/{instance}/{target}/{property}`.
     pub fn desired(&self, target: &str, property: &str) -> String {
         format!("{}/{target}/{property}", self.lane("Desired"))
@@ -276,6 +282,7 @@ mod tests {
     fn a_configured_instances_read_back_lanes() {
         let t = Topics::new("IR", "salon").unwrap();
         assert_eq!(t.state_target_filter(), "IR/State/salon/+");
+        assert_eq!(t.config_target_filter(), "IR/Config/salon/+");
         assert_eq!(t.parse("IR/Status/salon"), Inbound::Status);
         assert_eq!(t.parse("IR/Status/salon/x"), Inbound::Unknown);
         assert_eq!(t.parse("IR/Status/other"), Inbound::Unknown);

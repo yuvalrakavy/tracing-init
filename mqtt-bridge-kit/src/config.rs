@@ -63,7 +63,18 @@ pub struct Settings {
     pub options: BTreeMap<String, String>,
     /// `--device-stable`: overrides the driver's `Timing::stable`.
     pub device_stable: Option<Duration>,
+    /// `--name` (a multi-device host only): the bridge id, unique on the root; by default the
+    /// kind (multi-device spec §3).
+    pub name: Option<String>,
+    /// `--factory-timeout` (a multi-device host only): the bound on a device's construction, its
+    /// factory and then its driver's `info()`; by default [`FACTORY_TIMEOUT`] (multi-device spec
+    /// §4.3).
+    pub factory_timeout: Option<Duration>,
 }
+
+/// A multi-device host's default bound on a device's construction (`--factory-timeout`): its
+/// factory, and then its driver's `info()`, each within it (multi-device spec §4.3).
+pub const FACTORY_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Settings {
     /// The defaults for a bridge of `family`: its name as the root, nothing else set.
@@ -77,6 +88,8 @@ impl Settings {
             mqtt: MqttTiming::default(),
             options: BTreeMap::new(),
             device_stable: None,
+            name: None,
+            factory_timeout: None,
         }
     }
 }
@@ -208,9 +221,43 @@ pub fn usage(program: &str, family: &str, options: &[(String, String)]) -> Strin
     text
 }
 
+/// A multi-device host's usage text (multi-device spec §4): its kind, its default root, and its
+/// drivers' declared options. `--name` in place of `--instance`, and `--factory-timeout`.
+pub fn usage_host(program: &str, kind: &str, root: &str, options: &[(String, String)]) -> String {
+    let fixed = usage(program, kind, options);
+    let mut text = format!(
+        "Usage: {program} --broker <host[:port]> [options]\n\n\
+         The {kind} bridge, a multi-device host on the Bridge Runtime (mqtt-bridge-kit): it serves\n\
+         every instance whose Config/<instance> names this process.\n\n\
+         Options:\n\
+         \x20 --root <Root>                MQTT root (default: {root})\n\
+         \x20 --name <id>                  this process's bridge id, unique on the root (default: {kind})\n\
+         \x20 --factory-timeout <d>        the bound on a device's construction (default: {}s)\n",
+        FACTORY_TIMEOUT.as_secs()
+    );
+    // The rest is the fixed bridge's, past its `--root` and `--instance`.
+    text.extend(fixed.lines().skip_while(|l| !l.contains("the MQTT broker (port")).map(|l| format!("{l}\n")));
+    text
+}
+
 /// Parse `args` (without the program name) over `settings`; `options` are the driver's declared
 /// option names.
 pub fn parse(args: impl IntoIterator<Item = String>, settings: &mut Settings, options: &[(String, String)]) -> Result<(), Problem> {
+    parse_as(args, settings, options, false)
+}
+
+/// Parse a multi-device host's `args`: as [`parse`], with `--name` and `--factory-timeout` in place
+/// of `--instance`.
+pub fn parse_host(args: impl IntoIterator<Item = String>, settings: &mut Settings, options: &[(String, String)]) -> Result<(), Problem> {
+    parse_as(args, settings, options, true)
+}
+
+fn parse_as(
+    args: impl IntoIterator<Item = String>,
+    settings: &mut Settings,
+    options: &[(String, String)],
+    host: bool,
+) -> Result<(), Problem> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
@@ -234,7 +281,9 @@ pub fn parse(args: impl IntoIterator<Item = String>, settings: &mut Settings, op
         };
         match name.as_str() {
             "root" => settings.root = value,
-            "instance" => settings.instance = Some(value),
+            "instance" if !host => settings.instance = Some(value),
+            "name" if host => settings.name = Some(value),
+            "factory-timeout" if host => settings.factory_timeout = Some(nonzero()?),
             "broker" => settings.broker = Some(value),
             "log-config" => settings.log_config = Some(PathBuf::from(value)),
             "connect-timeout" => settings.timing.connect = Some(duration()?),
@@ -264,7 +313,7 @@ pub fn parse(args: impl IntoIterator<Item = String>, settings: &mut Settings, op
             other => return Err(Problem::Usage(format!("unknown option `--{other}`"))),
         }
     }
-    if settings.instance.is_none() {
+    if !host && settings.instance.is_none() {
         return Err(Problem::Usage("`--instance` is required".into()));
     }
     match &settings.broker {
@@ -273,7 +322,14 @@ pub fn parse(args: impl IntoIterator<Item = String>, settings: &mut Settings, op
             broker_host_port(broker).map_err(Problem::Usage)?;
         }
     }
-    crate::topics::Topics::new(&settings.root, settings.instance.as_deref().unwrap_or_default()).map_err(Problem::Usage)?;
+    // A host's bridge id stands where a fixed bridge's instance does (`Active/{bridge id}`); one the
+    // command line did not give is the kind, checked when the host starts.
+    let id = if host { settings.name.as_deref() } else { settings.instance.as_deref() };
+    if !host || id.is_some() {
+        crate::topics::Topics::new(&settings.root, id.unwrap_or_default()).map_err(Problem::Usage)?;
+    } else if !crate::topics::valid_segment(&settings.root) {
+        crate::topics::Topics::new(&settings.root, "x").map_err(Problem::Usage)?;
+    }
     Ok(())
 }
 
@@ -387,6 +443,26 @@ mod tests {
         let option = text.lines().find(|l| l.contains("--coolmaster")).expect("the driver's option's line");
         assert_eq!(column(option, "its address"), column(root, "MQTT root"), "the driver's option is off its column:\n{text}");
         assert!(option.contains("--coolmaster <value>"), "the driver's option shows no value placeholder: `{option}`");
+    }
+
+    /// A multi-device host's command line (multi-device spec §3, §4.3): `--name` is its bridge id
+    /// (by default the kind), `--factory-timeout` bounds a construction; it has no `--instance`.
+    #[test]
+    fn a_hosts_command_line() {
+        let mut s = Settings::new("globalcache");
+        parse_host(args("--broker x --name gc-lan1 --root IRemitter --factory-timeout 3s --retry 1s"), &mut s, &[]).unwrap();
+        assert_eq!((s.name.as_deref(), s.root.as_str()), (Some("gc-lan1"), "IRemitter"));
+        assert_eq!(s.factory_timeout, Some(Duration::from_secs(3)));
+        let mut s = Settings::new("globalcache");
+        parse_host(args("--broker x"), &mut s, &[]).unwrap();
+        assert_eq!(s.name, None, "a bridge id was invented");
+        let usage = |line: &str| matches!(parse_host(args(line), &mut Settings::new("gc"), &[]), Err(Problem::Usage(_)));
+        for bad in ["--broker x --instance i", "--broker x --factory-timeout 0", "--broker x --name a/b", "--name n"] {
+            assert!(usage(bad), "`{bad}` was accepted");
+        }
+        let text = usage_host("gc", "globalcache", "IRemitter", &[]);
+        assert!(text.contains("--name <id>") && text.contains("--factory-timeout <d>"), "{text}");
+        assert!(!text.contains("--instance"), "a host's usage offers `--instance`: {text}");
     }
 
     #[test]

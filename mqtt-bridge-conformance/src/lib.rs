@@ -6,9 +6,13 @@
 //!
 //! Every payload a bridge publishes is checked against its lane's JSON Schema
 //! (`schemas/`, [`schema`]) when a harness stops, with the lanes' retain flags and QoS.
+//!
+//! The multi-device host (multi-device spec §7) has a harness of its own ([`host`]): a fake
+//! factory, and a host in-process against a broker for several clients.
 
 pub mod capture;
 pub mod device;
+pub mod host;
 pub mod schema;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,7 +66,7 @@ pub struct Req {
 }
 
 impl Req {
-    fn options(&self) -> SendOptions {
+    pub(crate) fn options(&self) -> SendOptions {
         let mut options = SendOptions { message_expiry: self.expiry, ..SendOptions::default() };
         if let Some(conflict) = self.conflict {
             options = options.user_property("conflict", conflict);

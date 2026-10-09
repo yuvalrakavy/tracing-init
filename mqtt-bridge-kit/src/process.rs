@@ -373,96 +373,127 @@ impl Bridge {
         if let Some(code) = self.usage_exit() {
             return code;
         }
-        install_panic_hook();
-        // No runtime, no bridge: said by the status alone (there is no log yet).
-        let Ok(runtime) = tokio::runtime::Builder::new_multi_thread().enable_all().build() else {
-            return ExitCode::FAILURE;
-        };
-        // WAIT: runtime
-        let exit = runtime.block_on(self.serve(driver));
-        // Shut down within a bound, never dropped: dropping waits for every thread still in a
-        // synchronous call — a DNS lookup of the broker's name (tokio and rumqttc resolve names on
-        // blocking threads), a stalled logging start — without limit.
-        runtime.shutdown_timeout(RUNTIME_GRACE);
-        exit
-    }
-
-    /// From the stop signals to the bounded shutdown. tracing-init's guard lives here and is
-    /// dropped when this returns, inside the runtime.
-    async fn serve<D: DeviceDriver>(self, driver: D) -> ExitCode {
-        let mut signals = StopSignals::register();
         let app = self.app();
         let log_config = self.settings.log_config.clone();
-        let starting = tokio::task::spawn_blocking(move || crate::logging::start(&app, log_config.as_deref()));
-        let logging = match &mut signals {
-            Ok(signals) => {
-                // WAIT: logging-start
-                tokio::select! {
-                    started = starting => started,
-                    _ = signals.next() => {
-                        // Stopped before there is a log to say so in.
-                        return ExitCode::SUCCESS;
-                    }
-                }
-            }
-            Err(_) => {
-                // The bridge will not start; the wait is only to say why, so it is bounded.
-                // WAIT: logging-start
-                match tokio::time::timeout(SHUTDOWN_GRACE, starting).await {
-                    Ok(started) => started,
-                    // No log to say it in: the status says it.
-                    Err(_) => return ExitCode::FAILURE,
-                }
-            }
-        };
-        // A start that failed said so on its own thread; one that panicked, through the hook.
-        let _logging = logging.ok().flatten();
-        if let Some(guard) = &_logging {
-            info!(logging = %guard, "Logging started");
-        }
-        let mut signals = match signals {
-            Ok(signals) => signals,
-            Err(e) => {
-                warn!(kind = "signal_handler_unavailable", error = %e, "The stop signals cannot be handled; not starting");
-                return ExitCode::FAILURE;
-            }
-        };
-        // `info()` should be pure; one that is not must not hold up the stop. It runs on a blocking
-        // thread, raced against the stop signals, and a stop abandons it within the runtime's grace
-        // (Codex, process.rs:251).
-        let describing = tokio::task::spawn_blocking(move || {
+        // `info()` should be pure; one that is not must not hold up the stop: it runs on a
+        // blocking thread raced against the stop signals (Codex, process.rs:251).
+        let describe = move || {
             let info = driver.info();
             (driver, info)
-        });
-        // WAIT: driver-info
-        let (driver, info) = tokio::select! {
-            described = describing => match described {
-                Ok(described) => described,
-                // A panic, said through the hook.
-                Err(e) => {
-                    warn!(kind = "startup_failed", error = %e, "The driver could not describe itself");
-                    return ExitCode::FAILURE;
-                }
-            },
-            _ = signals.next() => {
-                info!("Stopped before the driver described itself");
-                return ExitCode::SUCCESS;
-            }
         };
-        let running = match self.launch(driver, Some(info)) {
-            Ok(running) => running,
+        run_with(app, log_config, describe, move |(driver, info)| self.launch(driver, Some(info)))
+    }
+}
+
+/// [`Host::run`](crate::Host::run)'s process: a [`Bridge::run`]'s, with nothing to describe before
+/// the start (a host's drivers are built per instance, each `info()` under the factory's bound).
+pub(crate) fn run_process(
+    app: String,
+    log_config: Option<std::path::PathBuf>,
+    launch: impl FnOnce() -> Result<Running, String>,
+) -> ExitCode {
+    run_with(app, log_config, || (), move |()| launch())
+}
+
+/// The process around a bridge or a host: the panic hook, an explicit runtime, `serve`, and the
+/// runtime's bounded end. `describe` runs on a blocking thread raced against the stop signals,
+/// then `launch` starts the parts.
+fn run_with<P: Send + 'static>(
+    app: String,
+    log_config: Option<std::path::PathBuf>,
+    describe: impl FnOnce() -> P + Send + 'static,
+    launch: impl FnOnce(P) -> Result<Running, String>,
+) -> ExitCode {
+    install_panic_hook();
+    // No runtime, no bridge: said by the status alone (there is no log yet).
+    let Ok(runtime) = tokio::runtime::Builder::new_multi_thread().enable_all().build() else {
+        return ExitCode::FAILURE;
+    };
+    // WAIT: runtime
+    let exit = runtime.block_on(serve_with(app, log_config, describe, launch));
+    // Shut down within a bound, never dropped: dropping waits for every thread still in a
+    // synchronous call — a DNS lookup of the broker's name (tokio and rumqttc resolve names on
+    // blocking threads), a stalled logging start — without limit.
+    runtime.shutdown_timeout(RUNTIME_GRACE);
+    exit
+}
+
+/// From the stop signals to the bounded shutdown. tracing-init's guard lives here and is
+/// dropped when this returns, inside the runtime.
+async fn serve_with<P: Send + 'static>(
+    app: String,
+    log_config: Option<std::path::PathBuf>,
+    describe: impl FnOnce() -> P + Send + 'static,
+    launch: impl FnOnce(P) -> Result<Running, String>,
+) -> ExitCode {
+    let mut signals = StopSignals::register();
+    let starting = tokio::task::spawn_blocking(move || crate::logging::start(&app, log_config.as_deref()));
+    let logging = match &mut signals {
+        Ok(signals) => {
+            // WAIT: logging-start
+            tokio::select! {
+                started = starting => started,
+                _ = signals.next() => {
+                    // Stopped before there is a log to say so in.
+                    return ExitCode::SUCCESS;
+                }
+            }
+        }
+        Err(_) => {
+            // The bridge will not start; the wait is only to say why, so it is bounded.
+            // WAIT: logging-start
+            match tokio::time::timeout(SHUTDOWN_GRACE, starting).await {
+                Ok(started) => started,
+                // No log to say it in: the status says it.
+                Err(_) => return ExitCode::FAILURE,
+            }
+        }
+    };
+    // A start that failed said so on its own thread; one that panicked, through the hook.
+    let _logging = logging.ok().flatten();
+    if let Some(guard) = &_logging {
+        info!(logging = %guard, "Logging started");
+    }
+    let mut signals = match signals {
+        Ok(signals) => signals,
+        Err(e) => {
+            warn!(kind = "signal_handler_unavailable", error = %e, "The stop signals cannot be handled; not starting");
+            return ExitCode::FAILURE;
+        }
+    };
+    // A bridge's `info()`, on a blocking thread raced against the stop signals: a stop abandons it
+    // within the runtime's grace (Codex, process.rs:251).
+    let describing = tokio::task::spawn_blocking(describe);
+    // WAIT: driver-info
+    let described = tokio::select! {
+        described = describing => match described {
+            Ok(described) => described,
+            // A panic, said through the hook.
             Err(e) => {
-                warn!(kind = "startup_failed", error = %e, "The bridge could not start");
+                warn!(kind = "startup_failed", error = %e, "The driver could not describe itself");
                 return ExitCode::FAILURE;
             }
-        };
-        let span = running.span.clone();
-        match serve(running, signals.next()).instrument(span).await {
-            Ending::Stopped => ExitCode::SUCCESS,
-            Ending::WorkerDied => ExitCode::FAILURE,
+        },
+        _ = signals.next() => {
+            info!("Stopped before the driver described itself");
+            return ExitCode::SUCCESS;
         }
+    };
+    let running = match launch(described) {
+        Ok(running) => running,
+        Err(e) => {
+            warn!(kind = "startup_failed", error = %e, "The bridge could not start");
+            return ExitCode::FAILURE;
+        }
+    };
+    let span = running.span.clone();
+    match serve(running, signals.next()).instrument(span).await {
+        Ending::Stopped => ExitCode::SUCCESS,
+        Ending::WorkerDied => ExitCode::FAILURE,
     }
+}
 
+impl Bridge {
     /// Start the bridge on the current tokio runtime, in-process: the MQTT side as tasks, the
     /// device worker on a thread of its own, and the watchdog. No logging start, no signals and no
     /// panic hook — [`run`](Self::run) adds those; a process that runs bridges this way calls

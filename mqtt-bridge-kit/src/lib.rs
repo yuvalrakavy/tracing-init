@@ -52,7 +52,9 @@ compile_error!(
 );
 
 pub mod config;
+mod devices;
 pub mod driver;
+pub mod host;
 pub mod link;
 pub mod logging;
 pub mod mailbox;
@@ -73,6 +75,7 @@ pub use driver::{
     CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkError, OpError, PropertyFailure,
     PropertyMap, Scope, TargetState, Timing, Value, Writes,
 };
+pub use host::{DeviceConfig, FactoryError, Host};
 pub use link::{LinkContext, LinkHandle, ReadBack, Reporter};
 pub use process::{install_panic_hook, Bridge, Died, Running};
 pub use session::MqttTiming;

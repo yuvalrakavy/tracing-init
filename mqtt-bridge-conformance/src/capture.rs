@@ -82,6 +82,9 @@ impl Drop for Capture {
 /// A span's `instance`, kept in its extensions.
 struct Instance(String);
 
+/// A host span's `bridge`, kept in its extensions.
+struct Bridge(String);
+
 struct Recorder;
 
 impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Recorder {
@@ -91,22 +94,38 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Recorder {
         if let (Some(instance), Some(span)) = (fields.0.remove("instance"), ctx.span(id)) {
             span.extensions_mut().insert(Instance(instance));
         }
+        // A multi-device host's span names its bridge id: its log, and every device's under it, is
+        // captured by that name too.
+        if let (Some(bridge), Some(span)) = (fields.0.remove("bridge"), ctx.span(id)) {
+            span.extensions_mut().insert(Bridge(bridge));
+        }
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let Some(scope) = ctx.event_scope(event) else {
             return;
         };
-        let Some(instance) = scope.into_iter().find_map(|span| span.extensions().get::<Instance>().map(|i| i.0.clone())) else {
-            return;
+        let spans: Vec<_> = scope.into_iter().collect();
+        let instance = spans.iter().find_map(|span| span.extensions().get::<Instance>().map(|i| i.0.clone()));
+        let bridge = spans.iter().find_map(|span| span.extensions().get::<Bridge>().map(|b| b.0.clone()));
+        let found: Vec<Arc<Mutex<Vec<Record>>>> = {
+            let sinks = sinks().lock().unwrap_or_else(|p| p.into_inner());
+            [&instance, &bridge].into_iter().flatten().filter_map(|name| sinks.get(name).cloned()).collect()
         };
-        let Some(sink) = sinks().lock().unwrap_or_else(|p| p.into_inner()).get(&instance).cloned() else {
+        if found.is_empty() {
             return;
-        };
+        }
         let mut fields = Fields::default();
         event.record(&mut fields);
+        // The device an event was logged under, for a host's capture.
+        if let Some(instance) = &instance {
+            fields.0.entry("@instance".to_owned()).or_insert_with(|| instance.clone());
+        }
         let kind = fields.0.get("kind").cloned().unwrap_or_default();
-        sink.lock().unwrap_or_else(|p| p.into_inner()).push(Record { level: *event.metadata().level(), kind, fields: fields.0 });
+        let record = Record { level: *event.metadata().level(), kind, fields: fields.0 };
+        for sink in found {
+            sink.lock().unwrap_or_else(|p| p.into_inner()).push(record.clone());
+        }
     }
 }
 
