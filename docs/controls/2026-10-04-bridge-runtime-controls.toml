@@ -46,6 +46,13 @@
 # 2ad7414: 187 RED, 1 ANCHOR-MISS (`a_retraction_leaves_the_assumption_unproven`, whose line minor
 # 7 moved one level deeper; re-anchored in 2816b96, RED). Every one of the 188 rows is RED.
 #
+# The fifth re-gate's fixes (G1, G2 and the minors, 2026-10-09): 7 rows added, 5 re-anchored, 1
+# retargeted; 195 in all. The batch at 860e81b: 12 RED, 1 WRONG-REASON (`a_finished_verdict_is_
+# aborted` failed on the stop's bound, the right guard: its expect text fixed in 46749cc, RED).
+# The whole table at 46749cc: 194 RED, 1 GREEN (`a_command_cut_off_is_answered_again` still
+# mutated `command_done`, which the worker no longer calls: retargeted to `command_done_then`,
+# RED). Every one of the 195 rows is RED.
+#
 # Failing first, beyond these rows: the read-back scenario
 # (`the_outage_conflict_after_a_bridge_restart_uses_the_read_back`) failed against the first
 # build — "no Error said the request was superseded: []" — because the session published the
@@ -2493,9 +2500,10 @@ guard       = "restore_by_feedback"
 [[control]]
 name        = "a_command_cut_off_is_answered_again"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''        self.locked().in_flight_command.take().is_some()'''
-replacement = '''        self.locked().in_flight_command.take();
-        true'''
+anchor      = '''        if inner.in_flight_command.take().is_none() {
+            return false;
+        }'''
+replacement = '''        let _ = inner.in_flight_command.take();'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_cut_off_by_the_watchdog_is_answered_once", "--exact"]
 expect_text = '''one command answered more than once'''
