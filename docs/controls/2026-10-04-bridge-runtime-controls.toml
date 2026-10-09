@@ -2557,14 +2557,17 @@ guard       = "reads_between_report_batches"
 
 # Codex final gate 1: the read-back's subscription goes once the read-back is done; kept, the
 # bridge's own State comes back ahead of every request.
+# Retargeted (second confirming review, minor 5): with up to 64 reads per batch, the echoed States
+# no longer starve the steady-stream scenario's command, so it went GREEN; the connack scenario
+# now sees the UNSUBSCRIBE itself.
 [[control]]
 name        = "the_read_back_stays_subscribed"
 file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''                Step::Event(Some(PumpEvent::SubAck { .. })) if read_back_done => {'''
 replacement = '''                Step::Event(Some(PumpEvent::SubAck { .. })) if false && read_back_done => {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_is_answered_under_a_steady_stream_of_reports", "--exact"]
-expect_text = '''a command under a steady stream of reports was never read'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
+expect_text = '''the read-back's subscription was kept once it was done'''
 guard       = "read_back_unsubscribed"
 
 # Second final gate 1: a link loss's or a verdict's refusals go to the session past the capped queues.

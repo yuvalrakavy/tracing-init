@@ -52,6 +52,14 @@ async fn a_connack_subscribes_before_active_then_republishes_the_model() {
     let last_sub = first.iter().rposition(|l| l.starts_with("sub ")).expect("no subscription");
     assert!(last_sub < first_publish, "the bridge published before it had subscribed: {first:#?}");
     assert!(first[first_publish].starts_with(&format!("pub {} true", t.active())), "the first publish was not Active=true: {first:#?}");
+    // Once done, the read-back's subscription goes: kept, it brings back each State the bridge
+    // publishes, queued ahead of every request (Codex final gate 1).
+    let unsubscribed = format!("unsub {}", t.state_filter());
+    assert!(
+        h.eventually(BOUND, |h| position(&from_connection(&h.broker, 1), &unsubscribed).is_some()).await,
+        "the read-back's subscription was kept once it was done: {:#?}",
+        from_connection(&h.broker, 1)
+    );
 
     h.broker.drop_connection();
     assert!(
