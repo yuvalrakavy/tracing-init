@@ -219,8 +219,9 @@ commands are refused, and reads are dropped.
     its assumption; it is applied on the next link, until a probe or read proves it or a newer
     request replaces it (Codex final gate 5). An identical retained replay of it is that write still:
     the held one is kept, with its obligation; a different value, or a live request — whatever its
-    value — replaces it, with its own deadline and policy (second final gate 2; confirming
-    review 1).
+    value — replaces it, with its own deadline and policy, and the replaced write's assumption is
+    withdrawn at once, before a retraction of the new request could settle it as proven (second
+    final gate 2; confirming reviews 1).
     One that leaves without being applied — expired, superseded, failed — withdraws its assumed
     value: the key goes back to what it was before the write, and `State` says so, for the device
     may never have taken it (the second final gate's minor 1).
@@ -359,12 +360,15 @@ commands are refused, and reads are dropped.
   queues, which a full mailbox (one command executing, 64 waiting) would overflow (Codex final
   gate 2); so they go out ahead of what was queued before them, nothing lost (the second final
   gate's minor 4: documented) — then publish what is pending (`Status`, `Error`, replies; a
-  watchdog's verdict included), then `Active=false`; then it waits until every QoS 1 publish is
-  acknowledged — proof the broker has the answers — before the DISCONNECT, and after it the pump
+  watchdog's verdict included), then `Active=false`; then it waits until every QoS 1 publish the
+  session enqueued has been written and acknowledged — a watermark, not the momentary in-flight
+  count — before the DISCONNECT, and after it the pump
   reads on until the broker closes the connection (1 s at most; past it, INFO
   `bridge_shutdown_cut`): closed with the broker's acks unread, the socket was reset, and the
   broker dropped what it had not read yet — the last replies, `Active=false`, the DISCONNECT
-  (confirming review N1). All within the flush's bound (re-gate R15). A cut-off command's error says it was cut off while it ran, so the device
+  (confirming review N1). All within the flush's bound (re-gate R15). The flush runs on any
+  connection the broker accepted — the outage episode's stability window has no say in it (second
+  confirming review 2: a stop soon after a reconnect skipped every answer). A cut-off command's error says it was cut off while it ran, so the device
   may or may not have done it; a waiting one's, that it was refused before it ran. **Exactly one
   answer per command:** whoever takes the command out of flight answers it — the worker when its
   operation ends (`Mailbox::command_done_then`, which queues the worker's answer under the same

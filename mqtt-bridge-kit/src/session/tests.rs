@@ -25,6 +25,7 @@ fn shared_for(broker: &FakeBroker) -> Shared {
         outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         read_back_requested: AtomicBool::new(false),
         read_back_next: AtomicBool::new(false),
+        enqueued: std::sync::atomic::AtomicU64::new(0),
     }
 }
 
@@ -80,6 +81,7 @@ fn shared_for_port() -> Shared {
         outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         read_back_requested: AtomicBool::new(false),
         read_back_next: AtomicBool::new(false),
+        enqueued: std::sync::atomic::AtomicU64::new(0),
     }
 }
 
@@ -172,7 +174,7 @@ async fn the_flush_publishes_what_is_pending_before_its_last_words() {
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     shared.reports.error(crate::wire::ErrorReport::new(crate::wire::Reason::Rejected, "pending at the stop").target(Some("t1")));
-    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming)).await;
+    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, true)).await;
     assert!(flushed.is_ok(), "the flush did not end");
     let (error, active) = (shared.topics.error(), shared.topics.active());
     assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&active).is_empty()).await, "the flush never said Active=false");
@@ -203,7 +205,7 @@ async fn the_flush_publishes_answers_before_state() {
     let refusal = crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop").target(Some("t1"));
     let reply = Outbound { topic: Some("Store/replies/flush".into()), payload: b"{}".to_vec(), correlation: None };
     shared.reports.refused(vec![refusal], vec![reply]);
-    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, true)).await;
     let error = shared.topics.error();
     assert!(
         broker
@@ -215,4 +217,76 @@ async fn the_flush_publishes_answers_before_state() {
         "the refusal was not published within the flush: the States went first"
     );
     assert!(!broker.received_on("Store/replies/flush").is_empty(), "the reply was not published within the flush");
+}
+
+/// A write of level 40 held again before proof, its assumption published.
+fn re_held_assumption(shared: &Shared) -> String {
+    shared.mailbox.connected();
+    let topic = shared.topics.desired("t1", "level");
+    route(shared, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), None), Instant::now());
+    assert!(shared.mailbox.try_take().is_some());
+    shared.mailbox.applied(true);
+    shared.reports.assume_unproven("t1", serde_json::json!({"level": 40}).as_object().unwrap().clone());
+    let _ = shared.mailbox.disconnected();
+    topic
+}
+
+/// A live request replacing a write held again before proof ends that write, and withdraws its
+/// assumption: retracted before recovery, it settles nothing, and a later request of the same
+/// value meets no current value to be satisfied by (second confirming review 1: the never-proven
+/// 40 became the proven value, and the later request was dropped as satisfied).
+#[test]
+fn a_live_replacement_of_a_re_held_write_withdraws_its_assumption() {
+    let shared = shared_for_port();
+    let topic = re_held_assumption(&shared);
+    route(&shared, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), None), Instant::now());
+    let mut retraction = Publish::new(topic.clone(), QoS::AtLeastOnce, Vec::<u8>::new(), None);
+    retraction.retain = true;
+    route(&shared, &topic, &retraction, Instant::now());
+    assert_eq!(
+        shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
+        None,
+        "a live replacement left the re-held write's assumption standing, proven by the retraction"
+    );
+}
+
+/// The same when the live replacement expires before the retraction.
+#[test]
+fn an_expired_live_replacement_of_a_re_held_write_withdraws_its_assumption() {
+    let shared = shared_for_port();
+    let topic = re_held_assumption(&shared);
+    let properties = rumqttc::v5::mqttbytes::v5::PublishProperties { message_expiry_interval: Some(1), ..Default::default() };
+    route(&shared, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), Some(properties)), Instant::now());
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut retraction = Publish::new(topic.clone(), QoS::AtLeastOnce, Vec::<u8>::new(), None);
+    retraction.retain = true;
+    route(&shared, &topic, &retraction, Instant::now());
+    assert_eq!(
+        shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
+        None,
+        "an expired live replacement left the re-held write's assumption standing"
+    );
+}
+
+/// The flush waits until every publish it enqueued is written and acknowledged before the
+/// DISCONNECT, even a batch so small the in-flight count is still zero when it checks (the second
+/// confirming review's minor): with the acks held, no DISCONNECT goes out within the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(5);
+    let shared = shared_for(&broker);
+    let (client, events) = client(&shared);
+    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
+    let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
+    assert!(matches!(first, Some(PumpEvent::Connected)));
+    broker.hold_acks();
+    shared.reports.refused(
+        vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")],
+        vec![Outbound { topic: Some("Store/replies/held".into()), payload: b"{}".to_vec(), correlation: None }],
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, true)).await;
+    let disconnected = broker.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Disconnected));
+    assert!(!disconnected, "the DISCONNECT went out before the flush's publishes were acknowledged");
+    broker.release_acks();
 }

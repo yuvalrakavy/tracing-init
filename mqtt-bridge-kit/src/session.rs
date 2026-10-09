@@ -104,6 +104,8 @@ pub(crate) struct Shared {
     pub outage: Arc<BrokerOutage>,
     /// The read-back's subscription has been made (once per process).
     pub read_back_requested: AtomicBool,
+    /// The QoS 1 publishes this session has enqueued; the pump counts those it wrote.
+    pub enqueued: std::sync::atomic::AtomicU64,
     /// The read-back's SUBACK granted it, and the retained `State` it replays follow it: the next
     /// SUBACK — the next subscription's, sent after it — comes behind them, and completes the
     /// read-back.
@@ -168,17 +170,23 @@ type Failed = rumqttc::v5::ClientError;
 /// Publish one message. A refusal — a topic rumqttc does not publish to, or the event loop gone —
 /// is that one message dropped, said at DEBUG; the caller goes on with the rest (review B2: the
 /// first refusal ended the CONNACK duties, and the session never published a report again).
-async fn emit(client: &AsyncClient, topic: String, retain: bool, payload: Vec<u8>, properties: PublishProperties) {
+async fn emit(shared: &Shared, client: &AsyncClient, topic: String, retain: bool, payload: Vec<u8>, properties: PublishProperties) {
     let refused_topic = topic.clone();
     // WAIT: mqtt-request
-    if let Err(e) = client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await {
-        debug!(topic = %refused_topic, error = %e, "An MQTT publish was refused; this message is dropped");
+    match client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await {
+        // Counted: the shutdown waits until the pump has written, and the broker acknowledged,
+        // every publish enqueued (the second confirming review's minor).
+        Ok(()) => {
+            shared.enqueued.fetch_add(1, Ordering::SeqCst);
+        }
+        Err(e) => debug!(topic = %refused_topic, error = %e, "An MQTT publish was refused; this message is dropped"),
     }
 }
 
 /// One session: a fresh client and its pump, for one connection, until it ends or the shutdown.
 async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> SessionEnd {
     let (client, events) = client(shared);
+    shared.enqueued.store(0, Ordering::SeqCst);
     // Polling first, so every request below has an event loop draining it.
     // When the connection is lost, what the bridge knew then is the conflict rule's "before" values
     // for what the broker replays on the next one (review B1).
@@ -280,7 +288,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                 return SessionEnd::Ended { connected: accepted };
             }
             Ok(Some(SessionEnd::Shutdown)) => {
-                flush(shared, &client, &mut incoming).await;
+                flush(shared, &client, &mut incoming, accepted.is_some()).await;
                 return SessionEnd::Shutdown;
             }
             // The event loop is gone (the pump ended): the next event says so.
@@ -347,8 +355,8 @@ async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incomin
         // WAIT: mqtt-request
         client.subscribe_many(vec![filter]).await?;
     }
-    emit(client, topics.active(), true, b"true".to_vec(), properties()).await;
-    emit(client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
+    emit(shared, client, topics.active(), true, b"true".to_vec(), properties()).await;
+    emit(shared, client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
     republish(shared, client, shared.reports.model()).await;
     Ok(true)
 }
@@ -392,10 +400,10 @@ async fn read_back_acknowledged(shared: &Shared, incoming: &mut Incoming) -> Rea
 async fn republish(shared: &Shared, client: &AsyncClient, model: Model) {
     debug!(targets = model.states.len(), "Publishing the retained model again after a CONNACK");
     if let Some(status) = model.status {
-        emit(client, shared.topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await;
+        emit(shared, client, shared.topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await;
     }
     for (target, document) in model.states {
-        emit(client, shared.topics.state(&target), true, document, properties()).await;
+        emit(shared, client, shared.topics.state(&target), true, document, properties()).await;
     }
 }
 
@@ -405,33 +413,36 @@ async fn publish_changes(shared: &Shared, client: &AsyncClient, changes: Changes
     // Answers first: a stop's bounded flush, or a slow broker, reaches them before State and
     // unsolicited traffic (confirming review 3).
     for error in changes.answer_errors {
-        emit(client, topics.error(), false, error.encode(), properties()).await;
+        emit(shared, client, topics.error(), false, error.encode(), properties()).await;
     }
     for reply in changes.replies {
         let mut props = properties();
         props.correlation_data = reply.correlation;
-        emit(client, reply.topic.unwrap_or_else(|| topics.event()), false, reply.payload, props).await;
+        emit(shared, client, reply.topic.unwrap_or_else(|| topics.event()), false, reply.payload, props).await;
     }
     if let Some(status) = changes.status {
-        emit(client, topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await;
+        emit(shared, client, topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await;
     }
     for (target, document) in changes.states {
-        emit(client, topics.state(&target), true, document, properties()).await;
+        emit(shared, client, topics.state(&target), true, document, properties()).await;
     }
     for error in changes.errors {
-        emit(client, topics.error(), false, error.encode(), properties()).await;
+        emit(shared, client, topics.error(), false, error.encode(), properties()).await;
     }
     for event in changes.events {
         let mut props = properties();
         props.correlation_data = event.correlation;
-        emit(client, event.topic.unwrap_or_else(|| topics.event()), false, event.payload, props).await;
+        emit(shared, client, event.topic.unwrap_or_else(|| topics.event()), false, event.payload, props).await;
     }
 }
 
 /// The shutdown's flush: `Active=false` and DISCONNECT, polling until it is written, within
-/// [`FLUSH_BOUND`]. Skipped when the broker is out of reach: the last will says it then.
-async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) {
-    if shared.outage.down() {
+/// [`FLUSH_BOUND`]. Skipped when the session holds no connection: the last will says it then.
+async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, connected: bool) {
+    // A connection the broker accepted is one to flush on, whether or not its recovery has lasted
+    // long enough to close the outage episode (second confirming review 2: a stop within the
+    // stability window skipped every answer).
+    if !connected {
         info!(kind = "bridge_shutdown_cut", "The broker is out of reach at shutdown; the last will says Active=false");
         return;
     }
@@ -443,12 +454,11 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) {
         // cannot overflow them (Codex final gate 2).
         crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);
         publish_changes(shared, client, shared.reports.take()).await;
-        emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
+        emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
         // Every QoS 1 publish acknowledged before the DISCONNECT: proof the broker has the answers,
         // and nothing of the broker's left unread at the close (confirming review N1). Bounded by
         // the flush's bound.
-        tokio::task::yield_now().await;
-        while incoming.inflight() > 0 {
+        while incoming.written() < shared.enqueued.load(Ordering::SeqCst) || incoming.inflight() > 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // WAIT: mqtt-request
@@ -531,6 +541,7 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                             reheld: false,
                         };
                         shared.mailbox.post_state(value, publish.retain);
+                        withdraw_abandoned(shared);
                     }
                 },
             }
@@ -557,6 +568,7 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                         })
                         .collect();
                     shared.mailbox.post_target(values);
+                    withdraw_abandoned(shared);
                 }
             }
         }
@@ -685,6 +697,15 @@ fn panic_for_test(topic: &str) {
 
 #[cfg(not(feature = "test-seams"))]
 fn panic_for_test(_: &str) {}
+
+/// A live request replaced writes held again before proof: their assumptions are withdrawn now,
+/// before a retraction of the new request could settle them as proven (second confirming review
+/// 1).
+fn withdraw_abandoned(shared: &Shared) {
+    for (target, property) in shared.mailbox.take_abandoned() {
+        shared.reports.assumption_abandoned(&target, &property);
+    }
+}
 
 /// What a stop refuses: a command still waiting for the device.
 const STOPPED_BEFORE: &str = "the bridge stopped before it ran";

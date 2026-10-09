@@ -271,12 +271,19 @@ pub struct Incoming {
     backlog: Arc<Backlog>,
     /// The QoS 1 publishes the event loop has written and the broker not yet acknowledged.
     inflight: Arc<AtomicUsize>,
+    /// The publishes the event loop has written in this session.
+    written: Arc<AtomicU64>,
 }
 
 impl Incoming {
     /// How many QoS 1 publishes the broker has not acknowledged yet, as of the pump's last event.
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::SeqCst)
+    }
+
+    /// How many publishes the event loop has written in this session.
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::SeqCst)
     }
 
     pub async fn recv(&mut self) -> Option<PumpEvent> {
@@ -314,15 +321,17 @@ impl Pump {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let backlog = Arc::new(Backlog::new());
         let inflight = Arc::new(AtomicUsize::new(0));
-        let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), inflight.clone(), outage, stall, on_lost).in_current_span());
-        (Pump { task }, Incoming { rx, backlog, inflight })
+        let written = Arc::new(AtomicU64::new(0));
+        let counts = (inflight.clone(), written.clone());
+        let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), counts, outage, stall, on_lost).in_current_span());
+        (Pump { task }, Incoming { rx, backlog, inflight, written })
     }
 
     async fn run(
         mut events: EventLoop,
         tx: UnboundedSender<PumpEvent>,
         backlog: Arc<Backlog>,
-        inflight: Arc<AtomicUsize>,
+        (inflight, written): (Arc<AtomicUsize>, Arc<AtomicU64>),
         outage: Arc<BrokerOutage>,
         stall: Duration,
         on_lost: impl FnOnce() + Send + 'static,
@@ -368,6 +377,9 @@ impl Pump {
             };
             outstanding.after(&event, events.state.inflight());
             inflight.store(usize::from(events.state.inflight()), Ordering::SeqCst);
+            if matches!(event, Event::Outgoing(Outgoing::Publish(_))) {
+                written.fetch_add(1, Ordering::SeqCst);
+            }
 
             // Only an incoming event is proof of the broker; an outgoing one (a connect request)
             // is rumqttc trying.

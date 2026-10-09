@@ -647,3 +647,27 @@ async fn a_link_loss_with_a_full_mailbox_answers_every_caller() {
     }
     assert!(h.stop().await);
 }
+
+/// A stop right after the bridge reconnected to the broker — inside the reconnect's stability
+/// window, its outage episode still open — answers what it refuses: the connection is up (second
+/// confirming review 2: the flush took the open episode for no connection, and skipped every
+/// answer).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_right_after_a_reconnect_answers_what_it_refuses() {
+    let timing = mqtt_bridge_kit::TimingOverrides { operation: Some(Duration::from_secs(3)), ..quick_timing() };
+    let mut h = Harness::start_with("stop-after-reconnect", acknowledged(), timing, up_at_20).await;
+    assert!(connected(&h).await);
+    let accepted = h.broker.accepted();
+    h.broker.drop_connection();
+    assert!(h.broker.wait_until(BOUND, |b| b.accepted() > accepted).await, "the bridge did not reconnect");
+    assert!(h.broker.wait_until(BOUND, |b| b.subscriptions().iter().filter(|s| **s == h.topics.command()).count() >= 2).await);
+    h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(2500)), 1);
+    let replies = "Store/replies/stop-after-reconnect";
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"r-1"))));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
+    assert!(h.stop_bridge().await);
+    assert!(
+        h.eventually(BOUND, |h| !h.published(replies).is_empty()).await,
+        "a stop inside the reconnect's stability window answered nothing"
+    );
+}

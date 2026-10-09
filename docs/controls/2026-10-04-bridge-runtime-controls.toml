@@ -143,7 +143,7 @@ guard       = "connack_every_time"
 name        = "active_is_announced_before_the_subscriptions"
 file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''    for (filter, retain_as_published) in requests {'''
-replacement = '''    emit(client, topics.active(), true, b"true".to_vec(), properties()).await;
+replacement = '''    emit(shared, client, topics.active(), true, b"true".to_vec(), properties()).await;
     for (filter, retain_as_published) in requests {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
@@ -154,7 +154,7 @@ guard       = "connack_order"
 [[control]]
 name        = "the_version_is_not_published"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    emit(client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
+anchor      = '''    emit(shared, client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
 '''
 replacement = ''''''
 target      = "command"
@@ -317,7 +317,7 @@ guard       = "assume"
 [[control]]
 name        = "no_active_false_at_shutdown"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    if shared.outage.down() {
+anchor      = '''    if !connected {
 '''
 replacement = '''    if true {
 '''
@@ -1376,13 +1376,13 @@ guard       = "reported_names_validated"
 name        = "a_refused_publish_ends_the_connack_duties"
 file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''    for (target, document) in model.states {
-        emit(client, shared.topics.state(&target), true, document, properties()).await;
+        emit(shared, client, shared.topics.state(&target), true, document, properties()).await;
     }'''
 replacement = '''    for (target, document) in model.states {
         if target.contains('#') {
             return;
         }
-        emit(client, shared.topics.state(&target), true, document, properties()).await;
+        emit(shared, client, shared.topics.state(&target), true, document, properties()).await;
     }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_refused_publish_is_one_message_dropped", "--exact"]
@@ -2264,8 +2264,8 @@ guard       = "stop_refuses_waiting"
 name        = "the_flush_drops_what_is_pending"
 file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''        publish_changes(shared, client, shared.reports.take()).await;
-        emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
-replacement = '''        emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
+        emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
+replacement = '''        emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_what_is_pending_before_its_last_words", "--exact"]
 expect_text = '''the flush dropped what was pending'''
@@ -2709,3 +2709,36 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::delayed_acks_keep_the_order_of_their_publishes", "--exact"]
 expect_text = '''delayed acks overtook one another'''
 guard       = "fake_undelayed_acks_ordered"
+
+# Second confirming review 1: a live request replacing a re-held write withdraws its assumption.
+[[control]]
+name        = "a_replaced_re_held_write_stays_assumed"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                        inner.abandoned.push(key.clone());'''
+replacement = '''                        let _ = &key;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_live_replacement_of_a_re_held_write_withdraws_its_assumption", "--exact"]
+expect_text = '''a live replacement left the re-held write's assumption standing'''
+guard       = "replacement_withdraws_reheld"
+
+# Second confirming review 2: the flush runs on any accepted connection, stable or not.
+[[control]]
+name        = "the_flush_skips_an_unstable_connection"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    if !connected {'''
+replacement = '''    if !connected || shared.outage.down() {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_stop_right_after_a_reconnect_answers_what_it_refuses", "--exact"]
+expect_text = '''a stop inside the reconnect's stability window answered nothing'''
+guard       = "flush_on_accepted_connection"
+
+# Second confirming review minor: the flush waits for its own publishes, by watermark.
+[[control]]
+name        = "the_flush_waits_on_the_momentary_count"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        while incoming.written() < shared.enqueued.load(Ordering::SeqCst) || incoming.inflight() > 0 {'''
+replacement = '''        while incoming.inflight() > 0 {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_waits_for_its_own_publishes_to_be_acknowledged", "--exact"]
+expect_text = '''the DISCONNECT went out before the flush's publishes were acknowledged'''
+guard       = "flush_ack_watermark"
