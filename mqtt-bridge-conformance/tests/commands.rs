@@ -441,6 +441,13 @@ async fn a_burst_of_refused_commands_is_answered_every_one() {
     }
     h.eventually(Duration::from_secs(5), |h| h.published(replies).len() >= 200).await;
     assert_eq!(h.published(replies).len(), 200, "replies were lost in a burst");
+    // Their Errors too: a refusal on arrival goes to the capped Error queue, which the reports
+    // published between reads keep short.
+    assert!(
+        h.eventually(Duration::from_secs(5), |h| h.errors_for("refused").len() >= 200).await,
+        "refusal Errors were lost in a burst: {}",
+        h.errors_for("refused").len()
+    );
     assert!(h.stop().await);
 }
 
@@ -563,6 +570,7 @@ async fn a_stop_with_a_full_mailbox_answers_every_command() {
         assert_eq!(errors.len(), 1, "command {id} was answered {} times", errors.len());
     }
     assert!(answers["c-0"][0].contains("cut off"), "the executing command was not said cut off: {:?}", answers["c-0"]);
+    assert_eq!(h.errors_for("refused").len(), 65, "a stop with a full mailbox dropped refusal Errors");
 }
 
 /// A watchdog's verdict with the mailbox full — one command blocking the worker's thread past its
@@ -593,6 +601,11 @@ async fn a_watchdog_verdict_with_a_full_mailbox_answers_every_command() {
         assert_eq!(errors.len(), 1, "command {id} was answered {} times", errors.len());
     }
     assert!(answers["c-0"][0].contains("cut off"), "the executing command was not said cut off: {:?}", answers["c-0"]);
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("refused").len() >= 65).await,
+        "a watchdog verdict with a full mailbox dropped refusal Errors: {}",
+        h.errors_for("refused").len()
+    );
     assert!(h.stop().await);
 }
 

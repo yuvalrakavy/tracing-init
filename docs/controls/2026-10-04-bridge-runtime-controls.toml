@@ -2235,8 +2235,7 @@ guard       = "catch_up_configs_first"
 [[control]]
 name        = "the_stop_answers_nothing_waiting"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        let (errors, replies) = crate::worker::refusals(shared.mailbox.disconnected(), STOPPED_BEFORE);
-        publish_changes(shared, client, Changes { errors, events: replies, ..Changes::default() }).await;'''
+anchor      = '''        crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);'''
 replacement = '''        let _ = STOPPED_BEFORE;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_answers_the_commands_waiting_for_the_device", "--exact"]
@@ -2311,7 +2310,7 @@ replacement = '''                event = incoming.recv() => Step::Event(event),
                 () = shared.reports.reported(), if announced => Step::Reported,'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_burst_of_refused_commands_is_answered_every_one", "--exact"]
-expect_text = '''replies were lost in a burst'''
+expect_text = '''refusal Errors were lost in a burst'''
 guard       = "reports_not_starved"
 
 # Re-gate 3 S3: the command the worker was cut off from answering is refused too.
@@ -2564,18 +2563,6 @@ argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformanc
 expect_text = '''a command under a steady stream of reports was never read'''
 guard       = "read_back_unsubscribed"
 
-# Codex final gate 2: the stop's refusals are published directly, not through the capped queues.
-[[control]]
-name        = "the_stops_refusals_overflow_the_queues"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        let (errors, replies) = crate::worker::refusals(shared.mailbox.disconnected(), STOPPED_BEFORE);
-        publish_changes(shared, client, Changes { errors, events: replies, ..Changes::default() }).await;'''
-replacement = '''        crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);'''
-target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_stop_with_a_full_mailbox_answers_every_command", "--exact"]
-expect_text = '''a stop with a full mailbox left commands unanswered'''
-guard       = "stop_refusals_direct"
-
 # Second final gate 1: a link loss's or a verdict's refusals go to the session past the capped queues.
 [[control]]
 name        = "a_verdicts_refusals_overflow_the_queues"
@@ -2589,7 +2576,7 @@ replacement = '''    for error in errors {
     }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_watchdog_verdict_with_a_full_mailbox_answers_every_command", "--exact"]
-expect_text = '''a watchdog verdict with a full mailbox left commands unanswered'''
+expect_text = '''a watchdog verdict with a full mailbox dropped refusal Errors'''
 guard       = "verdict_refusals_uncapped"
 
 # Second final gate 2: an identical replay of a re-held write keeps its proof obligation.

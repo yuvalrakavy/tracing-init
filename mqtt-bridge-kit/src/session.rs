@@ -429,10 +429,9 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) {
         // What still waits for the device will not run: refused, on Error and on its response
         // topic; then what is pending — Status, Errors, replies — then the last words (re-gate
         // R15). Here, in the session's own flush, so nothing else publishes them first by chance.
-        // Published directly, not through the reports' capped queues, which a full mailbox would
-        // overflow (Codex final gate 2).
-        let (errors, replies) = crate::worker::refusals(shared.mailbox.disconnected(), STOPPED_BEFORE);
-        publish_changes(shared, client, Changes { errors, events: replies, ..Changes::default() }).await;
+        // Refusals go to the reports' uncapped answers, which `take` gives first: a full mailbox
+        // cannot overflow them (Codex final gate 2).
+        crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);
         publish_changes(shared, client, shared.reports.take()).await;
         emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
         // WAIT: mqtt-request
