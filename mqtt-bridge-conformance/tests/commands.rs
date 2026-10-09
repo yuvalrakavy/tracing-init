@@ -465,6 +465,8 @@ async fn a_command_executing_at_the_stop_is_answered() {
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-2"))));
     assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
     assert!(h.stop_bridge().await);
+    // The broker's reads may trail the stop by a little: waited for, not taken at once.
+    h.eventually(BOUND, |h| answers_by_correlation(h, replies).len() >= 2).await;
     let answers = answers_by_correlation(&h, replies);
     assert_eq!(answers.len(), 2, "a command in flight at the stop got no reply: {answers:?}");
     for (id, errors) in &answers {
@@ -563,6 +565,7 @@ async fn a_stop_with_a_full_mailbox_answers_every_command() {
     // Every one of them waits in the mailbox before the stop.
     h.settle(Duration::from_millis(500)).await;
     assert!(h.stop_bridge().await);
+    h.eventually(BOUND, |h| answers_by_correlation(h, replies).len() >= 65).await;
     let answers = answers_by_correlation(&h, replies);
     let missing: Vec<String> = (0..=64).map(|i| format!("c-{i}")).filter(|id| !answers.contains_key(id)).collect();
     assert!(missing.is_empty(), "a stop with a full mailbox left commands unanswered: {missing:?}");

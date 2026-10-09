@@ -444,6 +444,13 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) {
         crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);
         publish_changes(shared, client, shared.reports.take()).await;
         emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
+        // Every QoS 1 publish acknowledged before the DISCONNECT: proof the broker has the answers,
+        // and nothing of the broker's left unread at the close (confirming review N1). Bounded by
+        // the flush's bound.
+        tokio::task::yield_now().await;
+        while incoming.inflight() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         // WAIT: mqtt-request
         client.disconnect().await?;
         loop {

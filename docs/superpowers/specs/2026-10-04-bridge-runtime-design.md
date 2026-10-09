@@ -359,8 +359,12 @@ commands are refused, and reads are dropped.
   queues, which a full mailbox (one command executing, 64 waiting) would overflow (Codex final
   gate 2); so they go out ahead of what was queued before them, nothing lost (the second final
   gate's minor 4: documented) — then publish what is pending (`Status`, `Error`, replies; a
-  watchdog's verdict included), then `Active=false` and the DISCONNECT, all within the flush's
-  bound (re-gate R15). A cut-off command's error says it was cut off while it ran, so the device
+  watchdog's verdict included), then `Active=false`; then it waits until every QoS 1 publish is
+  acknowledged — proof the broker has the answers — before the DISCONNECT, and after it the pump
+  reads on until the broker closes the connection (1 s at most; past it, INFO
+  `bridge_shutdown_cut`): closed with the broker's acks unread, the socket was reset, and the
+  broker dropped what it had not read yet — the last replies, `Active=false`, the DISCONNECT
+  (confirming review N1). All within the flush's bound (re-gate R15). A cut-off command's error says it was cut off while it ran, so the device
   may or may not have done it; a waiting one's, that it was refused before it ran. **Exactly one
   answer per command:** whoever takes the command out of flight answers it — the worker when its
   operation ends (`Mailbox::command_done_then`, which queues the worker's answer under the same

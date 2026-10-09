@@ -109,6 +109,7 @@ logging-start src/process.rs Bridge::serve
 mailbox-lock src/mailbox.rs Mailbox::locked
 mailbox-posted src/mailbox.rs Mailbox::take
 mqtt-poll src/pump.rs Pump::run
+mqtt-poll src/pump.rs linger
 mqtt-pump-queue src/pump.rs Incoming::recv
 mqtt-pump-queue src/session.rs flush
 mqtt-request src/session.rs connected

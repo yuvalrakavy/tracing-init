@@ -269,9 +269,16 @@ impl Drop for Pump {
 pub struct Incoming {
     rx: UnboundedReceiver<PumpEvent>,
     backlog: Arc<Backlog>,
+    /// The QoS 1 publishes the event loop has written and the broker not yet acknowledged.
+    inflight: Arc<AtomicUsize>,
 }
 
 impl Incoming {
+    /// How many QoS 1 publishes the broker has not acknowledged yet, as of the pump's last event.
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::SeqCst)
+    }
+
     pub async fn recv(&mut self) -> Option<PumpEvent> {
         // WAIT: mqtt-pump-queue
         let event = self.rx.recv().await;
@@ -306,14 +313,16 @@ impl Pump {
     ) -> (Pump, Incoming) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let backlog = Arc::new(Backlog::new());
-        let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), outage, stall, on_lost).in_current_span());
-        (Pump { task }, Incoming { rx, backlog })
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), inflight.clone(), outage, stall, on_lost).in_current_span());
+        (Pump { task }, Incoming { rx, backlog, inflight })
     }
 
     async fn run(
         mut events: EventLoop,
         tx: UnboundedSender<PumpEvent>,
         backlog: Arc<Backlog>,
+        inflight: Arc<AtomicUsize>,
         outage: Arc<BrokerOutage>,
         stall: Duration,
         on_lost: impl FnOnce() + Send + 'static,
@@ -358,6 +367,7 @@ impl Pump {
                 }
             };
             outstanding.after(&event, events.state.inflight());
+            inflight.store(usize::from(events.state.inflight()), Ordering::SeqCst);
 
             // Only an incoming event is proof of the broker; an outgoing one (a connect request)
             // is rumqttc trying.
@@ -380,12 +390,45 @@ impl Pump {
                     pkid: ack.pkid,
                     granted: ack.return_codes.iter().all(|code| matches!(code, SubscribeReasonCode::Success(_))),
                 },
-                Event::Outgoing(Outgoing::Disconnect) => PumpEvent::Disconnected,
+                Event::Outgoing(Outgoing::Disconnect) => {
+                    // Read on until the broker closes the connection: closed with its acks still
+                    // unread, the socket would be reset, and the broker would drop what it had not
+                    // read yet — the last replies, Active=false, the DISCONNECT (confirming review
+                    // N1).
+                    linger(&mut events, &inflight).await;
+                    PumpEvent::Disconnected
+                }
                 _ => continue,
             };
             let disconnected = matches!(forward, PumpEvent::Disconnected);
             if tx.send(forward).is_err() || disconnected {
                 // The session is gone, or asked to disconnect: polling on would reconnect.
+                return;
+            }
+        }
+    }
+}
+
+/// After the DISCONNECT, how long the pump reads on for the broker's close.
+const LINGER_BOUND: Duration = Duration::from_secs(1);
+
+/// Poll the event loop after the DISCONNECT was written until the broker closes the connection —
+/// every ack it sent read, so the close is orderly — or [`LINGER_BOUND`]: past it, one INFO
+/// `bridge_shutdown_cut`. Never polled again after the close, which would reconnect.
+async fn linger(events: &mut EventLoop, inflight: &AtomicUsize) {
+    let deadline = Instant::now() + LINGER_BOUND;
+    loop {
+        // WAIT: mqtt-poll
+        match tokio::time::timeout_at(deadline.into(), events.poll()).await {
+            Ok(Ok(_)) => inflight.store(usize::from(events.state.inflight()), Ordering::SeqCst),
+            Ok(Err(_)) => return,
+            Err(_) => {
+                info!(
+                    kind = "bridge_shutdown_cut",
+                    unacknowledged = events.state.inflight(),
+                    bound_ms = LINGER_BOUND.as_millis() as u64,
+                    "The broker did not close the connection after the DISCONNECT in time; closing it"
+                );
                 return;
             }
         }

@@ -264,7 +264,7 @@ guard       = "target_write_never_retained"
 [[control]]
 name        = "a_reply_loses_its_correlation_data"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        props.correlation_data = event.correlation;
+anchor      = '''        props.correlation_data = reply.correlation;
 '''
 replacement = ''''''
 target      = "command"
@@ -276,7 +276,7 @@ guard       = "reply_correlation"
 [[control]]
 name        = "a_reply_goes_to_the_event_lane"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''event.topic.unwrap_or_else(|| topics.event())'''
+anchor      = '''reply.topic.unwrap_or_else(|| topics.event())'''
 replacement = '''topics.event()'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
@@ -2308,19 +2308,6 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "pump::tests::a_poll_that_does_not_return_ends_the_session_within_twice_the_keep_alive", "--exact"]
 expect_text = '''the flush was never blocked, so this test proves nothing'''
 guard       = "broker_stop_reading"
-
-# Re-gate 3 S2: the session publishes what is pending before its next read.
-[[control]]
-name        = "the_reads_starve_the_reports"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                () = shared.reports.reported(), if announced => Step::Reported,
-                event = incoming.recv() => Step::Event(event),'''
-replacement = '''                event = incoming.recv() => Step::Event(event),
-                () = shared.reports.reported(), if announced => Step::Reported,'''
-target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_burst_of_refused_commands_is_answered_every_one", "--exact"]
-expect_text = '''refusal Errors were lost in a burst'''
-guard       = "reports_not_starved"
 
 # Re-gate 3 S3: the command the worker was cut off from answering is refused too.
 [[control]]

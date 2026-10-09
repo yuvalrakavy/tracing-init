@@ -684,6 +684,7 @@ impl Reports {
             || !state.errors.items.is_empty()
             || !state.events.items.is_empty()
             || !state.refusals.0.is_empty()
+            || !state.refusals.1.is_empty()
     }
 }
 

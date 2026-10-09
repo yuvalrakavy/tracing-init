@@ -433,6 +433,8 @@ impl Mailbox {
             let key = (value.target.clone(), value.property.clone());
             match inner.copies.remove(&key) {
                 Some((copy, until)) if copy == value.value && now < until => Posted::Skipped,
+                // (After the copy check above: a target-level write's copy of the same value is that
+                // write, so the copy pin it clears is moot.)
                 // The same value as a write held again before proof, replayed by the broker — the
                 // retained request it came from — is that write still: the held one is kept, with
                 // its proof obligation; a different value, or a live request, replaces it (second
