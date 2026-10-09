@@ -336,6 +336,9 @@ enum Step {
 
 /// The CONNACK duties, in order: the subscriptions (the read-back's first, once per process), then
 /// `Active=true`, the version, and the whole retained model.
+// The error is rumqttc's `ClientError` (it carries the refused request), returned once per CONNACK;
+// boxing it buys nothing on a path this cold.
+#[allow(clippy::result_large_err)]
 async fn connected(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming) -> Result<bool, Failed> {
     let topics = &shared.topics;
     if !shared.read_back_requested.load(Ordering::SeqCst) {

@@ -106,7 +106,11 @@ impl Backlog {
 
     /// The session took a publish. Saturating: a count gone wrong must not panic the session.
     fn popped(&self) {
-        let before = self.depth.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| Some(d.saturating_sub(1))).unwrap_or_default();
+        // A compare-exchange loop rather than `fetch_update`, deprecated from Rust 1.99.
+        let mut before = self.depth.load(Ordering::SeqCst);
+        while let Err(now) = self.depth.compare_exchange_weak(before, before.saturating_sub(1), Ordering::SeqCst, Ordering::SeqCst) {
+            before = now;
+        }
         let depth = before.saturating_sub(1);
         if depth <= LOW_WATER {
             self.close(depth, false);

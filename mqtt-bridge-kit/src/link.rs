@@ -189,10 +189,18 @@ struct Slot(Arc<Abandoned>, Kind);
 impl Slot {
     fn reserve(abandoned: &Arc<Abandoned>, kind: Kind) -> Option<Slot> {
         let (count, cap, full_since) = abandoned.budget(kind);
-        let slot = count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| (running < cap).then_some(running + 1))
-            .ok()
-            .map(|_| Slot(abandoned.clone(), kind));
+        // A compare-exchange loop, not `fetch_update` (deprecated from Rust 1.99, its successor
+        // `try_update` absent before it): the same atomic reservation on every toolchain.
+        let mut running = count.load(Ordering::SeqCst);
+        let slot = loop {
+            if running >= cap {
+                break None;
+            }
+            match count.compare_exchange_weak(running, running + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break Some(Slot(abandoned.clone(), kind)),
+                Err(now) => running = now,
+            }
+        };
         match slot {
             // A place had: the budget is not full, whatever a refusal that lost the race with a
             // release stamped (re-gate 3 S6).

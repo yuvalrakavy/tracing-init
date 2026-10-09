@@ -1212,10 +1212,16 @@ guard       = "blocking_slot_raii"
 [[control]]
 name        = "the_blocking_cap_is_not_reserved"
 file        = "mqtt-bridge-kit/src/link.rs"
-anchor      = '''        let slot = count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| (running < cap).then_some(running + 1))
-            .ok()
-            .map(|_| Slot(abandoned.clone(), kind));'''
+anchor      = '''        let mut running = count.load(Ordering::SeqCst);
+        let slot = loop {
+            if running >= cap {
+                break None;
+            }
+            match count.compare_exchange_weak(running, running + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break Some(Slot(abandoned.clone(), kind)),
+                Err(now) => running = now,
+            }
+        };'''
 replacement = '''        let slot = if count.load(Ordering::SeqCst) >= cap {
             None
         } else {
