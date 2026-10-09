@@ -23,7 +23,14 @@ tracing = "0.1"
 tracing-init = { path = "..", features = ["otel"] }
 
 [dev-dependencies]
+# The tutorial's example (examples/tutorial_bridge.rs) speaks TCP lines: tokio's io-util.
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 mqtt-test-broker = { path = "../mqtt-test-broker" }
 wait-lint = { path = "../wait-lint" }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 tracing-core = "0.1"
+
+# The tutorial's bridge, with its tests (docs/tutorial-writing-a-bridge.md): `cargo test` runs them.
+[[example]]
+name = "tutorial_bridge"
+test = true
