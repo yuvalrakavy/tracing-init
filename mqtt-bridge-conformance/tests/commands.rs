@@ -685,3 +685,34 @@ async fn a_stop_right_after_a_reconnect_answers_what_it_refuses() {
         "a stop inside the reconnect's stability window answered nothing"
     );
 }
+
+/// In normal operation a reply follows the State its command produced: a `refresh`'s reply means
+/// "its State is current", so the State goes out first, every time (the second confirming review's
+/// F1, its probe: the answers-first order put the reply first in half the runs).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_follows_the_state_its_command_produced() {
+    let h = Harness::start_with("reply-after-state", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    let state_topic = h.topics.state("t1");
+    let mut reply_first = Vec::new();
+    for i in 0..20 {
+        h.device.set("t1", "temp", json!(100 + i));
+        let corr = format!("p-{i}");
+        assert!(h.command(json!({"target": "t1", "command": "refresh"}), Some(("Store/replies/order", corr.as_bytes()))));
+        let mine = |r: &mqtt_bridge_conformance::Received| {
+            r.topic == "Store/replies/order"
+                && r.properties.as_ref().and_then(|p| p.correlation_data.as_ref()).map(|c| &c[..]) == Some(corr.as_bytes())
+        };
+        assert!(h.eventually(BOUND, |h| h.broker.received().iter().any(mine)).await, "refresh {i} was not answered");
+        assert!(h.eventually(BOUND, |h| h.state("t1").is_some_and(|s| s["temp"] == 100 + i)).await, "refresh {i} published no State");
+        let all = h.broker.received();
+        let reply_at = all.iter().position(mine);
+        let want = format!("\"temp\":{}", 100 + i);
+        let state_at = all.iter().position(|r| r.topic == state_topic && String::from_utf8_lossy(&r.payload).contains(&want));
+        if reply_at < state_at {
+            reply_first.push(i);
+        }
+    }
+    assert!(reply_first.is_empty(), "a reply went out before the State its refresh produced: refreshes {reply_first:?}");
+    assert!(h.stop().await);
+}

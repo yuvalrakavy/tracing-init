@@ -2263,7 +2263,7 @@ guard       = "stop_refuses_waiting"
 [[control]]
 name        = "the_flush_drops_what_is_pending"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        publish_changes(shared, client, shared.reports.take()).await;
+anchor      = '''        publish_changes(shared, client, shared.reports.take(), true).await;
         emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
 replacement = '''        emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
 target      = "command"

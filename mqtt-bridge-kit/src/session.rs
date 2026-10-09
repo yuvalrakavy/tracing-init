@@ -40,7 +40,7 @@ use crate::driver::{CommandClass, CommandSpec};
 use crate::mailbox::{Check, Mailbox, Posted, ReadKey, StateValue};
 use crate::pump::{stall_bound, BrokerOutage, Incoming, Pump, PumpEvent, MAX_CONSECUTIVE_ERRORS};
 use crate::replies::{reply_payload, Answer, ReplyTo};
-use crate::reports::{Changes, Model, Outbound, Reports};
+use crate::reports::{Changes, LinkStatus, Model, Outbound, Reports};
 use crate::topics::{Inbound, Topics};
 use crate::wire::{self, ErrorReport, Reason};
 
@@ -276,7 +276,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                     Ok(Some(SessionEnd::Ended { connected: None }))
                 }
                 Step::Reported => {
-                    publish_changes(shared, &client, shared.reports.take()).await;
+                    publish_changes(shared, &client, shared.reports.take(), false).await;
                     Ok(None)
                 }
                 Step::Shutdown => Ok(Some(SessionEnd::Shutdown)),
@@ -418,28 +418,53 @@ async fn republish(shared: &Shared, client: &AsyncClient, model: Model) {
 }
 
 /// What the device side reported since the last take. A message refused is dropped alone.
-async fn publish_changes(shared: &Shared, client: &AsyncClient, changes: Changes) {
+async fn publish_changes(shared: &Shared, client: &AsyncClient, changes: Changes, answers_first: bool) {
+    let Changes { answer_errors, replies, status, states, errors, events } = changes;
+    // In normal operation a reply follows the State its command produced — a `refresh`'s reply
+    // says its State is current — so Status and State go first, then the answers (the second
+    // confirming review's F1). At the stop, answers go first: the flush is bounded, and they are
+    // what must not be cut (confirming review 3).
+    if answers_first {
+        publish_answers(shared, client, answer_errors, replies).await;
+        publish_model(shared, client, status, states).await;
+    } else {
+        publish_model(shared, client, status, states).await;
+        publish_answers(shared, client, answer_errors, replies).await;
+    }
+    publish_unsolicited(shared, client, errors, events).await;
+}
+
+/// A batch's answers: every terminal `Error` of a request, then every reply.
+async fn publish_answers(shared: &Shared, client: &AsyncClient, errors: Vec<ErrorReport>, replies: Vec<Outbound>) {
     let topics = &shared.topics;
-    // Answers first: a stop's bounded flush, or a slow broker, reaches them before State and
-    // unsolicited traffic (confirming review 3).
-    for error in changes.answer_errors {
+    for error in errors {
         emit(shared, client, topics.error(), false, error.encode(), properties()).await;
     }
-    for reply in changes.replies {
+    for reply in replies {
         let mut props = properties();
         props.correlation_data = reply.correlation;
         emit(shared, client, reply.topic.unwrap_or_else(|| topics.event()), false, reply.payload, props).await;
     }
-    if let Some(status) = changes.status {
+}
+
+/// A batch's `Status` and changed `State`s.
+async fn publish_model(shared: &Shared, client: &AsyncClient, status: Option<LinkStatus>, states: Vec<(String, Vec<u8>)>) {
+    let topics = &shared.topics;
+    if let Some(status) = status {
         emit(shared, client, topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await;
     }
-    for (target, document) in changes.states {
+    for (target, document) in states {
         emit(shared, client, topics.state(&target), true, document, properties()).await;
     }
-    for error in changes.errors {
+}
+
+/// A batch's unsolicited reports: the capped `Error`s and `Event`s.
+async fn publish_unsolicited(shared: &Shared, client: &AsyncClient, errors: Vec<ErrorReport>, events: Vec<Outbound>) {
+    let topics = &shared.topics;
+    for error in errors {
         emit(shared, client, topics.error(), false, error.encode(), properties()).await;
     }
-    for event in changes.events {
+    for event in events {
         let mut props = properties();
         props.correlation_data = event.correlation;
         emit(shared, client, event.topic.unwrap_or_else(|| topics.event()), false, event.payload, props).await;
@@ -463,7 +488,7 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, c
         // Refusals go to the reports' uncapped answers, which `take` gives first: a full mailbox
         // cannot overflow them (Codex final gate 2).
         crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);
-        publish_changes(shared, client, shared.reports.take()).await;
+        publish_changes(shared, client, shared.reports.take(), true).await;
         emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
         // Every QoS 1 publish acknowledged before the DISCONNECT: proof the broker has the answers,
         // and nothing of the broker's left unread at the close (confirming review N1). Bounded by

@@ -187,9 +187,10 @@ pub struct Reports {
 /// What changed since the session last took it.
 #[derive(Debug, Default, PartialEq)]
 pub struct Changes {
-    /// Answers to requests — every terminal `Error` of one, and every reply — published before
-    /// everything else: past every cap, and ahead of `State` and unsolicited traffic, so a stop's
-    /// bounded flush delivers them first (confirming review 2, 3).
+    /// Answers to requests — every terminal `Error` of one, and every reply — past every cap, and
+    /// ahead of unsolicited traffic. In normal operation they follow the batch's `Status` and
+    /// `State`, so a reply follows the State its command produced (the second confirming review's
+    /// F1); a stop's bounded flush publishes them first (confirming review 2, 3).
     pub answer_errors: Vec<ErrorReport>,
     pub replies: Vec<Outbound>,
     pub status: Option<LinkStatus>,
@@ -412,16 +413,15 @@ impl Reports {
         self.ready.notify_one();
     }
 
-    /// A request's terminal `Error` — its failure, a refusal, a supersession: an answer, taken
-    /// first and past every cap; the capped queue keeps only unsolicited reports (confirming
+    /// A request's terminal `Error` — its failure, a refusal, a supersession: an answer, past
+    /// every cap; the capped queue keeps only unsolicited reports (confirming
     /// review 2). Never waits.
     pub fn request_error(&self, report: ErrorReport) {
         self.locked().answers.0.push(report);
         self.ready.notify_one();
     }
 
-    /// Refused commands' `Error`s and replies, taken before everything else queued, past every
-    /// cap. Never waits.
+    /// Refused commands' `Error`s and replies: answers, past every cap. Never waits.
     pub fn refused(&self, errors: Vec<ErrorReport>, replies: Vec<Outbound>) {
         {
             let mut state = self.locked();

@@ -399,9 +399,13 @@ commands are refused, and reads are dropped.
   a response topic) and every terminal `Error` of one — a refusal (a stop's, a link loss's, a
   watchdog's, an expired read caller's, one on arrival), a failure (`Rejected`, `Unusable`,
   `Unsupported`, each of a `Partial`'s properties, a command's), a supersession — go to an uncapped
-  batch of answers, published before `Status`, `State` and unsolicited traffic, at the stop and
-  always; the capped `Error` and `Event` queues keep only unsolicited reports, malformed input
-  among them (Codex final gate 2, second final gate 1, confirming review 2 and 3).
+  batch of answers; the capped `Error` and `Event` queues keep only unsolicited reports, malformed
+  input among them (Codex final gate 2, second final gate 1, confirming review 2). **A reply follows
+  the State its command produced; at the stop, answers go first:** in normal operation each batch
+  publishes `Status` and `State`, then the answers, then the unsolicited reports, so a `refresh`'s
+  reply never reaches the Store before the State it read (the second confirming review's F1); the
+  stop's bounded flush publishes the answers first, before what else is pending (confirming
+  review 3).
 - **Panics:** `Bridge::run` installs a process-global panic hook (`install_panic_hook`, also for
   in-process users of `Bridge::start`): ERROR `panic` through tracing (lossy), and the report for
   stderr handed to the process's one reporter thread through a bounded, lossy queue (16; full, the
