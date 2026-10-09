@@ -174,7 +174,7 @@ async fn the_flush_publishes_what_is_pending_before_its_last_words() {
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     shared.reports.error(crate::wire::ErrorReport::new(crate::wire::Reason::Rejected, "pending at the stop").target(Some("t1")));
-    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, true)).await;
+    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, true, Batch::default())).await;
     assert!(flushed.is_ok(), "the flush did not end");
     let (error, active) = (shared.topics.error(), shared.topics.active());
     assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&active).is_empty()).await, "the flush never said Active=false");
@@ -205,7 +205,7 @@ async fn the_flush_publishes_answers_before_state() {
     let refusal = crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop").target(Some("t1"));
     let reply = Outbound { topic: Some("Store/replies/flush".into()), payload: b"{}".to_vec(), correlation: None };
     shared.reports.refused(vec![refusal], vec![reply]);
-    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, true)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, true, Batch::default())).await;
     let error = shared.topics.error();
     assert!(
         broker
@@ -316,7 +316,7 @@ async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
         vec![Outbound { topic: Some("Store/replies/held".into()), payload: b"{}".to_vec(), correlation: None }],
     );
     let disconnected = |b: &FakeBroker| b.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Disconnected));
-    let flushing = flush(&shared, &client, &mut incoming, true);
+    let flushing = flush(&shared, &client, &mut incoming, true, Batch::default());
     tokio::pin!(flushing);
     // Half a second in, the acks still held: no DISCONNECT yet.
     let early = tokio::time::timeout(Duration::from_millis(500), flushing.as_mut()).await;
@@ -329,4 +329,50 @@ async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
         "with the acks never coming, no DISCONNECT was sent at all"
     );
     broker.release_acks();
+}
+
+/// A stop that cuts a batch's publish short hands what the batch has not enqueued to the flush:
+/// its answers first, nothing enqueued twice (third confirming reviews, Codex 1: the batch was
+/// taken out of the reports whole, and a stop while its States backed up behind a slow broker
+/// dropped its reply — owned by nobody).
+#[tokio::test]
+async fn a_stop_mid_batch_still_publishes_the_batchs_reply() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(5);
+    let shared = Arc::new(shared_for(&broker));
+    let (stop, mut stopped) = watch::channel(false);
+    let running = {
+        let shared = shared.clone();
+        tokio::spawn(async move { session(&shared, &mut stopped).await })
+    };
+    let active = shared.topics.active();
+    assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&active).is_empty()).await, "the session never announced itself");
+    // One batch (the session does not run between these): 400 States, then a reply. The broker
+    // acknowledges nothing, so the States back up — rumqttc's window, then its request channel —
+    // and the session waits in the batch's publish.
+    broker.hold_acks();
+    for t in 0..400 {
+        let values = serde_json::json!({"n": t}).as_object().unwrap().clone();
+        shared.reports.state(&format!("m{t:04}"), values, false);
+    }
+    shared.reports.event(Outbound { topic: Some("Store/replies/mid-batch".into()), payload: b"{}".to_vec(), correlation: None });
+    assert!(broker.wait_until(Duration::from_secs(5), |b| b.held_acks() >= 10).await, "the States never filled the window");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(broker.received_on("Store/replies/mid-batch").is_empty(), "the reply went out before the States had backed up");
+    // The stop cuts the batch's publish short; then the broker recovers.
+    stop.send(true).expect("the session is gone");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    broker.release_acks();
+    let ended = tokio::time::timeout(Duration::from_secs(5), running).await;
+    assert!(matches!(ended, Ok(Ok(SessionEnd::Shutdown))), "the session did not end with the stop");
+    assert!(
+        broker.wait_until(Duration::from_secs(2), |b| !b.received_on("Store/replies/mid-batch").is_empty()).await,
+        "the reply of a batch the stop cut short was never published"
+    );
+    // Every State once: the one whose publish the stop cut short finished, not dropped nor sent
+    // again.
+    let prefix = shared.topics.state("");
+    let states = |b: &FakeBroker| b.received().iter().filter(|r| r.topic.starts_with(&prefix)).count();
+    broker.wait_until(Duration::from_secs(2), |b| states(b) >= 400).await;
+    assert_eq!(states(&broker), 400, "a State of the batch the stop cut short was lost, or published twice");
 }

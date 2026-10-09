@@ -282,9 +282,8 @@ guard       = "target_write_never_retained"
 [[control]]
 name        = "a_reply_loses_its_correlation_data"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        props.correlation_data = reply.correlation;
-'''
-replacement = ''''''
+anchor      = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation)'''
+replacement = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, None)'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
 expect_text = '''the reply lost the correlation data'''
@@ -294,8 +293,8 @@ guard       = "reply_correlation"
 [[control]]
 name        = "a_reply_goes_to_the_event_lane"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''reply.topic.unwrap_or_else(|| topics.event())'''
-replacement = '''topics.event()'''
+anchor      = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation)'''
+replacement = '''Out::new(topics.event(), false, r.payload, r.correlation)'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
 expect_text = '''no reply on the response topic'''
@@ -2221,10 +2220,10 @@ guard       = "read_back_suback_granted"
 [[control]]
 name        = "a_late_state_changes_the_read_back_basis"
 file        = "mqtt-bridge-kit/src/reports.rs"
-anchor      = '''                if state.readback_frozen.is_none() {
-                    state.readback_frozen = Some(state.readback.clone());
-                }'''
-replacement = '''                let _ = &mut state;'''
+anchor      = '''        if state.readback_frozen.is_none() {
+            state.readback_frozen = Some(state.readback.clone());
+        }'''
+replacement = '''        let _ = &mut state;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "reports::tests::a_late_state_does_not_change_the_read_back_basis", "--exact"]
 expect_text = '''a late State changed the conflict rule's read-back'''
@@ -2273,9 +2272,12 @@ guard       = "stop_refuses_waiting"
 [[control]]
 name        = "the_flush_drops_what_is_pending"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        publish_changes(shared, client, shared.reports.take(), true).await;
+anchor      = '''        batch.add(shared, shared.reports.take());
+        // WAIT: mqtt-request
+        batch.publish(shared, client, true).await;
         emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
-replacement = '''        emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
+replacement = '''        let _ = &mut batch;
+        emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_what_is_pending_before_its_last_words", "--exact"]
 expect_text = '''the flush dropped what was pending'''
@@ -2760,14 +2762,8 @@ guard       = "flush_ack_watermark"
 [[control]]
 name        = "a_reply_goes_before_its_state"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    } else {
-        publish_model(shared, client, status, states).await;
-        publish_answers(shared, client, answer_errors, replies).await;
-    }'''
-replacement = '''    } else {
-        publish_answers(shared, client, answer_errors, replies).await;
-        publish_model(shared, client, status, states).await;
-    }'''
+anchor      = '''                self.model.pop_front().or_else(|| self.answers.pop_front())'''
+replacement = '''                self.answers.pop_front().or_else(|| self.model.pop_front())'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_reply_follows_the_state_its_command_produced", "--exact"]
 expect_text = '''a reply went out before the State its refresh produced'''
@@ -2804,8 +2800,8 @@ guard       = "read_back_view_complete"
 [[control]]
 name        = "the_flush_puts_state_first"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        publish_changes(shared, client, shared.reports.take(), true).await;'''
-replacement = '''        publish_changes(shared, client, shared.reports.take(), false).await;'''
+anchor      = '''        batch.publish(shared, client, true).await;'''
+replacement = '''        batch.publish(shared, client, false).await;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_answers_before_state", "--exact"]
 expect_text = '''the refusal was not published within the flush'''
@@ -2849,3 +2845,31 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_replacements_withdrawal_never_reverts_the_replacement", "--exact"]
 expect_text = '''the replaced write's withdrawal reverted the replacement the worker had applied'''
 guard       = "replacement_withdrawal_atomic"
+
+# Third confirming reviews (Codex 1): the batch being published is the session's, outside the work
+# a stop cuts short, and the flush publishes what it has not enqueued.
+[[control]]
+name        = "a_stop_drops_the_batch_it_cut_short"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''                    batch.add(shared, shared.reports.take());
+                    // WAIT: mqtt-request
+                    batch.publish(shared, &client, false).await;'''
+replacement = '''                    let mut taken = Batch::default();
+                    taken.add(shared, shared.reports.take());
+                    // WAIT: mqtt-request
+                    taken.publish(shared, &client, false).await;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_stop_mid_batch_still_publishes_the_batchs_reply", "--exact"]
+expect_text = '''the reply of a batch the stop cut short was never published'''
+guard       = "batch_outlives_the_stop"
+
+# The same: the publish under way when the stop cuts it short is kept and finished, not dropped.
+[[control]]
+name        = "a_stop_drops_the_publish_under_way"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''            if let Some(sending) = self.sending.as_mut() {'''
+replacement = '''            if let Some(sending) = self.sending.take() {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_stop_mid_batch_still_publishes_the_batchs_reply", "--exact"]
+expect_text = '''a State of the batch the stop cut short was lost, or published twice'''
+guard       = "batch_sending_kept"

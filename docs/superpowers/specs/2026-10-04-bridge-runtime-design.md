@@ -359,9 +359,13 @@ commands are refused, and reads are dropped.
   stop signals, a panicking session) are compiled in only with the kit's `test-seams` cargo
   feature, which the conformance suite enables — never in a deployed bridge, debug build or not
   (Claude's re-gate minor 4).
-- **Best effort at the end:** the reports a session had taken for a publish when the shutdown cut
-  that publish short are not put back: the flush publishes what is pending after them, and what
-  was taken and cut is lost (re-gate 3 S6: documented, not counted).
+- **Nothing taken is lost at the end:** the batch a session took from the reports, and how far its
+  publication got, are the session's, outside the publish a stop cuts short: the flush finishes
+  the publish under way — kept, not dropped, since whether rumqttc's channel took its message
+  cannot be told from outside — then publishes what the batch has not enqueued with what is
+  pending, answers first, nothing enqueued twice (third confirming reviews, Codex 1: the batch
+  was taken whole, and a stop while its States backed up behind a slow broker dropped its reply;
+  re-gate 3 S6's "taken and cut is lost" is superseded).
 - **What a stop answers:** the bounded shutdown first stops the worker — it takes nothing more,
   the stop checked before every take, and what it runs is cut off — and waits for it (2.5 s at
   most: its driver's disconnect and its runtime's end); only then does the session's flush refuse

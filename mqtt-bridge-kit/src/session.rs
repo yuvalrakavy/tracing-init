@@ -26,6 +26,7 @@
 //! **Shutdown:** `Active=false`, then DISCONNECT, polling until it is written — within
 //! [`FLUSH_BOUND`]; past it the last will says `Active=false` instead (INFO `bridge_shutdown_cut`).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,7 +41,7 @@ use crate::driver::{CommandClass, CommandSpec};
 use crate::mailbox::{Check, Mailbox, Posted, ReadKey, StateValue};
 use crate::pump::{stall_bound, BrokerOutage, Incoming, Pump, PumpEvent, MAX_CONSECUTIVE_ERRORS};
 use crate::replies::{reply_payload, Answer, ReplyTo};
-use crate::reports::{Changes, LinkStatus, Model, Outbound, Reports};
+use crate::reports::{Changes, Model, Outbound, Reports};
 use crate::topics::{Inbound, Topics};
 use crate::wire::{self, ErrorReport, Reason};
 
@@ -176,13 +177,19 @@ type Failed = rumqttc::v5::ClientError;
 async fn emit(shared: &Shared, client: &AsyncClient, topic: String, retain: bool, payload: Vec<u8>, properties: PublishProperties) {
     let refused_topic = topic.clone();
     // WAIT: mqtt-request
-    match client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await {
-        // Counted: the shutdown waits until the pump has written, and the broker acknowledged,
-        // every publish enqueued (the second confirming review's minor).
+    let sent = client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await;
+    enqueued(shared, &refused_topic, sent);
+}
+
+/// What came of a publish: counted when rumqttc took it — the shutdown waits until the pump has
+/// written, and the broker acknowledged, every publish enqueued (the second confirming review's
+/// minor) — else that one message dropped, said at DEBUG.
+fn enqueued(shared: &Shared, topic: &str, sent: Result<(), Failed>) {
+    match sent {
         Ok(()) => {
             shared.enqueued.fetch_add(1, Ordering::SeqCst);
         }
-        Err(e) => debug!(topic = %refused_topic, error = %e, "An MQTT publish was refused; this message is dropped"),
+        Err(e) => debug!(topic, error = %e, "An MQTT publish was refused; this message is dropped"),
     }
 }
 
@@ -204,6 +211,8 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
     let mut accepted: Option<Instant> = None;
     // How many ready incoming events still go before the next batch of reports.
     let mut reads_owed: u32 = 0;
+    // The batch being published: outside the work a stop cuts short, for the flush.
+    let mut batch = Batch::default();
     loop {
         // The stop first: its flush publishes what is pending anyway (re-gate R15). Then, after a
         // batch of reports, the incoming events that are ready — up to READS_PER_BATCH — before the
@@ -276,7 +285,9 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                     Ok(Some(SessionEnd::Ended { connected: None }))
                 }
                 Step::Reported => {
-                    publish_changes(shared, &client, shared.reports.take(), false).await;
+                    batch.add(shared, shared.reports.take());
+                    // WAIT: mqtt-request
+                    batch.publish(shared, &client, false).await;
                     Ok(None)
                 }
                 Step::Shutdown => Ok(Some(SessionEnd::Shutdown)),
@@ -298,7 +309,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                 return SessionEnd::Ended { connected: accepted };
             }
             Ok(Some(SessionEnd::Shutdown)) => {
-                flush(shared, &client, &mut incoming, accepted.is_some()).await;
+                flush(shared, &client, &mut incoming, accepted.is_some(), batch).await;
                 return SessionEnd::Shutdown;
             }
             // The event loop is gone (the pump ended): the next event says so.
@@ -417,63 +428,96 @@ async fn republish(shared: &Shared, client: &AsyncClient, model: Model) {
     }
 }
 
-/// What the device side reported since the last take. A message refused is dropped alone.
-async fn publish_changes(shared: &Shared, client: &AsyncClient, changes: Changes, answers_first: bool) {
-    let Changes { answer_errors, replies, status, states, errors, events } = changes;
-    // In normal operation a reply follows the State its command produced — a `refresh`'s reply
-    // says its State is current — so Status and State go first, then the answers (the second
-    // confirming review's F1). At the stop, answers go first: the flush is bounded, and they are
-    // what must not be cut (confirming review 3).
-    if answers_first {
-        publish_answers(shared, client, answer_errors, replies).await;
-        publish_model(shared, client, status, states).await;
-    } else {
-        publish_model(shared, client, status, states).await;
-        publish_answers(shared, client, answer_errors, replies).await;
-    }
-    publish_unsolicited(shared, client, errors, events).await;
+/// One message of a batch, ready to publish.
+struct Out {
+    topic: String,
+    retain: bool,
+    payload: Vec<u8>,
+    properties: PublishProperties,
 }
 
-/// A batch's answers: every terminal `Error` of a request, then every reply.
-async fn publish_answers(shared: &Shared, client: &AsyncClient, errors: Vec<ErrorReport>, replies: Vec<Outbound>) {
-    let topics = &shared.topics;
-    for error in errors {
-        emit(shared, client, topics.error(), false, error.encode(), properties()).await;
-    }
-    for reply in replies {
-        let mut props = properties();
-        props.correlation_data = reply.correlation;
-        emit(shared, client, reply.topic.unwrap_or_else(|| topics.event()), false, reply.payload, props).await;
+impl Out {
+    fn new(topic: String, retain: bool, payload: Vec<u8>, correlation: Option<bytes::Bytes>) -> Out {
+        let mut properties = properties();
+        properties.correlation_data = correlation;
+        Out { topic, retain, payload, properties }
     }
 }
 
-/// A batch's `Status` and changed `State`s.
-async fn publish_model(shared: &Shared, client: &AsyncClient, status: Option<LinkStatus>, states: Vec<(String, Vec<u8>)>) {
-    let topics = &shared.topics;
-    if let Some(status) = status {
-        emit(shared, client, topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await;
-    }
-    for (target, document) in states {
-        emit(shared, client, topics.state(&target), true, document, properties()).await;
-    }
+/// A publish under way: its topic, for the refusal's line, and rumqttc's request.
+type Sending = std::pin::Pin<Box<dyn std::future::Future<Output = (String, Result<(), Failed>)> + Send>>;
+
+/// What the device side reported, taken from the reports, and how far its publication has got —
+/// the session's, outside the work a stop cuts short: a stop in the middle of a batch hands the
+/// flush what the batch has not enqueued, its answers first, and nothing enqueued goes twice
+/// (third confirming reviews, Codex 1: the batch was taken out of the reports whole, and the
+/// stop dropped what it had not published — a `refresh`'s reply among it, owned by nobody).
+#[derive(Default)]
+struct Batch {
+    /// Every terminal `Error` of a request, then every reply.
+    answers: VecDeque<Out>,
+    /// `Status`, then each changed `State`.
+    model: VecDeque<Out>,
+    /// The capped `Error`s and `Event`s.
+    unsolicited: VecDeque<Out>,
+    /// The publish under way. A stop that cuts it short leaves it here, not dropped — whether
+    /// rumqttc's channel took the message cannot be told from outside — and the next publication
+    /// finishes it first.
+    sending: Option<Sending>,
 }
 
-/// A batch's unsolicited reports: the capped `Error`s and `Event`s.
-async fn publish_unsolicited(shared: &Shared, client: &AsyncClient, errors: Vec<ErrorReport>, events: Vec<Outbound>) {
-    let topics = &shared.topics;
-    for error in errors {
-        emit(shared, client, topics.error(), false, error.encode(), properties()).await;
+impl Batch {
+    /// Add what the reports gave, behind what is still waiting.
+    fn add(&mut self, shared: &Shared, changes: Changes) {
+        let topics = &shared.topics;
+        let Changes { answer_errors, replies, status, states, errors, events } = changes;
+        self.answers.extend(answer_errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None)));
+        self.answers
+            .extend(replies.into_iter().map(|r| Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation)));
+        self.model.extend(status.map(|s| Out::new(topics.status(), true, s.as_str().as_bytes().to_vec(), None)));
+        self.model.extend(states.into_iter().map(|(target, document)| Out::new(topics.state(&target), true, document, None)));
+        self.unsolicited.extend(errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None)));
+        self.unsolicited
+            .extend(events.into_iter().map(|e| Out::new(e.topic.unwrap_or_else(|| topics.event()), false, e.payload, e.correlation)));
     }
-    for event in events {
-        let mut props = properties();
-        props.correlation_data = event.correlation;
-        emit(shared, client, event.topic.unwrap_or_else(|| topics.event()), false, event.payload, props).await;
+
+    /// Publish what waits, the publish under way first. In normal operation a reply follows the
+    /// State its command produced — a `refresh`'s reply says its State is current — so Status and
+    /// State go first, then the answers (the second confirming review's F1). At the stop, answers
+    /// go first: the flush is bounded, and they are what must not be cut (confirming review 3).
+    /// The unsolicited reports last. A message refused is dropped alone. Cancellation-safe: a
+    /// message leaves the batch only into `sending`, which is kept.
+    async fn publish(&mut self, shared: &Shared, client: &AsyncClient, answers_first: bool) {
+        loop {
+            if let Some(sending) = self.sending.as_mut() {
+                // WAIT: mqtt-request
+                let (topic, sent) = sending.await;
+                self.sending = None;
+                enqueued(shared, &topic, sent);
+            }
+            let next = if answers_first {
+                self.answers.pop_front().or_else(|| self.model.pop_front())
+            } else {
+                self.model.pop_front().or_else(|| self.answers.pop_front())
+            };
+            let Some(out) = next.or_else(|| self.unsolicited.pop_front()) else {
+                return;
+            };
+            let client = client.clone();
+            self.sending = Some(Box::pin(async move {
+                let Out { topic, retain, payload, properties } = out;
+                // WAIT: mqtt-request
+                let sent = client.publish_with_properties(topic.clone(), QoS::AtLeastOnce, retain, payload, properties).await;
+                (topic, sent)
+            }));
+        }
     }
 }
 
 /// The shutdown's flush: `Active=false` and DISCONNECT, polling until it is written, within
 /// [`FLUSH_BOUND`]. Skipped when the session holds no connection: the last will says it then.
-async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, connected: bool) {
+/// `batch` is what the stop cut short of the session's last batch: published with what is pending.
+async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, connected: bool, mut batch: Batch) {
     // A connection the broker accepted is one to flush on, whether or not its recovery has lasted
     // long enough to close the outage episode (second confirming review 2: a stop within the
     // stability window skipped every answer).
@@ -488,9 +532,13 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, c
         // topic; then what is pending — Status, Errors, replies — then the last words (re-gate
         // R15). Here, in the session's own flush, so nothing else publishes them first by chance.
         // Refusals go to the reports' uncapped answers, which `take` gives first: a full mailbox
-        // cannot overflow them (Codex final gate 2).
+        // cannot overflow them (Codex final gate 2). Behind what the stop cut short of the last
+        // batch — its publish under way finished first, then its answers, then these (third
+        // confirming reviews, Codex 1).
         crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);
-        publish_changes(shared, client, shared.reports.take(), true).await;
+        batch.add(shared, shared.reports.take());
+        // WAIT: mqtt-request
+        batch.publish(shared, client, true).await;
         emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
         // Before the DISCONNECT, until the ack wait's deadline: every publish this session enqueued
         // written by the pump — a watermark, so the pump's count cannot be read stale before it
