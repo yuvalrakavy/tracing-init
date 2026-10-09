@@ -75,6 +75,16 @@
 # shutdown reset (N1) is probabilistic and has no row: each stop scenario run 30 times alone, on
 # 7ca2ed2 under load 2 of 30 failed, on 174f6ab 30 of 30 passed, loaded and not.
 #
+# The second confirming reviews (Codex 1-3, Claude F1 and minors 1-5, the read-back API;
+# 2026-10-09): 7 rows added (3 with Codex's items in 70bdcda; then `a_reply_goes_before_its_state`,
+# `the_flush_puts_state_first`, `held_acks_send_no_disconnect`, `a_pending_read_back_reads_
+# complete`), 1 retargeted, 8 re-anchored; 198 in all. `--touched 2252230` at 417c555 (the new rows among them): 144 rows,
+# 143 RED, 1 GREEN — `the_read_back_stays_subscribed`, which up to 64 reads per batch had made
+# blind; retargeted in e68fe00 to the connack scenario, which now sees the UNSUBSCRIBE: RED, and
+# the three other rows bound to that scenario RED again. Minor 5 (the steady-stream flake) has no
+# row: it is probabilistic. The whole commands binary, 35 runs under 24 CPU hogs: 3 failures at
+# 2252230 and at 0cc961c (the review's runs), none at e68fe00.
+#
 # Failing first, beyond these rows: the read-back scenario
 # (`the_outage_conflict_after_a_bridge_restart_uses_the_read_back`) failed against the first
 # build — "no Error said the request was superseded: []" — because the session published the
@@ -2745,3 +2755,58 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_waits_for_its_own_publishes_to_be_acknowledged", "--exact"]
 expect_text = '''the DISCONNECT went out before the flush's publishes were acknowledged'''
 guard       = "flush_ack_watermark"
+
+# Second confirming review F1: in normal operation a reply follows the State its command produced.
+[[control]]
+name        = "a_reply_goes_before_its_state"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    } else {
+        publish_model(shared, client, status, states).await;
+        publish_answers(shared, client, answer_errors, replies).await;
+    }'''
+replacement = '''    } else {
+        publish_answers(shared, client, answer_errors, replies).await;
+        publish_model(shared, client, status, states).await;
+    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_reply_follows_the_state_its_command_produced", "--exact"]
+expect_text = '''a reply went out before the State its refresh produced'''
+guard       = "reply_after_state"
+
+# Second confirming review minor 2: acks that never come still end in a best-effort DISCONNECT.
+[[control]]
+name        = "held_acks_send_no_disconnect"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''                "The broker did not acknowledge the shutdown's publishes in time; disconnecting anyway"
+            );
+        }'''
+replacement = '''                "The broker did not acknowledge the shutdown's publishes in time; disconnecting anyway"
+            );
+            return Ok::<(), Failed>(());
+        }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_waits_for_its_own_publishes_to_be_acknowledged", "--exact"]
+expect_text = '''with the acks never coming, no DISCONNECT was sent at all'''
+guard       = "flush_disconnect_best_effort"
+
+# The driver API's read-back view says whether the read-back is done.
+[[control]]
+name        = "a_pending_read_back_reads_complete"
+file        = "mqtt-bridge-kit/src/link.rs"
+anchor      = '''        ReadBack { complete: self.reports.read_back_is_complete(), targets }'''
+replacement = '''        ReadBack { complete: true, targets }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::a_driver_reads_the_start_up_read_back", "--exact"]
+expect_text = '''a pending read-back read as done'''
+guard       = "read_back_view_complete"
+
+# Second confirming review F1: only the stop's flush puts the answers first.
+[[control]]
+name        = "the_flush_puts_state_first"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        publish_changes(shared, client, shared.reports.take(), true).await;'''
+replacement = '''        publish_changes(shared, client, shared.reports.take(), false).await;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_answers_before_state", "--exact"]
+expect_text = '''the refusal was not published within the flush'''
+guard       = "flush_answers_first"
