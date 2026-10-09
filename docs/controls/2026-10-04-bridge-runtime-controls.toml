@@ -2252,8 +2252,8 @@ anchor      = '''        publish_changes(shared, client, shared.reports.take()).
         emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
 replacement = '''        emit(client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_answers_the_commands_waiting_for_the_device", "--exact"]
-expect_text = '''the command waiting at SIGTERM was not answered'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_what_is_pending_before_its_last_words", "--exact"]
+expect_text = '''the flush dropped what was pending'''
 guard       = "flush_publishes_pending"
 
 # Claude's re-gate minor 6: an assume with a bad property name is the Store's malformed input.

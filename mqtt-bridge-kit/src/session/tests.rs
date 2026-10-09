@@ -158,3 +158,27 @@ fn a_retraction_after_the_re_hold_leaves_its_assumption_unproven() {
         "a confirmation after the re-hold proved a write the device never took"
     );
 }
+
+/// The stop's flush publishes what is pending — here an `Error` no refusal made — before its last
+/// words, `Active=false` (re-gate R15; the final gate's refusals now go out apart from it, so this
+/// is the flush's own proof).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_flush_publishes_what_is_pending_before_its_last_words() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(5);
+    let shared = shared_for(&broker);
+    let (client, events) = client(&shared);
+    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
+    let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
+    assert!(matches!(first, Some(PumpEvent::Connected)));
+    shared.reports.error(crate::wire::ErrorReport::new(crate::wire::Reason::Rejected, "pending at the stop").target(Some("t1")));
+    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming)).await;
+    assert!(flushed.is_ok(), "the flush did not end");
+    let (error, active) = (shared.topics.error(), shared.topics.active());
+    assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&active).is_empty()).await, "the flush never said Active=false");
+    let received = broker.received();
+    let error_at = received.iter().position(|r| r.topic == error && String::from_utf8_lossy(&r.payload).contains("pending at the stop"));
+    let active_at = received.iter().position(|r| r.topic == active);
+    assert!(error_at.is_some(), "the flush dropped what was pending");
+    assert!(error_at < active_at, "what was pending went out after the last words");
+}
