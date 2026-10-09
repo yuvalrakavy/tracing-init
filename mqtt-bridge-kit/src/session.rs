@@ -282,7 +282,13 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                     // WAIT: mqtt-request
                     client.unsubscribe(shared.topics.state_filter()).await.map(|()| None)
                 }
-                Step::Event(Some(PumpEvent::Disconnected | PumpEvent::SubAck { .. } | PumpEvent::Subscribing(_))) => Ok(None),
+                Step::Event(Some(
+                    PumpEvent::Disconnected
+                    | PumpEvent::SubAck { .. }
+                    | PumpEvent::Subscribing(_)
+                    | PumpEvent::Unsubscribing(_)
+                    | PumpEvent::UnsubAck { .. },
+                )) => Ok(None),
                 Step::Event(Some(PumpEvent::Ended(_))) => Ok(Some(SessionEnd::Ended { connected: None })),
                 // The pump went without a word — it panicked — so it never said the connection was
                 // lost: the broker snapshot is taken here (Claude's re-gate minor 14).
@@ -421,7 +427,13 @@ async fn read_back_acknowledged(shared: &Shared, incoming: &mut Incoming) -> Rea
             Ok(Some(PumpEvent::SubAck { pkid, granted })) if Some(pkid) == read_back => {
                 return if granted { ReadBack::Granted } else { ReadBack::Refused };
             }
-            Ok(Some(PumpEvent::SubAck { .. } | PumpEvent::Connected | PumpEvent::Disconnected)) => {}
+            Ok(Some(
+                PumpEvent::SubAck { .. }
+                | PumpEvent::Connected
+                | PumpEvent::Disconnected
+                | PumpEvent::Unsubscribing(_)
+                | PumpEvent::UnsubAck { .. },
+            )) => {}
             Ok(Some(PumpEvent::Publish(publish, received))) => handle(shared, &publish, received),
             Ok(Some(PumpEvent::Ended(_)) | None) => return ReadBack::Ended,
         }
@@ -747,7 +759,8 @@ fn route(shared: &Shared, topic: &str, publish: &Publish, now: Instant) {
                 shared.mailbox.post_config(&target, config);
             }
         },
-        Inbound::Unknown => malformed(format!("`{topic}` is no topic of this bridge's grammar"), blank()),
+        // A fixed bridge never subscribes to its `Status`: one arriving is no topic it reads.
+        Inbound::Status | Inbound::Unknown => malformed(format!("`{topic}` is no topic of this bridge's grammar"), blank()),
     }
 }
 

@@ -262,3 +262,35 @@ async fn a_poll_that_does_not_return_ends_the_session_within_twice_the_keep_aliv
         "every publish reached the broker: the flush was never blocked, so this test proves nothing ({delivered} of 64)"
     );
 }
+
+/// The pump forwards an UNSUBSCRIBE's packet id as it is written, and the broker's UNSUBACK with
+/// it: the multi-device host correlates a device's unsubscriptions by packet id before a
+/// successor bootstraps (multi-device spec §4.4 step 4 — an R2 extension of the pump).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsubscribe_and_its_unsuback_are_forwarded_with_their_packet_id() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(5);
+    let (client, events) = direct_client(&broker, "unsubscriber", 16);
+    let outage = Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5)));
+    let (_pump, mut incoming) = Pump::start(events, outage, stall_bound(Duration::from_secs(5)), || {});
+    let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no first CONNACK");
+    assert!(matches!(first, Some(PumpEvent::Connected)));
+    client.subscribe("t/a", QoS::AtLeastOnce).await.expect("subscribe");
+    client.unsubscribe("t/a").await.expect("unsubscribe");
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut unsubscribing = None;
+        loop {
+            match incoming.recv().await {
+                Some(PumpEvent::Unsubscribing(pkid)) => unsubscribing = Some(pkid),
+                Some(PumpEvent::UnsubAck { pkid, granted }) => return Some((unsubscribing, pkid, granted)),
+                None | Some(PumpEvent::Ended(_)) => return None,
+                Some(_) => {}
+            }
+        }
+    })
+    .await
+    .expect("the pump never forwarded an UNSUBACK")
+    .expect("the pump ended before the UNSUBACK");
+    assert_eq!(seen.0, Some(seen.1), "the UNSUBACK's packet id was not the UNSUBSCRIBE's: {seen:?}");
+    assert!(seen.2, "a granted UNSUBACK was forwarded as refused");
+}

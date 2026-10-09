@@ -639,3 +639,37 @@ fn a_re_held_write_expiring_during_its_conflict_read_is_abandoned() {
         "a re-held write expiring during its conflict read was not abandoned"
     );
 }
+
+/// A device's stop answers what waits for it (multi-device spec §4.4 step 2): every waiting state
+/// value is handed over to be answered — the momentary commands are the disconnect's — and the
+/// mailbox is left with none.
+#[test]
+fn a_stop_drains_the_waiting_values() {
+    let mailbox = Mailbox::new();
+    assert_eq!(mailbox.post_state(value("u1", "power", json!(true)), false), Posted::Held);
+    assert_eq!(mailbox.post_config("u1", Some(json!({"zone": 1}))), Posted::Held);
+    assert_eq!(mailbox.post_state(value("u2", "level", json!(4)), true), Posted::Held);
+    let drained = mailbox.drain_values();
+    let keys: Vec<(String, String)> = drained.iter().map(|v| (v.target.clone(), v.property.clone())).collect();
+    assert_eq!(keys, vec![("u1".to_owned(), "power".to_owned()), ("u2".to_owned(), "level".to_owned())]);
+    assert!(mailbox.drain_values().is_empty(), "a value was left waiting");
+    assert!(matches!(mailbox.take_held(), Some(Held::Config { .. })), "the drain took the config too");
+}
+
+/// A failed instance holds its property requests with no worker to take them (multi-device spec
+/// §4.3): the session sweeps those past their deadline, as a worker's take would drop them.
+#[test]
+fn a_sweep_drops_the_held_values_past_their_deadline() {
+    let mailbox = Mailbox::new();
+    let mut past = value("u1", "power", json!(true));
+    past.deadline = Some(Instant::now() - Duration::from_millis(1));
+    let mut later = value("u1", "level", json!(3));
+    later.deadline = Some(Instant::now() + Duration::from_secs(60));
+    mailbox.post_state(past, false);
+    mailbox.post_state(later, false);
+    assert_eq!(mailbox.sweep_expired(), 1, "the value past its deadline was not swept");
+    assert_eq!(mailbox.take_expired(), 1, "the swept value was not counted");
+    let left = held_values(&mailbox);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].values.iter().map(|v| v.property.as_str()).collect::<Vec<_>>(), vec!["level"]);
+}

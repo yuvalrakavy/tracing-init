@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rumqttc::v5::mqttbytes::v5::{Packet, Publish, SubscribeReasonCode};
+use rumqttc::v5::mqttbytes::v5::{Packet, Publish, SubscribeReasonCode, UnsubAckReason};
 use rumqttc::v5::{Event, EventLoop};
 use rumqttc::Outgoing;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -70,6 +70,17 @@ pub enum PumpEvent {
         /// The SUBSCRIBE's packet id.
         pkid: u16,
         /// Whether every filter was granted.
+        granted: bool,
+    },
+    /// An UNSUBSCRIBE was written, with its packet id: the multi-device host correlates a device's
+    /// unsubscriptions by it (multi-device spec §4.4 step 4; an R2 extension of the pump).
+    Unsubscribing(u16),
+    /// The broker answered an unsubscription: its packet id, and whether every filter's reason was
+    /// a success (`NoSubscriptionExisted` counts as one: the filter is gone either way).
+    UnsubAck {
+        /// The UNSUBSCRIBE's packet id.
+        pkid: u16,
+        /// Whether every filter's reason was a success.
         granted: bool,
     },
     /// The DISCONNECT the session asked for was written: the session's end.
@@ -459,6 +470,11 @@ impl Pump {
                 Event::Incoming(Packet::SubAck(ack)) => PumpEvent::SubAck {
                     pkid: ack.pkid,
                     granted: ack.return_codes.iter().all(|code| matches!(code, SubscribeReasonCode::Success(_))),
+                },
+                Event::Outgoing(Outgoing::Unsubscribe(pkid)) => PumpEvent::Unsubscribing(pkid),
+                Event::Incoming(Packet::UnsubAck(ack)) => PumpEvent::UnsubAck {
+                    pkid: ack.pkid,
+                    granted: ack.reasons.iter().all(|r| matches!(r, UnsubAckReason::Success | UnsubAckReason::NoSubscriptionExisted)),
                 },
                 Event::Outgoing(Outgoing::Disconnect) => {
                     // Read on until the broker closes the connection: closed with its acks still

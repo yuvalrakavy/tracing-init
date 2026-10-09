@@ -236,3 +236,37 @@ fn a_read_back_is_never_complete_with_a_partial_map() {
     }
     assert_eq!(torn, 0, "a read-back read as complete with a partial map: {torn} torn reads");
 }
+
+/// Several devices' reports share the session's readiness signal (multi-device spec §4.7): a report
+/// in any of them wakes the one session that serves them all.
+#[tokio::test]
+async fn reports_sharing_a_signal_wake_one_session() {
+    let ready = Arc::new(Notify::new());
+    let (a, b) = (Reports::with_ready(ready.clone()), Reports::with_ready(ready.clone()));
+    b.status(LinkStatus::Connecting);
+    let woke = tokio::time::timeout(std::time::Duration::from_secs(1), ready.notified()).await;
+    assert!(woke.is_ok(), "a report in the second device's reports did not wake the shared signal");
+    assert!(b.has_untaken() && !a.has_untaken(), "what waits is not told per device");
+    let _ = b.take();
+    assert!(!b.has_untaken(), "a take left something waiting");
+}
+
+/// The owner's healing of its slot (multi-device spec §4.5): a foreign write to its `Status` or a
+/// target's `State` makes it publish its current value again — once however many writes came
+/// (coalesced) — and a target it never reported is left as it is.
+#[test]
+fn a_reasserted_slot_is_published_again_once() {
+    let reports = Reports::new();
+    assert!(!reports.reassert_status(), "a status never reported was reasserted");
+    reports.status(LinkStatus::Connected);
+    reports.state("t1", values(&[("power", json!(true))]), false);
+    let _ = reports.take();
+    assert!(reports.reassert_status() && reports.reassert_status(), "the status was not reasserted");
+    assert!(reports.reassert_state("t1") && reports.reassert_state("t1"), "a reported target was not reasserted");
+    assert!(!reports.reassert_state("t9"), "a target never reported was reasserted");
+    let changes = reports.take();
+    assert_eq!(changes.status, Some(LinkStatus::Connected), "the reasserted status was not published again");
+    assert_eq!(changes.states.len(), 1, "two reassertions of one target were not coalesced: {:?}", changes.states);
+    assert_eq!(serde_json::from_slice::<Value>(&changes.states[0].1).unwrap(), json!({"power": true}));
+    assert_eq!(reports.take(), Changes::default(), "a reassertion was published twice");
+}

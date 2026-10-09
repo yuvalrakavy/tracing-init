@@ -189,7 +189,9 @@ struct State {
 #[derive(Debug)]
 pub struct Reports {
     state: Mutex<State>,
-    ready: Notify,
+    /// Told after every report; one per session — every device of a multi-device host shares it
+    /// ([`with_ready`](Reports::with_ready)), so one wait serves them all.
+    ready: Arc<Notify>,
     /// When the bridge started: the read-back is what the bridge knew then.
     epoch: Instant,
 }
@@ -239,6 +241,12 @@ fn known(state: &State) -> BTreeMap<String, PropertyMap> {
 impl Reports {
     /// An empty model: nothing reported, no read-back.
     pub fn new() -> Arc<Reports> {
+        Reports::with_ready(Arc::new(Notify::new()))
+    }
+
+    /// An empty model whose reports tell `ready` — the session's one signal, shared by every device
+    /// of a multi-device host (multi-device spec §4.7).
+    pub fn with_ready(ready: Arc<Notify>) -> Arc<Reports> {
         Arc::new(Reports {
             state: Mutex::new(
                 "reports-lock",
@@ -259,9 +267,60 @@ impl Reports {
                     written: BTreeMap::new(),
                 },
             ),
-            ready: Notify::new(),
+            ready,
             epoch: Instant::now(),
         })
+    }
+
+    /// The owner of a configured instance saw a foreign write to its `Status` (another process's
+    /// tag, or a retraction): the current status is published again, once however many writes came
+    /// — the flag coalesces (multi-device spec §4.5). Whether there was a status to reassert.
+    /// Never waits.
+    pub fn reassert_status(&self) -> bool {
+        let reasserted = {
+            let mut state = self.locked();
+            state.status_changed |= state.status.is_some();
+            state.status.is_some()
+        };
+        if reasserted {
+            self.ready.notify_one();
+        }
+        reasserted
+    }
+
+    /// The same for one target's `State`: published again, once, if the model holds the target; a
+    /// target never reported (or removed) is left as it is (multi-device spec §4.5). Whether there
+    /// was a state to reassert. Never waits.
+    pub fn reassert_state(&self, target: &str) -> bool {
+        let reasserted = {
+            let mut state = self.locked();
+            let held = state.targets.contains_key(target);
+            if held && !state.changed.iter().any(|t| t == target) {
+                state.changed.push(target.to_owned());
+            }
+            held
+        };
+        if reasserted {
+            self.ready.notify_one();
+        }
+        reasserted
+    }
+
+    /// Whether anything waits for the session: a changed status or state, a queued message, an
+    /// answer. Never waits.
+    pub fn has_untaken(&self) -> bool {
+        let state = self.locked();
+        state.status_changed
+            || !state.changed.is_empty()
+            || !state.errors.items.is_empty()
+            || !state.events.items.is_empty()
+            || !state.answers.0.is_empty()
+            || !state.answers.1.is_empty()
+    }
+
+    /// The link status, if one has been reported.
+    pub fn current_status(&self) -> Option<LinkStatus> {
+        self.locked().status
     }
 
     fn locked(&self) -> lock_order::sync::MutexGuard<'_, State> {

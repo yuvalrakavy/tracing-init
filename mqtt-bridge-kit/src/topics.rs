@@ -42,6 +42,9 @@ pub enum Inbound {
         /// The target.
         target: String,
     },
+    /// `Status/{instance}`: a configured instance's own status, as its read-back subscription shows
+    /// later writes to it (multi-device spec §4.5).
+    Status,
     /// Anything else the subscriptions let through: a malformed topic.
     Unknown,
 }
@@ -167,6 +170,12 @@ impl Topics {
         format!("{}/#", self.lane("State"))
     }
 
+    /// `{Root}/State/{instance}/+`: a configured instance's read-back of its targets' `State`
+    /// (multi-device spec §4.3, S1), kept for the life of its ownership.
+    pub fn state_target_filter(&self) -> String {
+        format!("{}/+", self.lane("State"))
+    }
+
     /// `{Root}/Desired/{instance}/{target}/{property}`.
     pub fn desired(&self, target: &str, property: &str) -> String {
         format!("{}/{target}/{property}", self.lane("Desired"))
@@ -200,6 +209,7 @@ impl Topics {
             ("Command", []) => Inbound::Command,
             ("Config", [target]) if ok(target) => Inbound::Config { target: (*target).to_owned() },
             ("State", [target]) if ok(target) => Inbound::State { target: (*target).to_owned() },
+            ("Status", []) => Inbound::Status,
             _ => Inbound::Unknown,
         }
     }
@@ -258,6 +268,17 @@ mod tests {
         ] {
             assert_eq!(t.parse(unknown), Inbound::Unknown, "{unknown}");
         }
+    }
+
+    /// A configured instance's read-back subscription (multi-device spec §4.3, S1): its targets'
+    /// `State` one level deep and its `Status`, both told apart on arrival.
+    #[test]
+    fn a_configured_instances_read_back_lanes() {
+        let t = Topics::new("IR", "salon").unwrap();
+        assert_eq!(t.state_target_filter(), "IR/State/salon/+");
+        assert_eq!(t.parse("IR/Status/salon"), Inbound::Status);
+        assert_eq!(t.parse("IR/Status/salon/x"), Inbound::Unknown);
+        assert_eq!(t.parse("IR/Status/other"), Inbound::Unknown);
     }
 
     #[test]

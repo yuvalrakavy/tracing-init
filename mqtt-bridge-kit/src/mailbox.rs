@@ -1038,6 +1038,36 @@ impl Mailbox {
     pub fn take_expired(&self) -> u32 {
         std::mem::take(&mut self.locked().expired)
     }
+
+    /// Every state value waiting, taken out, in order — for a device's stop, which answers each
+    /// (multi-device spec §4.4 step 2: `superseded` on a Config change, `refused` otherwise). Configs
+    /// stay; the momentary commands and reads are [`disconnected`](Self::disconnected)'s. Never
+    /// waits.
+    pub fn drain_values(&self) -> Vec<StateValue> {
+        let mut inner = self.locked();
+        let mut values = Vec::new();
+        inner.pending.retain_mut(|entry| match entry {
+            Entry::State { value, .. } => {
+                values.push(value.clone());
+                false
+            }
+            _ => true,
+        });
+        values
+    }
+
+    /// Drop the state values held past their deadline — for an instance with no worker to take
+    /// them (a failed construction, multi-device spec §4.3), which would otherwise hold them for
+    /// good. Counted as expired, as a take counts them. Returns how many. Never waits.
+    pub fn sweep_expired(&self) -> usize {
+        let now = Instant::now();
+        let mut inner = self.locked();
+        let before = inner.pending.len();
+        inner.pending.retain(|entry| !matches!(entry, Entry::State { value, .. } if value.expired(now)));
+        let swept = before - inner.pending.len();
+        inner.expired += swept as u32;
+        swept
+    }
 }
 
 #[cfg(test)]
