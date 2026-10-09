@@ -277,9 +277,26 @@ pub struct Incoming {
     progress: Arc<tokio::sync::Notify>,
     /// The session asked for the DISCONNECT the pump will see: it then reads on until the close.
     disconnect_asked: Arc<AtomicBool>,
+    /// The pump has read the broker's CONNACK.
+    accepted: Arc<AtomicBool>,
+    /// The pump has ended — returned, panicked or aborted — and its event loop with it.
+    ended: Arc<AtomicBool>,
 }
 
 impl Incoming {
+    /// Whether the pump holds a connection the broker accepted: its CONNACK read — whether or not
+    /// the session has taken it yet — and the pump not ended (third confirming reviews, Claude
+    /// minor 1).
+    pub fn connected(&self) -> bool {
+        self.accepted.load(Ordering::SeqCst) && !self.ended()
+    }
+
+    /// Whether the pump has ended: nothing more will be written or acknowledged. Its end wakes a
+    /// wait on [`progress`](Self::progress) (Claude minor 2).
+    pub fn ended(&self) -> bool {
+        self.ended.load(Ordering::SeqCst)
+    }
+
     /// How many QoS 1 publishes the broker has not acknowledged yet, as of the pump's last event.
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::SeqCst)
@@ -340,14 +357,18 @@ impl Pump {
         let written = Arc::new(AtomicU64::new(0));
         let progress = Arc::new(tokio::sync::Notify::new());
         let disconnect_asked = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
         let counts = Counts {
             inflight: inflight.clone(),
             written: written.clone(),
             progress: progress.clone(),
             disconnect_asked: disconnect_asked.clone(),
+            accepted: accepted.clone(),
+            ended: ended.clone(),
         };
         let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), counts, outage, stall, on_lost).in_current_span());
-        (Pump { task }, Incoming { rx, backlog, inflight, written, progress, disconnect_asked })
+        (Pump { task }, Incoming { rx, backlog, inflight, written, progress, disconnect_asked, accepted, ended })
     }
 
     async fn run(
@@ -415,6 +436,7 @@ impl Pump {
                 Event::Incoming(Packet::ConnAck(_)) => {
                     outage.connected();
                     connected = true;
+                    counts.accepted.store(true, Ordering::SeqCst);
                     PumpEvent::Connected
                 }
                 Event::Incoming(Packet::Publish(publish)) => {
@@ -447,16 +469,29 @@ impl Pump {
     }
 }
 
-/// The pump's counts and signals, shared with the session's [`Incoming`].
+/// The pump's counts and signals, shared with the session's [`Incoming`]. Dropped with the pump's
+/// task however it ends — returned, panicked or aborted, polled or not — it says the pump ended,
+/// and wakes a wait on its progress.
 struct Counts {
     inflight: Arc<AtomicUsize>,
     written: Arc<AtomicU64>,
     progress: Arc<tokio::sync::Notify>,
     disconnect_asked: Arc<AtomicBool>,
+    accepted: Arc<AtomicBool>,
+    ended: Arc<AtomicBool>,
 }
 
-/// After the DISCONNECT, how long the pump reads on for the broker's close.
-const LINGER_BOUND: Duration = Duration::from_secs(1);
+impl Drop for Counts {
+    fn drop(&mut self) {
+        self.ended.store(true, Ordering::SeqCst);
+        self.progress.notify_waiters();
+    }
+}
+
+/// After the DISCONNECT, how long the pump reads on for the broker's close: within what the
+/// session's flush keeps of its bound for the DISCONNECT and the close (third confirming reviews,
+/// Claude minor 3: 1 s here and 1.5 s of ack wait overran the flush's 2 s).
+pub(crate) const LINGER_BOUND: Duration = Duration::from_millis(500);
 
 /// Poll the event loop after the DISCONNECT was written until the broker closes the connection —
 /// every ack it sent read, so the close is orderly — or [`LINGER_BOUND`]: past it, one INFO

@@ -48,6 +48,14 @@ use crate::wire::{self, ErrorReport, Reason};
 /// The bound on the shutdown's flush: `Active=false` and DISCONNECT, written.
 pub const FLUSH_BOUND: Duration = Duration::from_secs(2);
 
+/// What the flush keeps of its bound, past the ack wait, for the DISCONNECT's write and the
+/// pump's linger after it, until the broker closes ([`crate::pump::LINGER_BOUND`], 500 ms): the
+/// ack wait ends this long before the bound (third confirming reviews, Claude minor 3).
+const DISCONNECT_PART: Duration = Duration::from_millis(750);
+
+// The linger and the DISCONNECT's write fit in their part, with 250 ms for the write.
+const _: () = assert!(crate::pump::LINGER_BOUND.as_millis() + 250 <= DISCONNECT_PART.as_millis());
+
 /// How long the first CONNACK waits for the read-back's SUBACK before it subscribes to the
 /// requests without it (WARN `read_back_incomplete`).
 pub const READ_BACK_WAIT: Duration = Duration::from_secs(5);
@@ -309,7 +317,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                 return SessionEnd::Ended { connected: accepted };
             }
             Ok(Some(SessionEnd::Shutdown)) => {
-                flush(shared, &client, &mut incoming, accepted.is_some(), batch).await;
+                flush(shared, &client, &mut incoming, batch).await;
                 return SessionEnd::Shutdown;
             }
             // The event loop is gone (the pump ended): the next event says so.
@@ -517,16 +525,18 @@ impl Batch {
 /// The shutdown's flush: `Active=false` and DISCONNECT, polling until it is written, within
 /// [`FLUSH_BOUND`]. Skipped when the session holds no connection: the last will says it then.
 /// `batch` is what the stop cut short of the session's last batch: published with what is pending.
-async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, connected: bool, mut batch: Batch) {
+async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, mut batch: Batch) {
     // A connection the broker accepted is one to flush on, whether or not its recovery has lasted
     // long enough to close the outage episode (second confirming review 2: a stop within the
-    // stability window skipped every answer).
-    if !connected {
+    // stability window skipped every answer). The pump's word, not the session's: a CONNACK the
+    // pump has read counts though the stop won the session's select over it, and a connection the
+    // pump has lost does not (third confirming reviews, Claude minor 1).
+    if !incoming.connected() {
         info!(kind = "bridge_shutdown_cut", "The broker is out of reach at shutdown; the last will says Active=false");
         return;
     }
     // The ack wait's deadline leaves the DISCONNECT and the close their part of the bound.
-    let ack_deadline = Instant::now() + FLUSH_BOUND - Duration::from_millis(500);
+    let ack_deadline = Instant::now() + FLUSH_BOUND - DISCONNECT_PART;
     let flushed = async {
         // What still waits for the device will not run: refused, on Error and on its response
         // topic; then what is pending — Status, Errors, replies — then the last words (re-gate
@@ -544,13 +554,16 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, c
         // written by the pump — a watermark, so the pump's count cannot be read stale before it
         // has taken the last ones — and none of them unacknowledged: the broker has the answers.
         // Past the deadline the DISCONNECT goes anyway, best effort (confirming review N1, second
-        // confirming review minors).
+        // confirming review minors). The pump's end ends the wait too: nothing more will be
+        // written or acknowledged (third confirming reviews, Claude minor 2) — a publish rumqttc
+        // refuses as it writes it (larger than the broker's maximum packet size) among the ways:
+        // it never counts as written, and it fails rumqttc's poll, which ends the pump (minor 4).
         let acked = async {
             loop {
                 let progress = incoming.progress();
                 tokio::pin!(progress);
                 progress.as_mut().enable();
-                if incoming.written() >= shared.enqueued.load(Ordering::SeqCst) && incoming.inflight() == 0 {
+                if incoming.ended() || (incoming.written() >= shared.enqueued.load(Ordering::SeqCst) && incoming.inflight() == 0) {
                     return;
                 }
                 // WAIT: mqtt-pump-queue
@@ -565,13 +578,16 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, c
                 "The broker did not acknowledge the shutdown's publishes in time; disconnecting anyway"
             );
         }
+        if incoming.ended() {
+            return Err("the connection ended".to_owned());
+        }
         incoming.expect_disconnect();
         // WAIT: mqtt-request
-        client.disconnect().await?;
+        client.disconnect().await.map_err(|e| e.to_string())?;
         loop {
             // WAIT: mqtt-pump-queue
             match incoming.recv().await {
-                Some(PumpEvent::Disconnected) | Some(PumpEvent::Ended(_)) | None => return Ok::<(), Failed>(()),
+                Some(PumpEvent::Disconnected) | Some(PumpEvent::Ended(_)) | None => return Ok::<(), String>(()),
                 Some(_) => {}
             }
         }
@@ -579,7 +595,12 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, c
     // WAIT: shutdown-flush
     match tokio::time::timeout(FLUSH_BOUND, flushed).await {
         Ok(Ok(())) => debug!("Active=false and DISCONNECT written"),
-        _ => info!(
+        Ok(Err(error)) => info!(
+            kind = "bridge_shutdown_cut",
+            error = %error,
+            "The connection ended before the shutdown's DISCONNECT; the last will says Active=false"
+        ),
+        Err(_) => info!(
             kind = "bridge_shutdown_cut",
             bound_ms = FLUSH_BOUND.as_millis() as u64,
             "The shutdown's flush ran out its bound; the last will says Active=false"

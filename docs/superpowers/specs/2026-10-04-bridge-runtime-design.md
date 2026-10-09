@@ -377,15 +377,22 @@ commands are refused, and reads are dropped.
   gate's minor 4: documented) — then publish what is pending (`Status`, `Error`, replies; a
   watchdog's verdict included), then `Active=false`; then it waits until every QoS 1 publish the
   session enqueued has been written and acknowledged — a watermark, not the momentary in-flight
-  count — before the DISCONNECT, until 500 ms before the flush's bound; acks that never come do
+  count — before the DISCONNECT, until 750 ms before the flush's bound, or until the pump ends
+  (the connection lost: nothing more will be written or acknowledged — a publish rumqttc refuses
+  as it writes it, larger than the broker's maximum packet size, fails rumqttc's poll and ends the
+  pump too; third confirming reviews, Claude minors 2 and 4); acks that never come do
   not keep the DISCONNECT back past that, it goes anyway, best effort (INFO `bridge_shutdown_cut`;
   the second confirming review's minor 2). After the session's own DISCONNECT — not one rumqttc
   sends on a protocol error (its minor 3) — the pump reads on until the broker closes the
-  connection (1 s at most; past it, INFO `bridge_shutdown_cut`): closed with the broker's acks unread, the socket was reset, and the
+  connection (500 ms at most; past it, INFO `bridge_shutdown_cut`): closed with the broker's acks unread, the socket was reset, and the
   broker dropped what it had not read yet — the last replies, `Active=false`, the DISCONNECT
-  (confirming review N1). All within the flush's bound (re-gate R15). The flush runs on any
+  (confirming review N1). All within the flush's bound (re-gate R15): the DISCONNECT's write and
+  the linger fit in the 750 ms the ack wait leaves (third confirming reviews, Claude minor 3: 1.5 s
+  of ack wait and 1 s of linger overran the 2 s bound). The flush runs on any
   connection the broker accepted — the outage episode's stability window has no say in it (second
-  confirming review 2: a stop soon after a reconnect skipped every answer). A cut-off command's error says it was cut off while it ran, so the device
+  confirming review 2: a stop soon after a reconnect skipped every answer) — as the pump says it:
+  a CONNACK the pump has read counts though the stop won the session's select over it, and a
+  connection the pump has lost does not (third confirming reviews, Claude minor 1). A cut-off command's error says it was cut off while it ran, so the device
   may or may not have done it; a waiting one's, that it was refused before it ran. **Exactly one
   answer per command:** whoever takes the command out of flight answers it — the worker when its
   operation ends (`Mailbox::command_done_then`, which queues the worker's answer under the same

@@ -326,7 +326,7 @@ guard       = "assume"
 [[control]]
 name        = "no_active_false_at_shutdown"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    if !connected {
+anchor      = '''    if !incoming.connected() {
 '''
 replacement = '''    if true {
 '''
@@ -2740,8 +2740,8 @@ guard       = "replacement_withdraws_reheld"
 [[control]]
 name        = "the_flush_skips_an_unstable_connection"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    if !connected {'''
-replacement = '''    if !connected || shared.outage.down() {'''
+anchor      = '''    if !incoming.connected() {'''
+replacement = '''    if !incoming.connected() || shared.outage.down() {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_stop_right_after_a_reconnect_answers_what_it_refuses", "--exact"]
 expect_text = '''a stop inside the reconnect's stability window answered nothing'''
@@ -2751,8 +2751,8 @@ guard       = "flush_on_accepted_connection"
 [[control]]
 name        = "the_flush_waits_on_the_momentary_count"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                if incoming.written() >= shared.enqueued.load(Ordering::SeqCst) && incoming.inflight() == 0 {'''
-replacement = '''                if incoming.inflight() == 0 {'''
+anchor      = '''                if incoming.ended() || (incoming.written() >= shared.enqueued.load(Ordering::SeqCst) && incoming.inflight() == 0) {'''
+replacement = '''                if incoming.ended() || incoming.inflight() == 0 {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_waits_for_its_own_publishes_to_be_acknowledged", "--exact"]
 expect_text = '''the DISCONNECT went out before the flush's publishes were acknowledged'''
@@ -2778,7 +2778,7 @@ anchor      = '''                "The broker did not acknowledge the shutdown's 
         }'''
 replacement = '''                "The broker did not acknowledge the shutdown's publishes in time; disconnecting anyway"
             );
-            return Ok::<(), Failed>(());
+            return Ok::<(), String>(());
         }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_waits_for_its_own_publishes_to_be_acknowledged", "--exact"]
@@ -2873,3 +2873,49 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_stop_mid_batch_still_publishes_the_batchs_reply", "--exact"]
 expect_text = '''a State of the batch the stop cut short was lost, or published twice'''
 guard       = "batch_sending_kept"
+
+# Third confirming reviews (Claude minor 1): the flush asks the pump whether there is a connection.
+[[control]]
+name        = "the_flush_asks_the_session"
+file        = "mqtt-bridge-kit/src/pump.rs"
+anchor      = '''                    counts.accepted.store(true, Ordering::SeqCst);'''
+replacement = '''                    let _ = &counts.accepted;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_stop_ahead_of_a_connack_the_pump_has_read_still_flushes", "--exact"]
+expect_text = '''the stop skipped the flush of a connection whose CONNACK the pump had read'''
+guard       = "flush_pump_connected"
+
+# Third confirming reviews (Claude minors 2 and 4): the ack wait ends with the pump.
+[[control]]
+name        = "the_ack_wait_outlives_the_pump"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''                if incoming.ended() || (incoming.written() >= shared.enqueued.load(Ordering::SeqCst) && incoming.inflight() == 0) {'''
+replacement = '''                if incoming.written() >= shared.enqueued.load(Ordering::SeqCst) && incoming.inflight() == 0 {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_ack_wait_ends_with_the_connection", "--exact"]
+expect_text = '''the ack wait outlived its connection'''
+guard       = "ack_wait_ends_with_pump"
+
+# The same: the pump's end wakes the wait.
+[[control]]
+name        = "the_pumps_end_wakes_nobody"
+file        = "mqtt-bridge-kit/src/pump.rs"
+anchor      = '''        self.ended.store(true, Ordering::SeqCst);
+        self.progress.notify_waiters();'''
+replacement = '''        self.ended.store(true, Ordering::SeqCst);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_ack_wait_ends_with_the_connection", "--exact"]
+expect_text = '''the ack wait outlived its connection'''
+guard       = "pump_end_wakes_ack_wait"
+
+# Third confirming reviews (Claude minor 3): the ack wait leaves the DISCONNECT and the linger their
+# part of the flush's bound.
+[[control]]
+name        = "the_linger_overruns_the_flush"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''    let ack_deadline = Instant::now() + FLUSH_BOUND - DISCONNECT_PART;'''
+replacement = '''    let ack_deadline = Instant::now() + FLUSH_BOUND - Duration::from_millis(250);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_ack_wait_and_the_linger_fit_in_the_flushs_bound", "--exact"]
+expect_text = '''the flush ran out its bound: its ack wait and linger do not fit in it'''
+guard       = "flush_parts_fit"

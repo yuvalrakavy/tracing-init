@@ -174,7 +174,7 @@ async fn the_flush_publishes_what_is_pending_before_its_last_words() {
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     shared.reports.error(crate::wire::ErrorReport::new(crate::wire::Reason::Rejected, "pending at the stop").target(Some("t1")));
-    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, true, Batch::default())).await;
+    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, Batch::default())).await;
     assert!(flushed.is_ok(), "the flush did not end");
     let (error, active) = (shared.topics.error(), shared.topics.active());
     assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&active).is_empty()).await, "the flush never said Active=false");
@@ -205,7 +205,7 @@ async fn the_flush_publishes_answers_before_state() {
     let refusal = crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop").target(Some("t1"));
     let reply = Outbound { topic: Some("Store/replies/flush".into()), payload: b"{}".to_vec(), correlation: None };
     shared.reports.refused(vec![refusal], vec![reply]);
-    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, true, Batch::default())).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, Batch::default())).await;
     let error = shared.topics.error();
     assert!(
         broker
@@ -316,7 +316,7 @@ async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
         vec![Outbound { topic: Some("Store/replies/held".into()), payload: b"{}".to_vec(), correlation: None }],
     );
     let disconnected = |b: &FakeBroker| b.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Disconnected));
-    let flushing = flush(&shared, &client, &mut incoming, true, Batch::default());
+    let flushing = flush(&shared, &client, &mut incoming, Batch::default());
     tokio::pin!(flushing);
     // Half a second in, the acks still held: no DISCONNECT yet.
     let early = tokio::time::timeout(Duration::from_millis(500), flushing.as_mut()).await;
@@ -375,4 +375,87 @@ async fn a_stop_mid_batch_still_publishes_the_batchs_reply() {
     let states = |b: &FakeBroker| b.received().iter().filter(|r| r.topic.starts_with(&prefix)).count();
     broker.wait_until(Duration::from_secs(2), |b| states(b) >= 400).await;
     assert_eq!(states(&broker), 400, "a State of the batch the stop cut short was lost, or published twice");
+}
+
+/// A stop that wins the session's select over a CONNACK the pump has already read still flushes:
+/// the pump's own word decides whether there is a connection to flush on (third confirming
+/// reviews, Claude minor 1: the session's had not taken the CONNACK yet, and skipped the flush).
+#[tokio::test]
+async fn a_stop_ahead_of_a_connack_the_pump_has_read_still_flushes() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(5);
+    let shared = shared_for(&broker);
+    let (stop, mut stopped) = watch::channel(false);
+    let running = session(&shared, &mut stopped);
+    tokio::pin!(running);
+    // Polled once: the pump starts, and the session waits on it. Not polled again until the stop,
+    // so the CONNACK the pump reads meanwhile waits on the session's queue.
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(running.as_mut(), cx).is_pending(), "the session ended before its connection");
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(broker.wait_until(Duration::from_secs(5), |b| b.accepted() >= 1).await, "the broker never accepted the connection");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.send(true).expect("the session is gone");
+    let ended = tokio::time::timeout(Duration::from_secs(5), running).await;
+    assert!(matches!(ended, Ok(SessionEnd::Shutdown)), "the session did not end with the stop");
+    let active = shared.topics.active();
+    assert!(
+        broker
+            .wait_until(Duration::from_secs(1), |b| b.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Disconnected)))
+            .await,
+        "the stop skipped the flush of a connection whose CONNACK the pump had read: no DISCONNECT"
+    );
+    assert!(!broker.received_on(&active).is_empty(), "the flush said no Active=false");
+}
+
+/// The flush's ack wait ends when the connection does: the pump's end, not only the wait's
+/// deadline (third confirming reviews, Claude minor 2: a connection lost under the stop held the
+/// shutdown to the ack wait's deadline). It covers a publish rumqttc refuses as it writes it — one
+/// larger than the broker's maximum packet size — too: rumqttc fails the poll, and the pump ends
+/// (Claude minor 4).
+#[tokio::test]
+async fn the_ack_wait_ends_with_the_connection() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(5);
+    let shared = shared_for(&broker);
+    let (client, events) = client(&shared);
+    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
+    let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
+    assert!(matches!(first, Some(PumpEvent::Connected)));
+    broker.hold_acks();
+    shared.reports.refused(vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")], Vec::new());
+    let started = Instant::now();
+    let dropping = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        broker.drop_connection();
+    };
+    let (flushed, ()) =
+        tokio::join!(tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, Batch::default())), dropping);
+    assert!(flushed.is_ok(), "the flush did not end");
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(800), "the ack wait outlived its connection, to its deadline: the flush took {took:?}");
+}
+
+/// The ack wait, the DISCONNECT and the linger fit in the flush's bound: with a broker that stops
+/// reading — no ack, no close after the DISCONNECT — the flush ends on the linger's own bound, not
+/// cut by its own (third confirming reviews, Claude minor 3: 1.5 s of ack wait and 1 s of linger
+/// in a 2 s bound).
+#[tokio::test]
+async fn the_ack_wait_and_the_linger_fit_in_the_flushs_bound() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(5);
+    let shared = shared_for(&broker);
+    let (client, events) = client(&shared);
+    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
+    let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
+    assert!(matches!(first, Some(PumpEvent::Connected)));
+    let capture = crate::test_support::Capture::start();
+    broker.stop_reading();
+    shared.reports.refused(vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")], Vec::new());
+    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, Batch::default())).await;
+    assert!(flushed.is_ok(), "the flush did not end");
+    let cut = capture.records().into_iter().filter_map(|r| r.field("message").map(str::to_owned)).find(|m| m.contains("ran out its bound"));
+    assert!(cut.is_none(), "the flush ran out its bound: its ack wait and linger do not fit in it ({cut:?})");
 }

@@ -59,6 +59,8 @@ fn requests_left_unread_when_the_session_ends_are_reported() {
         written: Arc::new(AtomicU64::new(0)),
         progress: Arc::new(tokio::sync::Notify::new()),
         disconnect_asked: Arc::new(AtomicBool::new(false)),
+        accepted: Arc::new(AtomicBool::new(false)),
+        ended: Arc::new(AtomicBool::new(false)),
     });
     let discarded = log.of_kind("mqtt_commands_discarded");
     assert!(
