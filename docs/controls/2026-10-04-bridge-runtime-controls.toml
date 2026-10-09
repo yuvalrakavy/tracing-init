@@ -53,6 +53,12 @@
 # mutated `command_done`, which the worker no longer calls: retargeted to `command_done_then`,
 # RED). Every one of the 195 rows is RED.
 #
+# The final gate (Codex; 2026-10-09): the restore removed from R1, its 17 rows with it; 5 rows
+# added, 9 re-anchored, 1 retargeted; 183 in all. The batch at def8915: 14 RED. The whole table at
+# def8915: 182 RED, 1 GREEN (`the_flush_drops_what_is_pending`: its scenario saw a refusal, and
+# the stop's refusals now go out apart from the pending reports; retargeted in 1783331 to a test of
+# the flush itself, RED). Every one of the 183 rows is RED.
+#
 # Failing first, beyond these rows: the read-back scenario
 # (`the_outage_conflict_after_a_bridge_restart_uses_the_read_back`) failed against the first
 # build — "no Error said the request was superseded: []" — because the session published the
