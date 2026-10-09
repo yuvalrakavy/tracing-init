@@ -481,6 +481,8 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, c
         info!(kind = "bridge_shutdown_cut", "The broker is out of reach at shutdown; the last will says Active=false");
         return;
     }
+    // The ack wait's deadline leaves the DISCONNECT and the close their part of the bound.
+    let ack_deadline = Instant::now() + FLUSH_BOUND - Duration::from_millis(500);
     let flushed = async {
         // What still waits for the device will not run: refused, on Error and on its response
         // topic; then what is pending — Status, Errors, replies — then the last words (re-gate
@@ -490,12 +492,32 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, c
         crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);
         publish_changes(shared, client, shared.reports.take(), true).await;
         emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
-        // Every QoS 1 publish acknowledged before the DISCONNECT: proof the broker has the answers,
-        // and nothing of the broker's left unread at the close (confirming review N1). Bounded by
-        // the flush's bound.
-        while incoming.written() < shared.enqueued.load(Ordering::SeqCst) || incoming.inflight() > 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        // Before the DISCONNECT, until the ack wait's deadline: every publish this session enqueued
+        // written by the pump — a watermark, so the pump's count cannot be read stale before it
+        // has taken the last ones — and none of them unacknowledged: the broker has the answers.
+        // Past the deadline the DISCONNECT goes anyway, best effort (confirming review N1, second
+        // confirming review minors).
+        let acked = async {
+            loop {
+                let progress = incoming.progress();
+                tokio::pin!(progress);
+                progress.as_mut().enable();
+                if incoming.written() >= shared.enqueued.load(Ordering::SeqCst) && incoming.inflight() == 0 {
+                    return;
+                }
+                // WAIT: mqtt-pump-queue
+                progress.await;
+            }
+        };
+        // WAIT: shutdown-flush
+        if tokio::time::timeout_at(ack_deadline.into(), acked).await.is_err() {
+            info!(
+                kind = "bridge_shutdown_cut",
+                unacknowledged = incoming.inflight(),
+                "The broker did not acknowledge the shutdown's publishes in time; disconnecting anyway"
+            );
         }
+        incoming.expect_disconnect();
         // WAIT: mqtt-request
         client.disconnect().await?;
         loop {

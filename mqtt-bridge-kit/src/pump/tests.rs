@@ -52,7 +52,14 @@ fn requests_left_unread_when_the_session_ends_are_reported() {
         let publish = Publish::new("t", QoS::AtLeastOnce, "x", None);
         assert!(tx.send(PumpEvent::Publish(publish, std::time::Instant::now())).is_ok());
     }
-    drop(Incoming { rx, backlog, inflight: Arc::new(AtomicUsize::new(0)), written: Arc::new(AtomicU64::new(0)) });
+    drop(Incoming {
+        rx,
+        backlog,
+        inflight: Arc::new(AtomicUsize::new(0)),
+        written: Arc::new(AtomicU64::new(0)),
+        progress: Arc::new(tokio::sync::Notify::new()),
+        disconnect_asked: Arc::new(AtomicBool::new(false)),
+    });
     let discarded = log.of_kind("mqtt_commands_discarded");
     assert!(
         discarded.len() == 1 && discarded[0].level == tracing::Level::WARN && discarded[0].field("discarded") == Some("1000"),

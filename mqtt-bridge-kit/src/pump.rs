@@ -273,6 +273,10 @@ pub struct Incoming {
     inflight: Arc<AtomicUsize>,
     /// The publishes the event loop has written in this session.
     written: Arc<AtomicU64>,
+    /// Told after each event the pump takes, for a wait on its counts.
+    progress: Arc<tokio::sync::Notify>,
+    /// The session asked for the DISCONNECT the pump will see: it then reads on until the close.
+    disconnect_asked: Arc<AtomicBool>,
 }
 
 impl Incoming {
@@ -284,6 +288,18 @@ impl Incoming {
     /// How many publishes the event loop has written in this session.
     pub fn written(&self) -> u64 {
         self.written.load(Ordering::SeqCst)
+    }
+
+    /// The next event the pump takes. Cancellation-safe; enable it before checking the counts.
+    pub fn progress(&self) -> tokio::sync::futures::OwnedNotified {
+        self.progress.clone().notified_owned()
+    }
+
+    /// The DISCONNECT the session is about to ask for is its own: the pump reads on after it until
+    /// the broker closes, rather than for one rumqttc sends on a protocol error (the second
+    /// confirming review's minor 3).
+    pub fn expect_disconnect(&self) {
+        self.disconnect_asked.store(true, Ordering::SeqCst);
     }
 
     pub async fn recv(&mut self) -> Option<PumpEvent> {
@@ -322,16 +338,23 @@ impl Pump {
         let backlog = Arc::new(Backlog::new());
         let inflight = Arc::new(AtomicUsize::new(0));
         let written = Arc::new(AtomicU64::new(0));
-        let counts = (inflight.clone(), written.clone());
+        let progress = Arc::new(tokio::sync::Notify::new());
+        let disconnect_asked = Arc::new(AtomicBool::new(false));
+        let counts = Counts {
+            inflight: inflight.clone(),
+            written: written.clone(),
+            progress: progress.clone(),
+            disconnect_asked: disconnect_asked.clone(),
+        };
         let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), counts, outage, stall, on_lost).in_current_span());
-        (Pump { task }, Incoming { rx, backlog, inflight, written })
+        (Pump { task }, Incoming { rx, backlog, inflight, written, progress, disconnect_asked })
     }
 
     async fn run(
         mut events: EventLoop,
         tx: UnboundedSender<PumpEvent>,
         backlog: Arc<Backlog>,
-        (inflight, written): (Arc<AtomicUsize>, Arc<AtomicU64>),
+        counts: Counts,
         outage: Arc<BrokerOutage>,
         stall: Duration,
         on_lost: impl FnOnce() + Send + 'static,
@@ -376,10 +399,11 @@ impl Pump {
                 }
             };
             outstanding.after(&event, events.state.inflight());
-            inflight.store(usize::from(events.state.inflight()), Ordering::SeqCst);
+            counts.inflight.store(usize::from(events.state.inflight()), Ordering::SeqCst);
             if matches!(event, Event::Outgoing(Outgoing::Publish(_))) {
-                written.fetch_add(1, Ordering::SeqCst);
+                counts.written.fetch_add(1, Ordering::SeqCst);
             }
+            counts.progress.notify_waiters();
 
             // Only an incoming event is proof of the broker; an outgoing one (a connect request)
             // is rumqttc trying.
@@ -407,7 +431,9 @@ impl Pump {
                     // unread, the socket would be reset, and the broker would drop what it had not
                     // read yet — the last replies, Active=false, the DISCONNECT (confirming review
                     // N1).
-                    linger(&mut events, &inflight).await;
+                    if counts.disconnect_asked.load(Ordering::SeqCst) {
+                        linger(&mut events, &counts.inflight).await;
+                    }
                     PumpEvent::Disconnected
                 }
                 _ => continue,
@@ -419,6 +445,14 @@ impl Pump {
             }
         }
     }
+}
+
+/// The pump's counts and signals, shared with the session's [`Incoming`].
+struct Counts {
+    inflight: Arc<AtomicUsize>,
+    written: Arc<AtomicU64>,
+    progress: Arc<tokio::sync::Notify>,
+    disconnect_asked: Arc<AtomicBool>,
 }
 
 /// After the DISCONNECT, how long the pump reads on for the broker's close.

@@ -362,9 +362,11 @@ commands are refused, and reads are dropped.
   gate's minor 4: documented) — then publish what is pending (`Status`, `Error`, replies; a
   watchdog's verdict included), then `Active=false`; then it waits until every QoS 1 publish the
   session enqueued has been written and acknowledged — a watermark, not the momentary in-flight
-  count — before the DISCONNECT, and after it the pump
-  reads on until the broker closes the connection (1 s at most; past it, INFO
-  `bridge_shutdown_cut`): closed with the broker's acks unread, the socket was reset, and the
+  count — before the DISCONNECT, until 500 ms before the flush's bound; acks that never come do
+  not keep the DISCONNECT back past that, it goes anyway, best effort (INFO `bridge_shutdown_cut`;
+  the second confirming review's minor 2). After the session's own DISCONNECT — not one rumqttc
+  sends on a protocol error (its minor 3) — the pump reads on until the broker closes the
+  connection (1 s at most; past it, INFO `bridge_shutdown_cut`): closed with the broker's acks unread, the socket was reset, and the
   broker dropped what it had not read yet — the last replies, `Active=false`, the DISCONNECT
   (confirming review N1). All within the flush's bound (re-gate R15). The flush runs on any
   connection the broker accepted — the outage episode's stability window has no say in it (second

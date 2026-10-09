@@ -2736,8 +2736,8 @@ guard       = "flush_on_accepted_connection"
 [[control]]
 name        = "the_flush_waits_on_the_momentary_count"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        while incoming.written() < shared.enqueued.load(Ordering::SeqCst) || incoming.inflight() > 0 {'''
-replacement = '''        while incoming.inflight() > 0 {'''
+anchor      = '''                if incoming.written() >= shared.enqueued.load(Ordering::SeqCst) && incoming.inflight() == 0 {'''
+replacement = '''                if incoming.inflight() == 0 {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_waits_for_its_own_publishes_to_be_acknowledged", "--exact"]
 expect_text = '''the DISCONNECT went out before the flush's publishes were acknowledged'''

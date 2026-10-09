@@ -285,8 +285,18 @@ async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
         vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")],
         vec![Outbound { topic: Some("Store/replies/held".into()), payload: b"{}".to_vec(), correlation: None }],
     );
-    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, true)).await;
-    let disconnected = broker.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Disconnected));
-    assert!(!disconnected, "the DISCONNECT went out before the flush's publishes were acknowledged");
+    let disconnected = |b: &FakeBroker| b.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Disconnected));
+    let flushing = flush(&shared, &client, &mut incoming, true);
+    tokio::pin!(flushing);
+    // Half a second in, the acks still held: no DISCONNECT yet.
+    let early = tokio::time::timeout(Duration::from_millis(500), flushing.as_mut()).await;
+    assert!(early.is_err() && !disconnected(&broker), "the DISCONNECT went out before the flush's publishes were acknowledged");
+    // The ack wait's deadline spent, the DISCONNECT goes anyway, best effort (the second
+    // confirming review's minor 2: none was sent).
+    let _ = tokio::time::timeout(Duration::from_secs(5), flushing).await;
+    assert!(
+        broker.wait_until(Duration::from_secs(2), |b| disconnected(b)).await,
+        "with the acks never coming, no DISCONNECT was sent at all"
+    );
     broker.release_acks();
 }
