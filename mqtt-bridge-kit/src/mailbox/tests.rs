@@ -585,3 +585,57 @@ fn a_target_level_write_drops_the_replay_pin() {
         "a replay after a live target-level write was decided against the old pinned basis"
     );
 }
+
+/// A write held again before proof, and the device still down.
+fn re_held(level: i64) -> Arc<Mailbox> {
+    let mailbox = up();
+    mailbox.post_state(value("u1", "level", json!(level)), false);
+    assert!(mailbox.try_take().is_some());
+    mailbox.applied(true);
+    let _ = mailbox.disconnected();
+    mailbox
+}
+
+/// A live request of the same value as a re-held write is a new request: it replaces the held
+/// one, with its own deadline and conflict policy — only a replay is that write still (confirming
+/// review 1: the preservation caught live requests too, and kept an expired deadline).
+#[test]
+fn a_live_request_of_the_same_value_replaces_a_re_held_write() {
+    let later = Instant::now() + Duration::from_secs(60);
+    let mailbox = re_held(40);
+    let mut live = value("u1", "level", json!(40));
+    live.deadline = Some(later);
+    mailbox.post_state(live, false);
+    mailbox.connected();
+    let held = held_values(&mailbox);
+    assert_eq!(held[0].values[0].deadline, Some(later), "a live request of the same value kept the re-held write's deadline");
+    let mailbox = re_held(40);
+    let mut live = value("u1", "level", json!(40));
+    live.conflict = Conflict::DeviceWins;
+    mailbox.post_state(live, false);
+    mailbox.connected();
+    let held = held_values(&mailbox);
+    assert_eq!(held[0].values[0].conflict, Conflict::DeviceWins, "a live request of the same value kept the re-held write's policy");
+}
+
+/// A re-held write that expires during its conflict read leaves unapplied: its assumption is
+/// withdrawn, as at any other expiry (the confirming review's minor).
+#[test]
+fn a_re_held_write_expiring_during_its_conflict_read_is_abandoned() {
+    let mailbox = up();
+    let mut write = value("u1", "level", json!(40));
+    write.deadline = Some(Instant::now() + Duration::from_millis(30));
+    mailbox.post_state(write, false);
+    assert!(mailbox.try_take().is_some());
+    mailbox.applied(true);
+    let _ = mailbox.disconnected();
+    mailbox.connected();
+    let Some(Held::Values(held)) = mailbox.take_held() else { panic!("nothing held") };
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(mailbox.revalidate(held.values).is_empty(), "a value past its deadline survived the conflict read");
+    assert_eq!(
+        mailbox.take_abandoned(),
+        vec![("u1".to_owned(), "level".to_owned())],
+        "a re-held write expiring during its conflict read was not abandoned"
+    );
+}

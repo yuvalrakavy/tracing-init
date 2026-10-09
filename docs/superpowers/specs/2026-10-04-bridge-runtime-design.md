@@ -218,7 +218,9 @@ commands are refused, and reads are dropped.
     retraction arriving after the re-hold — a delayed confirmation — neither drops it nor settles
     its assumption; it is applied on the next link, until a probe or read proves it or a newer
     request replaces it (Codex final gate 5). An identical retained replay of it is that write still:
-    the held one is kept, with its obligation; a different value replaces it (second final gate 2).
+    the held one is kept, with its obligation; a different value, or a live request — whatever its
+    value — replaces it, with its own deadline and policy (second final gate 2; confirming
+    review 1).
     One that leaves without being applied — expired, superseded, failed — withdraws its assumed
     value: the key goes back to what it was before the write, and `State` says so, for the device
     may never have taken it (the second final gate's minor 1).
@@ -384,10 +386,13 @@ commands are refused, and reads are dropped.
   at one per report batch, so under a steady stream N queued commands wait N batches: latency,
   bounded, not a hang — a command past its expiry meanwhile is answered as expired (the second
   final gate's minor 3: documented, not changed).
-- **Answers are never displaced:** every reply to a request (an outbound message with a response
-  topic) and every refusal's `Error` — a stop's, a link loss's, a watchdog's, an expired read
-  caller's — go to an uncapped batch the session takes first; the capped `Error` and `Event`
-  queues displace only unsolicited reports (Codex final gate 2, second final gate 1).
+- **Answers are never displaced, and go first:** every reply to a request (an outbound message with
+  a response topic) and every terminal `Error` of one — a refusal (a stop's, a link loss's, a
+  watchdog's, an expired read caller's, one on arrival), a failure (`Rejected`, `Unusable`,
+  `Unsupported`, each of a `Partial`'s properties, a command's), a supersession — go to an uncapped
+  batch of answers, published before `Status`, `State` and unsolicited traffic, at the stop and
+  always; the capped `Error` and `Event` queues keep only unsolicited reports, malformed input
+  among them (Codex final gate 2, second final gate 1, confirming review 2 and 3).
 - **Panics:** `Bridge::run` installs a process-global panic hook (`install_panic_hook`, also for
   in-process users of `Bridge::start`): ERROR `panic` through tracing (lossy), and the report for
   stderr handed to the process's one reporter thread through a bounded, lossy queue (16; full, the

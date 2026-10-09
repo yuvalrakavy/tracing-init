@@ -187,6 +187,11 @@ pub struct Reports {
 /// What changed since the session last took it.
 #[derive(Debug, Default, PartialEq)]
 pub struct Changes {
+    /// Answers to requests — every terminal `Error` of one, and every reply — published before
+    /// everything else: past every cap, and ahead of `State` and unsolicited traffic, so a stop's
+    /// bounded flush delivers them first (confirming review 2, 3).
+    pub answer_errors: Vec<ErrorReport>,
+    pub replies: Vec<Outbound>,
     pub status: Option<LinkStatus>,
     /// Each changed target's `State` document; an empty one retracts it.
     pub states: Vec<(String, Vec<u8>)>,
@@ -407,6 +412,14 @@ impl Reports {
         self.ready.notify_one();
     }
 
+    /// A request's terminal `Error` — its failure, a refusal, a supersession: an answer, taken
+    /// first and past every cap; the capped queue keeps only unsolicited reports (confirming
+    /// review 2). Never waits.
+    pub fn request_error(&self, report: ErrorReport) {
+        self.locked().refusals.0.push(report);
+        self.ready.notify_one();
+    }
+
     /// Refused commands' `Error`s and replies, taken before everything else queued, past every
     /// cap. Never waits.
     pub fn refused(&self, errors: Vec<ErrorReport>, replies: Vec<Outbound>) {
@@ -432,10 +445,14 @@ impl Reports {
                     None => None,
                 })
                 .collect();
-            let (mut errors, mut events) = std::mem::take(&mut state.refusals);
-            errors.extend(state.errors.items.drain(..));
-            events.extend(state.events.items.drain(..));
-            (Changes { status, states, errors, events }, state.errors.displacing.take(), state.events.displacing.take())
+            let (answer_errors, replies) = std::mem::take(&mut state.refusals);
+            let errors = state.errors.items.drain(..).collect();
+            let events = state.events.items.drain(..).collect();
+            (
+                Changes { answer_errors, replies, status, states, errors, events },
+                state.errors.displacing.take(),
+                state.events.displacing.take(),
+            )
         };
         if let Some((since, dropped)) = errors_ended {
             info!(

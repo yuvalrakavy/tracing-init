@@ -1808,9 +1808,10 @@ guard       = "device_outage_stable"
 [[control]]
 name        = "a_partial_apply_fails_the_whole_write"
 file        = "mqtt-bridge-kit/src/worker.rs"
-anchor      = '''                    self.reports.error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property));'''
+anchor      = '''                    self.reports
+                        .request_error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property));'''
 replacement = '''                    for value in &values {
-                        self.reports.error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&value.property));
+                        self.reports.request_error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&value.property));
                     }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_partial_apply_reports_only_the_properties_that_failed", "--exact"]
@@ -2591,11 +2592,10 @@ guard       = "verdict_refusals_uncapped"
 [[control]]
 name        = "a_replay_erases_the_re_hold"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''                _ if inner
-                    .pending'''
+anchor      = '''                _ if replay
+                    && inner.pending.iter().any('''
 replacement = '''                _ if false
-                    && inner
-                    .pending'''
+                    && inner.pending.iter().any('''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::an_identical_replay_keeps_a_re_held_writes_proof_obligation", "--exact"]
 expect_text = '''a replay over the re-held write lost its proof obligation'''
@@ -2638,14 +2638,79 @@ guard       = "fake_unsuback_ordered"
 [[control]]
 name        = "the_fake_brokers_delayed_acks_reorder"
 file        = "mqtt-test-broker/src/lib.rs"
-anchor      = '''                    tokio::time::sleep_until(due).await;
-                    let _ = writer.send(packet);'''
-replacement = '''                    let writer = writer.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep_until(due).await;
-                        let _ = writer.send(packet);
-                    });'''
+anchor      = '''                tokio::time::sleep_until(due).await;
+                let _ = writer.send(packet);'''
+replacement = '''                let writer = writer.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep_until(due).await;
+                    let _ = writer.send(packet);
+                });'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::delayed_acks_keep_the_order_of_their_publishes", "--exact"]
 expect_text = '''delayed acks overtook one another'''
 guard       = "fake_delayed_acks_ordered"
+
+# Confirming review 1: only a replay keeps a re-held write; a live request replaces it.
+[[control]]
+name        = "a_live_request_keeps_the_re_held_write"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                _ if replay
+                    && inner.pending.iter().any('''
+replacement = '''                _ if (replay || true)
+                    && inner.pending.iter().any('''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_live_request_of_the_same_value_replaces_a_re_held_write", "--exact"]
+expect_text = '''a live request of the same value kept the re-held write's deadline'''
+guard       = "live_request_replaces_reheld"
+
+# Confirming review 2: a request's terminal Error is an answer, past the cap.
+[[control]]
+name        = "a_requests_error_is_capped"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''        self.locked().refusals.0.push(report);
+        self.ready.notify_one();
+    }'''
+replacement = '''        self.error(report);
+    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_of_many_properties_reports_every_one", "--exact"]
+expect_text = '''a rejected request's Errors were displaced'''
+guard       = "request_errors_uncapped"
+
+# Confirming review 3: answers are published before State.
+[[control]]
+name        = "answers_go_after_state"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''            let (answer_errors, replies) = std::mem::take(&mut state.refusals);
+            let errors = state.errors.items.drain(..).collect();
+            let events = state.events.items.drain(..).collect();'''
+replacement = '''            let (mut errors, mut events) = std::mem::take(&mut state.refusals);
+            errors.extend(state.errors.items.drain(..));
+            events.extend(state.events.items.drain(..));
+            let (answer_errors, replies) = (Vec::new(), Vec::new());'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_answers_before_state", "--exact"]
+expect_text = '''the refusal was not published within the flush'''
+guard       = "answers_first"
+
+# Confirming review minor: an expiry during the conflict read abandons a re-held write.
+[[control]]
+name        = "a_conflict_read_expiry_keeps_the_assumption"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                        if value.reheld {'''
+replacement = '''                        if false && value.reheld {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_re_held_write_expiring_during_its_conflict_read_is_abandoned", "--exact"]
+expect_text = '''a re-held write expiring during its conflict read was not abandoned'''
+guard       = "revalidate_abandons"
+
+# Confirming review minor: an undelayed ack does not overtake delayed ones.
+[[control]]
+name        = "the_fake_brokers_undelayed_ack_overtakes"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''    if !has_line && delay.is_zero() {'''
+replacement = '''    if delay.is_zero() {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::delayed_acks_keep_the_order_of_their_publishes", "--exact"]
+expect_text = '''delayed acks overtook one another'''
+guard       = "fake_undelayed_acks_ordered"

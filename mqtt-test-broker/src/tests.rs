@@ -536,8 +536,15 @@ async fn delayed_acks_keep_the_order_of_their_publishes() {
     for i in 3..6u8 {
         client.publish("t", QoS::AtLeastOnce, false, vec![i]).await.unwrap();
     }
+    assert!(broker.wait_until(BOUND, |b| b.received_on("t").len() == 6).await, "the next publishes never came");
+    // No delay at all now: these must not overtake the delayed ones either (the confirming
+    // review's minor).
+    broker.delay_acks(Duration::ZERO);
+    for i in 6..9u8 {
+        client.publish("t", QoS::AtLeastOnce, false, vec![i]).await.unwrap();
+    }
     let mut order = Vec::new();
-    while order.len() < 6 {
+    while order.len() < 9 {
         match tokio::time::timeout(BOUND, acks.recv()).await {
             Ok(Some(("puback", pkid))) => order.push(pkid),
             Ok(Some(_)) => {}

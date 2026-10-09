@@ -433,13 +433,14 @@ impl Mailbox {
             let key = (value.target.clone(), value.property.clone());
             match inner.copies.remove(&key) {
                 Some((copy, until)) if copy == value.value && now < until => Posted::Skipped,
-                // The same value as a write held again before proof — the broker replaying the
+                // The same value as a write held again before proof, replayed by the broker — the
                 // retained request it came from — is that write still: the held one is kept, with
-                // its proof obligation; a different value replaces it (second final gate 2).
-                _ if inner
-                    .pending
-                    .iter()
-                    .any(|e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld && v.value == value.value)) =>
+                // its proof obligation; a different value, or a live request, replaces it (second
+                // final gate 2; confirming review 1).
+                _ if replay
+                    && inner.pending.iter().any(
+                        |e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld && v.value == value.value),
+                    ) =>
                 {
                     if inner.connected {
                         Posted::Queued
@@ -861,6 +862,9 @@ impl Mailbox {
                 } else {
                     if in_flight && value.expired(now) {
                         inner.expired += 1;
+                        if value.reheld {
+                            inner.abandoned.push((value.target.clone(), value.property.clone()));
+                        }
                     }
                     dropped += 1;
                 }

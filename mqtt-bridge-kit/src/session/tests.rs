@@ -182,3 +182,37 @@ async fn the_flush_publishes_what_is_pending_before_its_last_words() {
     assert!(error_at.is_some(), "the flush dropped what was pending");
     assert!(error_at < active_at, "what was pending went out after the last words");
 }
+
+/// The stop's flush publishes answers first: with a thousand States pending and a broker slow but
+/// steady to acknowledge, a refusal and its reply still go out within the flush's bound
+/// (confirming review 3: the States went first, and the answers were cut with the flush).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_flush_publishes_answers_before_state() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(5);
+    let shared = shared_for(&broker);
+    let (client, events) = client(&shared);
+    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
+    let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
+    assert!(matches!(first, Some(PumpEvent::Connected)));
+    broker.delay_acks(Duration::from_millis(500));
+    for t in 0..1000 {
+        let values = serde_json::json!({"n": t}).as_object().unwrap().clone();
+        shared.reports.state(&format!("m{t:04}"), values, false);
+    }
+    let refusal = crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop").target(Some("t1"));
+    let reply = Outbound { topic: Some("Store/replies/flush".into()), payload: b"{}".to_vec(), correlation: None };
+    shared.reports.refused(vec![refusal], vec![reply]);
+    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming)).await;
+    let error = shared.topics.error();
+    assert!(
+        broker
+            .wait_until(Duration::from_secs(1), |b| b
+                .received_on(&error)
+                .iter()
+                .any(|r| String::from_utf8_lossy(&r.payload).contains("refused at the stop")))
+            .await,
+        "the refusal was not published within the flush: the States went first"
+    );
+    assert!(!broker.received_on("Store/replies/flush").is_empty(), "the reply was not published within the flush");
+}

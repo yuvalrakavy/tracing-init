@@ -402,6 +402,16 @@ async fn republish(shared: &Shared, client: &AsyncClient, model: Model) {
 /// What the device side reported since the last take. A message refused is dropped alone.
 async fn publish_changes(shared: &Shared, client: &AsyncClient, changes: Changes) {
     let topics = &shared.topics;
+    // Answers first: a stop's bounded flush, or a slow broker, reaches them before State and
+    // unsolicited traffic (confirming review 3).
+    for error in changes.answer_errors {
+        emit(client, topics.error(), false, error.encode(), properties()).await;
+    }
+    for reply in changes.replies {
+        let mut props = properties();
+        props.correlation_data = reply.correlation;
+        emit(client, reply.topic.unwrap_or_else(|| topics.event()), false, reply.payload, props).await;
+    }
     if let Some(status) = changes.status {
         emit(client, topics.status(), true, status.as_str().as_bytes().to_vec(), properties()).await;
     }
@@ -603,7 +613,7 @@ fn command(shared: &Shared, target: Option<String>, call: crate::driver::Command
         }
     };
     let refused = |reason: Reason, error: &str| {
-        shared.reports.error(ErrorReport::new(reason, error).target(target.as_deref()).command(&call.command));
+        shared.reports.request_error(ErrorReport::new(reason, error).target(target.as_deref()).command(&call.command));
         answer(Answer::Failed { reason, error: error.to_owned() });
     };
     // Past its expiry when the session reads it — it waited behind a stalled broker — a command

@@ -444,7 +444,7 @@ impl FakeBroker {
         let held = std::mem::take(&mut *held);
         if let Some(tx) = &*self.shared.to_client.lock().unwrap() {
             for pkid in held {
-                let _ = tx.send(puback(self.shared.protocol, pkid));
+                send_ack(&self.shared, tx, puback(self.shared.protocol, pkid), Duration::ZERO);
             }
         }
     }
@@ -803,25 +803,34 @@ fn ack_or_hold(shared: &Shared, tx: &mpsc::UnboundedSender<BytesMut>, pkid: u16)
     let delay = shared.ack_delay_ms.load(Ordering::SeqCst);
     if shared.hold_acks.load(Ordering::SeqCst) {
         held.push(pkid);
-    } else if delay > 0 {
-        let due = tokio::time::Instant::now() + Duration::from_millis(delay);
-        let mut line = shared.ack_line.lock().unwrap();
-        if !line.as_ref().is_some_and(|(writer, _)| writer.same_channel(tx)) {
-            let (queue, mut queued) = mpsc::unbounded_channel::<(tokio::time::Instant, BytesMut)>();
-            let writer = tx.clone();
-            tokio::spawn(async move {
-                while let Some((due, packet)) = queued.recv().await {
-                    tokio::time::sleep_until(due).await;
-                    let _ = writer.send(packet);
-                }
-            });
-            *line = Some((tx.clone(), queue));
-        }
-        if let Some((_, queue)) = line.as_ref() {
-            let _ = queue.send((due, puback(shared.protocol, pkid)));
-        }
     } else {
-        let _ = tx.send(puback(shared.protocol, pkid));
+        send_ack(shared, tx, puback(shared.protocol, pkid), Duration::from_millis(delay));
+    }
+}
+
+/// Send an ack `delay` from now. Once a connection has a line of delayed acks, every later ack of
+/// it — at no delay, or released — goes through that line too, so none overtakes one delayed
+/// before it (the confirming review's minor).
+fn send_ack(shared: &Shared, tx: &mpsc::UnboundedSender<BytesMut>, packet: BytesMut, delay: Duration) {
+    let mut line = shared.ack_line.lock().unwrap();
+    let has_line = line.as_ref().is_some_and(|(writer, _)| writer.same_channel(tx));
+    if !has_line && delay.is_zero() {
+        let _ = tx.send(packet);
+        return;
+    }
+    if !has_line {
+        let (queue, mut queued) = mpsc::unbounded_channel::<(tokio::time::Instant, BytesMut)>();
+        let writer = tx.clone();
+        tokio::spawn(async move {
+            while let Some((due, packet)) = queued.recv().await {
+                tokio::time::sleep_until(due).await;
+                let _ = writer.send(packet);
+            }
+        });
+        *line = Some((tx.clone(), queue));
+    }
+    if let Some((_, queue)) = line.as_ref() {
+        let _ = queue.send((tokio::time::Instant::now() + delay, packet));
     }
 }
 

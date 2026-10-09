@@ -631,3 +631,32 @@ async fn an_unproven_write_that_expires_unapplied_withdraws_its_assumption() {
     assert!(h.device.get("dimmer", "level").is_none(), "the expired write was applied");
     assert!(h.stop().await);
 }
+
+/// A target-level request of seventy properties that the device rejects, while the session is
+/// held up publishing: every property's terminal Error arrives — a request's Error is an answer,
+/// never displaced by the capped queue (confirming review 2: the first six were dropped).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_request_of_many_properties_reports_every_one() {
+    let h = Harness::start_with("many-rejected", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Apply, None, Answer::Rejected, 1);
+    let values: serde_json::Map<String, Value> = (0..70).map(|i| (format!("p{i:02}"), json!(i))).collect();
+    // The session is held up in a long batch of publishes: acks slow but steady, and more States
+    // than the client's window takes at once.
+    h.broker.delay_acks(Duration::from_millis(200));
+    for t in 0..300 {
+        let n: mqtt_bridge_kit::PropertyMap = [("n".to_owned(), json!(t))].into_iter().collect();
+        h.device.report(&format!("m{t:03}"), n);
+    }
+    h.settle(Duration::from_millis(500)).await;
+    assert!(h.desire_many("t1", Value::Object(values), REQ));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty()).await, "never applied");
+    h.broker.delay_acks(Duration::ZERO);
+    let rejected = |h: &Harness| h.errors_for("rejected").iter().filter(|e| e["target"] == "t1").count();
+    assert!(
+        h.eventually(Duration::from_secs(20), |h| rejected(h) >= 70).await,
+        "a rejected request's Errors were displaced: {} of 70",
+        rejected(&h)
+    );
+    assert!(h.stop().await);
+}

@@ -473,7 +473,7 @@ impl<D: DeviceDriver> Worker<D> {
         };
         for value in values {
             info!(target = %value.target, property = %value.property, unknown, "A held request was superseded by a change at the device");
-            self.reports.error(ErrorReport::new(Reason::Superseded, message).target(Some(&value.target)).property(&value.property));
+            self.reports.request_error(ErrorReport::new(Reason::Superseded, message).target(Some(&value.target)).property(&value.property));
         }
     }
 
@@ -549,7 +549,8 @@ impl<D: DeviceDriver> Worker<D> {
                     } else {
                         info!(target, property = %failure.property, error = %failure.error, ?reason, "A property of a request failed");
                     }
-                    self.reports.error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property));
+                    self.reports
+                        .request_error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property));
                 }
                 Ok(count)
             }
@@ -568,7 +569,7 @@ impl<D: DeviceDriver> Worker<D> {
                     _ => debug!(target, ?properties, error = message, "The device's answer to a request was unusable; passed over"),
                 }
                 for value in &values {
-                    self.reports.error(ErrorReport::new(reason, message).target(Some(target)).property(&value.property));
+                    self.reports.request_error(ErrorReport::new(reason, message).target(Some(target)).property(&value.property));
                 }
                 Ok(0)
             }
@@ -597,7 +598,7 @@ impl<D: DeviceDriver> Worker<D> {
                 if reason == Reason::Rejected {
                     warn!(kind = "command_rejected", target, error = message, "The device rejected a target's configuration");
                 }
-                self.reports.error(ErrorReport::new(reason, format!("configuration: {message}")).target(Some(target)));
+                self.reports.request_error(ErrorReport::new(reason, format!("configuration: {message}")).target(Some(target)));
                 Ok(())
             }
         }
@@ -880,7 +881,7 @@ impl<D: DeviceDriver> Worker<D> {
                     warn!(kind = "command_rejected", target, command, error = message, "The device rejected a command");
                 }
                 if error_lane {
-                    self.reports.error(ErrorReport::new(reason, message).target(target).command(command));
+                    self.reports.request_error(ErrorReport::new(reason, message).target(target).command(command));
                 }
                 let answer = Answer::Failed { reason, error: message.to_owned() };
                 let lost = match failure {
