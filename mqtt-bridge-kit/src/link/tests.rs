@@ -344,3 +344,24 @@ fn a_full_helpers_budget_is_seen_full() {
     let (_, whose) = abandoned.full_for().expect("a full helpers' budget was not seen full");
     assert_eq!(whose, "helpers'");
 }
+
+/// A driver reads the start-up read-back at `connect` and from its handle: incomplete while the
+/// read-back is pending, complete — and frozen — once done (mqtt_ac v2 seeds its known units from
+/// it).
+#[test]
+fn a_driver_reads_the_start_up_read_back() {
+    let reports = Reports::new();
+    let ctx = LinkContext::new(1, "i", reports.clone(), Arc::new(Abandoned::default()), Arc::new(OpClock::new()));
+    assert_eq!(ctx.read_back(), ReadBack::default(), "a pending read-back read as done");
+    let off: PropertyMap = [("powered".to_owned(), serde_json::json!(false))].into_iter().collect();
+    reports.read_back("unit-1", off.clone());
+    assert!(!ctx.read_back().complete, "a read-back still pending read as complete");
+    reports.read_back_complete();
+    let handle = ctx.handle();
+    let read = handle.read_back();
+    assert!(read.complete, "a done read-back read as incomplete");
+    assert_eq!(read.targets.get("unit-1"), Some(&off));
+    // Frozen: a State retained later changes nothing.
+    reports.read_back("unit-2", off.clone());
+    assert!(!ctx.read_back().targets.contains_key("unit-2"), "the frozen read-back took a later State");
+}

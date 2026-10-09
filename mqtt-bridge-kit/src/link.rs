@@ -63,7 +63,25 @@ pub struct Reporter {
     reports: Arc<Reports>,
 }
 
+/// The bridge's start-up read-back of its own retained `State`, as the conflict rule reads it:
+/// frozen when it was first done. Its values are what the previous run last published — its
+/// reports and assumptions as retained by the broker — not evidence from the device.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReadBack {
+    /// Whether the read-back is done: `false` while its SUBACK is pending, and for good when the
+    /// broker refused it or it came late (then `targets` holds what arrived before that).
+    pub complete: bool,
+    /// Each target's retained `State` values.
+    pub targets: std::collections::BTreeMap<String, PropertyMap>,
+}
+
 impl Reporter {
+    /// The start-up read-back (see [`ReadBack`]). Never waits.
+    pub(crate) fn read_back(&self) -> ReadBack {
+        let (_, targets) = self.reports.read_back_before();
+        ReadBack { complete: self.reports.read_back_is_complete(), targets }
+    }
+
     pub(crate) fn new(reports: Arc<Reports>) -> Reporter {
         Reporter { reports }
     }
@@ -285,6 +303,12 @@ impl LinkHandle {
     /// The reporter.
     pub fn report(&self) -> &Reporter {
         &self.report
+    }
+
+    /// The bridge's start-up read-back of its retained `State` — the previous run's reports, not
+    /// device evidence; `complete` says whether it is done (see [`ReadBack`]). Never waits.
+    pub fn read_back(&self) -> ReadBack {
+        self.report.read_back()
     }
 
     /// The link died, as a helper noticed (an unsolicited-input reader that reads end of file).
@@ -528,6 +552,13 @@ impl LinkContext {
     /// A handle on this link, to keep.
     pub fn handle(&self) -> LinkHandle {
         self.handle.clone()
+    }
+
+    /// The bridge's start-up read-back of its retained `State`, as at `connect`: the previous run's
+    /// reports, not device evidence. At the first connect it may not be done yet — `complete` says
+    /// so; keep the [`handle`](Self::handle) to read it again later (see [`ReadBack`]). Never waits.
+    pub fn read_back(&self) -> ReadBack {
+        self.handle.read_back()
     }
 
     /// The bridge's instance.

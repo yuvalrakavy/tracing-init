@@ -107,6 +107,13 @@ lost link, never a hang.
   them (re-gate 5: round 3's "helpers never end it" is superseded). A refusal stamped when a place
   is free again leaves no stamp (re-gate 4 minor 3), and a call whose thread cannot start is a
   lost link too (minor 5).
+- `ctx.read_back()` (and `LinkHandle::read_back()`): the bridge's start-up read-back of its own
+  retained `State` — `ReadBack { complete, targets }`, frozen as the conflict rule reads it. Its
+  values are what the previous run last published (its reports and assumptions, as the broker
+  retained them), not device evidence; `complete` is `false` while the read-back is pending, and for
+  good when the broker refused it or it came late. At the first `connect` it may not be done yet:
+  a driver that needs it (mqtt_ac v2 seeds its known units, and which were `powered:false`) reads
+  it again from its handle.
 - `ctx.handle()`: a cloneable `LinkHandle` (`report()`, `link_lost()`, `is_lost()`, `blocking()`, `spawn()`) to
   keep for later calls, since the context itself is only handed to `connect`. `ctx.report` is a
   cloneable `Reporter`.

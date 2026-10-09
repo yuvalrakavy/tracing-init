@@ -64,7 +64,7 @@ pub use driver::{
     CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkError, OpError, PropertyFailure,
     PropertyMap, Scope, TargetState, Timing, Value, Writes,
 };
-pub use link::{LinkContext, LinkHandle, Reporter};
+pub use link::{LinkContext, LinkHandle, ReadBack, Reporter};
 pub use process::{install_panic_hook, Bridge, Died, Running};
 pub use session::MqttTiming;
 pub use wire::Conflict;
