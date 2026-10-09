@@ -320,6 +320,9 @@ struct Inner {
     /// The command the worker took and has not answered: refused at a stop or a watchdog's end,
     /// which cancel it mid-operation (re-gate 3 S3).
     in_flight_command: Option<Unanswered>,
+    /// Writes held again before proof that reached their deadline unapplied: their assumptions are
+    /// withdrawn ([`take_abandoned`](Mailbox::take_abandoned)).
+    abandoned: Vec<(String, String)>,
 }
 
 impl Inner {
@@ -373,6 +376,9 @@ impl Inner {
     /// Drop the values past their deadline, counting them.
     fn drop_expired(&mut self, values: &mut Vec<StateValue>, now: Instant) -> usize {
         let before = values.len();
+        let abandoned: Vec<(String, String)> =
+            values.iter().filter(|v| v.reheld && v.expired(now)).map(|v| (v.target.clone(), v.property.clone())).collect();
+        self.abandoned.extend(abandoned);
         values.retain(|v| !v.expired(now));
         let dropped = before - values.len();
         self.expired += dropped as u32;
@@ -427,15 +433,23 @@ impl Mailbox {
             let key = (value.target.clone(), value.property.clone());
             match inner.copies.remove(&key) {
                 Some((copy, until)) if copy == value.value && now < until => Posted::Skipped,
+                // The same value as a write held again before proof — the broker replaying the
+                // retained request it came from — is that write still: the held one is kept, with
+                // its proof obligation; a different value replaces it (second final gate 2).
+                _ if inner
+                    .pending
+                    .iter()
+                    .any(|e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld && v.value == value.value)) =>
+                {
+                    if inner.connected {
+                        Posted::Queued
+                    } else {
+                        Posted::Held
+                    }
+                }
                 _ => {
                     let held = !inner.connected;
                     value.check = Check { replayed: replay, held };
-                    // The same value replayed over one held again before proof is that write still:
-                    // it keeps the proof obligation (second final gate 2).
-                    value.reheld |= replay
-                        && inner.pending.iter().any(
-                            |e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld && v.value == value.value),
-                        );
                     if replay {
                         match inner.bases.get(&key) {
                             Some((first, basis)) if *first == value.value => value.basis = Some(basis.clone()),
@@ -874,14 +888,10 @@ impl Mailbox {
         }
     }
 
-    /// Whether a value for `target` and `property` waits — one past its deadline will be dropped,
-    /// not applied, so it does not. Never waits.
-    pub fn waits_for_key(&self, target: &str, property: &str) -> bool {
-        let now = Instant::now();
-        self.locked()
-            .pending
-            .iter()
-            .any(|e| matches!(e, Entry::State { value, .. } if value.is_key(target, property) && !value.expired(now)))
+    /// The keys of writes held again before proof that expired unapplied since the last call: the
+    /// device may never have taken them (second final gate, Claude's minor 1). Never waits.
+    pub fn take_abandoned(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.locked().abandoned)
     }
 
     /// Keep in flight only the values `keep` says (the rest were decided by the conflict rule).

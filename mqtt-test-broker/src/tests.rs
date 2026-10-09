@@ -477,3 +477,74 @@ async fn a_denied_subscription_is_refused_and_replays_nothing() {
     assert!(got.is_err(), "a denied subscription replayed: {got:?}");
     assert!(!broker.events().iter().any(|e| matches!(e, BrokerEvent::Subscribed(f) if f == "secret/#")), "a denied subscription was made");
 }
+
+/// The acks the client gets, by kind and packet id, in the order they come.
+fn pump_acks(mut events: rumqttc::v5::EventLoop) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedReceiver<(&'static str, u16)>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        loop {
+            match events.poll().await {
+                Ok(Event::Incoming(rumqttc::v5::Incoming::SubAck(a))) => {
+                    let _ = tx.send(("suback", a.pkid));
+                }
+                Ok(Event::Incoming(rumqttc::v5::Incoming::UnsubAck(a))) => {
+                    let _ = tx.send(("unsuback", a.pkid));
+                }
+                Ok(Event::Incoming(rumqttc::v5::Incoming::PubAck(a))) => {
+                    let _ = tx.send(("puback", a.pkid));
+                }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    });
+    (task, rx)
+}
+
+/// An UNSUBSCRIBE answered while a SUBACK is held waits behind it, as a broker answers in order
+/// (Claude's final gate minor 2: the UNSUBACK went first).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsuback_waits_behind_a_held_suback() {
+    let broker = FakeBroker::start().await;
+    broker.hold_subacks();
+    let (client, events) = client(&broker, 10);
+    let (_task, mut acks) = pump_acks(events);
+    client.subscribe("x/#", QoS::AtLeastOnce).await.unwrap();
+    assert!(broker.wait_for_subscription("x/#", BOUND).await, "never subscribed");
+    client.unsubscribe("x/#").await.unwrap();
+    assert!(broker.wait_until(BOUND, |b| b.events().iter().any(|e| matches!(e, BrokerEvent::Unsubscribed(_)))).await, "never unsubscribed");
+    assert!(tokio::time::timeout(Duration::from_millis(300), acks.recv()).await.is_err(), "an ack went out while the SUBACK was held");
+    broker.release_subacks();
+    let first = tokio::time::timeout(BOUND, acks.recv()).await.expect("no ack after the release");
+    let second = tokio::time::timeout(BOUND, acks.recv()).await.expect("one ack after the release");
+    assert_eq!((first.map(|a| a.0), second.map(|a| a.0)), (Some("suback"), Some("unsuback")), "the acks went out of order");
+}
+
+/// Delayed acks keep the order of their publishes, though the delay changes between them (Claude's
+/// final gate minor 6: a task per ack let a shorter delay overtake a longer one).
+#[tokio::test(flavor = "multi_thread")]
+async fn delayed_acks_keep_the_order_of_their_publishes() {
+    let broker = FakeBroker::start().await;
+    let (client, events) = client(&broker, 10);
+    let (_task, mut acks) = pump_acks(events);
+    broker.delay_acks(Duration::from_millis(300));
+    for i in 0..3u8 {
+        client.publish("t", QoS::AtLeastOnce, false, vec![i]).await.unwrap();
+    }
+    assert!(broker.wait_until(BOUND, |b| b.received_on("t").len() == 3).await, "the first publishes never came");
+    broker.delay_acks(Duration::from_millis(10));
+    for i in 3..6u8 {
+        client.publish("t", QoS::AtLeastOnce, false, vec![i]).await.unwrap();
+    }
+    let mut order = Vec::new();
+    while order.len() < 6 {
+        match tokio::time::timeout(BOUND, acks.recv()).await {
+            Ok(Some(("puback", pkid))) => order.push(pkid),
+            Ok(Some(_)) => {}
+            _ => panic!("the acks stopped at {order:?}"),
+        }
+    }
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(order, sorted, "delayed acks overtook one another");
+}

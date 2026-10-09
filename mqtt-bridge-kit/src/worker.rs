@@ -456,6 +456,7 @@ impl<D: DeviceDriver> Worker<D> {
                 }
             }
         }
+        self.abandon(std::iter::empty());
         if self.info.writes == Writes::Unacknowledged && self.mailbox.unproven_since().is_some() {
             self.probe(handle).await?;
         }
@@ -473,6 +474,18 @@ impl<D: DeviceDriver> Worker<D> {
         for value in values {
             info!(target = %value.target, property = %value.property, unknown, "A held request was superseded by a change at the device");
             self.reports.error(ErrorReport::new(Reason::Superseded, message).target(Some(&value.target)).property(&value.property));
+        }
+    }
+
+    /// Writes held again before proof that leave unapplied — superseded, failed, or (from the
+    /// mailbox) expired: the device may never have taken them, so their assumed values are
+    /// withdrawn (second final gate, Claude's minor 1). A value never held again has nothing to
+    /// withdraw.
+    fn abandon<'a>(&self, values: impl Iterator<Item = &'a StateValue>) {
+        let expired = self.mailbox.take_abandoned();
+        let gone = values.filter(|v| v.reheld).map(|v| (v.target.clone(), v.property.clone()));
+        for (target, property) in gone.chain(expired) {
+            self.reports.assumption_abandoned(&target, &property);
         }
     }
 
@@ -510,6 +523,7 @@ impl<D: DeviceDriver> Worker<D> {
             Err(OpError::Partial(failures)) => {
                 // Every value it does not name was applied; those it names failed, each said.
                 let failed = |v: &StateValue| failures.iter().any(|f| f.property == v.property);
+                self.abandon(values.iter().filter(|v| failed(v)));
                 self.mailbox.retain_in_flight(|v| !failed(v));
                 self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
                 let applied: PropertyMap = map
@@ -541,6 +555,7 @@ impl<D: DeviceDriver> Worker<D> {
             }
             Err(failure) => {
                 self.mailbox.failed();
+                self.abandon(values.iter());
                 let properties: Vec<&str> = values.iter().map(|v| v.property.as_str()).collect();
                 let (reason, message) = classify(&failure);
                 match reason {
@@ -692,6 +707,7 @@ impl<D: DeviceDriver> Worker<D> {
                 }
                 Step::Work(work) => self.work(handle, work).await,
             };
+            self.abandon(std::iter::empty());
             if let Err(e) = outcome {
                 return e;
             }
@@ -808,6 +824,7 @@ impl<D: DeviceDriver> Worker<D> {
         self.mailbox.retain_in_flight(|v| apply.iter().any(|a| a.target == v.target && a.property == v.property));
         self.superseded(&superseded, false);
         self.superseded(&unknown, true);
+        self.abandon(superseded.iter().chain(&unknown));
         Ok(apply)
     }
 

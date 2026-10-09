@@ -185,7 +185,7 @@ async fn a_helpers_blocking_call_is_not_held_to_an_operation_it_overlapped() {
 
 /// An operation is not started on a link already lost: it is refused at once with the loss, and
 /// the driver is not called (the R1 re-gate's R6: the biased wrapper ran every new operation on a
-/// lost link, and catch-up or restore writes went on after the loss).
+/// lost link, and catch-up writes went on after the loss).
 #[tokio::test]
 async fn an_operation_is_not_started_on_a_link_already_lost() {
     let ctx = link_context();

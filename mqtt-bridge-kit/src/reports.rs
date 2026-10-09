@@ -150,15 +150,15 @@ struct State {
     changed: Vec<String>,
     errors: Capped<ErrorReport>,
     events: Capped<Outbound>,
-    /// Refusals of the commands a link's loss or a watchdog's verdict cut off or left waiting, with
-    /// their replies: uncapped — bounded by the mailbox's own cap — and taken first, so a full
-    /// mailbox's 65 refusals do not displace one another in the capped queues (Codex final gate 2,
+    /// Answers to requests: every reply (an `Outbound` with a response topic), and the refusals'
+    /// `Error`s — uncapped, bounded by what the mailbox holds and the Store asks, and taken first:
+    /// the capped queues displace only unsolicited reports, never an answer (Codex final gate 2,
     /// second final gate 1).
     refusals: (Vec<ErrorReport>, Vec<Outbound>),
     readback: BTreeMap<String, PropertyMap>,
     /// The read-back as it stood when it was first done, complete or not: the conflict rule's
     /// "before" values, which a retained State arriving later does not change in mid-process
-    /// (Claude's re-gate minor 11). `readback` itself goes on taking late arrivals.
+    /// (Claude's re-gate minor 11).
     readback_frozen: Option<BTreeMap<String, PropertyMap>>,
     /// The model when the MQTT connection was last lost, and when.
     broker_lost: Option<(Instant, BTreeMap<String, PropertyMap>)>,
@@ -392,8 +392,14 @@ impl Reports {
         self.ready.notify_one();
     }
 
-    /// An `Event` message, or a reply. Never waits: past [`EVENT_CAP`] waiting, the oldest goes.
+    /// An `Event` message, or a reply. Never waits: past [`EVENT_CAP`] waiting, the oldest event
+    /// goes; a reply — it has a response topic — is an answer, and is never displaced.
     pub fn event(&self, message: Outbound) {
+        if message.topic.is_some() {
+            self.locked().refusals.1.push(message);
+            self.ready.notify_one();
+            return;
+        }
         let began = self.locked().events.push(message);
         if began {
             warn!(kind = "event_report_dropped", waiting = EVENT_CAP, "Event reports are displacing older ones: MQTT is not taking them");
@@ -529,6 +535,38 @@ impl Reports {
         }
     }
 
+    /// A write held again before proof left without being applied — expired, superseded, failed:
+    /// the device may never have taken it, so its assumption is withdrawn — the key's value goes
+    /// back to what it was before the write, and `State` says so (second final gate, Claude's
+    /// minor 1: the assumed value stood, unproven, for good). Never waits.
+    pub fn assumption_abandoned(&self, target: &str, property: &str) {
+        let reverted = {
+            let mut state = self.locked();
+            let reverted = match state.targets.get_mut(target) {
+                Some(model) => match model.unproven.remove(property) {
+                    Some(Some(before)) => {
+                        model.values.insert(property.to_owned(), before);
+                        true
+                    }
+                    Some(None) => {
+                        model.values.remove(property);
+                        true
+                    }
+                    None => false,
+                },
+                None => false,
+            };
+            if reverted && !state.changed.iter().any(|t| t == target) {
+                state.changed.push(target.to_owned());
+            }
+            reverted
+        };
+        if reverted {
+            info!(target, property, "A write the device never proved taken left unapplied; its assumed value is withdrawn");
+            self.ready.notify_one();
+        }
+    }
+
     /// These writes were proven (a probe or read after them): their assumptions stand. Never waits.
     pub fn assumptions_proven(&self, values: &[crate::mailbox::StateValue]) {
         let mut state = self.locked();
@@ -613,17 +651,11 @@ impl Reports {
 
     /// A target's state as the bridge's retained `State` held it at start.
     pub fn read_back(&self, target: &str, values: PropertyMap) {
-        self.locked().readback.insert(target.to_owned(), values);
-    }
-
-    /// A property's value in the read-back, if it had one.
-    pub fn read_back_value(&self, target: &str, property: &str) -> Option<Value> {
-        self.locked().readback.get(target).and_then(|v| v.get(property)).cloned()
-    }
-
-    /// The whole read-back.
-    pub fn read_back_all(&self) -> BTreeMap<String, PropertyMap> {
-        self.locked().readback.clone()
+        let mut state = self.locked();
+        // Once frozen, it is what the conflict rule reads; a late State changes nothing.
+        if state.readback_frozen.is_none() {
+            state.readback.insert(target.to_owned(), values);
+        }
     }
 
     /// Whether anything waits for the session (tests).

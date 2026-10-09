@@ -217,8 +217,11 @@ commands are refused, and reads are dropped.
     minor 7). A write held again at a link's loss keeps that provenance (`StateValue::reheld`): a
     retraction arriving after the re-hold — a delayed confirmation — neither drops it nor settles
     its assumption; it is applied on the next link, until a probe or read proves it or a newer
-    request replaces it (Codex final gate 5). An identical retained replay of it is that write still,
-    and keeps the obligation (second final gate 2).
+    request replaces it (Codex final gate 5). An identical retained replay of it is that write still:
+    the held one is kept, with its obligation; a different value replaces it (second final gate 2).
+    One that leaves without being applied — expired, superseded, failed — withdraws its assumed
+    value: the key goes back to what it was before the write, and `State` says so, for the device
+    may never have taken it (the second final gate's minor 1).
   - **What the snapshots hold:** the reported model, and over it what an acknowledged `apply`
     (`Writes::Acknowledged`) wrote since — for a `Partial`, only the values it did not name. A
     report of the key replaces a written value, and a key the driver reported during the `apply`
@@ -352,7 +355,8 @@ commands are refused, and reads are dropped.
   from answering, which the mailbox keeps as in flight until it is answered (re-gate 3 S3) — on
   `Error` and on its response topic, published directly rather than through the reports' capped
   queues, which a full mailbox (one command executing, 64 waiting) would overflow (Codex final
-  gate 2) — then publish what is pending (`Status`, `Error`, replies; a
+  gate 2); so they go out ahead of what was queued before them, nothing lost (the second final
+  gate's minor 4: documented) — then publish what is pending (`Status`, `Error`, replies; a
   watchdog's verdict included), then `Active=false` and the DISCONNECT, all within the flush's
   bound (re-gate R15). A cut-off command's error says it was cut off while it ran, so the device
   may or may not have done it; a waiting one's, that it was refused before it ran. **Exactly one
@@ -376,7 +380,14 @@ commands are refused, and reads are dropped.
   good, the acknowledgements keeping the progress bound from firing (Codex final gate 1). The
   read-back's subscription is dropped once the read-back is done — complete, or late — since its
   frozen copy is all the conflict rule reads: kept, it brought each `State` the bridge publishes
-  back as an incoming publish, queued ahead of every request.
+  back as an incoming publish, queued ahead of every request. A backlog of incoming events drains
+  at one per report batch, so under a steady stream N queued commands wait N batches: latency,
+  bounded, not a hang — a command past its expiry meanwhile is answered as expired (the second
+  final gate's minor 3: documented, not changed).
+- **Answers are never displaced:** every reply to a request (an outbound message with a response
+  topic) and every refusal's `Error` — a stop's, a link loss's, a watchdog's, an expired read
+  caller's — go to an uncapped batch the session takes first; the capped `Error` and `Event`
+  queues displace only unsolicited reports (Codex final gate 2, second final gate 1).
 - **Panics:** `Bridge::run` installs a process-global panic hook (`install_panic_hook`, also for
   in-process users of `Bridge::start`): ERROR `panic` through tracing (lossy), and the report for
   stderr handed to the process's one reporter thread through a bounded, lossy queue (16; full, the

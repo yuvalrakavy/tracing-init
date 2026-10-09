@@ -598,3 +598,36 @@ async fn a_stop_after_an_unread_verdict_does_not_wait_for_the_blocked_worker() {
     assert!(stopping.elapsed() < Duration::from_secs(2), "the stop waited for a worker the verdict said blocked: {:?}", stopping.elapsed());
     assert!(h.log.of_kind("shutdown_timeout").is_empty(), "the stop ran out its grace for a worker the verdict said blocked");
 }
+
+/// A write held again before proof that expires before the device returns leaves unapplied: the
+/// device may never have taken it, so its assumed value is withdrawn from `State` (the second final
+/// gate's minor 1: the unproven assumption stood for good).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unproven_write_that_expires_unapplied_withdraws_its_assumption() {
+    let h = Harness::start_with("reheld-expired", info(Writes::Unacknowledged, Feedback::Assumed), quick_timing(), |_, _, device| {
+        device.answer(Op::Read, None, Answer::Unsupported);
+    })
+    .await;
+    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    // The device never hears the write; the probe after it loses the link, and the device stays
+    // out of reach past the request's expiry.
+    h.device.answer_times(Op::Apply, None, Answer::Unheard, 1);
+    h.device.answer_times(Op::Probe, None, Answer::Link, 1);
+    h.device.answer(Op::Connect, None, Answer::Link);
+    assert!(h.desire("dimmer", "level", json!(40), Req { expiry: Some(2), conflict: Some("RequestWins") }));
+    assert!(
+        h.eventually(BOUND, |h| h.state("dimmer").is_some_and(|s| s["level"] == json!(40) && s["assumed"] == json!(true))).await,
+        "the write was not assumed: {:?}",
+        h.state("dimmer")
+    );
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Disconnect).is_empty()).await, "the link was not lost before proof");
+    h.settle(Duration::from_millis(2500)).await;
+    h.device.answer_normally();
+    assert!(
+        h.eventually(Duration::from_secs(5), |h| h.state("dimmer").is_some_and(|s| s.get("level").is_none())).await,
+        "an unproven write that expired unapplied is still assumed: {:?}",
+        h.state("dimmer")
+    );
+    assert!(h.device.get("dimmer", "level").is_none(), "the expired write was applied");
+    assert!(h.stop().await);
+}

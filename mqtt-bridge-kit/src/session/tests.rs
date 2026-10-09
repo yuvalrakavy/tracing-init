@@ -51,19 +51,19 @@ async fn a_refused_publish_is_one_message_dropped() {
 }
 
 /// Only a retained `State` is read back: a live one — the bridge's own publish coming back on its
-/// read-back subscription, or another client's — is no record of what the previous run knew (the
-/// frozen read-back covers the conflict rule; this guard covers what a restore reads).
+/// read-back subscription, or another client's — is no record of what the previous run knew, and
+/// no "before" value for the conflict rule.
 #[test]
 fn a_live_state_is_not_read_back() {
     let shared = shared_for_port();
     let topic = shared.topics.state("t1");
     let live = Publish::new(topic.clone(), QoS::AtLeastOnce, br#"{"temp":1}"#.to_vec(), None);
     route(&shared, &topic, &live, Instant::now());
-    assert!(shared.reports.read_back_all().is_empty(), "a live State was read back");
+    assert!(shared.reports.read_back_before().1.is_empty(), "a live State was read back");
     let mut retained = Publish::new(topic.clone(), QoS::AtLeastOnce, br#"{"temp":2}"#.to_vec(), None);
     retained.retain = true;
     route(&shared, &topic, &retained, Instant::now());
-    assert_eq!(shared.reports.read_back_all()["t1"]["temp"], serde_json::json!(2));
+    assert_eq!(shared.reports.read_back_before().1["t1"]["temp"], serde_json::json!(2));
 }
 
 /// The shared state of a session that never connects: for routing alone.

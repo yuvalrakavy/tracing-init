@@ -211,6 +211,9 @@ struct Shared {
     held: Mutex<Vec<u16>>,
     /// How long each QoS 1 ack is delayed, in milliseconds (0: none): a broker slow but steady.
     ack_delay_ms: AtomicU64,
+    /// The delayed acks' line, for the connection whose writer it holds: one task sends them in
+    /// the order they were decided, each at its time, so a delay changed mid-test reorders nothing.
+    ack_line: Mutex<Option<AckLine>>,
     /// The current connection's writer, taking encoded packets.
     to_client: Mutex<Option<mpsc::UnboundedSender<BytesMut>>>,
     /// Any change a test may wait for: a publish received, a subscription, a connection.
@@ -277,6 +280,7 @@ impl FakeBroker {
             hold_acks: AtomicBool::new(false),
             held: Mutex::new(Vec::new()),
             ack_delay_ms: AtomicU64::new(0),
+            ack_line: Mutex::new(None),
             to_client: Mutex::new(None),
             changed: Notify::new(),
             retained: Mutex::new(BTreeMap::new()),
@@ -418,7 +422,8 @@ impl FakeBroker {
 
     /// Acknowledge each of the client's QoS 1 publishes `delay` after it arrives, from now on (zero:
     /// at once): a broker slow but steady — the acks keep coming, so nothing stalls, but a client
-    /// whose in-flight window fills publishes no faster than they do.
+    /// whose in-flight window fills publishes no faster than they do. The delayed acks go out in
+    /// the order their publishes came, whatever the delay was for each.
     pub fn delay_acks(&self, delay: Duration) {
         self.shared.ack_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
     }
@@ -633,6 +638,10 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
     shared.changed.notify_waiters();
 }
 
+/// A connection's writer, and the line of delayed acks — each with when it is due — that one task
+/// sends to it in order.
+type AckLine = (mpsc::UnboundedSender<BytesMut>, mpsc::UnboundedSender<(tokio::time::Instant, BytesMut)>);
+
 /// The receive buffer a wedged connection is pinned to (see `connection`).
 const WEDGED_RECV_BUFFER: usize = 64 * 1024;
 
@@ -795,11 +804,22 @@ fn ack_or_hold(shared: &Shared, tx: &mpsc::UnboundedSender<BytesMut>, pkid: u16)
     if shared.hold_acks.load(Ordering::SeqCst) {
         held.push(pkid);
     } else if delay > 0 {
-        let (tx, protocol) = (tx.clone(), shared.protocol);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-            let _ = tx.send(puback(protocol, pkid));
-        });
+        let due = tokio::time::Instant::now() + Duration::from_millis(delay);
+        let mut line = shared.ack_line.lock().unwrap();
+        if !line.as_ref().is_some_and(|(writer, _)| writer.same_channel(tx)) {
+            let (queue, mut queued) = mpsc::unbounded_channel::<(tokio::time::Instant, BytesMut)>();
+            let writer = tx.clone();
+            tokio::spawn(async move {
+                while let Some((due, packet)) = queued.recv().await {
+                    tokio::time::sleep_until(due).await;
+                    let _ = writer.send(packet);
+                }
+            });
+            *line = Some((tx.clone(), queue));
+        }
+        if let Some((_, queue)) = line.as_ref() {
+            let _ = queue.send((due, puback(shared.protocol, pkid)));
+        }
     } else {
         let _ = tx.send(puback(shared.protocol, pkid));
     }
@@ -917,7 +937,14 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
                 event(shared, BrokerEvent::Unsubscribed(f.clone()));
             }
             let reasons = u.filters.iter().map(|_| v5::UnsubAckReason::Success).collect();
-            let _ = tx.send(encode_v5(v5::Packet::UnsubAck(v5::UnsubAck { pkid: u.pkid, reasons, properties: None })));
+            let unsuback = encode_v5(v5::Packet::UnsubAck(v5::UnsubAck { pkid: u.pkid, reasons, properties: None }));
+            // Behind any SUBACK held: a broker answers in order (Claude's final gate minor 2).
+            let mut held = shared.held_subacks.lock().unwrap();
+            if shared.holding_subacks.load(Ordering::SeqCst) {
+                held.push(unsuback);
+            } else {
+                let _ = tx.send(unsuback);
+            }
         }
         v5::Packet::Publish(p) => {
             let topic = String::from_utf8_lossy(&p.topic).into_owned();

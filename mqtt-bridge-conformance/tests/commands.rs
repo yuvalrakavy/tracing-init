@@ -595,3 +595,39 @@ async fn a_watchdog_verdict_with_a_full_mailbox_answers_every_command() {
     assert!(answers["c-0"][0].contains("cut off"), "the executing command was not said cut off: {:?}", answers["c-0"]);
     assert!(h.stop().await);
 }
+
+/// A link lost with the mailbox full — one command executing, 64 waiting, and a read three
+/// callers asked for — answers every caller, once: no refusal goes through a capped queue (the
+/// second final gate's item 1, more broadly).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_loss_with_a_full_mailbox_answers_every_caller() {
+    let timing = mqtt_bridge_kit::TimingOverrides { operation: Some(Duration::from_secs(3)), ..quick_timing() };
+    let h = Harness::start_with("loss-full", acknowledged(), timing, up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(2500)), 1);
+    let replies = "Store/replies/loss-full";
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-0"))));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
+    let mut ids = vec!["c-0".to_owned()];
+    for i in 1..=64 {
+        let id = format!("c-{i}");
+        assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, id.as_bytes()))));
+        ids.push(id);
+    }
+    for i in 1..=3 {
+        let id = format!("s-{i}");
+        assert!(h.command(json!({"target": "t1", "command": "status"}), Some((replies, id.as_bytes()))));
+        ids.push(id);
+    }
+    h.settle(Duration::from_millis(500)).await;
+    h.device.set_up(false);
+    assert!(
+        h.eventually(Duration::from_secs(8), |h| answers_by_correlation(h, replies).len() == ids.len()).await,
+        "a link loss with a full mailbox left callers unanswered: {:?}",
+        ids.iter().filter(|id| !answers_by_correlation(&h, replies).contains_key(*id)).collect::<Vec<_>>()
+    );
+    for (id, errors) in &answers_by_correlation(&h, replies) {
+        assert_eq!(errors.len(), 1, "caller {id} was answered {} times", errors.len());
+    }
+    assert!(h.stop().await);
+}

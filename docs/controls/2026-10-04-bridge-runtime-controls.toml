@@ -711,10 +711,12 @@ name        = "a_rejection_drops_the_link"
 file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''            Err(failure) => {
                 self.mailbox.failed();
+                self.abandon(values.iter());
                 let properties'''
 replacement = '''            Err(OpError::Rejected(m)) => Err(LinkError::new(m)),
             Err(failure) => {
                 self.mailbox.failed();
+                self.abandon(values.iter());
                 let properties'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_is_reported_and_the_link_stays_up", "--exact"]
@@ -727,10 +729,12 @@ name        = "an_unusable_answer_drops_the_link"
 file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''            Err(failure) => {
                 self.mailbox.failed();
+                self.abandon(values.iter());
                 let properties'''
 replacement = '''            Err(OpError::Unusable(m)) => Err(LinkError::new(m)),
             Err(failure) => {
                 self.mailbox.failed();
+                self.abandon(values.iter());
                 let properties'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unusable_answer_is_reported_once_and_passed_over", "--exact"]
@@ -1963,17 +1967,6 @@ argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.
 expect_text = '''two different integers compared as the same value'''
 guard       = "numbers_by_value"
 
-# Re-gate minor: a value past its deadline does not wait for its key.
-[[control]]
-name        = "an_expired_value_waits_for_its_key"
-file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''if value.is_key(target, property) && !value.expired(now)))'''
-replacement = '''if value.is_key(target, property) && !value.expired(now - Duration::from_secs(3600))))'''
-target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::an_expired_value_does_not_wait_for_its_key", "--exact"]
-expect_text = '''a value past its deadline still waits for its key'''
-guard       = "waits_for_key_live"
-
 # Re-gate minor: a read queued at a disconnect is refused even with no response topic.
 [[control]]
 name        = "a_read_with_no_reply_is_dropped_at_a_disconnect"
@@ -2603,8 +2596,11 @@ guard       = "verdict_refusals_uncapped"
 [[control]]
 name        = "a_replay_erases_the_re_hold"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''                    value.reheld |= replay'''
-replacement = '''                    value.reheld |= false && replay'''
+anchor      = '''                _ if inner
+                    .pending'''
+replacement = '''                _ if false
+                    && inner
+                    .pending'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::an_identical_replay_keeps_a_re_held_writes_proof_obligation", "--exact"]
 expect_text = '''a replay over the re-held write lost its proof obligation'''
@@ -2620,3 +2616,41 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_target_level_write_drops_the_replay_pin", "--exact"]
 expect_text = '''a replay after a live target-level write was decided against the old pinned basis'''
 guard       = "target_write_unpins"
+
+# Second final gate minor 1: a re-held write that expires unapplied withdraws its assumption.
+[[control]]
+name        = "an_expired_re_held_write_stays_assumed"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''        self.abandoned.extend(abandoned);'''
+replacement = '''        let _ = abandoned;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unproven_write_that_expires_unapplied_withdraws_its_assumption", "--exact"]
+expect_text = '''an unproven write that expired unapplied is still assumed'''
+guard       = "abandoned_reheld_withdrawn"
+
+# Second final gate minor 2: the fake broker's UNSUBACK waits behind a held SUBACK.
+[[control]]
+name        = "the_fake_broker_sends_its_unsuback_first"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''                held.push(unsuback);'''
+replacement = '''                let _ = tx.send(unsuback);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::an_unsuback_waits_behind_a_held_suback", "--exact"]
+expect_text = '''an ack went out while the SUBACK was held'''
+guard       = "fake_unsuback_ordered"
+
+# Second final gate minor 6: the fake broker's delayed acks keep their order.
+[[control]]
+name        = "the_fake_brokers_delayed_acks_reorder"
+file        = "mqtt-test-broker/src/lib.rs"
+anchor      = '''                    tokio::time::sleep_until(due).await;
+                    let _ = writer.send(packet);'''
+replacement = '''                    let writer = writer.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep_until(due).await;
+                        let _ = writer.send(packet);
+                    });'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::delayed_acks_keep_the_order_of_their_publishes", "--exact"]
+expect_text = '''delayed acks overtook one another'''
+guard       = "fake_delayed_acks_ordered"
