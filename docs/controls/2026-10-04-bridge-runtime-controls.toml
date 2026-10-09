@@ -59,6 +59,14 @@
 # the stop's refusals now go out apart from the pending reports; retargeted in 1783331 to a test of
 # the flush itself, RED). Every one of the 183 rows is RED.
 #
+# The second final gate (Codex and Claude, 2026-10-09): 6 rows added, 1 retired with
+# `waits_for_key`, 1 retired as redundant (`the_stops_refusals_overflow_the_queues`), several
+# re-anchored; 187 in all. By the owner's decision the whole table runs only at landing; this
+# round ran the rows whose anchor file changed since 2f54844 (`--touched 2f54844`) and those new or
+# whose bound test file changed: 130 rows at 3cf84c1, 127 RED and 3 GREEN — all three rows that
+# uncapped answers had made blind, given assertions that see their guards, or retired, in 8ec2850;
+# the four rows that commit touched RED there.
+#
 # Failing first, beyond these rows: the read-back scenario
 # (`the_outage_conflict_after_a_bridge_restart_uses_the_read_back`) failed against the first
 # build — "no Error said the request was superseded: []" — because the session published the
