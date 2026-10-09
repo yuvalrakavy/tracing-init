@@ -24,12 +24,7 @@ fn shared_for(broker: &FakeBroker) -> Shared {
         reports: Reports::new(),
         outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         read_back_requested: AtomicBool::new(false),
-        read_back_late: std::sync::atomic::AtomicU32::new(0),
         read_back_next: AtomicBool::new(false),
-        restore: false,
-        restored: AtomicBool::new(false),
-        restore_said: AtomicBool::new(false),
-        subscriptions_pending: std::sync::atomic::AtomicU32::new(u32::MAX),
     }
 }
 
@@ -84,12 +79,7 @@ fn shared_for_port() -> Shared {
         reports: Reports::new(),
         outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         read_back_requested: AtomicBool::new(false),
-        read_back_late: std::sync::atomic::AtomicU32::new(0),
         read_back_next: AtomicBool::new(false),
-        restore: false,
-        restored: AtomicBool::new(false),
-        restore_said: AtomicBool::new(false),
-        subscriptions_pending: std::sync::atomic::AtomicU32::new(u32::MAX),
     }
 }
 
@@ -142,5 +132,29 @@ fn a_retraction_of_an_unproven_write_leaves_its_assumption_unproven() {
         shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
         None,
         "a retraction proved a write the device never proved taken"
+    );
+}
+
+/// The same after the link was lost: the write is held again, unproven, and a confirmation then
+/// settles nothing (Codex final gate 5).
+#[test]
+fn a_retraction_after_the_re_hold_leaves_its_assumption_unproven() {
+    let shared = shared_for_port();
+    shared.mailbox.connected();
+    let level = serde_json::json!({"level": 40}).as_object().unwrap().clone();
+    let topic = shared.topics.desired("t1", "level");
+    let request = Publish::new(topic.clone(), QoS::AtLeastOnce, b"40".to_vec(), None);
+    route(&shared, &topic, &request, Instant::now());
+    assert!(shared.mailbox.try_take().is_some());
+    shared.mailbox.applied(true);
+    shared.reports.assume_unproven("t1", level);
+    let _ = shared.mailbox.disconnected();
+    let mut retraction = Publish::new(topic.clone(), QoS::AtLeastOnce, Vec::<u8>::new(), None);
+    retraction.retain = true;
+    route(&shared, &topic, &retraction, Instant::now());
+    assert_eq!(
+        shared.reports.values_of("t1").and_then(|v| v.get("level").cloned()),
+        None,
+        "a confirmation after the re-hold proved a write the device never took"
     );
 }

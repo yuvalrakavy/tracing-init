@@ -247,22 +247,11 @@ pub struct DriverInfo {
     pub feedback: Feedback,
     pub commands: Vec<CommandSpec>,
     pub timing: Timing,
-    /// Restore a one-way device after the bridge restarts: at the process's first connect, each
-    /// target with assumed feedback gets the read-back's values — what the previous run said it had
-    /// set — before any held value. For a device that comes back dark (DMX). Off by default; the
-    /// command line's `--restore on|off` overrides it.
-    pub restore: bool,
 }
 
 impl Default for DriverInfo {
     fn default() -> DriverInfo {
-        DriverInfo {
-            writes: Writes::Acknowledged,
-            feedback: Feedback::Observed,
-            commands: Vec::new(),
-            timing: Timing::default(),
-            restore: false,
-        }
+        DriverInfo { writes: Writes::Acknowledged, feedback: Feedback::Observed, commands: Vec::new(), timing: Timing::default() }
     }
 }
 

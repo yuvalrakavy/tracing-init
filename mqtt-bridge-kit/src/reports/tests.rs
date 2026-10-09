@@ -170,7 +170,7 @@ fn an_unproven_assumption_is_left_out_until_proven() {
         conflict: crate::wire::Conflict::DeviceWins,
         check: Default::default(),
         basis: None,
-        restored: false,
+        reheld: false,
     };
     reports.assumptions_proven(&[written]);
     assert_eq!(reports.values_of("u1").unwrap()["level"], json!(50), "a proven assumption was left out");
@@ -183,9 +183,9 @@ fn an_unproven_assumption_is_left_out_until_proven() {
 #[test]
 fn a_late_state_does_not_change_the_read_back_basis() {
     let reports = Reports::new();
-    reports.read_back("u1", values(&[("level", json!(10))]), false);
+    reports.read_back("u1", values(&[("level", json!(10))]));
     reports.read_back_incomplete();
-    reports.read_back("u1", values(&[("level", json!(40))]), false);
+    reports.read_back("u1", values(&[("level", json!(40))]));
     assert_eq!(reports.read_back_before().1["u1"]["level"], json!(10), "a late State changed the conflict rule's read-back");
     assert_eq!(reports.broker_basis("u1", "level").before, Some(json!(10)));
     assert_eq!(reports.read_back_all()["u1"]["level"], json!(40), "a late State did not reach the read-back a restore reads");

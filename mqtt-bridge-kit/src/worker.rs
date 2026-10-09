@@ -512,10 +512,6 @@ impl<D: DeviceDriver> Worker<D> {
                 let failed = |v: &StateValue| failures.iter().any(|f| f.property == v.property);
                 self.mailbox.retain_in_flight(|v| !failed(v));
                 self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
-                // A request that failed did not take its key: the restore's, if it left it (re-gate
-                // 5 minor 1).
-                let unapplied: Vec<StateValue> = values.iter().filter(|v| failed(v)).cloned().collect();
-                self.mailbox.restore_deferred(&unapplied);
                 let applied: PropertyMap = map
                     .iter()
                     .filter(|(property, _)| !failures.iter().any(|f| f.property == **property))
@@ -539,17 +535,12 @@ impl<D: DeviceDriver> Worker<D> {
                     } else {
                         info!(target, property = %failure.property, error = %failure.error, ?reason, "A property of a request failed");
                     }
-                    let restored = values.iter().any(|v| v.restored && v.property == failure.property);
-                    self.request_failed(
-                        restored,
-                        ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property),
-                    );
+                    self.reports.error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property));
                 }
                 Ok(count)
             }
             Err(failure) => {
                 self.mailbox.failed();
-                self.mailbox.restore_deferred(&values);
                 let properties: Vec<&str> = values.iter().map(|v| v.property.as_str()).collect();
                 let (reason, message) = classify(&failure);
                 match reason {
@@ -562,26 +553,10 @@ impl<D: DeviceDriver> Worker<D> {
                     _ => debug!(target, ?properties, error = message, "The device's answer to a request was unusable; passed over"),
                 }
                 for value in &values {
-                    self.request_failed(value.restored, ErrorReport::new(reason, message).target(Some(target)).property(&value.property));
+                    self.reports.error(ErrorReport::new(reason, message).target(Some(target)).property(&value.property));
                 }
                 Ok(0)
             }
-        }
-    }
-
-    /// A value's failure: on `Error` for a request; for a restored value, which no one requested, a
-    /// WARN `restore_failed` (re-gate 4 minor 10).
-    fn request_failed(&self, restored: bool, report: ErrorReport) {
-        if restored {
-            warn!(
-                kind = "restore_failed",
-                target = report.target.as_deref(),
-                property = report.property.as_deref(),
-                error = %report.error,
-                "A restored value failed at the device"
-            );
-        } else {
-            self.reports.error(report);
         }
     }
 
@@ -784,7 +759,6 @@ impl<D: DeviceDriver> Worker<D> {
         values: Vec<StateValue>,
         proving: &BTreeMap<String, PropertyMap>,
     ) -> Result<Vec<StateValue>, LinkError> {
-        let values = self.restorable(target, values);
         if !values.iter().any(|v| v.check.any()) {
             return Ok(values);
         }
@@ -834,25 +808,7 @@ impl<D: DeviceDriver> Worker<D> {
         self.mailbox.retain_in_flight(|v| apply.iter().any(|a| a.target == v.target && a.property == v.property));
         self.superseded(&superseded, false);
         self.superseded(&unknown, true);
-        let restored = self.mailbox.restore_deferred(&unknown);
-        if restored > 0 {
-            info!(target, values = restored, "Keys whose request was superseded on an unknown value are restored");
-        }
         Ok(apply)
-    }
-
-    /// A target's values less the restored ones, unless its feedback — its config's, taken before
-    /// its values — is still `Assumed`: a restore is for a target the bridge cannot read, not one
-    /// that now reports (re-gate 4 F2: a target reported since was restored over the device's own
-    /// value). What is dropped leaves the in-flight set.
-    fn restorable(&self, target: &str, values: Vec<StateValue>) -> Vec<StateValue> {
-        if !values.iter().any(|v| v.restored) || self.mailbox.feedback(target, self.info.feedback) == Feedback::Assumed {
-            return values;
-        }
-        let (kept, dropped): (Vec<StateValue>, Vec<StateValue>) = values.into_iter().partition(|v| !v.restored);
-        info!(target, values = dropped.len(), "A target no longer assumed is not restored");
-        self.mailbox.retain_in_flight(|v| kept.contains(v));
-        kept
     }
 
     /// The outcome of the command the worker took: answered if it is still the worker's to answer

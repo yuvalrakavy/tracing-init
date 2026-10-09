@@ -17,7 +17,7 @@ fn value(target: &str, property: &str, v: Value) -> StateValue {
         conflict: Conflict::DeviceWins,
         check: Check::default(),
         basis: None,
-        restored: false,
+        reheld: false,
     }
 }
 
@@ -534,147 +534,25 @@ fn a_retraction_keeps_an_unproven_write_held_again() {
     assert_eq!(held_values(&mailbox).len(), 1, "a retraction dropped an unproven write: it was not held again");
 }
 
-/// A key the restore leaves to a request goes back to the restore when that request is superseded
-/// on an unknown value — whether the supersession comes before the restore is posted or after —
-/// and stays the request's when it was applied (re-gate 4 F6).
+/// A write held again at a link's loss, before proof, is still the device's unproven write: a
+/// retraction that arrives then — the Store confirming the assumed State it published — neither
+/// drops it nor says it is settled; it is applied on the next link (Codex final gate 5: the re-hold
+/// made it an ordinary waiting value, and the delayed confirmation deleted it).
 #[test]
-fn a_key_superseded_on_an_unknown_value_goes_back_to_the_restore_in_either_order() {
-    let restored_now = |mailbox: &Mailbox| match mailbox.try_take() {
-        Some(Work::Apply { values, .. }) => values.iter().filter(|v| v.restored).map(|v| v.value.clone()).collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    // Superseded first, the restore after.
+fn a_retraction_after_the_re_hold_keeps_the_unproven_write() {
     let mailbox = up();
-    mailbox.post_state(value("u1", "level", json!(70)), true);
-    let request = held_or_taken(&mailbox);
-    mailbox.restore_deferred(&request);
-    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
-    assert_eq!(restored_now(&mailbox), [json!(40)], "a key superseded before the restore came stayed dark");
-    // The restore first, superseded after.
-    let mailbox = up();
-    mailbox.post_state(value("u1", "level", json!(70)), true);
-    let request = held_or_taken(&mailbox);
-    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
-    assert_eq!(mailbox.restore_deferred(&request), 1, "a key superseded after the restore was not given back");
-    assert_eq!(restored_now(&mailbox), [json!(40)]);
-    // Applied first: the request keeps its key.
-    let mailbox = up();
-    mailbox.post_state(value("u1", "level", json!(70)), true);
-    let _ = held_or_taken(&mailbox);
-    mailbox.applied(false);
-    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
-    assert_eq!(mailbox.restore_deferred(&[value("u1", "level", json!(70))]), 0, "an applied request's key went to the restore");
-    assert!(restored_now(&mailbox).is_empty());
-}
-
-/// The values the worker takes next.
-fn held_or_taken(mailbox: &Mailbox) -> Vec<StateValue> {
-    match mailbox.try_take() {
-        Some(Work::Apply { values, .. }) => values,
-        other => panic!("no values taken: {other:?}"),
-    }
-}
-
-/// A key superseded on an unknown value before the restore, then given a newer request that still
-/// waits when the restore is posted: the newer request keeps its key (re-gate 5 G1, its RG5-1).
-#[test]
-fn a_newer_request_waiting_at_the_restore_is_not_replaced() {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mailbox = up();
-    mailbox.post_state(value("u1", "level", json!(70)), true);
-    let request = held_or_taken(&mailbox);
-    // Superseded on an unknown value, before the restore.
-    mailbox.restore_deferred(&request);
-    // A newer live request, still waiting.
-    let mut newer = value("u1", "level", json!(90));
-    newer.conflict = Conflict::RequestWins;
-    mailbox.post_state(newer, false);
-    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
-    let taken: Vec<Value> = held_or_taken(&mailbox).iter().map(|v| v.value.clone()).collect();
-    assert_eq!(taken, [json!(90)], "the restore replaced a newer request that waited");
-}
-
-/// The same with the device down — the newer request held (re-gate 5 G1, its RG5-1b).
-#[test]
-fn a_newer_request_held_at_the_restore_is_not_replaced() {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mailbox = up();
-    mailbox.post_state(value("u1", "level", json!(70)), true);
-    let request = held_or_taken(&mailbox);
-    mailbox.restore_deferred(&request);
+    mailbox.post_state(value("u1", "temp", json!(22)), false);
+    assert!(mailbox.try_take().is_some());
+    mailbox.applied(true);
     let _ = mailbox.disconnected();
-    let mut newer = value("u1", "level", json!(90));
-    newer.conflict = Conflict::RequestWins;
-    mailbox.post_state(newer, false);
-    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
-    let held: Vec<Value> = match mailbox.take_held() {
-        Some(Held::Values(h)) => h.values.iter().map(|v| v.value.clone()).collect(),
-        other => panic!("nothing held: {other:?}"),
-    };
-    assert_eq!(held, [json!(90)], "the restore replaced a newer request held for the device");
-}
-
-/// A key left to a request that expires before it is applied, or that the Store retracts before
-/// it is applied, goes back to the restore; one retracted after it was applied — the confirm flow —
-/// does not (re-gate 5 minor 1: only a supersession gave it back).
-#[test]
-fn a_key_whose_request_expires_or_is_cancelled_goes_back_to_the_restore() {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let restored = |mailbox: &Mailbox| match mailbox.try_take() {
-        Some(Work::Apply { values, .. }) => values.iter().filter(|v| v.restored).map(|v| v.value.clone()).collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    // Expired while waiting.
-    let mailbox = up();
-    let mut request = value("u1", "level", json!(70));
-    request.deadline = Some(Instant::now() + Duration::from_millis(20));
-    mailbox.post_state(request, false);
-    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
-    std::thread::sleep(Duration::from_millis(40));
-    assert_eq!(restored(&mailbox), [json!(40)], "a key whose request expired stayed dark");
-    // Cancelled before it was applied.
-    let mailbox = up();
-    mailbox.post_state(value("u1", "level", json!(70)), false);
-    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
-    mailbox.retract("u1", "level");
-    assert_eq!(restored(&mailbox), [json!(40)], "a key whose request was cancelled stayed dark");
-    // Retracted after it was applied: the request had its key.
-    let mailbox = up();
-    mailbox.post_state(value("u1", "level", json!(70)), false);
-    let _ = held_or_taken(&mailbox);
-    mailbox.applied(false);
-    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
-    mailbox.retract("u1", "level");
-    assert_eq!(restored(&mailbox), Vec::<Value>::new(), "a retraction after the request was applied gave its key to the restore");
-}
-
-/// A key left to a request that fails at the device goes back to the restore (re-gate 5 minor 1).
-#[test]
-fn a_key_whose_request_fails_goes_back_to_the_restore() {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mailbox = up();
-    mailbox.post_state(value("u1", "level", json!(70)), false);
-    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
-    let request = held_or_taken(&mailbox);
-    mailbox.failed();
-    assert_eq!(mailbox.restore_deferred(&request), 1, "a key whose request failed stayed dark");
-}
-
-/// A newer request that came while an older one of the key was being decided — the older then
-/// superseded on an unknown value, before the restore — keeps its key: the restore defers to a
-/// request still waiting, whatever became of an older one (re-gate 5 G1's belt and braces).
-#[test]
-fn a_request_that_came_while_an_older_was_decided_keeps_its_key() {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mailbox = up();
-    mailbox.post_state(value("u1", "level", json!(70)), true);
-    let older = held_or_taken(&mailbox);
-    let mut newer = value("u1", "level", json!(90));
-    newer.conflict = Conflict::RequestWins;
-    mailbox.post_state(newer, false);
-    mailbox.restore_deferred(&older);
-    mailbox.post_restore(vec![value("u1", "level", json!(40))], deadline);
-    let taken: Vec<Value> = held_or_taken(&mailbox).iter().map(|v| v.value.clone()).collect();
-    assert_eq!(taken, [json!(90)], "the restore replaced a request that came while an older one was decided");
+    assert!(mailbox.retract("u1", "temp"), "a retraction after the re-hold took the unproven write for settled");
+    mailbox.connected();
+    let held = held_values(&mailbox);
+    assert_eq!(held.len(), 1, "a retraction after the re-hold dropped the unproven write: it was never applied again");
+    // A newer request replaces it, as any request does.
+    let _ = mailbox.disconnected();
+    mailbox.post_state(value("u1", "temp", json!(25)), false);
+    mailbox.connected();
+    let held = held_values(&mailbox);
+    assert_eq!(held[0].values[0].value, json!(25), "a newer request did not replace the re-held write");
 }

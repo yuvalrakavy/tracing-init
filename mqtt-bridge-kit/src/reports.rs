@@ -153,14 +153,8 @@ struct State {
     readback: BTreeMap<String, PropertyMap>,
     /// The read-back as it stood when it was first done, complete or not: the conflict rule's
     /// "before" values, which a retained State arriving later does not change in mid-process
-    /// (Claude's re-gate minor 11). `readback` itself goes on taking late arrivals, for a restore.
+    /// (Claude's re-gate minor 11). `readback` itself goes on taking late arrivals.
     readback_frozen: Option<BTreeMap<String, PropertyMap>>,
-    /// The read-back's targets whose `State` was marked assumed.
-    readback_assumed: std::collections::BTreeSet<String>,
-    /// The read-back is being read again, on a later connection (re-gate 4 F5): what it replays
-    /// for a target the first read gave, or this run has a model of, may be this run's own State
-    /// — published meanwhile over the previous run's — and is not taken (re-gate 5 G2).
-    read_again: bool,
     /// The model when the MQTT connection was last lost, and when.
     broker_lost: Option<(Instant, BTreeMap<String, PropertyMap>)>,
     /// The names a driver reported that cannot stand as a topic segment, each said once.
@@ -229,11 +223,9 @@ impl Reports {
                     events: Capped::new(EVENT_CAP),
                     readback: BTreeMap::new(),
                     readback_frozen: None,
-                    readback_assumed: std::collections::BTreeSet::new(),
                     broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
                     removed: std::collections::BTreeSet::new(),
-                    read_again: false,
                     written: BTreeMap::new(),
                 },
             ),
@@ -602,30 +594,8 @@ impl Reports {
     }
 
     /// A target's state as the bridge's retained `State` held it at start.
-    pub fn read_back(&self, target: &str, values: PropertyMap, assumed: bool) {
-        let mut state = self.locked();
-        if state.read_again && (state.readback.contains_key(target) || state.targets.contains_key(target) || state.removed.contains(target))
-        {
-            return;
-        }
-        if assumed {
-            state.readback_assumed.insert(target.to_owned());
-        } else {
-            state.readback_assumed.remove(target);
-        }
-        state.readback.insert(target.to_owned(), values);
-    }
-
-    /// The read-back is read again on a later connection: from now on a target the first read
-    /// gave, or this run has a model of, keeps what it has (re-gate 5 G2). Never waits.
-    pub fn reading_again(&self) {
-        self.locked().read_again = true;
-    }
-
-    /// The read-back's targets whose `State` said `"assumed": true`: what a restore restores.
-    pub fn read_back_assumed(&self) -> BTreeMap<String, PropertyMap> {
-        let state = self.locked();
-        state.readback.iter().filter(|(t, _)| state.readback_assumed.contains(*t)).map(|(t, v)| (t.clone(), v.clone())).collect()
+    pub fn read_back(&self, target: &str, values: PropertyMap) {
+        self.locked().readback.insert(target.to_owned(), values);
     }
 
     /// A property's value in the read-back, if it had one.

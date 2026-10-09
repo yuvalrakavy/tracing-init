@@ -14,7 +14,7 @@ fn request(value: Value, conflict: Conflict) -> StateValue {
         conflict,
         check: Default::default(),
         basis: None,
-        restored: false,
+        reheld: false,
     }
 }
 

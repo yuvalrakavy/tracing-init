@@ -141,42 +141,9 @@ capped queue whose overflow is counted and logged once per episode.
   driver) are standard and handled by the runtime.
 - **`timing`:** defaults for connect, operation, retry pacing, the outage WARN threshold (30 s), the poll
   interval, and the probe interval and deadline. Each can be overridden on the command line.
-- **`restore`** (default off; `--restore on|off` overrides it, `Bridge::restore` in code): for a
-  one-way device that comes back dark (DMX). When the process's first read-back is complete, and
-  every request subscription's SUBACK has come — behind the last, every retained `Config` and
-  `Desired` has been posted — the session posts each value of the read-back's assumed targets into
-  the mailbox as an ordinary held request: `RequestWins`, expiring after `RESTORE_EXPIRY` (an AC's
-  `RequestExpiry`, 1 h). Only the request subscriptions' SUBACKs count: a late read-back's own
-  SUBACK, which comes ahead of theirs, does not (re-gate 4 F1: counted, the restore went before the
-  last subscription's retained replay, and wrote the old value over a newer request). A key a
-  request was posted for since the start is left to that request — always while a request of the
-  key waits, is held or is in flight, and to the newest request of the key, whatever became of an
-  older one (re-gate 5 G1: a key settled by a superseded request let the restore replace a newer
-  one) — and a request posted later replaces a restored value still waiting. If the request a key
-  was left to does not take it — superseded because the device's current value is unknown (a
-  `DeviceWins` replay to a one-way device), expired before it was applied, failed at the device,
-  or retracted before it was applied — the key goes back to the restore, unless the restore value
-  has expired: it is posted then, as the restore would have posted it — or, when that happened
-  before the restore was posted, by the restore itself (re-gate 4 F6, a decision: otherwise
-  neither is applied and the device stays dark on that key; re-gate 5 minor 1). A request applied
-  keeps its key; a retraction after it was applied — the confirm flow — gives nothing back. A restored
-  value is marked: it is applied only while its target's feedback — its config's, taken before its
-  values — is still `Assumed` when it is taken (re-gate 4 F2: a target whose config now says it
-  reports was restored over the device's own value). From then on nothing is special: configs
-  first, the conflict rule (a device already at the value is satisfied), proof and re-hold for
-  unacknowledged writes, expiry — except that a restored value's own failures (a `Partial`'s, a
-  refusal, its expiry) are a WARN `restore_failed`, not the Store's `Error`: no one requested it
-  (re-gate 4 minor 10). If the read-back never completes, nothing is restored: one WARN
-  `restore_incomplete`, and nothing waits. A read-back cut short by the session's end — its SUBACK
-  late, or its replay under way — with the restore still to do is subscribed again on the next
-  connection, its frozen "before" values kept (re-gate 4 F5: the `State` subscription went with
-  the session, and nothing was ever restored); one the broker refused is not asked again. Read
-  again, the read-back takes a target only if the first read did not give it and this run has no
-  model of it: the broker's retained `State` of a target this run published is this run's, not
-  the previous run's, and is not taken (re-gate 5 G2). So a previous-run value of a target this
-  run published before the read-back came is not restored: the broker no longer has it.
-  (Re-gate S1: the restore had waits of its own — for the read-back, for the replays to go quiet —
-  and a defect in each round; it is now requests.)
+- **No restore in R1.** Restoring a one-way device that comes back dark (DMX, DALI) from the
+  read-back is deferred: see "Deferred: restore for one-way devices" under §11. The read-back stays,
+  for the conflict rule's "before" values.
 
 ## 5. What the runtime owns
 
@@ -246,7 +213,10 @@ commands are refused, and reads are dropped.
     no write of it is unproven; an unproven one stays unproven, held again if the link dies before
     proof — the Store retracts once it has seen the assumed `State`, before any proof, so a
     retraction that dropped it would leave the re-hold off in the normal confirm flow (re-gate 4
-    minor 7).
+    minor 7). A write held again at a link's loss keeps that provenance (`StateValue::reheld`): a
+    retraction arriving after the re-hold — a delayed confirmation — neither drops it nor settles
+    its assumption; it is applied on the next link, until a probe or read proves it or a newer
+    request replaces it (Codex final gate 5).
   - **What the snapshots hold:** the reported model, and over it what an acknowledged `apply`
     (`Writes::Acknowledged`) wrote since — for a `Partial`, only the values it did not name. A
     report of the key replaces a written value, and a key the driver reported during the `apply`
@@ -307,11 +277,7 @@ commands are refused, and reads are dropped.
   - `panic` (ERROR), from the panic hook: `thread`, `location`, `payload`;
   - `read_back_incomplete` (WARN): the read-back's SUBACK did not come within 5 s, or refused the
     subscription (an ACL; `refused`); the requests were subscribed without it;
-  - `restore_incomplete` (WARN): the read-back is incomplete, so nothing is restored unless it
-    completes after all; once;
-  - `restore_failed` (WARN): a restored value failed at the device (`target`, `property`,
-    `error`), or restored values reached their expiry unapplied (`values`); in place of the
-    `Error` a request's failure publishes.
+  - (`restore_incomplete` and `restore_failed` went with the restore; see §11's deferred note.)
 
 ### 5.2 Bounds and repairs from the R1 gate (2026-10-04)
 
@@ -545,6 +511,36 @@ schemas/                  JSON Schemas for each lane's payload
 - **R3:** `mqtt-bridge-host`, the protocol, the plugin fake device, the Python SDK, and a Broadlink IR
   plugin.
 
+### Deferred: restore for one-way devices
+
+R1 shipped a restore for six gate rounds: at the first read-back, the previous run's assumed values
+were posted as requests, for a one-way device that comes back dark. Every round's fix to it brought
+new defects, and no adopting bridge needs it yet. It is removed from R1 (`DriverInfo::restore`,
+`--restore`, and the mailbox's and session's machinery for it), and comes back when mqtt_dmx
+migrates, designed with that bridge as its consumer. The hazards the gates found are its design
+inputs:
+
+- **When to post.** The restore must wait for every retained `Config` and `Desired` to be read,
+  which comes behind the last request subscription's SUBACK; a late read-back's own SUBACK comes
+  ahead of theirs (re-gate 4 F1). A restore that waits for the read-back without a bound hangs a
+  catch-up (re-gate 3 RG3-4); one run from the worker's loop never runs under a fast poll (RG3-1).
+- **Which targets.** The previous run's `"assumed"` flag is not this run's feedback: a target whose
+  `Config` now says `observed` was restored over the device's own value (re-gate 4 F2). The
+  feedback must be judged when the value is taken, after its config.
+- **A read-back cut short.** The `State` subscription goes with its session; read again later, the
+  broker's retained `State` of any target this run has published since is this run's, not the
+  previous run's — that value is gone from the broker (re-gate 4 F5, re-gate 5 G2).
+- **Keys left to requests.** A key a request was posted for is that request's — but the request
+  may not take it: superseded on an unknown value (a `DeviceWins` replay to a one-way device),
+  expired, failed, or cancelled — and then the key stays dark (re-gate 4 F6, re-gate 5 minor 1).
+  Giving it back has its own traps: a mark that outlives a newer request lets the restore replace
+  it (re-gate 5 G1); an older failed request can consume the restore a newer waiting request was
+  to inherit (Codex final gate 3); a confirmation that arrives while an apply executes can post the
+  restore over that apply's success (Codex final gate 4). Ownership must follow the newest request
+  through waiting, flight and outcome.
+- **Whose failures.** A restored value is no one's request: its failures and expiry are not the
+  Store's `Error` (re-gate 4 minor 10).
+
 ## 12. Risks
 
 - **One runtime is one point of failure.** Mitigated by the conformance suite, negative controls,
@@ -560,9 +556,9 @@ schemas/                  JSON Schemas for each lane's payload
   (an ACL), the requests are subscribed without it (WARN `read_back_incomplete`), and a replay that
   meets no "before" values is applied. The read-back's SUBACK is told by its packet id, and only one
   that grants it counts. The read-back is complete at the next SUBACK, behind its retained replay;
-  incomplete, a late SUBACK that grants it completes it (and a restore then runs), but the conflict rule's
-  read-back is frozen as it stood when it was first done, so a `State` arriving later does not
-  change "before" values in mid-process. After a broker-only outage, replayed requests are checked
+  incomplete, it stays so: the conflict rule's read-back is frozen as it stood when it was first
+  done, so a `State` arriving later — a late SUBACK's replay — does not change "before" values in
+  mid-process. After a broker-only outage, replayed requests are checked
   against the model as it stood when the connection was lost; the read-back serves only the
   process's first session (and held values until the device's first outage snapshot). A change at
   the device the bridge never saw — made while the bridge was away, between two reads — is still a

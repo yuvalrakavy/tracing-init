@@ -306,13 +306,6 @@ impl Bridge {
         self
     }
 
-    /// Restore one-way devices at start (in code; `--restore on|off` on the command line): see
-    /// `DriverInfo::restore`, whose default this overrides.
-    pub fn restore(mut self, restore: bool) -> Bridge {
-        self.settings.restore = Some(restore);
-        self
-    }
-
     /// Set the MQTT side's timing (in code; `--mqtt-…` on the command line).
     pub fn mqtt_timing(mut self, timing: MqttTiming) -> Bridge {
         self.settings.mqtt = timing;
@@ -455,7 +448,7 @@ impl Bridge {
         let info: DriverInfo = info.unwrap_or_else(|| driver.info());
         let mut timing = self.settings.timing.apply(info.timing);
         timing.stable = self.settings.device_stable.unwrap_or(timing.stable);
-        let info = DriverInfo { timing, restore: self.settings.restore.unwrap_or(info.restore), ..info };
+        let info = DriverInfo { timing, ..info };
         config::check_timing(&info.timing, &self.settings.mqtt)?;
         let mailbox = Mailbox::new();
         let reports = Reports::new();
@@ -470,12 +463,7 @@ impl Bridge {
             reports: reports.clone(),
             outage: Arc::new(BrokerOutage::new(self.settings.mqtt.warn_after, self.settings.mqtt.stable_after)),
             read_back_requested: AtomicBool::new(false),
-            read_back_late: std::sync::atomic::AtomicU32::new(0),
             read_back_next: AtomicBool::new(false),
-            restore: info.restore,
-            restored: AtomicBool::new(false),
-            restore_said: AtomicBool::new(false),
-            subscriptions_pending: std::sync::atomic::AtomicU32::new(u32::MAX),
         });
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (worker_stop, worker_stop_rx) = watch::channel(false);

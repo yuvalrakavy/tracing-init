@@ -160,12 +160,7 @@ fn shared_through(relay: &Relay, timing: MqttTiming) -> Arc<crate::session::Shar
         reports: crate::reports::Reports::new(),
         outage: Arc::new(BrokerOutage::new(timing.warn_after, timing.stable_after)),
         read_back_requested: AtomicBool::new(false),
-        read_back_late: std::sync::atomic::AtomicU32::new(0),
         read_back_next: AtomicBool::new(false),
-        restore: false,
-        restored: AtomicBool::new(false),
-        restore_said: AtomicBool::new(false),
-        subscriptions_pending: std::sync::atomic::AtomicU32::new(u32::MAX),
     })
 }
 
