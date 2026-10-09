@@ -815,15 +815,15 @@ async fn an_on_time_read_back_restore_yields_to_a_newer_retained_request() {
     assert!(h.stop().await);
 }
 
-/// A target the previous run assumed, whose Config now says it reports, is not restored: its
-/// feedback when the restore is taken decides (re-gate 4 F2, its RG4-4: an IR unit replaced by a
-/// wired one was set back to the IR unit's last assumed value).
+/// A target the previous run assumed, whose Config now overrides the assumed driver's feedback to
+/// `observed`, is not restored: its feedback when the restore is taken decides (re-gate 4 F2, its
+/// RG4-4: an IR unit replaced by a wired one was set back to the IR unit's last assumed value;
+/// re-gate 5: the scenario's driver and config did not exercise the override).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_target_now_reported_is_not_restored() {
-    let info = mqtt_bridge_kit::DriverInfo { restore: true, ..acknowledged() };
-    let h = Harness::start_with("restore-now-reported", info, quick_timing(), |broker, topics, device| {
+async fn a_target_a_config_now_says_observed_is_not_restored() {
+    let h = Harness::start_with("restore-now-observed", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
         broker.retain(&topics.state("t1"), json!({"temp": 18, "assumed": true}).to_string(), &SendOptions::default());
-        broker.retain(&topics.config("t1"), json!({"feedback": "reported"}).to_string(), &SendOptions::default());
+        broker.retain(&topics.config("t1"), json!({"feedback": "observed"}).to_string(), &SendOptions::default());
         device.set("t1", "temp", json!(25));
     })
     .await;
@@ -883,6 +883,146 @@ async fn a_read_back_cut_short_by_a_lost_connection_is_read_again() {
     assert!(
         h.eventually(Duration::from_secs(8), |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
         "a read-back cut short by a lost connection was never read again: nothing restored"
+    );
+    assert!(h.stop().await);
+}
+
+/// The first read gave the dimmer's previous-run State — the read-back's SUBACK and replay came —
+/// and the session was cut short before the next SUBACK, having published this run's own State of
+/// the dimmer (a live request applied meanwhile). Read again on the next connection, the broker's
+/// retained State of the dimmer is this run's: it is not taken over what the first read gave, and
+/// the previous run's level is restored (re-gate 5 G2, its RG5-2: this run's document replaced the
+/// first read's entry, and the level was never restored). `drop = false` is the control: no cut.
+async fn read_again_after_this_run_published(name: &str, drop: bool) -> Harness {
+    let h = Harness::start_unwaited(name, restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        device.answer(Op::Read, None, Answer::Unsupported);
+        broker.hold_subacks();
+    })
+    .await;
+    // The read-back's SUBACK and replay go out; every later SUBACK is held.
+    assert!(h.broker.wait_for_subscription(&h.topics.state_filter(), BOUND).await, "the read-back was not subscribed");
+    h.broker.release_subacks();
+    h.broker.hold_subacks();
+    assert!(h.broker.wait_for_subscription(&h.topics.command(), BOUND).await, "the requests were not subscribed");
+    h.settle(Duration::from_millis(200)).await;
+    // A live request for another property of the dimmer, applied in the first session.
+    assert!(h.desire("dimmer", "color", json!("red"), Req::default()));
+    let state = h.topics.state("dimmer");
+    assert!(
+        h.eventually(BOUND, |h| h.broker.retained_on(&state).is_some_and(|p| String::from_utf8_lossy(&p).contains("red"))).await,
+        "the first session did not publish the dimmer's state"
+    );
+    if drop {
+        let accepted = h.broker.accepted();
+        h.broker.drop_connection();
+        assert!(h.broker.wait_until(BOUND, |b| b.accepted() > accepted).await, "the bridge did not reconnect");
+        h.settle(Duration::from_millis(300)).await;
+    }
+    h.broker.release_subacks();
+    assert!(
+        h.eventually(Duration::from_secs(8), |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
+        "the previous run's level was never restored: the read-again took this run's own State {:?}; applies {:?}",
+        h.broker.retained_on(&state),
+        h.device.applies()
+    );
+    h
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_again_does_not_replace_what_the_first_read_gave() {
+    let h = read_again_after_this_run_published("read-again-own", true).await;
+    assert!(h.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_back_replayed_in_its_own_session_is_restored() {
+    let h = read_again_after_this_run_published("read-again-own-control", false).await;
+    assert!(h.stop().await);
+}
+
+/// A read-back cut short while its replay is under way — its SUBACK came, the next subscription's
+/// did not — is read again on the next connection and restored from (re-gate 4 F5's "replaying"
+/// branch; re-gate 5: only the late-SUBACK branch had a scenario).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_back_cut_short_in_its_replay_is_read_again() {
+    let h = Harness::start_unwaited("restore-replay-cut", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        device.answer(Op::Read, None, Answer::Unsupported);
+        broker.hold_subacks();
+    })
+    .await;
+    // The read-back's SUBACK and replay go out; every later SUBACK is held.
+    assert!(h.broker.wait_for_subscription(&h.topics.state_filter(), BOUND).await, "the read-back was not subscribed");
+    h.broker.release_subacks();
+    h.broker.hold_subacks();
+    assert!(h.broker.wait_for_subscription(&h.topics.config_filter(), BOUND).await, "the requests were not subscribed");
+    h.settle(Duration::from_millis(300)).await;
+    assert!(h.log.of_kind("restore_incomplete").is_empty(), "the read-back's SUBACK was late, not its replay under way");
+    let accepted = h.broker.accepted();
+    h.broker.drop_connection();
+    assert!(h.broker.wait_until(BOUND, |b| b.accepted() > accepted).await, "the bridge did not reconnect");
+    assert!(h.eventually(BOUND, |h| !h.log.of_kind("restore_incomplete").is_empty()).await, "the replay cut short was not said incomplete");
+    h.settle(Duration::from_millis(300)).await;
+    h.broker.release_subacks();
+    assert!(
+        h.eventually(Duration::from_secs(8), |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
+        "a read-back cut short in its replay was never read again: nothing restored"
+    );
+    assert!(h.stop().await);
+}
+
+/// A request superseded on an unknown value before the restore is posted — the restore waits for
+/// the last request subscription's SUBACK, held here — gives its key to the restore when it comes
+/// (re-gate 4 F6's before-order; re-gate 5: it had a unit test only).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_superseded_before_the_restore_gives_its_key_to_it() {
+    let h = Harness::start_with("restore-superseded-before", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        broker.retain(
+            &topics.desired("dimmer", "level"),
+            "70",
+            &SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins"),
+        );
+        device.answer(Op::Read, None, Answer::Unsupported);
+        broker.hold_subacks_on(&topics.command());
+    })
+    .await;
+    assert!(
+        h.eventually(BOUND, |h| h.errors_for("superseded").len() == 1).await,
+        "the request was not superseded before the restore: {:?}",
+        h.errors()
+    );
+    assert!(h.device.get("dimmer", "level").is_none(), "the restore came before the Command SUBACK");
+    h.broker.release_subacks();
+    assert!(
+        h.eventually(Duration::from_secs(5), |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
+        "a key superseded before the restore stayed dark: {:?}",
+        h.errors()
+    );
+    assert!(h.stop().await);
+}
+
+/// A key the restore left to a request that then fails at the device goes back to the restore
+/// (re-gate 5 minor 1: only a supersession gave it back, and the key stayed dark).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_that_fails_gives_its_key_back_to_the_restore() {
+    let h = Harness::start_with("restore-after-failure", restoring(Writes::Acknowledged), quick_timing(), |broker, topics, device| {
+        broker.retain(&topics.state("dimmer"), json!({"level": 40, "assumed": true}).to_string(), &SendOptions::default());
+        broker.retain(
+            &topics.desired("dimmer", "level"),
+            "70",
+            &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"),
+        );
+        device.answer(Op::Read, None, Answer::Unsupported);
+        device.answer_times(Op::Apply, None, Answer::Rejected, 1);
+    })
+    .await;
+    assert!(
+        h.eventually(Duration::from_secs(5), |h| h.device.get("dimmer", "level") == Some(json!(40))).await,
+        "a key whose request failed stayed dark: {:?}; applies {:?}",
+        h.errors(),
+        h.device.applies()
     );
     assert!(h.stop().await);
 }

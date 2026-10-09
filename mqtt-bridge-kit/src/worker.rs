@@ -512,6 +512,10 @@ impl<D: DeviceDriver> Worker<D> {
                 let failed = |v: &StateValue| failures.iter().any(|f| f.property == v.property);
                 self.mailbox.retain_in_flight(|v| !failed(v));
                 self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
+                // A request that failed did not take its key: the restore's, if it left it (re-gate
+                // 5 minor 1).
+                let unapplied: Vec<StateValue> = values.iter().filter(|v| failed(v)).cloned().collect();
+                self.mailbox.restore_deferred(&unapplied);
                 let applied: PropertyMap = map
                     .iter()
                     .filter(|(property, _)| !failures.iter().any(|f| f.property == **property))
@@ -545,6 +549,7 @@ impl<D: DeviceDriver> Worker<D> {
             }
             Err(failure) => {
                 self.mailbox.failed();
+                self.mailbox.restore_deferred(&values);
                 let properties: Vec<&str> = values.iter().map(|v| v.property.as_str()).collect();
                 let (reason, message) = classify(&failure);
                 match reason {
@@ -851,8 +856,9 @@ impl<D: DeviceDriver> Worker<D> {
     }
 
     /// The outcome of the command the worker took: answered if it is still the worker's to answer
-    /// ([`Mailbox::command_done`]) — exactly one answer per command — and a lost link returned
-    /// either way.
+    /// ([`Mailbox::command_done_then`]) — exactly one answer per command, queued in the same step
+    /// that ends its flight, so a stop's flush cannot refuse what waits and take the reports
+    /// between the two (re-gate 5 minor 4) — and a lost link returned either way.
     fn answer_once(
         &self,
         target: Option<&str>,
@@ -860,9 +866,19 @@ impl<D: DeviceDriver> Worker<D> {
         result: Result<Option<Value>, OpError>,
         replies: Vec<ReplyTo>,
     ) -> Result<(), LinkError> {
-        if self.mailbox.command_done() {
-            return self.answered(target, command, result, replies, true);
+        let mut result = Some(result);
+        let mut outcome = None;
+        let answered = self.mailbox.command_done_then(|| {
+            if let Some(result) = result.take() {
+                outcome = Some(self.answered(target, command, result, replies, true));
+            }
+        });
+        if let (true, Some(outcome)) = (answered, outcome) {
+            return outcome;
         }
+        let Some(result) = result else {
+            return Ok(());
+        };
         debug!(target, command, "A command answered as cut off finished after all; not answered again");
         match result {
             Err(OpError::Link(e)) => Err(e),

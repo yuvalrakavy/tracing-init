@@ -666,10 +666,12 @@ name        = "a_rejection_drops_the_link"
 file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''            Err(failure) => {
                 self.mailbox.failed();
+                self.mailbox.restore_deferred(&values);
                 let properties'''
 replacement = '''            Err(OpError::Rejected(m)) => Err(LinkError::new(m)),
             Err(failure) => {
                 self.mailbox.failed();
+                self.mailbox.restore_deferred(&values);
                 let properties'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_is_reported_and_the_link_stays_up", "--exact"]
@@ -682,10 +684,12 @@ name        = "an_unusable_answer_drops_the_link"
 file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''            Err(failure) => {
                 self.mailbox.failed();
+                self.mailbox.restore_deferred(&values);
                 let properties'''
 replacement = '''            Err(OpError::Unusable(m)) => Err(LinkError::new(m)),
             Err(failure) => {
                 self.mailbox.failed();
+                self.mailbox.restore_deferred(&values);
                 let properties'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unusable_answer_is_reported_once_and_passed_over", "--exact"]
@@ -2281,7 +2285,7 @@ guard       = "restore_posted"
 [[control]]
 name        = "a_restore_overrides_a_newer_request"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''                if inner.requested.contains(&key) && settled.get(&key) != Some(&true) {'''
+anchor      = '''                if inner.requested.contains(&key) {'''
 replacement = '''                if false {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_restore_follows_the_targets_config_and_yields_to_a_newer_request", "--exact"]
@@ -2480,7 +2484,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        if !values.iter().any(|v| v.restored) || self.mailbox.feedback(target, self.info.feedback) == Feedback::Assumed {'''
 replacement = '''        if true {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_target_now_reported_is_not_restored", "--exact"]
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_target_a_config_now_says_observed_is_not_restored", "--exact"]
 expect_text = '''a target now reported was restored over the device's own value'''
 guard       = "restore_by_feedback"
 
@@ -2546,11 +2550,11 @@ guard       = "refusal_stamp_rechecked"
 [[control]]
 name        = "a_finished_verdict_is_aborted"
 file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''                if supervisor.is_finished() {'''
-replacement = '''                if false && supervisor.is_finished() {'''
+anchor      = '''                        } => worker_blocked = true,'''
+replacement = '''                        }, if false => worker_blocked = true,'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_stop_after_an_unread_verdict_does_not_wait_for_the_blocked_worker", "--exact"]
-expect_text = '''the stop did not end in time'''
+expect_text = '''the stop waited for a worker the verdict said blocked'''
 guard       = "stop_reads_a_finished_verdict"
 
 # Re-gate 4 minor 7: a retraction leaves an unproven write unproven, held again at a loss.
@@ -2594,9 +2598,93 @@ guard       = "restore_failure_warn"
 [[control]]
 name        = "a_key_superseded_before_the_restore_stays_dark"
 file        = "mqtt-bridge-kit/src/mailbox.rs"
-anchor      = '''                    inner.settled_before_restore.insert(key, true);'''
+anchor      = '''                    self.settled_before_restore.insert(key, true);'''
 replacement = '''                    let _ = key;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_key_superseded_on_an_unknown_value_goes_back_to_the_restore_in_either_order", "--exact"]
 expect_text = '''a key superseded before the restore came stayed dark'''
+guard       = "restore_after_superseded_early"
+
+# Re-gate 5 G1: the restore defers to a request of the key still waiting, held or in flight.
+# (Its braces, the mark cleared at a post, is covered by this check alone and has no row of its own.)
+[[control]]
+name        = "the_restore_replaces_a_waiting_request"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                    let waiting = inner.waits_for(&value) || inner.in_flight.iter().any(|v| v.same_key(&value));'''
+replacement = '''                    let waiting = false;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_request_that_came_while_an_older_was_decided_keeps_its_key", "--exact"]
+expect_text = '''the restore replaced a request that came while an older one was decided'''
+guard       = "restore_defers_to_waiting"
+
+# Re-gate 5 G2: a read-back read again takes nothing for a target the first read gave, or this run has a model of.
+[[control]]
+name        = "a_read_again_replaces_the_first_read"
+file        = "mqtt-bridge-kit/src/reports.rs"
+anchor      = '''        if state.read_again && (state.readback.contains_key(target) || state.targets.contains_key(target) || state.removed.contains(target))'''
+replacement = '''        if false && state.read_again && (state.readback.contains_key(target) || state.targets.contains_key(target) || state.removed.contains(target))'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_read_again_does_not_replace_what_the_first_read_gave", "--exact"]
+expect_text = '''the previous run's level was never restored'''
+guard       = "read_again_keeps_first_read"
+
+# Re-gate 5 minor 1: a key whose request expired goes back to the restore.
+[[control]]
+name        = "an_expired_request_keeps_its_key_dark"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''        for key in lapsed {
+            self.give_back(key, now);
+        }'''
+replacement = '''        let _ = lapsed;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_key_whose_request_expires_or_is_cancelled_goes_back_to_the_restore", "--exact"]
+expect_text = '''a key whose request expired stayed dark'''
+guard       = "restore_after_expiry"
+
+# Re-gate 5 minor 1: a key whose request was cancelled before it was applied goes back to the restore.
+[[control]]
+name        = "a_cancelled_request_keeps_its_key_dark"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''            inner.give_back((target.to_owned(), property.to_owned()), Instant::now());'''
+replacement = '''            let _ = target;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_key_whose_request_expires_or_is_cancelled_goes_back_to_the_restore", "--exact"]
+expect_text = '''a key whose request was cancelled stayed dark'''
+guard       = "restore_after_cancel"
+
+# Re-gate 5 minor 1: a key whose request failed at the device goes back to the restore.
+[[control]]
+name        = "a_failed_request_keeps_its_key_dark"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''                self.mailbox.failed();
+                self.mailbox.restore_deferred(&values);
+                let properties'''
+replacement = '''                self.mailbox.failed();
+                let properties'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_request_that_fails_gives_its_key_back_to_the_restore", "--exact"]
+expect_text = '''a key whose request failed stayed dark'''
+guard       = "restore_after_failure"
+
+# Re-gate 4 F5's replaying branch (re-gate 5): a read-back cut short in its replay is read again.
+[[control]]
+name        = "a_replay_cut_short_is_not_read_again"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''                if (late || replaying) && shared.restore && !shared.restored.load(Ordering::SeqCst) {'''
+replacement = '''                if late && shared.restore && !shared.restored.load(Ordering::SeqCst) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_read_back_cut_short_in_its_replay_is_read_again", "--exact"]
+expect_text = '''a read-back cut short in its replay was never read again'''
+guard       = "read_back_again_replaying"
+
+# Re-gate 4 F6's before-order, as a scenario (re-gate 5): the restore, posted after the supersession,
+# takes the key.
+[[control]]
+name        = "a_key_superseded_before_the_restore_stays_dark_end_to_end"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                    self.settled_before_restore.insert(key, true);'''
+replacement = '''                    let _ = key;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_request_superseded_before_the_restore_gives_its_key_to_it", "--exact"]
+expect_text = '''a key superseded before the restore stayed dark'''
 guard       = "restore_after_superseded_early"

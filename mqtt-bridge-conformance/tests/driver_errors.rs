@@ -594,6 +594,7 @@ async fn a_stop_after_an_unread_verdict_does_not_wait_for_the_blocked_worker() {
     assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "the watchdog did not judge the blocked worker");
     let stopping = std::time::Instant::now();
     assert!(h.stop_bridge().await, "the stop did not end in time");
-    assert!(stopping.elapsed() < Duration::from_secs(4), "the stop waited for a worker the verdict said blocked: {:?}", stopping.elapsed());
+    // A flush takes well under the worker's stop bound (2.5 s): waiting for the worker would show.
+    assert!(stopping.elapsed() < Duration::from_secs(2), "the stop waited for a worker the verdict said blocked: {:?}", stopping.elapsed());
     assert!(h.log.of_kind("shutdown_timeout").is_empty(), "the stop ran out its grace for a worker the verdict said blocked");
 }

@@ -101,8 +101,12 @@ lost link, never a hang.
   link; either budget refusing calls, with no place freed, for twice the operation bound is a dead
   worker — the helpers' too, since a reader whose synchronous reads never return leaks a thread at
   each link loss, and once its budget is full every link is lost at its first call, for good
-  (re-gate 4 F4). A refusal stamped when a place is free again leaves no stamp (re-gate 4 minor 3),
-  and a call whose thread cannot start is a lost link too (minor 5).
+  (re-gate 4 F4). So the helpers' budget can end the process too: a driver that keeps sixteen
+  long helper calls running and has one more refused, with none freed for twice the operation
+  bound, is restarted — which is the intent: its helpers are stuck, and only the restart frees
+  them (re-gate 5: round 3's "helpers never end it" is superseded). A refusal stamped when a place
+  is free again leaves no stamp (re-gate 4 minor 3), and a call whose thread cannot start is a
+  lost link too (minor 5).
 - `ctx.handle()`: a cloneable `LinkHandle` (`report()`, `link_lost()`, `is_lost()`, `blocking()`, `spawn()`) to
   keep for later calls, since the context itself is only handed to `connect`. `ctx.report` is a
   cloneable `Reporter`.
@@ -145,13 +149,17 @@ capped queue whose overflow is counted and logged once per episode.
   `RequestExpiry`, 1 h). Only the request subscriptions' SUBACKs count: a late read-back's own
   SUBACK, which comes ahead of theirs, does not (re-gate 4 F1: counted, the restore went before the
   last subscription's retained replay, and wrote the old value over a newer request). A key a
-  request was posted for since the start is left to that request; a request posted later replaces
-  a restored value still waiting. If the request a key was left to is then superseded because the
-  device's current value is unknown (a `DeviceWins` replay to a one-way device), the key goes back
-  to the restore: its restore value is posted then, as the restore would have posted it — or, when
-  the request was superseded before the restore was posted, by the restore itself (re-gate 4 F6, a
-  decision: otherwise neither is applied and the device stays dark on that key). A request applied
-  keeps its key. A restored
+  request was posted for since the start is left to that request — always while a request of the
+  key waits, is held or is in flight, and to the newest request of the key, whatever became of an
+  older one (re-gate 5 G1: a key settled by a superseded request let the restore replace a newer
+  one) — and a request posted later replaces a restored value still waiting. If the request a key
+  was left to does not take it — superseded because the device's current value is unknown (a
+  `DeviceWins` replay to a one-way device), expired before it was applied, failed at the device,
+  or retracted before it was applied — the key goes back to the restore, unless the restore value
+  has expired: it is posted then, as the restore would have posted it — or, when that happened
+  before the restore was posted, by the restore itself (re-gate 4 F6, a decision: otherwise
+  neither is applied and the device stays dark on that key; re-gate 5 minor 1). A request applied
+  keeps its key; a retraction after it was applied — the confirm flow — gives nothing back. A restored
   value is marked: it is applied only while its target's feedback — its config's, taken before its
   values — is still `Assumed` when it is taken (re-gate 4 F2: a target whose config now says it
   reports was restored over the device's own value). From then on nothing is special: configs
@@ -162,7 +170,11 @@ capped queue whose overflow is counted and logged once per episode.
   `restore_incomplete`, and nothing waits. A read-back cut short by the session's end — its SUBACK
   late, or its replay under way — with the restore still to do is subscribed again on the next
   connection, its frozen "before" values kept (re-gate 4 F5: the `State` subscription went with
-  the session, and nothing was ever restored); one the broker refused is not asked again.
+  the session, and nothing was ever restored); one the broker refused is not asked again. Read
+  again, the read-back takes a target only if the first read did not give it and this run has no
+  model of it: the broker's retained `State` of a target this run published is this run's, not
+  the previous run's, and is not taken (re-gate 5 G2). So a previous-run value of a target this
+  run published before the read-back came is not restored: the broker no longer has it.
   (Re-gate S1: the restore had waits of its own — for the read-back, for the replays to go quiet —
   and a defect in each round; it is now requests.)
 
@@ -373,10 +385,16 @@ commands are refused, and reads are dropped.
   bound (re-gate R15). A cut-off command's error says it was cut off while it ran, so the device
   may or may not have done it; a waiting one's, that it was refused before it ran. **Exactly one
   answer per command:** whoever takes the command out of flight answers it — the worker when its
-  operation ends (`Mailbox::command_done` says whether it still may), else the flush or the
-  watchdog's verdict — so a command a verdict answered "cut off" is not answered again when its
-  blocked call returns, and the worker, stopped before the flush, cannot answer between the
-  flush's refusals and its publish (re-gate 4 F3, minors 1 and 2).
+  operation ends (`Mailbox::command_done_then`, which queues the worker's answer under the same
+  lock step that ends the flight, so a flush finds either the command or its answer; re-gate 5
+  minor 4), else the flush or the watchdog's verdict — so a command a verdict answered "cut off"
+  is not answered again when its blocked call returns, and the worker, stopped before the flush,
+  cannot answer between the flush's refusals and its publish (re-gate 4 F3, minors 1 and 2). The
+  stop watches the watchdog while it waits for the worker: a verdict that the worker's thread is
+  blocked, reached before the stop or during its wait, ends the wait at once (re-gate 4 minor 4;
+  re-gate 5: a verdict just after a check made the stop wait out its 2.5 s). After a
+  full-budget verdict the worker still runs, and nothing is refused until the stop: an embedder
+  that reads the verdict late keeps serving meanwhile, with its blocking budget full.
 - **Reports before reads:** the session's select takes the stop, then what is pending to publish,
   then the next incoming event. `reported` fires only with something queued, so reports cannot
   starve the reads while publishing keeps up; a steady report stream (a fade, a meter) to a broker

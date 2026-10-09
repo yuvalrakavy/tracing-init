@@ -642,18 +642,11 @@ impl Running {
     pub async fn stop(mut self) -> bool {
         let span = self.span.clone();
         async move {
-            if let Some(supervisor) = self.supervisor.take() {
-                if supervisor.is_finished() {
-                    // A verdict reached and not read: a worker it found blocked will not stop, and
-                    // is not waited for (re-gate 4 minor 4).
-                    // WAIT: shutdown
-                    if let Ok((_, blocked)) = supervisor.await {
-                        self.worker_blocked |= blocked;
-                    }
-                } else {
-                    supervisor.abort();
-                }
-            }
+            // The watchdog, if its verdict is not read yet: it is watched while the stop waits for the
+            // worker — a verdict, reached before or during that wait, that the worker's thread is
+            // blocked ends the wait (re-gate 4 minor 4; re-gate 5: a verdict just after a check
+            // made the stop wait out the bound).
+            let mut supervisor = self.supervisor.take();
             // The worker first: it takes nothing more, and what it runs is cut off. Then the
             // session: its flush refuses what the worker left — the command it was cut off from
             // answering included — on Error and on its response topic, before its last words
@@ -666,14 +659,28 @@ impl Running {
             let tasks = &mut self.tasks;
             let all = async move {
                 let mut worker_ended = false;
+                let mut worker_blocked = false;
                 if let Some(worker) = worker.as_mut() {
                     // WAIT: shutdown
-                    worker_ended = tokio::time::timeout(WORKER_STOP_BOUND, worker).await.is_ok();
+                    tokio::select! {
+                        ended = tokio::time::timeout(WORKER_STOP_BOUND, worker) => worker_ended = ended.is_ok(),
+                        Ok((_, true)) = async {
+                            match supervisor.as_mut() {
+                                // WAIT: shutdown
+                                Some(supervisor) => supervisor.await,
+                                // WAIT: shutdown
+                                None => std::future::pending().await,
+                            }
+                        } => worker_blocked = true,
+                    }
+                }
+                if let Some(supervisor) = supervisor {
+                    supervisor.abort();
                 }
                 let _ = shutdown.send(true);
                 // WAIT: shutdown
                 while tasks.join_next().await.is_some() {}
-                if let Some(worker) = worker.filter(|_| !worker_ended) {
+                if let Some(worker) = worker.filter(|_| !worker_ended && !worker_blocked) {
                     // WAIT: shutdown
                     let _ = worker.await;
                 }

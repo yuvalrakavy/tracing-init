@@ -339,6 +339,30 @@ impl Inner {
         self.pending.push_back(Entry::State { value, held });
     }
 
+    /// A key's request did not take it — superseded on an unknown value, expired, failed or
+    /// retracted before it was applied: the restore's value, if the restore left the key to that
+    /// request and has not expired, is posted in its place; before the restore is posted, it takes
+    /// the key when it comes (re-gate 4 F6, re-gate 5 minor 1). Returns whether one was posted.
+    fn give_back(&mut self, key: (String, String), now: Instant) -> bool {
+        match self.deferred_restore.remove(&key) {
+            Some(restore) => {
+                let pending = self.waits_for(&restore) || self.in_flight.iter().any(|v| v.same_key(&restore));
+                if restore.expired(now) || pending {
+                    return false;
+                }
+                let held = !self.connected;
+                self.replace_state(restore, held);
+                true
+            }
+            None => {
+                if !self.restore_posted {
+                    self.settled_before_restore.insert(key, true);
+                }
+                false
+            }
+        }
+    }
+
     fn waits_for(&self, value: &StateValue) -> bool {
         self.pending.iter().any(|e| matches!(e, Entry::State { value: v, .. } if v.same_key(value)))
     }
@@ -384,7 +408,12 @@ impl Inner {
     fn drop_expired(&mut self, values: &mut Vec<StateValue>, now: Instant) -> usize {
         let before = values.len();
         let restored = values.iter().filter(|v| v.restored && v.expired(now)).count();
+        let lapsed: Vec<(String, String)> =
+            values.iter().filter(|v| !v.restored && v.expired(now)).map(|v| (v.target.clone(), v.property.clone())).collect();
         values.retain(|v| !v.expired(now));
+        for key in lapsed {
+            self.give_back(key, now);
+        }
         let dropped = before - values.len();
         // A restored value is no one's request: its expiry is said apart (minor 10).
         self.restore_expired += restored as u32;
@@ -457,6 +486,9 @@ impl Mailbox {
                     let held = !inner.connected;
                     value.check = Check { replayed: replay, held };
                     inner.requested.insert(key.clone());
+                    // A newer request for the key: it is that request's, whatever became of an
+                    // older one (re-gate 5 G1).
+                    inner.settled_before_restore.remove(&key);
                     if replay {
                         match inner.bases.get(&key) {
                             Some((first, basis)) if *first == value.value => value.basis = Some(basis.clone()),
@@ -491,6 +523,7 @@ impl Mailbox {
             let held = !inner.connected;
             for mut value in values {
                 inner.requested.insert((value.target.clone(), value.property.clone()));
+                inner.settled_before_restore.remove(&(value.target.clone(), value.property.clone()));
                 inner.copies.insert((value.target.clone(), value.property.clone()), (value.value.clone(), until));
                 value.check = Check { replayed: false, held };
                 inner.replace_state(value, held);
@@ -511,6 +544,19 @@ impl Mailbox {
         self.locked().in_flight_command.take().is_some()
     }
 
+    /// The same, and if the command was still in flight, `answer` — its answer queued — run in the
+    /// same step, under the mailbox's lock: a stop's flush, which refuses what is in flight and
+    /// then takes the reports, finds either the command or its answer (re-gate 5 minor 4).
+    /// Returns whether it was.
+    pub fn command_done_then(&self, answer: impl FnOnce()) -> bool {
+        let mut inner = self.locked();
+        if inner.in_flight_command.take().is_none() {
+            return false;
+        }
+        answer();
+        true
+    }
+
     /// A restore (`DriverInfo::restore`): each of `values` — what the previous run assumed, from
     /// the read-back — waits as an ordinary request would, held, checked by the conflict rule
     /// (`RequestWins`, so a device already at the value is satisfied), until `deadline`; but one
@@ -529,13 +575,19 @@ impl Mailbox {
                 value.conflict = Conflict::RequestWins;
                 value.check = Check { replayed: false, held: true };
                 value.restored = true;
-                // A key left to a request: kept by it if it was applied, the restore's again if it
-                // was superseded on an unknown value — before the restore came, or after.
-                if inner.requested.contains(&key) && settled.get(&key) != Some(&true) {
-                    if !settled.contains_key(&key) {
-                        inner.deferred_restore.insert(key, value);
+                // A key left to a request: deferred to one still waiting, held or in flight (re-gate 5
+                // G1); kept by one applied; the restore's if its request did not take it — before
+                // the restore came, or after (give_back).
+                if inner.requested.contains(&key) {
+                    let waiting = inner.waits_for(&value) || inner.in_flight.iter().any(|v| v.same_key(&value));
+                    match (waiting, settled.get(&key)) {
+                        (false, Some(true)) => {}
+                        (false, Some(false)) => continue,
+                        _ => {
+                            inner.deferred_restore.insert(key, value);
+                            continue;
+                        }
                     }
-                    continue;
                 }
                 inner.replace_state(value, held);
                 posted += 1;
@@ -548,27 +600,23 @@ impl Mailbox {
         posted
     }
 
-    /// Requests superseded because the device's current value is unknown: each key the restore left
-    /// to one gets the restore's value back, posted as the restore would have (re-gate 4 F6: the
-    /// key was left dark). Returns how many were posted. Never waits.
+    /// Requests that did not take their key — superseded because the device's current value is
+    /// unknown, or failed at the device: each key the restore left to one gets the restore's value
+    /// back, posted as the restore would have (re-gate 4 F6: the key was left dark; re-gate 5
+    /// minor 1). Returns how many were posted. Never waits.
     pub fn restore_deferred(&self, superseded: &[StateValue]) -> usize {
+        let now = Instant::now();
         let (posted, any) = {
             let mut inner = self.locked();
-            let held = !inner.connected;
+            // They are done with: no longer in flight, whoever asks.
+            inner.in_flight.retain(|v| !superseded.contains(v));
             let mut posted = 0;
-            for value in superseded {
-                let key = (value.target.clone(), value.property.clone());
-                if let Some(restore) = inner.deferred_restore.remove(&key) {
-                    if !inner.waits_for(&restore) {
-                        inner.replace_state(restore, held);
-                        posted += 1;
-                    }
-                } else if !inner.restore_posted {
-                    // The restore has not come yet: it takes the key when it does.
-                    inner.settled_before_restore.insert(key, true);
+            for value in superseded.iter().filter(|v| !v.restored) {
+                if inner.give_back((value.target.clone(), value.property.clone()), now) {
+                    posted += 1;
                 }
             }
-            (posted, posted > 0 && !held)
+            (posted, posted > 0 && inner.connected)
         };
         if any {
             self.posted.notify_one();
@@ -583,8 +631,14 @@ impl Mailbox {
     /// whether the key has such a write.
     pub fn retract(&self, target: &str, property: &str) -> bool {
         let mut inner = self.locked();
+        let before = inner.pending.len() + inner.in_flight.len();
         inner.pending.retain(|e| !matches!(e, Entry::State { value, .. } if value.is_key(target, property)));
         inner.in_flight.retain(|v| !v.is_key(target, property));
+        // A request cancelled before it was applied leaves its key to the restore (re-gate 5
+        // minor 1); one retracted after it was applied — the confirm flow — does not.
+        if inner.pending.len() + inner.in_flight.len() < before {
+            inner.give_back((target.to_owned(), property.to_owned()), Instant::now());
+        }
         let unproven = inner.unproven.iter().any(|(v, _)| v.is_key(target, property));
         inner.copies.remove(&(target.to_owned(), property.to_owned()));
         inner.bases.remove(&(target.to_owned(), property.to_owned()));

@@ -303,6 +303,7 @@ async fn session(shared: &Shared, shutdown: &mut watch::Receiver<bool>) -> Sessi
                 // broker refused is not asked again. The frozen "before" values stay as they were.
                 if (late || replaying) && shared.restore && !shared.restored.load(Ordering::SeqCst) {
                     shared.read_back_requested.store(false, Ordering::SeqCst);
+                    shared.reports.reading_again();
                 }
                 return SessionEnd::Ended { connected: accepted };
             }

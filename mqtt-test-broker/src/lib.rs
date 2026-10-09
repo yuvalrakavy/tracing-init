@@ -239,6 +239,8 @@ struct Shared {
     max_packet: Mutex<Option<(usize, u32)>>,
     /// Whether SUBACKs (and their replays) are held, and those held, in order.
     holding_subacks: AtomicBool,
+    /// Filters whose SUBACK is held whatever `holding_subacks` says ([`FakeBroker::hold_subacks_on`]).
+    holding_prefixes: Mutex<Vec<String>>,
     held_subacks: Mutex<Vec<BytesMut>>,
     /// Filters starting with one of these are refused, `NotAuthorized` (an ACL).
     denied: Mutex<Vec<String>>,
@@ -289,6 +291,7 @@ impl FakeBroker {
             will: Mutex::new(None),
             max_packet: Mutex::new(None),
             holding_subacks: AtomicBool::new(false),
+            holding_prefixes: Mutex::new(Vec::new()),
             held_subacks: Mutex::new(Vec::new()),
             denied: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -440,6 +443,14 @@ impl FakeBroker {
         self.shared.holding_subacks.store(true, Ordering::SeqCst);
     }
 
+    /// Hold the SUBACK — and its replay — of every subscription to a filter starting with `prefix`
+    /// from now on, the others answered: a broker slow on one subscription. Released with the rest
+    /// by [`release_subacks`](Self::release_subacks); a SUBACK after a held one is answered out of
+    /// order, so hold only the last subscription a client makes.
+    pub fn hold_subacks_on(&self, prefix: &str) {
+        self.shared.holding_prefixes.lock().unwrap().push(prefix.to_owned());
+    }
+
     /// Refuse every subscription to a filter starting with `prefix` from now on, with the reason
     /// code `NotAuthorized`: no subscription is made and nothing replayed (a broker's ACL).
     pub fn deny_subscriptions(&self, prefix: &str) {
@@ -451,6 +462,7 @@ impl FakeBroker {
         let held = {
             let mut held = self.shared.held_subacks.lock().unwrap();
             self.shared.holding_subacks.store(false, Ordering::SeqCst);
+            self.shared.holding_prefixes.lock().unwrap().clear();
             std::mem::take(&mut *held)
         };
         if let Some(tx) = &*self.shared.to_client.lock().unwrap() {
@@ -875,7 +887,11 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
                 packets.extend(replay(shared, &f.path));
             }
             let mut held = shared.held_subacks.lock().unwrap();
-            if shared.holding_subacks.load(Ordering::SeqCst) {
+            let held_filter = {
+                let prefixes = shared.holding_prefixes.lock().unwrap();
+                s.filters.iter().any(|f| prefixes.iter().any(|p| f.path.starts_with(p.as_str())))
+            };
+            if shared.holding_subacks.load(Ordering::SeqCst) || held_filter {
                 held.extend(packets);
             } else {
                 for packet in packets {
