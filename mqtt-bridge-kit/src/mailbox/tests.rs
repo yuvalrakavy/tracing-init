@@ -556,3 +556,45 @@ fn a_retraction_after_the_re_hold_keeps_the_unproven_write() {
     let held = held_values(&mailbox);
     assert_eq!(held[0].values[0].value, json!(25), "a newer request did not replace the re-held write");
 }
+
+/// An identical retained replay of a write held again before proof is that write still: a
+/// retraction while the device is down — the Store confirming the assumed State — keeps it, and it
+/// is applied on recovery (second final gate 2: the replay erased the provenance).
+#[test]
+fn an_identical_replay_keeps_a_re_held_writes_proof_obligation() {
+    let mailbox = up();
+    mailbox.post_state(value("u1", "level", json!(40)), false);
+    assert!(mailbox.try_take().is_some());
+    mailbox.applied(true);
+    let _ = mailbox.disconnected();
+    mailbox.post_state(value("u1", "level", json!(40)), true);
+    assert!(mailbox.retract("u1", "level"), "a replay over the re-held write lost its proof obligation");
+    mailbox.connected();
+    assert_eq!(held_values(&mailbox).len(), 1, "the re-held write was dropped by a replay and a retraction: never applied again");
+}
+
+/// A live target-level write drops each property's replay pin, as a live property write does: a
+/// later replay of the old value is decided against its own basis, not the first replay's (second
+/// final gate 3).
+#[test]
+fn a_target_level_write_drops_the_replay_pin() {
+    let mailbox = up();
+    let basis = |before: i64| Basis { at: Instant::now(), before: Some(json!(before)) };
+    let mut first = value("u1", "level", json!(22));
+    first.basis = Some(basis(20));
+    mailbox.post_state(first, true);
+    let _ = mailbox.try_take();
+    mailbox.failed();
+    mailbox.post_target(vec![value("u1", "level", json!(24))]);
+    let _ = mailbox.try_take();
+    mailbox.applied(false);
+    let mut again = value("u1", "level", json!(22));
+    again.basis = Some(basis(24));
+    mailbox.post_state(again, true);
+    let Some(Work::Apply { values, .. }) = mailbox.try_take() else { panic!("nothing taken") };
+    assert_eq!(
+        values[0].basis.as_ref().and_then(|b| b.before.clone()),
+        Some(json!(24)),
+        "a replay after a live target-level write was decided against the old pinned basis"
+    );
+}

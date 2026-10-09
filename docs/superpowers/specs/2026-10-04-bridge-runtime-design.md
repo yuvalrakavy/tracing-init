@@ -200,7 +200,8 @@ commands are refused, and reads are dropped.
     not replace it; and it is pinned per key: a replay of the same retained value in a later
     session (the Store has not retracted it yet) is decided against the basis it was first
     replayed with, not a later snapshot that already holds the change at the device. A live write
-    or a retraction of the key, or a replay of another value, drops the pin (re-gate R2, R12). What
+    of the key — property-level or target-level — or a retraction of it, or a replay of another
+    value, drops the pin (re-gate R2, R12; second final gate 3). What
     an acknowledged write teaches the bridge changes later snapshots only, never a basis already
     captured. The check applies to each value on its own: a live value taken with a
     checked one is applied as it is.
@@ -216,7 +217,8 @@ commands are refused, and reads are dropped.
     minor 7). A write held again at a link's loss keeps that provenance (`StateValue::reheld`): a
     retraction arriving after the re-hold — a delayed confirmation — neither drops it nor settles
     its assumption; it is applied on the next link, until a probe or read proves it or a newer
-    request replaces it (Codex final gate 5).
+    request replaces it (Codex final gate 5). An identical retained replay of it is that write still,
+    and keeps the obligation (second final gate 2).
   - **What the snapshots hold:** the reported model, and over it what an acknowledged `apply`
     (`Writes::Acknowledged`) wrote since — for a `Partial`, only the values it did not name. A
     report of the key replaces a written value, and a key the driver reported during the `apply`
@@ -317,7 +319,9 @@ commands are refused, and reads are dropped.
   pause): the worker was paused too, so for 2 s after it the watchdog judges nothing (re-gate 3 S6).
 
   Then: ERROR `worker_died`, for a blocked thread `Status=unreachable` and what waits refused —
-  the command the worker was running among them, "cut off" — and the dead-part path: the bounded
+  the command the worker was running among them, "cut off"; the refusals go to the session in a
+  batch of their own, past the capped `Error` and reply queues, as a link loss's do (second final
+  gate 1) — and the dead-part path: the bounded
   shutdown (which does not wait for a blocked worker, whether or not the verdict was read; re-gate
   4 minor 4) and a failure exit, so the supervisor restarts the process. A thread cannot be
   cancelled; the restart is the recovery (re-gate R1, R13).

@@ -150,6 +150,11 @@ struct State {
     changed: Vec<String>,
     errors: Capped<ErrorReport>,
     events: Capped<Outbound>,
+    /// Refusals of the commands a link's loss or a watchdog's verdict cut off or left waiting, with
+    /// their replies: uncapped — bounded by the mailbox's own cap — and taken first, so a full
+    /// mailbox's 65 refusals do not displace one another in the capped queues (Codex final gate 2,
+    /// second final gate 1).
+    refusals: (Vec<ErrorReport>, Vec<Outbound>),
     readback: BTreeMap<String, PropertyMap>,
     /// The read-back as it stood when it was first done, complete or not: the conflict rule's
     /// "before" values, which a retained State arriving later does not change in mid-process
@@ -225,6 +230,7 @@ impl Reports {
                     readback_frozen: None,
                     broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
+                    refusals: (Vec::new(), Vec::new()),
                     removed: std::collections::BTreeSet::new(),
                     written: BTreeMap::new(),
                 },
@@ -395,6 +401,17 @@ impl Reports {
         self.ready.notify_one();
     }
 
+    /// Refused commands' `Error`s and replies, taken before everything else queued, past every
+    /// cap. Never waits.
+    pub fn refused(&self, errors: Vec<ErrorReport>, replies: Vec<Outbound>) {
+        {
+            let mut state = self.locked();
+            state.refusals.0.extend(errors);
+            state.refusals.1.extend(replies);
+        }
+        self.ready.notify_one();
+    }
+
     /// What changed since the last take; the queued messages are taken out.
     pub fn take(&self) -> Changes {
         let (changes, errors_ended, events_ended) = {
@@ -409,8 +426,9 @@ impl Reports {
                     None => None,
                 })
                 .collect();
-            let errors = state.errors.items.drain(..).collect();
-            let events = state.events.items.drain(..).collect();
+            let (mut errors, mut events) = std::mem::take(&mut state.refusals);
+            errors.extend(state.errors.items.drain(..));
+            events.extend(state.events.items.drain(..));
             (Changes { status, states, errors, events }, state.errors.displacing.take(), state.events.displacing.take())
         };
         if let Some((since, dropped)) = errors_ended {
@@ -612,7 +630,11 @@ impl Reports {
     #[cfg(test)]
     pub fn untaken(&self) -> bool {
         let state = self.locked();
-        state.status_changed || !state.changed.is_empty() || !state.errors.items.is_empty() || !state.events.items.is_empty()
+        state.status_changed
+            || !state.changed.is_empty()
+            || !state.errors.items.is_empty()
+            || !state.events.items.is_empty()
+            || !state.refusals.0.is_empty()
     }
 }
 

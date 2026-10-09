@@ -920,12 +920,7 @@ const READ_EXPIRED: &str = "the command reached its expiry while it waited for t
 /// What a disconnect refused, or what expired: each command on `Error`, and every reply waited for.
 pub(crate) fn report_refused(reports: &Reports, unanswered: Vec<Unanswered>, message: &str) {
     let (errors, replies) = refusals(unanswered, message);
-    for error in errors {
-        reports.error(error);
-    }
-    for reply in replies {
-        reports.event(reply);
-    }
+    reports.refused(errors, replies);
 }
 
 /// The same, as the messages themselves — for the stop's flush, which publishes them directly

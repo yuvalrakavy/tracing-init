@@ -2582,3 +2582,41 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_stop_with_a_full_mailbox_answers_every_command", "--exact"]
 expect_text = '''a stop with a full mailbox left commands unanswered'''
 guard       = "stop_refusals_direct"
+
+# Second final gate 1: a link loss's or a verdict's refusals go to the session past the capped queues.
+[[control]]
+name        = "a_verdicts_refusals_overflow_the_queues"
+file        = "mqtt-bridge-kit/src/worker.rs"
+anchor      = '''    reports.refused(errors, replies);'''
+replacement = '''    for error in errors {
+        reports.error(error);
+    }
+    for reply in replies {
+        reports.event(reply);
+    }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_watchdog_verdict_with_a_full_mailbox_answers_every_command", "--exact"]
+expect_text = '''a watchdog verdict with a full mailbox left commands unanswered'''
+guard       = "verdict_refusals_uncapped"
+
+# Second final gate 2: an identical replay of a re-held write keeps its proof obligation.
+[[control]]
+name        = "a_replay_erases_the_re_hold"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                    value.reheld |= replay'''
+replacement = '''                    value.reheld |= false && replay'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::an_identical_replay_keeps_a_re_held_writes_proof_obligation", "--exact"]
+expect_text = '''a replay over the re-held write lost its proof obligation'''
+guard       = "replay_keeps_reheld"
+
+# Second final gate 3: a live target-level write drops each property's replay pin.
+[[control]]
+name        = "a_target_level_write_keeps_the_pin"
+file        = "mqtt-bridge-kit/src/mailbox.rs"
+anchor      = '''                inner.bases.remove(&(value.target.clone(), value.property.clone()));'''
+replacement = '''                let _ = &value;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "mailbox::tests::a_target_level_write_drops_the_replay_pin", "--exact"]
+expect_text = '''a replay after a live target-level write was decided against the old pinned basis'''
+guard       = "target_write_unpins"

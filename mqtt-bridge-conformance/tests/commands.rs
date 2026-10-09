@@ -564,3 +564,34 @@ async fn a_stop_with_a_full_mailbox_answers_every_command() {
     }
     assert!(answers["c-0"][0].contains("cut off"), "the executing command was not said cut off: {:?}", answers["c-0"]);
 }
+
+/// A watchdog's verdict with the mailbox full — one command blocking the worker's thread past its
+/// deadline, 64 waiting, each with a response topic — answers every one, once: its refusals go to
+/// the session past the reports' capped queues (second final gate 1: 65 refusals into 64-entry
+/// queues dropped the executing command's answer).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watchdog_verdict_with_a_full_mailbox_answers_every_command() {
+    let h = Harness::start_with("watchdog-full", acknowledged(), quick_timing(), up_at_20).await;
+    assert!(connected(&h).await);
+    h.device.answer_times(Op::Execute, None, Answer::Block(Duration::from_millis(4000)), 1);
+    let replies = "Store/replies/watchdog-full";
+    assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-0"))));
+    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
+    for i in 1..=64 {
+        let id = format!("c-{i}");
+        assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, id.as_bytes()))));
+    }
+    // The verdict comes at the deadline plus the grace (about 2.5 s); the blocked call returns at 4 s.
+    assert!(
+        h.eventually(Duration::from_secs(8), |h| answers_by_correlation(h, replies).len() == 65).await,
+        "a watchdog verdict with a full mailbox left commands unanswered: {:?}",
+        (0..=64).map(|i| format!("c-{i}")).filter(|id| !answers_by_correlation(&h, replies).contains_key(id)).collect::<Vec<_>>()
+    );
+    h.settle(Duration::from_secs(2)).await;
+    let answers = answers_by_correlation(&h, replies);
+    for (id, errors) in &answers {
+        assert_eq!(errors.len(), 1, "command {id} was answered {} times", errors.len());
+    }
+    assert!(answers["c-0"][0].contains("cut off"), "the executing command was not said cut off: {:?}", answers["c-0"]);
+    assert!(h.stop().await);
+}

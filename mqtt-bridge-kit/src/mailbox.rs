@@ -430,6 +430,12 @@ impl Mailbox {
                 _ => {
                     let held = !inner.connected;
                     value.check = Check { replayed: replay, held };
+                    // The same value replayed over one held again before proof is that write still:
+                    // it keeps the proof obligation (second final gate 2).
+                    value.reheld |= replay
+                        && inner.pending.iter().any(
+                            |e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld && v.value == value.value),
+                        );
                     if replay {
                         match inner.bases.get(&key) {
                             Some((first, basis)) if *first == value.value => value.basis = Some(basis.clone()),
@@ -464,6 +470,8 @@ impl Mailbox {
             let held = !inner.connected;
             for mut value in values {
                 inner.copies.insert((value.target.clone(), value.property.clone()), (value.value.clone(), until));
+                // A live write of the key, as `post_state`'s: the replay pin goes (second final gate 3).
+                inner.bases.remove(&(value.target.clone(), value.property.clone()));
                 value.check = Check { replayed: false, held };
                 inner.replace_state(value, held);
             }
