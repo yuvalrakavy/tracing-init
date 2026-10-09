@@ -2554,7 +2554,7 @@ anchor      = '''                        } => worker_blocked = true,'''
 replacement = '''                        }, if false => worker_blocked = true,'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_stop_after_an_unread_verdict_does_not_wait_for_the_blocked_worker", "--exact"]
-expect_text = '''the stop waited for a worker the verdict said blocked'''
+expect_text = '''the stop did not end in time'''
 guard       = "stop_reads_a_finished_verdict"
 
 # Re-gate 4 minor 7: a retraction leaves an unproven write unproven, held again at a loss.
