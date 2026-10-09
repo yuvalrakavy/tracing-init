@@ -40,8 +40,14 @@ async fn malformed_desired_and_command_payloads_are_answered_on_error() {
         "not every malformed payload was answered on Error: {:#?}",
         h.errors()
     );
+    // A malformed property write names its target and property. Found, not taken as the first:
+    // a malformed command is a request's answer, and in a batch that holds both it goes ahead of
+    // the unsolicited ones (spec §5.2), so arrival order is not publish order under load.
     let errors = h.errors_for("malformed");
-    assert_eq!((errors[0]["target"].as_str(), errors[0]["property"].as_str()), (Some("t1"), Some("temp")), "{:?}", errors[0]);
+    assert!(
+        errors.iter().any(|e| (e["target"].as_str(), e["property"].as_str()) == (Some("t1"), Some("temp"))),
+        "no malformed property write named its target and property: {errors:?}"
+    );
     assert!(
         h.eventually(BOUND, |h| h.errors_for("unsupported").len() == 1).await,
         "the unknown command was not answered: {:?}",
