@@ -3,3 +3,5 @@ App.*.log
 /wait-lint/target
 /lock-order/target
 /mqtt-test-broker/target
+/mqtt-bridge-kit/target
+/mqtt-bridge-conformance/target

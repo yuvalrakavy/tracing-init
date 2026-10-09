@@ -67,7 +67,7 @@ lost link, never a hang.
 |---|---|---|---|
 | `info()` | once, at start | be pure | `DriverInfo` (§4.4) |
 | `connect(ctx)` | to open the device link (paced retries) | finish or fail within the connect timing; may start helpers via `ctx` | ok or `LinkError` |
-| `disconnect()` | after a lost link, at shutdown | be quick; best effort | nothing |
+| `disconnect()` | after a lost link, at shutdown | be quick; best effort; bounded by the operation timeout after a lost link and by a fixed 2 s at shutdown | nothing |
 | `read_state(scope)` | after connecting, on the poll interval, for `refresh`, and before resolving outage conflicts | read the device, not a cache | observed state per target |
 | `apply(target, values)` | for a request; several values arrive together for an atomic write | apply all values, in the order the device needs | ok, an error class for the whole write, or `Partial`: the properties that failed, each with its class (the rest were applied) |
 | `execute(target, command, params)` | for a momentary command | act once; never retry | ok with an optional reply, or an error class |
@@ -631,3 +631,10 @@ inputs:
   SUBACK (Mosquitto does) queues the retained `State` ahead of every retained request. A broker
   that sent retained messages later, on its own schedule, could still interleave them; and past
   5 s without the SUBACK the requests are subscribed anyway (WARN `read_back_incomplete`).
+
+
+### Notes from the documentation pass (2026-10-10)
+
+- `LinkStatus::Disabled` (`disabled`) is part of the grammar but no R1 bridge reports it; it arrives with the multi-device host (a configured instance that is disabled).
+- `MqttTiming::poll_retry` is settable in code only (no CLI flag); `--connect-timeout 0` is not yet refused like the other zero timings (follow-up).
+- §10's `plugin`, `mqtt-bridge-host` and Python SDK are R3 and not built.
