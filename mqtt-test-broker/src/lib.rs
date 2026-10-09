@@ -50,6 +50,11 @@
 //!   discarded, never sent — as MQTT v5 has a broker do.
 //! - **The last will** (v5): a connection that ends without a DISCONNECT leaves its CONNECT's will
 //!   retained, if the will is retained — as a broker publishes it.
+//! - **One slow subscription:** [`FakeBroker::hold_subacks_matching`] holds only the SUBACKs of
+//!   subscriptions to a filter with a given prefix, the rest answered at once.
+//! - **Several clients** (v5, [`FakeBroker::start_multi`]): for the multi-device host's two
+//!   processes on one root — each connection keeps its own subscriptions and will, every publish
+//!   reaches every matching subscription, and one connection's end publishes its own will alone.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -176,6 +181,16 @@ impl Retained {
     }
 }
 
+/// One client's connection, in a broker for several clients at once (`FakeBroker::start_multi`).
+struct Conn {
+    number: usize,
+    tx: mpsc::UnboundedSender<BytesMut>,
+    /// Its subscriptions, each with whether it was made retain-as-published.
+    active: Vec<(String, bool)>,
+    /// Its last will: topic, payload, retain. A DISCONNECT clears it.
+    will: Option<(String, Bytes, bool)>,
+}
+
 /// The protocol the broker speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -242,9 +257,17 @@ struct Shared {
     will: Mutex<Option<(usize, String, Bytes, bool)>>,
     /// The current connection's maximum packet size (v5 CONNECT), by connection number.
     max_packet: Mutex<Option<(usize, u32)>>,
-    /// Whether SUBACKs (and their replays) are held, and those held, in order.
+    /// Whether SUBACKs (and their replays) are held, and those held, in order — each with the
+    /// writer of the connection it is for.
     holding_subacks: AtomicBool,
-    held_subacks: Mutex<Vec<BytesMut>>,
+    held_subacks: Mutex<Vec<(mpsc::UnboundedSender<BytesMut>, BytesMut)>>,
+    /// SUBACKs of a subscription to a filter starting with one of these are held
+    /// (`hold_subacks_matching`), the others answered.
+    held_prefixes: Mutex<Vec<String>>,
+    /// Several clients at once (`start_multi`): each connection keeps its own subscriptions and
+    /// will, in `conns`, and a publish goes to every connection with a matching subscription.
+    multi: bool,
+    conns: Mutex<Vec<Conn>>,
     /// Filters starting with one of these are refused, `NotAuthorized` (an ACL).
     denied: Mutex<Vec<String>>,
     /// Arrivals at the `held` lock (see `lock_held`).
@@ -268,7 +291,20 @@ impl FakeBroker {
         FakeBroker::start_protocol(Protocol::V4, 0).await
     }
 
+    /// A v5 broker for several clients at once — two bridge processes sharing a root: each
+    /// connection keeps its own subscriptions and last will, a publish (the test's or a client's)
+    /// reaches every connection with a matching subscription, and one connection's end publishes
+    /// its own will alone. The retained messages are shared. The acks are never held per client
+    /// (`hold_acks` is for one client); `drop_connection` closes every connection.
+    pub async fn start_multi() -> FakeBroker {
+        FakeBroker::start_with(Protocol::V5, 10, true).await
+    }
+
     async fn start_protocol(protocol: Protocol, receive_max: u16) -> FakeBroker {
+        FakeBroker::start_with(protocol, receive_max, false).await
+    }
+
+    async fn start_with(protocol: Protocol, receive_max: u16, multi: bool) -> FakeBroker {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind the fake broker");
         let port = listener.local_addr().expect("the fake broker's address").port();
         let shared = Arc::new(Shared {
@@ -297,6 +333,9 @@ impl FakeBroker {
             max_packet: Mutex::new(None),
             holding_subacks: AtomicBool::new(false),
             held_subacks: Mutex::new(Vec::new()),
+            held_prefixes: Mutex::new(Vec::new()),
+            multi,
+            conns: Mutex::new(Vec::new()),
             denied: Mutex::new(Vec::new()),
             #[cfg(test)]
             held_lock_reached: AtomicUsize::new(0),
@@ -338,6 +377,21 @@ impl FakeBroker {
         let payload = payload.into();
         if options.retain {
             store_retained(&self.shared, topic, payload.clone(), options.clone());
+        }
+        if self.shared.multi {
+            let mut delivered = false;
+            for (tx, preserve_retain) in matching_conns(&self.shared, topic) {
+                let encoded = encode_publish(
+                    self.shared.protocol,
+                    topic,
+                    payload.clone(),
+                    options.retain && preserve_retain,
+                    options.properties(options.message_expiry),
+                    Some(next_pkid(&self.shared)),
+                );
+                delivered |= tx.send(encoded).is_ok();
+            }
+            return delivered;
         }
         let Some(preserve_retain) = matching(&self.shared, topic) else {
             return false;
@@ -461,17 +515,22 @@ impl FakeBroker {
         self.shared.denied.lock().unwrap().push(prefix.to_owned());
     }
 
+    /// Hold, from now on, the SUBACK (and replay) of every subscription to a filter starting with
+    /// `prefix` — the others are answered at once, out of order with the held one, as a broker that
+    /// is slow on one subscription. Released by [`release_subacks`](Self::release_subacks).
+    pub fn hold_subacks_matching(&self, prefix: &str) {
+        self.shared.held_prefixes.lock().unwrap().push(prefix.to_owned());
+    }
+
     /// Send the SUBACKs held, and their replays, in order, and hold none from now on.
     pub fn release_subacks(&self) {
         // Sent under the lock a SUBSCRIBE takes to decide whether to hold its SUBACK: one coming
         // meanwhile goes out after these, as the broker answers in order (Codex final gate).
         let mut held = self.shared.held_subacks.lock().unwrap();
         self.shared.holding_subacks.store(false, Ordering::SeqCst);
-        let packets = std::mem::take(&mut *held);
-        if let Some(tx) = &*self.shared.to_client.lock().unwrap() {
-            for packet in packets {
-                let _ = tx.send(packet);
-            }
+        self.shared.held_prefixes.lock().unwrap().clear();
+        for (tx, packet) in std::mem::take(&mut *held) {
+            let _ = tx.send(packet);
         }
     }
 
@@ -570,11 +629,16 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
     let (mut rd, mut wr) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<BytesMut>();
     *shared.to_client.lock().unwrap() = Some(tx.clone());
-    lock_held(&shared).clear();
-    // A new connection starts without a session: no subscription carries over, nor a SUBACK or a
-    // replay held for an earlier connection (the R1 re-gate).
-    shared.active.lock().unwrap().clear();
-    shared.held_subacks.lock().unwrap().clear();
+    if shared.multi {
+        // One client among several: a connection of its own, the others untouched.
+        shared.conns.lock().unwrap().push(Conn { number, tx: tx.clone(), active: Vec::new(), will: None });
+    } else {
+        lock_held(&shared).clear();
+        // A new connection starts without a session: no subscription carries over, nor a SUBACK or
+        // a replay held for an earlier connection (the R1 re-gate).
+        shared.active.lock().unwrap().clear();
+        shared.held_subacks.lock().unwrap().clear();
+    }
     let mut kick = shared.kick.subscribe();
     kick.mark_unchanged();
     shared.current.store(number, Ordering::SeqCst);
@@ -634,7 +698,30 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
             _ = kick.changed() => break,
         }
     }
-    publish_will(&shared, number);
+    if shared.multi {
+        let conn = {
+            let mut conns = shared.conns.lock().unwrap();
+            conns.iter().position(|c| c.number == number).map(|i| conns.remove(i))
+        };
+        // Its will, kept when retained and delivered to the others' matching subscriptions.
+        if let Some((topic, payload, retain)) = conn.and_then(|c| c.will) {
+            if retain {
+                store_retained(&shared, &topic, payload.clone(), SendOptions { retain: true, ..SendOptions::default() });
+            }
+            for (tx, preserve_retain) in matching_conns(&shared, &topic) {
+                let _ = tx.send(encode_publish(
+                    shared.protocol,
+                    &topic,
+                    payload.clone(),
+                    retain && preserve_retain,
+                    None,
+                    Some(next_pkid(&shared)),
+                ));
+            }
+        }
+    } else {
+        publish_will(&shared, number);
+    }
     shared.changed.notify_waiters();
 }
 
@@ -647,6 +734,12 @@ const WEDGED_RECV_BUFFER: usize = 64 * 1024;
 
 /// A clean DISCONNECT: the connection's will is not published.
 fn clear_will(shared: &Shared, number: usize) {
+    if shared.multi {
+        if let Some(conn) = shared.conns.lock().unwrap().iter_mut().find(|c| c.number == number) {
+            conn.will = None;
+        }
+        return;
+    }
     let mut will = shared.will.lock().unwrap();
     if will.as_ref().is_some_and(|(n, ..)| *n == number) {
         *will = None;
@@ -696,6 +789,35 @@ fn matching(shared: &Shared, topic: &str) -> Option<bool> {
     active.iter().find(|(filter, _)| rumqttc::v5::mqttbytes::matches(topic, filter)).map(|(_, preserve)| *preserve)
 }
 
+/// In a broker for several clients: every connection with a subscription matching `topic`, its
+/// writer and the retain-as-published of its first matching subscription.
+fn matching_conns(shared: &Shared, topic: &str) -> Vec<(mpsc::UnboundedSender<BytesMut>, bool)> {
+    let conns = shared.conns.lock().unwrap();
+    conns
+        .iter()
+        .filter_map(|c| {
+            c.active
+                .iter()
+                .find(|(filter, _)| rumqttc::v5::mqttbytes::matches(topic, filter))
+                .map(|(_, preserve)| (c.tx.clone(), *preserve))
+        })
+        .collect()
+}
+
+/// The subscriptions of connection `number`: the broker's one list, or — for several clients — the
+/// connection's own.
+fn with_active<T>(shared: &Shared, number: usize, f: impl FnOnce(&mut Vec<(String, bool)>) -> T) -> T {
+    if shared.multi {
+        let mut conns = shared.conns.lock().unwrap();
+        match conns.iter_mut().find(|c| c.number == number) {
+            Some(conn) => f(&mut conn.active),
+            None => f(&mut Vec::new()),
+        }
+    } else {
+        f(&mut shared.active.lock().unwrap())
+    }
+}
+
 /// The next packet id of a QoS 1 publish to the client (never 0).
 fn next_pkid(shared: &Shared) -> u16 {
     loop {
@@ -725,6 +847,19 @@ fn route(
             correlation_data: properties.as_ref().and_then(|p| p.correlation_data.clone()),
         };
         store_retained(shared, topic, payload.clone(), options);
+    }
+    if shared.multi {
+        for (to, preserve_retain) in matching_conns(shared, topic) {
+            let _ = to.send(encode_publish(
+                shared.protocol,
+                topic,
+                payload.clone(),
+                retain && preserve_retain,
+                properties.clone(),
+                Some(next_pkid(shared)),
+            ));
+        }
+        return;
     }
     if let Some(preserve_retain) = matching(shared, topic) {
         let _ = tx.send(encode_publish(
@@ -887,8 +1022,14 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
     match packet {
         v5::Packet::Connect(connect, will, _) => {
             *shared.max_packet.lock().unwrap() = connect.properties.as_ref().and_then(|p| p.max_packet_size).map(|max| (number, max));
-            *shared.will.lock().unwrap() =
-                will.map(|w| (number, String::from_utf8_lossy(&w.topic).into_owned(), w.message.clone(), w.retain));
+            if shared.multi {
+                if let Some(conn) = shared.conns.lock().unwrap().iter_mut().find(|c| c.number == number) {
+                    conn.will = will.map(|w| (String::from_utf8_lossy(&w.topic).into_owned(), w.message.clone(), w.retain));
+                }
+            } else {
+                *shared.will.lock().unwrap() =
+                    will.map(|w| (number, String::from_utf8_lossy(&w.topic).into_owned(), w.message.clone(), w.retain));
+            }
             shared.connections.fetch_add(1, Ordering::SeqCst);
             event(shared, BrokerEvent::Connected);
             let properties = v5::ConnAckProperties {
@@ -922,7 +1063,7 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
                 .collect();
             let granted: Vec<&v5::Filter> = s.filters.iter().filter(|f| !denied(&f.path)).collect();
             shared.subscriptions.lock().unwrap().extend(granted.iter().map(|f| f.path.clone()));
-            shared.active.lock().unwrap().extend(granted.iter().map(|f| (f.path.clone(), f.preserve_retain)));
+            with_active(shared, number, |active| active.extend(granted.iter().map(|f| (f.path.clone(), f.preserve_retain))));
             for f in &granted {
                 event(shared, BrokerEvent::Subscribed(f.path.clone()));
             }
@@ -930,9 +1071,13 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             for f in &granted {
                 packets.extend(replay(shared, &f.path));
             }
+            let slow = {
+                let prefixes = shared.held_prefixes.lock().unwrap();
+                s.filters.iter().any(|f| prefixes.iter().any(|p| f.path.starts_with(p.as_str())))
+            };
             let mut held = shared.held_subacks.lock().unwrap();
-            if shared.holding_subacks.load(Ordering::SeqCst) {
-                held.extend(packets);
+            if shared.holding_subacks.load(Ordering::SeqCst) || slow {
+                held.extend(packets.into_iter().map(|p| (tx.clone(), p)));
             } else {
                 for packet in packets {
                     let _ = tx.send(packet);
@@ -940,8 +1085,20 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             }
         }
         v5::Packet::Unsubscribe(u) => {
-            shared.subscriptions.lock().unwrap().retain(|f| !u.filters.contains(f));
-            shared.active.lock().unwrap().retain(|(f, _)| !u.filters.contains(f));
+            {
+                let mut subscriptions = shared.subscriptions.lock().unwrap();
+                if shared.multi {
+                    // One client's subscription, taken off the list once: another client's stays.
+                    for f in &u.filters {
+                        if let Some(i) = subscriptions.iter().position(|s| s == f) {
+                            subscriptions.remove(i);
+                        }
+                    }
+                } else {
+                    subscriptions.retain(|f| !u.filters.contains(f));
+                }
+            }
+            with_active(shared, number, |active| active.retain(|(f, _)| !u.filters.contains(f)));
             for f in &u.filters {
                 event(shared, BrokerEvent::Unsubscribed(f.clone()));
             }
@@ -950,7 +1107,7 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             // Behind any SUBACK held: a broker answers in order (Claude's final gate minor 2).
             let mut held = shared.held_subacks.lock().unwrap();
             if shared.holding_subacks.load(Ordering::SeqCst) {
-                held.push(unsuback);
+                held.push((tx.clone(), unsuback));
             } else {
                 let _ = tx.send(unsuback);
             }

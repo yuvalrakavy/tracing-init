@@ -555,3 +555,65 @@ async fn delayed_acks_keep_the_order_of_their_publishes() {
     sorted.sort_unstable();
     assert_eq!(order, sorted, "delayed acks overtook one another");
 }
+
+/// A v5 client with its own client id and a retained last will on `will`.
+fn named_client(broker: &FakeBroker, id: &str, will: &str) -> (AsyncClient, rumqttc::v5::EventLoop) {
+    let mut options = MqttOptions::new(id, "127.0.0.1", broker.port());
+    options.set_keep_alive(Duration::from_secs(5));
+    options.set_last_will(rumqttc::v5::mqttbytes::v5::LastWill::new(will, "false", QoS::AtLeastOnce, true, None));
+    AsyncClient::new(options, 10)
+}
+
+/// A broker for several clients at once (the multi-device host's two processes on one root): each
+/// keeps its own subscriptions and last will; a publish — the test's, or a client's — reaches
+/// every client with a matching subscription, user properties kept; one client's abrupt end
+/// publishes its will alone, and the other goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_clients_share_one_broker() {
+    let broker = FakeBroker::start_multi().await;
+    let (a, a_events) = named_client(&broker, "a", "Active/a");
+    let (a_task, mut a_in) = pump_publishes(a_events);
+    let (b, b_events) = named_client(&broker, "b", "Active/b");
+    let (_b_task, mut b_in) = pump_publishes(b_events);
+    a.subscribe("x/#", QoS::AtLeastOnce).await.unwrap();
+    b.subscribe("x/#", QoS::AtLeastOnce).await.unwrap();
+    assert!(broker.wait_until(BOUND, |b| b.subscriptions().iter().filter(|f| *f == "x/#").count() == 2).await, "both never subscribed");
+    let tagged = rumqttc::v5::mqttbytes::v5::PublishProperties { user_properties: vec![("via".into(), "a".into())], ..Default::default() };
+    a.publish_with_properties("x/1", QoS::AtLeastOnce, true, "from a", tagged).await.unwrap();
+    let at_b = next_publish(&mut b_in).await;
+    assert_eq!(
+        (&at_b.payload[..], at_b.properties.and_then(|p| p.user_properties.first().cloned())),
+        (&b"from a"[..], Some(("via".into(), "a".into())))
+    );
+    let at_a = next_publish(&mut a_in).await;
+    assert_eq!(&at_a.payload[..], b"from a", "the publisher's own subscription did not get its publish");
+    assert!(broker.publish("x/2", "from the test", &SendOptions::default()));
+    assert_eq!(&next_publish(&mut b_in).await.payload[..], b"from the test");
+    assert_eq!(&next_publish(&mut a_in).await.payload[..], b"from the test");
+    assert_eq!(broker.retained_on("x/1").as_deref(), Some(&b"from a"[..]));
+    // `a` ends without a DISCONNECT: its will, and only its, is published; `b` still gets publishes.
+    a_task.abort();
+    drop(a);
+    assert!(broker.wait_until(BOUND, |b| b.retained_on("Active/a").is_some()).await, "the client that ended left no will");
+    assert!(broker.retained_on("Active/b").is_none(), "the client still connected had its will published");
+    assert!(broker.publish("x/3", "after", &SendOptions::default()));
+    assert_eq!(&next_publish(&mut b_in).await.payload[..], b"after");
+}
+
+/// A SUBACK held for one filter alone (`hold_subacks_matching`): the others are answered, and the
+/// held one goes out at the release, with its replay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_suback_held_for_one_filter_alone() {
+    let broker = FakeBroker::start().await;
+    broker.retain("slow/1", "kept", &SendOptions::default());
+    broker.hold_subacks_matching("slow/");
+    let (client, events) = client(&broker, 10);
+    let (_task, mut acks) = pump_acks(events);
+    client.subscribe("slow/#", QoS::AtLeastOnce).await.unwrap();
+    client.subscribe("fast/#", QoS::AtLeastOnce).await.unwrap();
+    let first = tokio::time::timeout(BOUND, acks.recv()).await.expect("no SUBACK at all");
+    assert_eq!(first.map(|a| a.0), Some("suback"));
+    assert!(tokio::time::timeout(Duration::from_millis(300), acks.recv()).await.is_err(), "the held SUBACK went out");
+    broker.release_subacks();
+    assert_eq!(tokio::time::timeout(BOUND, acks.recv()).await.expect("the held SUBACK never came").map(|a| a.0), Some("suback"));
+}
