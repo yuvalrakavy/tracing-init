@@ -31,11 +31,14 @@ pub enum Scope {
 /// One target's observed state, as `read_state` returns it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TargetState {
+    /// The target's name: one topic segment (no `/`, `+`, `#`, not empty).
     pub target: String,
+    /// The properties read, by name. A property the device did not give is left out, not `null`.
     pub values: PropertyMap,
 }
 
 impl TargetState {
+    /// A target's observed values.
     pub fn new(target: impl Into<String>, values: PropertyMap) -> TargetState {
         TargetState { target: target.into(), values }
     }
@@ -45,7 +48,10 @@ impl TargetState {
 /// `Command` payload other than `target` and `command`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandCall {
+    /// The command's name, as the `Command` payload gave it (`refresh` and `assume` never reach the
+    /// driver: the runtime handles them).
     pub command: String,
+    /// The payload's other fields; empty when it had none.
     pub params: PropertyMap,
 }
 
@@ -56,10 +62,13 @@ pub struct LinkError {
 }
 
 impl LinkError {
+    /// A lost link, with the reason to log and to report (it becomes the `Error` text of what the
+    /// loss refuses).
     pub fn new(reason: impl Into<String>) -> LinkError {
         LinkError { reason: reason.into() }
     }
 
+    /// The reason, as given.
     pub fn reason(&self) -> &str {
         &self.reason
     }
@@ -93,26 +102,39 @@ impl From<std::io::Error> for LinkError {
 ///   failed. From any other operation it counts as `Rejected`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpError {
+    /// The connection failed (I/O, a timeout, closed): the link is lost. Also what a missed
+    /// deadline becomes, without the driver returning it. `From<LinkError>` makes `?` work.
     Link(LinkError),
+    /// The device refused this request; the link is fine. The text is for the `Error` payload.
     Rejected(String),
+    /// The device answered with something the driver could not parse. The text is for the `Error`
+    /// payload.
     Unusable(String),
+    /// No such command or property. The text is for the `Error` payload.
     Unsupported(String),
+    /// `apply` only: these properties failed and every other value was applied.
     Partial(Vec<PropertyFailure>),
 }
 
 /// One property an `apply` could not write (`OpError::Partial`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyFailure {
+    /// The property that was not written.
     pub property: String,
+    /// How it failed.
     pub class: FailureClass,
+    /// The text for the property's `Error` payload.
     pub error: String,
 }
 
 /// How one property of a partial `apply` failed: the classes of `OpError` a request can fail by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureClass {
+    /// The device refused this value (as [`OpError::Rejected`]); WARN `command_rejected`.
     Rejected,
+    /// The device's answer for this property could not be parsed (as [`OpError::Unusable`]).
     Unusable,
+    /// The device has no such property (as [`OpError::Unsupported`]).
     Unsupported,
 }
 
@@ -168,6 +190,8 @@ pub enum Feedback {
 }
 
 impl Feedback {
+    /// `"observed"` or `"assumed"`, as a target's `Config` spells its `feedback` override; anything
+    /// else is `None`.
     pub fn parse(text: &str) -> Option<Feedback> {
         match text {
             "observed" => Some(Feedback::Observed),
@@ -192,11 +216,14 @@ pub enum CommandClass {
 /// A command the driver executes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
+    /// The command's name, as the `Command` payload spells it.
     pub name: String,
+    /// How the runtime queues and answers it.
     pub class: CommandClass,
 }
 
 impl CommandSpec {
+    /// A command the driver executes.
     pub fn new(name: impl Into<String>, class: CommandClass) -> CommandSpec {
         CommandSpec { name: name.into(), class }
     }
@@ -225,6 +252,8 @@ pub struct Timing {
     pub stable: Duration,
 }
 
+/// Connect and operations 10 s, retry 5 s, outage WARN 30 s, no polling, probe every 30 s with a
+/// 10 s deadline, device stable after 5 s.
 impl Default for Timing {
     fn default() -> Timing {
         Timing {
@@ -243,19 +272,45 @@ impl Default for Timing {
 /// What a driver declares about itself (spec §4.4), once, at start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverInfo {
+    /// What a successful `apply` means.
     pub writes: Writes,
+    /// The default for every target; a target's `Config` may override it.
     pub feedback: Feedback,
+    /// The commands `execute` takes, besides the standard `refresh` and `assume`. A `Command`
+    /// naming anything else is answered `unsupported` by the runtime, without calling the driver.
     pub commands: Vec<CommandSpec>,
+    /// The timing defaults; the command line overrides each.
     pub timing: Timing,
 }
 
+/// An acknowledged-writes, observed-feedback driver with no commands and the default timing.
 impl Default for DriverInfo {
     fn default() -> DriverInfo {
         DriverInfo { writes: Writes::Acknowledged, feedback: Feedback::Observed, commands: Vec::new(), timing: Timing::default() }
     }
 }
 
-/// A device driver (spec §6). See the module documentation for how it is called.
+/// A device driver (spec §6): the one object a bridge writes. The runtime owns everything around
+/// it (see the crate documentation) and calls it from one task at a time, so a protocol that needs
+/// strict sequencing gets it for free. The driver runs on a thread of its own with a
+/// single-threaded runtime: its futures need not be `Send`, but the driver itself moves there, so
+/// it is `Send + 'static`.
+///
+/// **Deadlines.** Every call except `info` is bounded by the runtime, from [`Timing`] (each
+/// overridable on the command line): `connect` by `connect`, `probe` by `probe_deadline`,
+/// `disconnect` by `operation` after a lost link and by a fixed two seconds at shutdown, the rest by
+/// `operation`. The bound drops the call's future,
+/// so a driver's own awaits are cancelled at the deadline, and an overrun is a lost link
+/// ([`OpError::Link`]), never a hang. A call that blocks its *thread* cannot be interrupted: past
+/// its deadline and a two-second grace the watchdog declares the worker dead and the process exits
+/// with a failure for the supervisor to restart. A synchronous library call therefore goes through
+/// [`LinkContext::blocking`] / [`LinkHandle::blocking`](crate::link::LinkHandle::blocking), which holds it to the deadline on a thread
+/// that can be abandoned.
+///
+/// **Errors.** An operation answers with an [`OpError`]; its class says what the runtime does (see
+/// the type). The one rule to keep: report only a failure of the *connection* as `Link`. A device
+/// that answers "no" is `Rejected`; an answer the driver cannot read is `Unusable`, which never
+/// reconnects.
 ///
 /// | Operation | Called when | Must |
 /// |---|---|---|
@@ -269,14 +324,78 @@ impl Default for DriverInfo {
 /// | `probe` | for `Writes::Unacknowledged`: idle and while busy | prove the device alive; defaults to a read |
 #[allow(async_fn_in_trait)] // the runtime is generic over the driver and polls its futures on one thread: no `Send` bound is needed
 pub trait DeviceDriver: Send + 'static {
+    /// What the driver declares about itself: writes, feedback, commands, timing. Called once at
+    /// start, on a blocking thread raced against the stop signals; it must be pure and quick (no
+    /// I/O): one that does not return cannot hold up a stop, but the bridge does not start.
     fn info(&self) -> DriverInfo;
+
+    /// Open the device link. Called again, at most one per [`Timing::retry`], after every failed
+    /// connect and every lost link; bounded by [`Timing::connect`]. `ctx` lives as long as this
+    /// link: helpers started through it (an unsolicited-input reader) are cancelled when the link
+    /// drops. The context is only handed here; keep a [`LinkHandle`](crate::link::LinkHandle) (`ctx.handle()`) for later
+    /// operations. Return a [`LinkError`] if the connection cannot be made.
+    ///
+    /// Connecting is not yet proof of life: the runtime then reads the device
+    /// (`read_state(Scope::All)`, or `probe` if that is unsupported) and only a good answer makes
+    /// the link `Up`. Report what the connect learns through `ctx.report` as it goes.
     async fn connect(&mut self, ctx: &mut LinkContext) -> Result<(), LinkError>;
+
+    /// Close the device link: called after a lost link (before the next connect) and at shutdown.
+    /// Best effort and quick: it is bounded (see the trait's deadlines) and cannot fail. It is
+    /// called after every link that ended, a failed `connect` included, so it must cope with a
+    /// half-opened link.
     async fn disconnect(&mut self);
+
+    /// Read the device and return the observed state: the bridge publishes it as `State` and
+    /// uses it as proof of life. Called after connecting, every [`Timing::poll`], for `refresh`
+    /// and before the runtime resolves outage conflicts. Read the device, never a cache.
+    ///
+    /// A [`Scope::Target`] read returns that target; `All` returns every target the device has
+    /// (the runtime never withdraws a target by its absence: a target gone from the device is withdrawn
+    /// with [`Reporter::remove`](crate::link::Reporter::remove)). A device that can
+    /// only read one address at a time may answer a read of `All` with [`OpError::Unsupported`]:
+    /// the runtime then proves the link with `probe` and reads targets one by one when it needs
+    /// them. Bounded by [`Timing::operation`].
     async fn read_state(&mut self, scope: Scope) -> Result<Vec<TargetState>, OpError>;
+
+    /// Write `values` to `target`: several values arrive together when the write is atomic. Apply
+    /// every value, in the order the device needs. Bounded by [`Timing::operation`].
+    ///
+    /// Return `Ok(())` when every value was applied. Otherwise return the class for the whole
+    /// write (`Rejected`, `Unusable`, `Unsupported`, or `Link`), or [`OpError::Partial`] naming
+    /// exactly the properties that failed: every value not named was applied. The runtime
+    /// publishes an `Error` for each failed property alone, and what stood applied stays.
+    ///
+    /// With [`Writes::Acknowledged`] `Ok` is final. With [`Writes::Unacknowledged`] it only means
+    /// "sent": the value stays unproven until a later `probe` or read succeeds, and is applied
+    /// again if the link dies first.
     async fn apply(&mut self, target: &str, values: &PropertyMap) -> Result<(), OpError>;
-    /// `target`: the command's, or `None` for one that names none.
+
+    /// Run a momentary command, once: never retry (the runtime does not, and a retry here could
+    /// act twice). `target` is the command's target, or `None` for a command that names none.
+    /// Bounded by [`Timing::operation`].
+    ///
+    /// The value returned is the reply of a [`CommandClass::WithReply`] command, sent to the
+    /// command's response topic; `Ok(None)` is a plain success. A command of class
+    /// [`CommandClass::Read`] is coalesced and dropped while the link is down. Any failure class
+    /// is an `Error` with the command's name; `Link` also drops the link.
     async fn execute(&mut self, target: Option<&str>, call: &CommandCall) -> Result<Option<Value>, OpError>;
+
+    /// Accept (`Some`) or withdraw (`None`) a target's setup, as its `Config` intent arrived or was
+    /// retracted. Called only while the link is up; a config identical to the one last taken on this
+    /// link is not handed over again, and a lost link forgets what was taken. A config's `feedback`
+    /// override takes effect once this has returned `Ok`. Bounded by [`Timing::operation`].
     async fn configure(&mut self, target: &str, config: Option<&Value>) -> Result<(), OpError>;
+
+    /// Prove the device is alive, for a driver with [`Writes::Unacknowledged`]: called when the
+    /// device has been quiet for [`Timing::probe_interval`], and soon after writes while they are
+    /// unproven. The answer must have been caused by something sent after every unproven write: a
+    /// successful probe proves them all taken. Bounded by [`Timing::probe_deadline`].
+    ///
+    /// The default reads ([`Scope::Any`]) and drops the answer. `Link` loses the link; any other
+    /// answer, an unusable one included, proves the device alive. [`OpError::Unsupported`] proves
+    /// nothing: from an unacknowledged driver it is a contract violation (ERROR
+    /// `driver_contract_violation`, once), after which its writes are taken as proven anyway.
     async fn probe(&mut self) -> Result<(), OpError> {
         self.read_state(Scope::Any).await.map(drop)
     }

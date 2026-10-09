@@ -147,7 +147,37 @@ impl PanicReports {
     }
 }
 
-/// A bridge: its family, its command line, and its driver's options. See the crate documentation.
+/// A bridge, as `main` builds it: its family, its command line, and its driver's options, then
+/// [`run`](Bridge::run) with a [`DeviceDriver`]. Every setter takes and returns `self`.
+///
+/// ```no_run
+/// # use mqtt_bridge_kit::*;
+/// # fn driver() -> impl DeviceDriver { struct D; impl DeviceDriver for D {
+/// #     fn info(&self) -> DriverInfo { DriverInfo::default() }
+/// #     async fn connect(&mut self, _: &mut LinkContext) -> Result<(), LinkError> { Ok(()) }
+/// #     async fn disconnect(&mut self) {}
+/// #     async fn read_state(&mut self, _: Scope) -> Result<Vec<TargetState>, OpError> { Ok(vec![]) }
+/// #     async fn apply(&mut self, _: &str, _: &PropertyMap) -> Result<(), OpError> { Ok(()) }
+/// #     async fn execute(&mut self, _: Option<&str>, _: &CommandCall) -> Result<Option<Value>, OpError> { Ok(None) }
+/// #     async fn configure(&mut self, _: &str, _: Option<&Value>) -> Result<(), OpError> { Ok(()) }
+/// # } D }
+/// fn main() -> std::process::ExitCode {
+///     let bridge = Bridge::new("Aircondition").option("coolmaster", "the controller's address").require("coolmaster").from_cli();
+///     // A value the driver cannot use is a usage error, said before anything starts.
+///     let bridge = match bridge.value("coolmaster").map(str::parse::<std::net::SocketAddr>) {
+///         Some(Err(e)) => bridge.usage_error(format!("`--coolmaster`: {e}")),
+///         _ => bridge,
+///     };
+///     if let Some(code) = bridge.usage_exit() {
+///         return code;
+///     }
+///     bridge.run(driver())
+/// }
+/// ```
+///
+/// Everything the command line sets can also be set in code (`root`, `instance`, `broker`,
+/// `timing`, `device_stable`, `mqtt_timing`), which is how the conformance suite and in-process
+/// users ([`start`](Bridge::start)) configure a bridge.
 #[derive(Debug, Clone)]
 pub struct Bridge {
     family: String,
@@ -164,7 +194,11 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    /// A bridge of `family`: the default root (`Aircondition`, `Lutron`, `IR`).
+    /// A bridge of `family`, which is also the default MQTT root (`Aircondition`, `Lutron`, `IR`;
+    /// `--root` overrides it). The program's name (its executable's file name) is the logging's
+    /// application name and the usage text's, unless [`app_name`](Self::app_name) says otherwise.
+    /// Nothing is read from the command line until [`from_cli`](Self::from_cli) or
+    /// [`args`](Self::args).
     pub fn new(family: &str) -> Bridge {
         let program = std::env::args_os()
             .next()
@@ -183,15 +217,19 @@ impl Bridge {
         }
     }
 
-    /// Declare an option the driver takes (`--<name> <value>`), with its help; read it with
-    /// [`value`](Self::value) after [`from_cli`](Self::from_cli).
+    /// Declare an option the driver takes: `--<name> <value>` (or `--<name>=<value>`; `name` is
+    /// given without the dashes), listed in `--help` with `help`. Declare before
+    /// [`from_cli`](Self::from_cli), or the parser rejects the flag as unknown; read the value
+    /// with [`value`](Self::value) after it. An option is optional unless
+    /// [`require`](Self::require)d, and takes a value always (there are no switches).
     pub fn option(mut self, name: &str, help: &str) -> Bridge {
         self.declared.push((name.to_owned(), help.to_owned()));
         self
     }
 
     /// Make a declared option required: a command line without it is a usage error (exit 2, with
-    /// the usage text). Before or after [`from_cli`](Self::from_cli).
+    /// the usage text). Before or after [`from_cli`](Self::from_cli). `--instance` and `--broker`
+    /// are always required.
     pub fn require(mut self, name: &str) -> Bridge {
         self.required.push(name.to_owned());
         if self.parsed {
@@ -321,8 +359,16 @@ impl Bridge {
         self.app_name.clone().unwrap_or_else(|| self.program.clone())
     }
 
-    /// `main`'s whole body: `Bridge::new("Aircondition").from_cli().run(Coolmaster::new())`. See the
-    /// module documentation.
+    /// `main`'s whole body: `Bridge::new("Aircondition").from_cli().run(Coolmaster::new())`. It
+    /// says `--help` or a usage error and returns its code (0, or 2) before anything else; otherwise
+    /// it installs the panic hook, builds the tokio runtime, takes the stop signals, starts the
+    /// logging, asks the driver for its `info()`, starts the bridge ([`start`](Self::start)) and
+    /// blocks until SIGINT or SIGTERM (then the bounded shutdown, and `ExitCode::SUCCESS`) or until
+    /// a part of the bridge dies (ERROR `worker_died`, the bounded shutdown, and
+    /// `ExitCode::FAILURE`, for the service manager to restart). A start that fails (WARN
+    /// `startup_failed`: a topic segment, the broker address, timings that cannot run) is a failure
+    /// exit too. Return its value from `main`; never call `process::exit` after it. See the module
+    /// documentation for each guarantee.
     pub fn run<D: DeviceDriver>(self, driver: D) -> ExitCode {
         if let Some(code) = self.usage_exit() {
             return code;
@@ -573,7 +619,9 @@ impl PauseGrace {
 /// A part of the bridge that ended on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Died {
+    /// Which part ended: `"mqtt"` (the session) or `"device"` (the worker, or the watchdog's verdict on it).
     pub part: &'static str,
+    /// Why it ended.
     pub cause: String,
 }
 

@@ -14,7 +14,7 @@
 //! It waits on nothing but the driver (bounded), its mailbox and its pacing: what it reports goes
 //! to [`Reports`], which never waits, so a stalled broker holds up none of its work.
 //!
-//! The worker runs on a thread of its own, on a single-threaded runtime ([`spawn`]): the driver's
+//! The worker runs on a thread of its own, on a single-threaded runtime (`spawn`): the driver's
 //! futures need not be `Send`, and a driver that blocks its thread holds up only itself — never the
 //! MQTT side or the stop.
 

@@ -57,7 +57,10 @@ enum Kind {
     Helper,
 }
 
-/// Reports from a driver or its helpers, handed over without waiting.
+/// Reports from a driver or its helpers, handed over without waiting (`ctx.report`, or
+/// [`LinkHandle::report`]). Cheap to clone and `Send`, so a helper or a blocking thread can hold
+/// one. Nothing here ever waits on MQTT: `State` coalesces per target into the retained model;
+/// events go to a capped queue whose overflow is counted and logged once per episode.
 #[derive(Debug, Clone)]
 pub struct Reporter {
     reports: Arc<Reports>,
@@ -390,12 +393,19 @@ impl LinkHandle {
     }
 
     /// Run a synchronous library call on a thread of its own — called from a driver operation,
-    /// under that operation's deadline; from a helper, with none. A call that overruns it is
-    /// abandoned — a thread cannot be cancelled — the link is
-    /// reported lost, and the error is a `LinkError`. Every call's thread counts, from before it
-    /// starts until it ends, against [`ABANDONED_CAP`] — in use or abandoned, a helper's (no
-    /// deadline) too, and one whose caller was cancelled; past the cap the call is refused with a
-    /// `LinkError` at once, and the link reported lost.
+    /// under that operation's deadline (an operation's task carries it); from a helper, a task of
+    /// its own, with none, even while an operation runs. A call that overruns its deadline is
+    /// abandoned — a thread cannot be cancelled — the link is reported lost, and the error is a
+    /// `LinkError`. A call that panics is a `LinkError` too, without a loss.
+    ///
+    /// Every call's thread counts, from before it starts until it ends — in use or abandoned, a
+    /// helper's (no deadline) too, and one whose caller was cancelled — against a budget by kind:
+    /// [`ABANDONED_CAP`] for operations' calls, [`HELPER_CAP`] for helpers'. Past its budget a call
+    /// is refused with a `LinkError` at once, and the link reported lost. A budget that keeps
+    /// refusing, with no place freed, for twice the operation bound is a dead worker (the process
+    /// exits for its supervisor to restart): its threads are stuck for good. So give a synchronous
+    /// call its own timeout where the library allows, and do not park a long-lived read per
+    /// reconnect.
     pub async fn blocking<T, F>(&self, f: F) -> Result<T, LinkError>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -477,9 +487,12 @@ impl<F: Future<Output = ()>> Future for Watched<F> {
     }
 }
 
-/// What a driver's `connect` is given (spec §4.2).
+/// What a driver's `connect` is given (spec §4.2): the reporter, the helper spawners, a way to say
+/// the link died, and a bounded synchronous call. One lives as long as one device link: the worker
+/// makes it for `connect` and drops it when the link is lost, which cancels every helper started
+/// through it. To use its calls from later operations, keep [`LinkContext::handle`].
 pub struct LinkContext {
-    /// The reporter: observed or assumed state, and events.
+    /// The reporter: observed or assumed state, and events. A clone may be kept.
     pub report: Reporter,
     handle: LinkHandle,
 }

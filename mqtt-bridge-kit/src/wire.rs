@@ -28,6 +28,7 @@ impl Conflict {
     /// reverts what a person did by hand. (The Store always sends it.)
     pub const DEFAULT: Conflict = Conflict::DeviceWins;
 
+    /// `DeviceWins` or `RequestWins`, as the `conflict` user property spells them.
     pub fn parse(text: &str) -> Option<Conflict> {
         match text {
             "DeviceWins" => Some(Conflict::DeviceWins),
@@ -44,6 +45,7 @@ pub struct RequestMeta {
     /// received it, not when the session got to it. A held request is dropped then (Store kit spec
     /// Q6); one without an expiry never expires.
     pub deadline: Option<Instant>,
+    /// What to do if the device changed while the request waited.
     pub conflict: Conflict,
 }
 
@@ -172,6 +174,7 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// The text of the `reason` field.
     pub fn as_str(self) -> &'static str {
         match self {
             Reason::Malformed => "malformed",
@@ -188,33 +191,43 @@ impl Reason {
 /// An `Error` lane message: `{error, target?, property?, command?, reason}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorReport {
+    /// The human-readable text.
     pub error: String,
+    /// The target the failure concerns, if it concerns one.
     pub target: Option<String>,
+    /// The property, if it concerns one.
     pub property: Option<String>,
+    /// The command, if it concerns one.
     pub command: Option<String>,
+    /// The machine-readable class.
     pub reason: Reason,
 }
 
 impl ErrorReport {
+    /// A report with a reason and a text, naming no target.
     pub fn new(reason: Reason, error: impl Into<String>) -> ErrorReport {
         ErrorReport { error: error.into(), target: None, property: None, command: None, reason }
     }
 
+    /// Name the target, if there is one.
     pub fn target(mut self, target: Option<&str>) -> ErrorReport {
         self.target = target.map(str::to_owned);
         self
     }
 
+    /// Name the property.
     pub fn property(mut self, property: &str) -> ErrorReport {
         self.property = Some(property.to_owned());
         self
     }
 
+    /// Name the command.
     pub fn command(mut self, command: &str) -> ErrorReport {
         self.command = Some(command.to_owned());
         self
     }
 
+    /// The JSON payload of the `Error` lane message.
     pub fn encode(&self) -> Vec<u8> {
         let mut document = json!({ "error": self.error, "reason": self.reason.as_str() });
         for (key, value) in [("target", &self.target), ("property", &self.property), ("command", &self.command)] {

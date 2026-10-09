@@ -19,6 +19,13 @@
 //! }
 //! ```
 //!
+//! A driver is one object the runtime calls one operation at a time, under deadlines it enforces;
+//! each operation's contract and error classes are on [`DeviceDriver`] and [`OpError`]. A bridge is
+//! one process per controller: the controller is the topic `instance`, the devices behind it its
+//! targets (a multi-device host is planned, not built). To learn the API by building a bridge, read
+//! `docs/tutorial-writing-a-bridge.md` (its code is `examples/tutorial_bridge.rs`); for the command
+//! line, the topic grammar, the testing kit and the no-hang guarantees, this crate's `README.md`.
+//!
 //! What the runtime owns (spec §5), and where:
 //!
 //! | Area | Module |
@@ -34,6 +41,8 @@
 //! | replies on the response topic, with the correlation data | [`replies`] |
 //! | outage episodes with the fleet's kind names | [`pump`], [`worker`] |
 //! | the process: signals first, the logging start raced against the stop, a bounded end, a panic hook, a watchdog on the device worker | [`process`], [`logging`] |
+
+#![warn(missing_docs)]
 
 // The test seams compile only in this repository's own builds (build.rs; re-gate 3 S6): a deployed
 // bridge whose workspace unified the feature in fails here instead of shipping them.

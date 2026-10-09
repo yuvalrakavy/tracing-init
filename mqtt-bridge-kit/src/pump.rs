@@ -39,6 +39,7 @@ pub const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 /// A forward queue past this many unread publishes is a WARN, once; back under [`LOW_WATER`], an
 /// INFO with how long it lasted. Nothing is dropped (Store no-hang §14.6, ruling 1).
 pub const HIGH_WATER: usize = 1000;
+/// The forward queue's unread count under which a backlog episode ends.
 pub const LOW_WATER: usize = 100;
 
 /// How long a request may stay outstanding with nothing acknowledged, and how long one poll may
@@ -65,7 +66,12 @@ pub enum PumpEvent {
     Subscribing(u16),
     /// The broker answered a subscription: its packet id, and whether it granted every filter (an
     /// ACL may refuse one).
-    SubAck { pkid: u16, granted: bool },
+    SubAck {
+        /// The SUBSCRIBE's packet id.
+        pkid: u16,
+        /// Whether every filter was granted.
+        granted: bool,
+    },
     /// The DISCONNECT the session asked for was written: the session's end.
     Disconnected,
     /// The connection failed or stalled, and its event loop is dropped: the session ends and the
@@ -149,6 +155,7 @@ pub struct BrokerOutage {
 }
 
 impl BrokerOutage {
+    /// Episode tracking with the WARN threshold and the stability window of [`crate::session::MqttTiming`].
     pub fn new(warn_after: Duration, stable_after: Duration) -> BrokerOutage {
         BrokerOutage {
             warn_after,
@@ -323,6 +330,7 @@ impl Incoming {
         self.disconnect_asked.store(true, Ordering::SeqCst);
     }
 
+    /// The next event from the pump, waiting for it; `None` once the pump has ended.
     pub async fn recv(&mut self) -> Option<PumpEvent> {
         // WAIT: mqtt-pump-queue
         let event = self.rx.recv().await;

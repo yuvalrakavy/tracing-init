@@ -69,11 +69,15 @@ pub const COPY_WINDOW: Duration = Duration::from_secs(60);
 /// A property's requested value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateValue {
+    /// The target the value is for.
     pub target: String,
+    /// The property.
     pub property: String,
+    /// The requested value.
     pub value: Value,
     /// When it is dropped if not yet applied.
     pub deadline: Option<Instant>,
+    /// The policy for the outage conflict rule: what to do if the device changed meanwhile.
     pub conflict: Conflict,
     /// Why the outage conflict rule decides it, if it does; the mailbox sets it when the value is
     /// posted, and when it is held again.
@@ -139,7 +143,12 @@ pub enum ReadKey {
     /// `refresh`: one target, or (`None`) all.
     Refresh(Option<String>),
     /// A read-class command.
-    Command { target: Option<String>, command: String },
+    Command {
+        /// The command's target, or `None` for one that names none.
+        target: Option<String>,
+        /// The command's name.
+        command: String,
+    },
 }
 
 impl ReadKey {
@@ -186,34 +195,51 @@ pub enum Work {
     /// One target's waiting values, for one `apply`; those whose [`Check`] says so are decided by
     /// the conflict rule first, each on its own.
     Apply {
+        /// The target.
         target: String,
+        /// Its waiting values, the latest per property, in the order last set.
         values: Vec<StateValue>,
     },
+    /// A target's setup (or, `None`, its retraction), for `configure`.
     Configure {
+        /// The target.
         target: String,
+        /// The config, or `None` for a retraction.
         config: Option<Value>,
     },
+    /// A momentary command, for `execute`.
     Execute {
+        /// The command's target, if it names one.
         target: Option<String>,
+        /// The command and its parameters.
         call: CommandCall,
+        /// Where its answer goes, if it named a response topic.
         reply: Option<ReplyTo>,
     },
     /// A read for its callers still within their deadline; those past it, refused (review R9).
     Read {
+        /// What the read is for.
         key: ReadKey,
+        /// The command to run, for a read-class command; `None` for `refresh`.
         call: Option<CommandCall>,
+        /// The response topic of each caller still within its deadline.
         replies: Vec<ReplyTo>,
+        /// Callers past their deadline: refused, not run.
         expired: Vec<Unanswered>,
     },
     /// A read whose every caller reached its expiry while it waited: not run, every caller refused.
     ReadExpired {
+        /// Every caller of the read, refused.
         expired: Vec<Unanswered>,
     },
     /// A momentary command that reached its expiry while it waited: not executed, but reported
     /// and answered (review MINOR 4, C13).
     Expired {
+        /// The command's target, if it names one.
         target: Option<String>,
+        /// The command and its parameters.
         call: CommandCall,
+        /// Where its answer goes, if it named a response topic.
         reply: Option<ReplyTo>,
     },
 }
@@ -221,6 +247,7 @@ pub enum Work {
 /// How the outage conflict rule decides a checked value (Store kit spec §4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
+    /// Apply the requested value.
     Apply,
     /// The device already has it: nothing to write.
     Satisfied,
@@ -235,15 +262,24 @@ pub enum Resolution {
 /// worker decides them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeldValues {
+    /// The target.
     pub target: String,
+    /// Its held values, to be decided and applied together.
     pub values: Vec<StateValue>,
 }
 
 /// What the worker takes during the catch-up.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Held {
+    /// Values held while the device was down (or replayed, or held again).
     Values(HeldValues),
-    Config { target: String, config: Option<Value> },
+    /// A config held while the device was down; `None` is a retraction.
+    Config {
+        /// The target.
+        target: String,
+        /// The config, or `None` for a retraction.
+        config: Option<Value>,
+    },
 }
 
 /// What became of a post.
@@ -264,11 +300,14 @@ pub enum Posted {
 /// Why a momentary command was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
+    /// The device is not connected.
     DeviceDown,
+    /// [`MOMENTARY_CAP`] commands are already waiting.
     QueueFull,
 }
 
 impl Refusal {
+    /// The text reported on `Error` and in the reply.
     pub fn as_str(self) -> &'static str {
         match self {
             Refusal::DeviceDown => "the device is not connected",
@@ -281,10 +320,13 @@ impl Refusal {
 /// waits for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Unanswered {
+    /// The command's target, if it names one.
     pub target: Option<String>,
+    /// The command's name (`refresh` for a refresh).
     pub command: String,
     /// `true` for a momentary command (reported on `Error`); a read is only answered.
     pub momentary: bool,
+    /// The response topic of each caller waiting for the answer.
     pub replies: Vec<ReplyTo>,
     /// The worker had taken it and was running it when it was cut off.
     pub ran: bool,

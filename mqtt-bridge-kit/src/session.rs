@@ -68,7 +68,7 @@ pub const READ_BACK_WAIT: Duration = Duration::from_secs(5);
 /// matches the stdio plugin protocol's line cap (spec §7), and bounds what one message can cost.
 pub const MAX_PACKET_SIZE: u32 = 1024 * 1024;
 
-/// The test seam's environment variable (with the `test-seams` feature only): see [`panic_for_test`].
+/// The test seam's environment variable (with the `test-seams` feature only): see `panic_for_test`.
 pub const TEST_PANIC_TOPIC: &str = "MQTT_BRIDGE_TEST_PANIC_TOPIC";
 
 /// The MQTT side's timing.

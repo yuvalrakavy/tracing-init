@@ -12,7 +12,9 @@ use crate::wire::Reason;
 /// Where a command's answer goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyTo {
+    /// The MQTT v5 response topic.
     pub topic: String,
+    /// The correlation data to send back with the answer.
     pub correlation: Option<Bytes>,
 }
 
@@ -42,7 +44,12 @@ pub enum Answer {
     /// It acted; with the driver's answer, if it gave one.
     Done(Option<Value>),
     /// It did not.
-    Failed { reason: Reason, error: String },
+    Failed {
+        /// The `Error` reason.
+        reason: Reason,
+        /// The text.
+        error: String,
+    },
 }
 
 /// The reply's payload: `{"kind":"reply", "command", "target"?, "value"?}` or, for a failure,

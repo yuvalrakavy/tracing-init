@@ -19,15 +19,29 @@ pub struct Topics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {
     /// `Desired/{instance}/{target}/{property}`: a requested value, or (empty) its retraction.
-    DesiredProperty { target: String, property: String },
+    DesiredProperty {
+        /// The target.
+        target: String,
+        /// The property.
+        property: String,
+    },
     /// `Desired/{instance}/{target}`: several properties, atomically; never retained.
-    DesiredTarget { target: String },
+    DesiredTarget {
+        /// The target.
+        target: String,
+    },
     /// `Command/{instance}`.
     Command,
     /// `Config/{instance}/{target}`.
-    Config { target: String },
+    Config {
+        /// The target.
+        target: String,
+    },
     /// `State/{instance}/{target}`: the bridge's own retained state, read back at start.
-    State { target: String },
+    State {
+        /// The target.
+        target: String,
+    },
     /// Anything else the subscriptions let through: a malformed topic.
     Unknown,
 }
@@ -44,10 +58,12 @@ impl Topics {
         Ok(Topics { root: root.to_owned(), instance: instance.to_owned() })
     }
 
+    /// The root, one topic segment.
     pub fn root(&self) -> &str {
         &self.root
     }
 
+    /// The instance, one topic segment.
     pub fn instance(&self) -> &str {
         &self.instance
     }

@@ -13,7 +13,7 @@ use std::path::Path;
 use tracing_init::types::OnDestinationError;
 use tracing_init::TracingGuard;
 
-/// The test seam's environment variable (with the `test-seams` feature only): see [`hold_for_test`].
+/// The test seam's environment variable (with the `test-seams` feature only): see `hold_for_test`.
 pub const TEST_LOGGING_GATE: &str = "MQTT_BRIDGE_TEST_LOGGING_GATE";
 
 /// tracing-init's start, synchronous, on the raced start's thread.

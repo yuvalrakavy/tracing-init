@@ -51,13 +51,18 @@ pub const EVENT_CAP: usize = 64;
 /// The device link, as `Status/{instance}` says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkStatus {
+    /// The worker is making a connect attempt.
     Connecting,
+    /// The link is up: connected and proven by a good read or probe.
     Connected,
+    /// The link is down (lost, or a connect failed), or the watchdog found the worker dead.
     Unreachable,
+    /// In the Store kit's `Status` grammar, but not reported by the runtime today.
     Disabled,
 }
 
 impl LinkStatus {
+    /// The text of the retained `Status` payload.
     pub fn as_str(self) -> &'static str {
         match self {
             LinkStatus::Connecting => "connecting",
@@ -71,8 +76,11 @@ impl LinkStatus {
 /// A message for the `Event` lane (`topic: None`) or a command's response topic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outbound {
+    /// The topic, for a reply; `None` is the `Event` lane.
     pub topic: Option<String>,
+    /// The JSON payload.
     pub payload: Vec<u8>,
+    /// The correlation data of the command it answers.
     pub correlation: Option<Bytes>,
 }
 
@@ -194,18 +202,24 @@ pub struct Changes {
     /// `State`, so a reply follows the State its command produced (the second confirming review's
     /// F1); a stop's bounded flush publishes them first (confirming review 2, 3).
     pub answer_errors: Vec<ErrorReport>,
+    /// Replies to commands, ahead of unsolicited traffic.
     pub replies: Vec<Outbound>,
+    /// A changed link status.
     pub status: Option<LinkStatus>,
     /// Each changed target's `State` document; an empty one retracts it.
     pub states: Vec<(String, Vec<u8>)>,
+    /// Unsolicited `Error` reports (malformed input among them), capped at [`ERROR_CAP`].
     pub errors: Vec<ErrorReport>,
+    /// Unsolicited `Event` reports, capped at [`EVENT_CAP`].
     pub events: Vec<Outbound>,
 }
 
 /// Everything known: what the session publishes again after a CONNACK.
 #[derive(Debug, Default, PartialEq)]
 pub struct Model {
+    /// The link status, once one has been reported.
     pub status: Option<LinkStatus>,
+    /// Each target's `State` document, by target.
     pub states: Vec<(String, Vec<u8>)>,
 }
 
@@ -223,6 +237,7 @@ fn known(state: &State) -> BTreeMap<String, PropertyMap> {
 }
 
 impl Reports {
+    /// An empty model: nothing reported, no read-back.
     pub fn new() -> Arc<Reports> {
         Arc::new(Reports {
             state: Mutex::new(

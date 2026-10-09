@@ -12,13 +12,19 @@ use crate::session::MqttTiming;
 /// Overrides of the driver's timing defaults (`DriverInfo::timing`), from the command line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TimingOverrides {
+    /// `--connect-timeout`.
     pub connect: Option<Duration>,
+    /// `--operation-timeout`.
     pub operation: Option<Duration>,
+    /// `--retry`.
     pub retry: Option<Duration>,
+    /// `--outage-warn`.
     pub outage_warn: Option<Duration>,
     /// `Some(None)`: no polling.
     pub poll: Option<Option<Duration>>,
+    /// `--probe-interval`.
     pub probe_interval: Option<Duration>,
+    /// `--probe-deadline`.
     pub probe_deadline: Option<Duration>,
 }
 
@@ -41,12 +47,17 @@ impl TimingOverrides {
 /// Everything the command line sets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
+    /// `--root`: the first topic segment; by default the bridge's family.
     pub root: String,
+    /// `--instance`: required.
     pub instance: Option<String>,
     /// `host` or `host:port` (default port 1883).
     pub broker: Option<String>,
+    /// `--log-config`: a tracing-init `logging.toml`.
     pub log_config: Option<PathBuf>,
+    /// The driver-timing overrides.
     pub timing: TimingOverrides,
+    /// The MQTT side's timing (`--mqtt-keep-alive`, `--mqtt-retry`, `--mqtt-warn`, `--mqtt-stable`).
     pub mqtt: MqttTiming,
     /// The driver's options, by name.
     pub options: BTreeMap<String, String>,
@@ -55,6 +66,7 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// The defaults for a bridge of `family`: its name as the root, nothing else set.
     pub fn new(family: &str) -> Settings {
         Settings {
             root: family.to_owned(),
