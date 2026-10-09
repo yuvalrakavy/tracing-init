@@ -90,6 +90,16 @@
 # build — "no Error said the request was superseded: []" — because the session published the
 # device's state before its first CONNACK's subscriptions, overwriting the retained state the
 # read-back reads; the row `reports_are_published_before_the_connack` undoes that fix.
+#
+# The third confirming reviews (Codex 1-3, Claude F1 = Codex 3, Claude minors 1-4; 2026-10-09):
+# 8 rows added (`the_read_back_is_read_apart`, `the_replacements_withdrawal_comes_after`,
+# `a_stop_drops_the_batch_it_cut_short`, `a_stop_drops_the_publish_under_way`,
+# `the_flush_asks_the_session`, `the_ack_wait_outlives_the_pump`, `the_pumps_end_wakes_nobody`,
+# `the_linger_overruns_the_flush`), 11 re-anchored; 206 in all. A second read-back row (the flag
+# set in a lock hold apart from the freeze) was not added: with the reader taking both under one
+# lock, the probe cannot see it. The minor-3 row mutates the ack wait's deadline, not the linger:
+# a const assertion keeps `LINGER_BOUND` inside the flush's part, so a longer linger does not
+# compile. `--touched f106c94` plus the 8 new rows at 8259fc5: 121 rows, all RED (17 min).
 
 # The forward queue's high-water WARN (`mqtt_backlog_high`).
 [[control]]
