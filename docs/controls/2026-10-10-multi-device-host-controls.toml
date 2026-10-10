@@ -30,6 +30,13 @@
 # the host's), `the_publication_ignores_outstanding_requests` ANCHOR-MISS (the budget's line is the
 # flush's too), `a_devices_reports_wake_nobody` WRONG-REASON (a later assertion sees the guard: its
 # expected text follows); the three re-anchored or corrected: RED.
+# The one-runtime merge (2026-10-10): a `Bridge` is this host's N = 1 mode (its rows are in the R1
+# table). 8 rows re-anchored (the model's `first` flag, the fixed device built by the lifecycle, the
+# fixed read-back's own `read_back_complete`, `maybe_active` split into its fixed and configured
+# arms, the flush's budget asked of the lifecycle), `the_read_grant_republishes_directly` retargeted
+# to direct emits (`session::republish` is gone); none added or retired. `--touched 105283c` at
+# 291d032: 71 rows, 70 RED, `active_before_the_barrier` ANCHOR-MISS (its line moved into
+# `maybe_active`'s configured arm): re-anchored, RED.
 
 # ---- The pump ------------------------------------------------------------------------------------
 

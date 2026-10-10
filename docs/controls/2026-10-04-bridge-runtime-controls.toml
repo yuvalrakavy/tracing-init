@@ -121,6 +121,24 @@
 # The R2 confirming reviews' fix round (2026-10-10): `--touched 5e158de` at 8715a05, 44 rows: 43 RED,
 # `the_flush_puts_state_first` ANCHOR-MISS (the flush's loop is indented one level deeper now: the
 # host's budgeted flush); it and `the_flush_drops_what_is_pending` re-anchored: RED.
+#
+# The one-runtime merge (2026-10-10, owner: "There should not be multiple versions"): a `Bridge` is
+# the host's N = 1 mode, R1's own session path deleted. 14 rows anchored on the deleted code
+# (`connected`, `read_back_acknowledged`, `republish`, the `Mode::Fixed` arms) re-anchored on the
+# lifecycle code that now carries each behaviour, `a_required_option_is_not_checked` on the host's
+# builder, `a_refused_publish_ends_the_connack_duties` on the batch publish; 5 rows added for the
+# fixed instance's new code (`the_fixed_bridge_publishes_outside_the_budget`,
+# `the_late_read_back_never_ends`, `the_fixed_instance_is_routed_as_a_configured_one`,
+# `the_fixed_reports_go_before_active`, `a_fixed_bridge_subscribes_the_root_configs`); none retired —
+# no behaviour a row guards is gone. 211 in all. The new rows plus `--touched 105283c` at 291d032:
+# 79 rows, 77 RED, `the_flush_drops_what_is_pending` WRONG-REASON (an unpublished batch now waits for
+# an acknowledgement, and the flush then says no Active=false: retargeted to drop what is pending,
+# RED) and `the_flush_waits_on_the_momentary_count` GREEN — a race older than the merge: by hand at
+# 105283c the mutation is GREEN 3 runs in 13, at the merge 0 in 21, but the harness's own runs met it
+# twice; it is left as it is, a known probabilistic row (24 min). The whole table at 7d25fb5: 211
+# rows, 209 RED, the same GREEN, and `the_pump_reconnects_inside_its_event_loop` WRONG-REASON (the
+# reused client now shows in either of the scenario's two reconnect assertions: its expected text
+# covers both; RED three runs in three at its fix) (1 h 18 min).
 
 # The forward queue's high-water WARN (`mqtt_backlog_high`).
 [[control]]
