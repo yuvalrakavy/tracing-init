@@ -54,6 +54,9 @@ pub const GRANT_BOUND: Duration = Duration::from_secs(10);
 /// as it is acquired. An incomplete replay releases nothing.
 pub const REPLAY_FALLBACK: Duration = Duration::from_secs(5);
 
+/// The floor of a failed construction's retry pacing: each retry spends a thread on the factory.
+const CONSTRUCTION_RETRY_FLOOR: Duration = Duration::from_secs(1);
+
 /// How often a failed instance's held requests are swept for their deadlines.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
@@ -240,8 +243,11 @@ struct Instance {
 }
 
 impl Instance {
+    /// Failed: a live runtime with no worker, no construction under way and no driver waiting to
+    /// start — nothing serves the instance (a first construction failure; or the commit of a new
+    /// Config whose construction then failed).
     fn failed(&self) -> bool {
-        self.rt.as_ref().is_some_and(|rt| rt.phase == Phase::Live && !rt.worker) && self.accepted.is_none() && self.build.is_none()
+        self.rt.as_ref().is_some_and(|rt| rt.phase == Phase::Live && !rt.worker) && self.build.is_none() && self.ready.is_none()
     }
 }
 
@@ -321,6 +327,13 @@ pub(crate) struct Lifecycle {
     conn: Conn,
     next_id: u64,
     next_sweep: Option<Instant>,
+    /// The bridge cleanup of deleted instances not yet handed to a connection (a delete that ended
+    /// while the broker was away): each instance's own tagged topics, retracted once the next root
+    /// replay shows the instance is not this process's again (multi-device spec §4.5).
+    cleanups: BTreeMap<String, Vec<String>>,
+    /// The cleanups queued in this connection's outbox: back to `cleanups` if the connection is lost
+    /// before the outbox has gone out.
+    queued_cleanups: BTreeMap<String, Vec<String>>,
 }
 
 impl Lifecycle {
@@ -336,6 +349,8 @@ impl Lifecycle {
             conn: Conn::default(),
             next_id: 1,
             next_sweep: None,
+            cleanups: BTreeMap::new(),
+            queued_cleanups: BTreeMap::new(),
         }
     }
 
@@ -456,7 +471,13 @@ impl Lifecycle {
         let names: Vec<String> = self.instances.keys().cloned().collect();
         for name in names {
             let phase = self.instances.get(&name).and_then(|i| i.rt.as_ref()).map(|rt| rt.phase);
-            if matches!(phase, Some(Phase::Live | Phase::Disabled)) {
+            // A stop that ends disabled keeps S1; one that ends deleted reads its slot afresh for
+            // its cleanup. A successor bootstraps its own.
+            let read = matches!(
+                phase,
+                Some(Phase::Live | Phase::Disabled | Phase::Stopping { then: Then::Disable | Then::Release { cleanup: true }, .. })
+            );
+            if read {
                 self.request_read(Some(ctx), &name).await?;
             }
         }
@@ -508,6 +529,7 @@ impl Lifecycle {
             Purpose::Barrier => {
                 self.conn.barrier_acked = true;
                 self.replay_complete(Some(ctx), outputs).await?;
+                self.hand_over_cleanups(outputs);
             }
             Purpose::Read { instance, rt } => {
                 let Some(device) = self.current(&instance, rt).map(|rt| rt.device.clone()) else {
@@ -515,9 +537,12 @@ impl Lifecycle {
                 };
                 self.set_sub(&instance, |rt| rt.read = Sub::Granted);
                 // Its slot is read: its output may go out, its current Status and State first —
-                // before `Active=true` (multi-device spec §4.6).
-                outputs.announce(rt);
-                session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;
+                // before `Active=true` (multi-device spec §4.6). Not a stopping runtime's: its slot
+                // is no longer its to write.
+                if self.current(&instance, rt).is_some_and(|rt| matches!(rt.phase, Phase::Live | Phase::Disabled)) {
+                    outputs.announce(rt);
+                    session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;
+                }
                 if self.current(&instance, rt).is_some_and(|rt| rt.phase == Phase::Live) {
                     self.request_setup(Some(ctx), &instance).await?;
                 }
@@ -718,6 +743,9 @@ impl Lifecycle {
     /// After a turn of the rotation: a stopping device whose output has retired goes on to its
     /// unsubscriptions.
     pub(crate) async fn on_turn_done(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<Flow, Failed> {
+        if outputs.outbox.is_empty() {
+            self.queued_cleanups.clear();
+        }
         let retiring: Vec<String> = self
             .instances
             .values()
@@ -736,6 +764,9 @@ impl Lifecycle {
     pub(crate) async fn on_session_lost(&mut self, outputs: &mut Outputs) {
         self.conn = Conn::default();
         outputs.outbox_open = false;
+        // Cleanups queued in this connection's outbox may not have gone out: pending again.
+        let queued = std::mem::take(&mut self.queued_cleanups);
+        self.cleanups.extend(queued);
         let names: Vec<String> = self.instances.keys().cloned().collect();
         for name in names {
             let Some(rt) = self.instances.get_mut(&name).and_then(|i| i.rt.as_mut()) else {
@@ -805,9 +836,10 @@ impl Lifecycle {
                 self.rejected.insert(name.to_owned(), payload.to_vec());
                 let error = format!("kind mismatch: the Config names `{named}`, this process is `{kind}`");
                 self.config_rejected(outputs, name, Reason::Malformed, &error);
-                // Not served: released, if this process served it.
+                // Not served: released, if this process served it — its tagged topics cleared, as
+                // nothing of this kind serves it now.
                 if owned {
-                    self.set_want(name, Want::Leave { cleanup: false });
+                    self.set_want(name, Want::Leave { cleanup: true });
                     self.reconcile(ctx, outputs, name).await?;
                 }
             }
@@ -825,7 +857,9 @@ impl Lifecycle {
                 }
                 self.config_rejected(outputs, name, Reason::Malformed, &error);
                 self.reconcile(ctx, outputs, name).await?;
-                self.mark_failed(name);
+                if !owned {
+                    self.mark_failed(name);
+                }
             }
             Verdict::Ours { config, disabled, .. } => {
                 if self.instances.get(name).is_some_and(|i| i.last_seen.as_ref() == Some(&config)) {
@@ -842,6 +876,22 @@ impl Lifecycle {
             }
         }
         Ok(())
+    }
+
+    /// The root replay is complete: the pending cleanups of instances that are not this process's
+    /// again are queued in the outbox.
+    fn hand_over_cleanups(&mut self, outputs: &mut Outputs) {
+        let id = self.settings.id.clone();
+        for (name, topics) in std::mem::take(&mut self.cleanups) {
+            if self.instances.contains_key(&name) {
+                continue;
+            }
+            info!(instance = %name, topics = topics.len(), "Clearing a deleted instance's retained topics after the reconnect");
+            for topic in &topics {
+                outputs.queue_outbox(Part::Model, Out::new(topic.clone(), true, Vec::new(), None, Some(&id)));
+            }
+            self.queued_cleanups.insert(name, topics);
+        }
     }
 
     /// A Config naming this process was rejected: one `Error/{instance}` without a target, WARN
@@ -869,6 +919,9 @@ impl Lifecycle {
             return;
         };
         info!(instance = name, "The instance's Config names this process; acquired");
+        // Its own healing covers a cleanup still pending from an earlier delete.
+        self.cleanups.remove(name);
+        self.queued_cleanups.remove(name);
         self.instances.insert(
             name.to_owned(),
             Instance {
@@ -1075,7 +1128,8 @@ impl Lifecycle {
     /// With nothing serving the instance, a construction's failure makes it failed:
     /// `Status=unreachable`, retried at the reconnect pacing (multi-device spec §4.3).
     fn mark_failed(&mut self, name: &str) {
-        let retry = self.settings.retry;
+        // At the reconnect pacing, and at most once a second: a thread is spent on each.
+        let retry = self.settings.retry.max(CONSTRUCTION_RETRY_FLOOR);
         let Some(instance) = self.instances.get_mut(name) else {
             return;
         };
@@ -1127,7 +1181,7 @@ impl Lifecycle {
         let Some(old) = self.instances.get_mut(name).and_then(|i| i.rt.take()) else {
             return Ok(());
         };
-        outputs.remove(&self.shared, old.id);
+        retire_slot(&self.shared, outputs, old.id, name, self.conn.connected && ctx.is_some());
         self.create_rt(None, outputs, name, Phase::Live, LinkStatus::Connecting).await?;
         let connected = self.conn.connected;
         let Some(instance) = self.instances.get_mut(name) else {
@@ -1373,6 +1427,8 @@ impl Lifecycle {
         };
         match then {
             Then::Disable => {
+                // It keeps its read-back — on a connection newer than the stop, the CONNACK asked
+                // for it again (`on_connack`).
                 if let Some(rt) = instance.rt.as_mut() {
                     rt.phase = Phase::Disabled;
                     rt.setup = Sub::None;
@@ -1383,25 +1439,31 @@ impl Lifecycle {
             }
             Then::Successor | Then::Release { .. } => {
                 if let Some(old) = instance.rt.take() {
-                    outputs.remove(&self.shared, old.id);
+                    retire_slot(&self.shared, outputs, old.id, name, connected);
                 }
                 if let Then::Release { cleanup: true } = then {
-                    // Its own tagged topics, as its read-back last saw them, retracted.
+                    // Its own tagged topics, as its read-back last saw them, retracted — now, or
+                    // after the next root replay if the broker is away.
                     let own: Vec<String> =
                         instance.slot.iter().filter(|(_, seen)| seen.via.as_deref() == Some(id.as_str())).map(|(t, _)| t.clone()).collect();
-                    if connected {
-                        for topic in own {
-                            outputs.queue_outbox(Part::Model, Out::new(topic, true, Vec::new(), None, Some(&id)));
+                    if own.is_empty() {
+                    } else if connected {
+                        for topic in &own {
+                            outputs.queue_outbox(Part::Model, Out::new(topic.clone(), true, Vec::new(), None, Some(&id)));
                         }
-                    } else if !own.is_empty() {
-                        warn!(
-                            kind = "output_lost_at_session_end",
+                        self.queued_cleanups.insert(name.to_owned(), own);
+                    } else {
+                        info!(
                             instance = name,
-                            lost = own.len(),
-                            "A deleted instance's retained topics could not be cleared: the session ended"
+                            topics = own.len(),
+                            "A deleted instance's retained topics are cleared after the next root replay"
                         );
+                        self.cleanups.insert(name.to_owned(), own);
                     }
                 }
+                let Some(instance) = self.instances.get_mut(name) else {
+                    return Ok(());
+                };
                 instance.slot.clear();
                 if then == Then::Successor {
                     // Its bootstrap begins now; the driver built for it starts at S3's grant — or,
@@ -1434,11 +1496,11 @@ impl Lifecycle {
             observe_slot(instance, &id, topic, &inbound, publish);
             return;
         }
+        let failed = instance.failed();
         let Some(rt) = instance.rt.as_ref() else {
             debug!(topic, "A request for an instance with no device; ignored");
             return;
         };
-        let failed = rt.phase == Phase::Live && !rt.worker && instance.accepted.is_none() && instance.build.is_none();
         let device = rt.device.clone();
         match rt.phase {
             Phase::Stopping { .. } => terminal(
@@ -1547,6 +1609,34 @@ fn terminal(device: &Device, topic: &str, publish: &Publish, why: &str) {
             debug!(topic, "A retained request for an instance that takes none; ignored (it replays to a successor)");
         }
         Inbound::State { .. } | Inbound::Status | Inbound::Unknown => {}
+    }
+}
+
+/// A device runtime leaves the rotation (multi-device spec §4.4 step 3): the answers and unsolicited
+/// reports it still holds — refusals of deliveries that reached it as it unsubscribed — go to the
+/// outbox rather than with its runtime; its model is no longer its to write. With no connection they
+/// are lost, as a session's output is (WARN `output_lost_at_session_end`).
+fn retire_slot(shared: &session::Shared, outputs: &mut Outputs, id: u64, name: &str, connected: bool) {
+    let Some(mut slot) = outputs.remove(shared, id) else {
+        return;
+    };
+    slot.batch.add(&slot.device, slot.device.reports.take());
+    let answers = slot.batch.drain(Part::Answers);
+    let unsolicited = slot.batch.drain(Part::Unsolicited);
+    if connected {
+        for out in answers {
+            outputs.queue_outbox(Part::Answers, out);
+        }
+        for out in unsolicited {
+            outputs.queue_outbox(Part::Unsolicited, out);
+        }
+    } else if !answers.is_empty() || !unsolicited.is_empty() {
+        warn!(
+            kind = "output_lost_at_session_end",
+            instance = name,
+            lost = answers.len() + unsolicited.len(),
+            "A stopped device's answers were not published before the session ended; dropped"
+        );
     }
 }
 

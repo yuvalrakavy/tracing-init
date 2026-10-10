@@ -96,6 +96,46 @@ async fn a_changed_config_of_a_failed_instance_is_built_at_once() {
     .await
 }
 
+/// A Config change committed — the old device stopping for its successor — then changed again, the
+/// newest one's construction failing: nothing serves the instance, so it is failed — `unreachable`,
+/// a target-level write refused — not a runtime holding requests for a worker that never comes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_whose_newest_construction_fails_leaves_the_instance_failed() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        // Builds: the first device, the committed change (dropped for the newest), the newest — failing.
+        fleet.script(&lamp, &[Build::Ok, Build::Ok, Build::Unusable]);
+        fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(1000))));
+        let h = tuned("change-then-fail", fleet, |host| {
+            host.timing(mqtt_bridge_kit::TimingOverrides { retry: Some(Duration::from_secs(30)), ..quick_timing() })
+        })
+        .await;
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        let old = h.fleet.device(&lamp).expect("built");
+        assert!(h.configure(&lamp, json!({"address": "b"})));
+        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
+        assert!(h.configure(&lamp, json!({"address": "c"})));
+        assert!(
+            h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("unreachable") && !h.errors_for(&lamp, "unusable").is_empty()).await,
+            "a failed newest construction did not leave the instance failed: {:?} {:?}",
+            h.statuses(&lamp),
+            h.errors(&lamp)
+        );
+        let t = h.topics(&lamp);
+        assert!(h.eventually(BOUND, |h| h.subscribed(&t.desired_target_filter())).await);
+        assert!(h.broker.publish(&t.desired_target("t1"), json!({"power": true}).to_string(), &SendOptions::default()));
+        assert!(
+            h.eventually(BOUND, |h| h.errors_for(&lamp, "refused").iter().any(|e| e["target"] == "t1" && e.get("command").is_none())).await,
+            "a target-level write to the instance nothing serves was not refused: {:?}",
+            h.errors(&lamp)
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// Config equality is on the parsed value: an identical Config — the same fields in another order —
 /// is a no-op, building nothing and stopping nothing.
 #[tokio::test(flavor = "multi_thread")]

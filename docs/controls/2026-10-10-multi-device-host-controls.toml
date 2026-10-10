@@ -396,9 +396,9 @@ guard       = "fallback_no_spin"
 [[control]]
 name        = "no_status_at_the_read_backs_grant"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                outputs.announce(rt);
-                session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;'''
-replacement = '''                outputs.announce(rt);'''
+anchor      = '''                    outputs.announce(rt);
+                    session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;'''
+replacement = '''                    outputs.announce(rt);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "the_statuses_are_republished_before_active_after_a_reconnect", "--exact"]
 expect_text = '''Status was not republished'''
@@ -633,3 +633,62 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::a_suback_held_for_one_filter_alone", "--exact"]
 expect_text = '''the held SUBACK went out'''
 guard       = "fake_held_prefix"
+
+# ---- The adversarial review's findings (M1-M3, minor 2) ------------------------------------------
+
+# M1: a runtime leaving the rotation hands its answers to the outbox.
+[[control]]
+name        = "a_retired_runtimes_answers_go_with_it"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''    if connected {
+        for out in answers {'''
+replacement = '''    if connected && answers.is_empty() && unsolicited.is_empty() {
+        for out in answers {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "answers_refused_while_unsubscribing_are_published", "--exact"]
+expect_text = '''an answer refused while the device unsubscribed was lost with its runtime'''
+guard       = "retired_answers_kept"
+
+# M2: a stop that ends disabled (or deleted) reads its slot on a newer connection.
+[[control]]
+name        = "a_stop_across_a_reconnect_reads_nothing"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                Some(Phase::Live | Phase::Disabled | Phase::Stopping { then: Then::Disable | Then::Release { cleanup: true }, .. })'''
+replacement = '''                Some(Phase::Live | Phase::Disabled)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_disable_that_spans_a_reconnect_keeps_its_read_back", "--exact"]
+expect_text = '''the disabled instance did not subscribe its read-back on the new connection'''
+guard       = "stopping_reads_on_connack"
+
+# M3: a delete that ends offline keeps its cleanup pending...
+[[control]]
+name        = "an_offline_deletes_cleanup_is_forgotten"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                        self.cleanups.insert(name.to_owned(), own);'''
+replacement = '''                        let _ = own;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_delete_finished_while_disconnected_is_cleared_after_the_reconnect", "--exact"]
+expect_text = '''a delete that ended while disconnected left its tagged topics behind'''
+guard       = "cleanup_pending_kept"
+
+# ...and hands it over at the next root replay.
+[[control]]
+name        = "a_pending_cleanup_is_never_handed_over"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                self.hand_over_cleanups(outputs);'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_delete_finished_while_disconnected_is_cleared_after_the_reconnect", "--exact"]
+expect_text = '''a delete that ended while disconnected left its tagged topics behind'''
+guard       = "cleanup_handed_over"
+
+# Minor 2: failed is "nothing serves the instance", not "no Config ever accepted".
+[[control]]
+name        = "failed_means_nothing_accepted"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''&& self.build.is_none() && self.ready.is_none()'''
+replacement = '''&& self.accepted.is_none() && self.build.is_none()'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_change_whose_newest_construction_fails_leaves_the_instance_failed", "--exact"]
+expect_text = '''a target-level write to the instance nothing serves was not refused'''
+guard       = "failed_nothing_serves"

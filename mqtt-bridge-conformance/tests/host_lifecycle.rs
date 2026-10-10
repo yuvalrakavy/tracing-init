@@ -79,6 +79,123 @@ async fn a_stop_that_spans_a_reconnect_still_retires_its_output() {
     .await
 }
 
+/// Deliveries still on the wire when a stopping device's UNSUBSCRIBEs go out get the terminal
+/// policy, and their answers are published though the UNSUBACKs end the device's runtime right
+/// behind them (multi-device spec §4.4 steps 1 and 3).
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_refused_while_unsubscribing_are_published() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        let h = serving("unsubscribing", &lamp, fleet).await;
+        let t = h.topics(&lamp);
+        h.broker.hold_subacks();
+        assert!(h.configure(&lamp, json!({"address": "b"})));
+        assert!(
+            h.eventually(BOUND, |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.command()))).await,
+            "the old device's subscriptions were never unsubscribed: {:#?}",
+            h.labels()
+        );
+        // Commands already on their way — straight to the client — then the UNSUBACKs behind them.
+        for n in 0..10 {
+            let options =
+                SendOptions::default().expiry(30).response_topic(&format!("Store/replies/unsub-{n}")).correlation_data(vec![n as u8]);
+            assert!(h.broker.send_with(&t.command(), json!({"command": "learn"}).to_string(), &options));
+        }
+        h.broker.release_subacks();
+        assert!(
+            h.eventually(BOUND, |h| (0..10)
+                .all(|n| h.replies(&format!("Store/replies/unsub-{n}")).iter().any(|r| r["reason"] == "refused")))
+                .await,
+            "an answer refused while the device unsubscribed was lost with its runtime: {:?}",
+            (0..10).map(|n| h.replies(&format!("Store/replies/unsub-{n}")).len()).collect::<Vec<_>>()
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// The labels since the broker's last accepted connection.
+fn since_last_connect(h: &HostHarness) -> Vec<String> {
+    let labels = h.labels();
+    let last = labels.iter().rposition(|l| l == "connect").unwrap_or(0);
+    labels[last..].to_vec()
+}
+
+/// A disable whose stop spans a reconnect: once disabled, the instance keeps its read-back on the
+/// new connection, and heals its `Status=disabled` (multi-device spec §4.4 step 5, §4.5).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disable_that_spans_a_reconnect_keeps_its_read_back() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(1500))));
+        let h = serving("disable-reconnect", &lamp, fleet).await;
+        let t = h.topics(&lamp);
+        let device = h.fleet.device(&lamp).expect("built");
+        assert!(h.configure(&lamp, json!({"address": "a", "disabled": true})));
+        assert!(h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the worker was never stopped");
+        let before = h.broker.connections();
+        h.broker.refuse_connections(true);
+        h.broker.drop_connection();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.broker.refuse_connections(false);
+        assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("disabled")).await, "{:?}", h.statuses(&lamp));
+        assert!(
+            h.eventually(BOUND, |h| since_last_connect(h).iter().any(|l| *l == format!("sub {}", t.status()))).await,
+            "the disabled instance did not subscribe its read-back on the new connection: {:#?}",
+            since_last_connect(&h)
+        );
+        let marked = h.statuses(&lamp).len();
+        h.broker.publish(&t.status(), "connected", &SendOptions::default().retained().user_property("via", "elsewhere"));
+        assert!(
+            h.eventually(BOUND, |h| h.statuses(&lamp).len() > marked && h.status(&lamp).as_deref() == Some("disabled")).await,
+            "the disabled instance did not heal its Status after the reconnect: {:?}",
+            h.status_via(&lamp)
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// A delete whose stop ends while the broker is away: its own tagged topics are still cleared, after
+/// the reconnect (multi-device spec §4.5, the bridge cleanup).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_finished_while_disconnected_is_cleared_after_the_reconnect() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| {
+            d.set("t1", "power", json!(true));
+            d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(1000)));
+        });
+        let h = serving("delete-offline", &lamp, fleet).await;
+        let t = h.topics(&lamp);
+        assert!(
+            h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await,
+            "the device's State never reached the broker"
+        );
+        let device = h.fleet.device(&lamp).expect("built");
+        assert!(h.delete(&lamp));
+        assert!(h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the worker was never stopped");
+        // Away until the stop has ended.
+        let before = h.broker.connections();
+        h.broker.refuse_connections(true);
+        h.broker.drop_connection();
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        h.broker.refuse_connections(false);
+        assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
+        assert!(
+            h.eventually(BOUND, |h| [t.status(), t.state("t1")].iter().all(|topic| h.broker.retained_on(topic).is_none())).await,
+            "a delete that ended while disconnected left its tagged topics behind: {:?}",
+            h.broker.retained()
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// Whether `filter` was subscribed after `unsubscribed` was unsubscribed, in the broker's events.
 fn subscribed_since(h: &HostHarness, filter: &str, unsubscribed: &str) -> bool {
     let labels = h.labels();

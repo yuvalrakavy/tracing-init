@@ -60,6 +60,14 @@ async fn moving_via_hands_the_instance_over_and_heals_a_late_write() {
         );
         assert!(!two.log.of_kind("slot_reasserted").is_empty(), "{:#?}", two.log.records());
         assert_eq!(one.fleet.builds(&lamp), 1, "the old owner built the instance again");
+        // A move is no delete: the old owner retracted none of the instance's topics.
+        let instance_prefix = |lane: &str| format!("{ROOT}/{lane}/{lamp}");
+        let cleared = one.broker.received().into_iter().any(|r| {
+            r.payload.is_empty()
+                && r.user_property("via") == Some(one.bridge.as_str())
+                && (r.topic == instance_prefix("Status") || r.topic.starts_with(&format!("{}/", instance_prefix("State"))))
+        });
+        assert!(!cleared, "the old owner cleared the moved instance's topics");
         let (mut one, two) = (one, two);
         assert!(one.stop_host().await);
         assert!(two.stop().await);

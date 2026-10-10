@@ -882,6 +882,11 @@ impl Batch {
         }
     }
 
+    /// Every message of `part` waiting, taken out.
+    pub(crate) fn drain(&mut self, part: Part) -> Vec<Out> {
+        self.queue(part).drain(..).collect()
+    }
+
     /// Whether nothing waits: no message, and no publish under way.
     pub(crate) fn is_empty(&self) -> bool {
         self.sending.is_none() && self.answers.is_empty() && self.model.is_empty() && self.unsolicited.is_empty()

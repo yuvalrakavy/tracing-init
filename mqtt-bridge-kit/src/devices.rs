@@ -225,11 +225,13 @@ impl Spawner {
         let (ask, ask_rx) = watch::channel(false);
         let (done_tx, done) = watch::channel(false);
         let name = named.then(|| instance.to_owned());
-        tokio::spawn(keeper(id, name, end, supervisor, worker_stop, ask_rx, self.clone(), done_tx).instrument(span));
-        // The registry holds the stop request (a request dropped reads as one asked).
+        // Registered before the keeper runs, so a keeper that ends at once removes its own entry; a
+        // process already stopping asks it to stop at once. The registry holds the stop request (a
+        // request dropped reads as one asked).
         if !self.registry.insert(id, Keeper { ask: ask.clone(), done }) {
             let _ = ask.send(true);
         }
+        tokio::spawn(keeper(id, name, end, supervisor, worker_stop, ask_rx, self.clone(), done_tx).instrument(span));
         Ok(())
     }
 
