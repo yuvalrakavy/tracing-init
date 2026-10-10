@@ -289,3 +289,39 @@ async fn a_stop_spanning_a_reconnect_has_its_status_republished_before_active() 
     })
     .await
 }
+
+/// The statuses said at a read-back's grant go out through the publication's rotation, within the
+/// packet-id budget, and `Active=true` still waits for them (§4.3, §4.6): with the barrier already
+/// acknowledged, a stopping instance's read-back granted last brings every grant in at once —
+/// `Active=true` comes only once its `connecting` is out (the R2 confirming reviews: the Status left
+/// the direct path, which had said it at once).
+#[tokio::test(flavor = "multi_thread")]
+async fn active_waits_for_the_statuses_said_through_the_rotation() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(3000))));
+        let h = HostHarness::start("status-rotation", fleet).await;
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(BOUND, |h| actives(h) == 1).await);
+        let old = h.fleet.device(&lamp).expect("built");
+        assert!(h.configure(&lamp, json!({"address": "b"})));
+        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
+        // On the next connection the read-back's SUBACK comes after the barrier's.
+        h.broker.hold_subacks_matching(&format!("{ROOT}/State/{lamp}"));
+        let (before, mark) = (h.broker.accepted(), h.labels().len());
+        h.broker.drop_connection();
+        assert!(h.eventually(BOUND, |h| h.broker.accepted() > before).await, "no reconnect");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(actives(&h), 1, "Active=true came with the read-back's grant pending");
+        h.broker.release_subacks();
+        assert!(h.eventually(BOUND, |h| actives(h) == 2).await, "Active=true never came after the reconnect");
+        let labels = h.labels()[mark..].to_vec();
+        let active = labels.iter().position(|l| *l == format!("pub {} true", h.active_topic())).expect("Active=true");
+        let status = labels.iter().position(|l| *l == format!("pub {} connecting", h.topics(&lamp).status()));
+        assert!(status.is_some_and(|at| at < active), "Active=true went before the Status said through the rotation: {labels:#?}");
+        assert!(h.stop().await);
+    })
+    .await
+}

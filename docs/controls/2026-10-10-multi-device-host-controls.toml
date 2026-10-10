@@ -365,8 +365,9 @@ guard       = "s2_retraction"
 [[control]]
 name        = "active_with_a_grant_pending"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''self.conn.pending_subscriptions() > 0 || self.budget(ctx).is_some_and(|b| b < 2)'''
-replacement = '''self.budget(ctx).is_some_and(|b| b < 2)'''
+anchor      = '''            || self.conn.pending_subscriptions() > 0
+'''
+replacement = ''''''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "active_comes_only_after_every_grant_and_after_the_statuses", "--exact"]
 expect_text = '''Active=true was published with a grant pending'''
@@ -408,9 +409,11 @@ guard       = "fallback_no_spin"
 [[control]]
 name        = "no_status_at_the_read_backs_grant"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                    outputs.announce(rt);
-                    session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;'''
-replacement = '''                    outputs.announce(rt);'''
+anchor      = '''                    if let Some(slot) = outputs.slot(rt) {
+                        slot.batch.add_model(&device, device.reports.model());
+                    }
+'''
+replacement = ''''''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "the_statuses_are_republished_before_active_after_a_reconnect", "--exact"]
 expect_text = '''Status was not republished'''
@@ -975,3 +978,98 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "a_stop_spanning_a_reconnect_has_its_status_republished_before_active", "--exact"]
 expect_text = '''the stopping instance's Status was not republished before Active=true'''
 guard       = "successor_status_at_connack"
+
+# ---- The R2 confirming reviews' fix round ----------------------------------------------------------
+
+# Packet ids (both reviews): an instance's model republished at its S1 grant goes through the
+# rotation's budget, not by direct publishes (the direct call restored).
+[[control]]
+name        = "the_read_grant_republishes_directly"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                    if let Some(slot) = outputs.slot(rt) {
+                        slot.batch.add_model(&device, device.reports.model());
+                    }
+'''
+replacement = '''                    session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;
+'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_read_grants_republish_stays_within_the_packet_id_budget", "--exact"]
+expect_text = '''a packet id was reused while its acknowledgement was outstanding'''
+guard       = "read_grant_republish_budgeted"
+
+# The statuses republished through the rotation and the outbox still go out before Active=true:
+# Active waits until none waits. (The first two targets were GREEN, 2026-10-10: a live instance's S2
+# request holds Active back anyway, and a session's first turn comes before its next read; the
+# scenario now has the barrier acknowledged before the last read-back's grant.)
+[[control]]
+name        = "active_before_the_statuses_are_out"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''            || firsts_waiting
+'''
+replacement = ''''''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "active_waits_for_the_statuses_said_through_the_rotation", "--exact"]
+expect_text = '''Active=true went before the Status said through the rotation'''
+guard       = "active_after_firsts"
+
+# The shutdown's flush publishes within the ids left while a request is outstanding.
+[[control]]
+name        = "the_flush_publishes_unbudgeted"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''            let mut left = mode.flush_budget(&ctx).unwrap_or(usize::MAX);'''
+replacement = '''            let mut left = usize::MAX;
+            let _ = &ctx;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "the_shutdown_flush_stays_within_the_packet_id_budget", "--exact"]
+expect_text = '''the shutdown's flush reused a packet id while its acknowledgement was outstanding'''
+guard       = "flush_budgeted"
+
+# ...and past its ack wait publishes nothing more: no Active=false, which would take the id of the
+# request still outstanding — the last will says it.
+[[control]]
+name        = "the_flush_says_active_false_past_its_deadline"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''                Err(_) => {
+                    return Err('''
+replacement = '''                Err(_) => break,
+                Ok(None) if false => {
+                    return Err('''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "the_shutdown_flush_stays_within_the_packet_id_budget", "--exact"]
+expect_text = '''the shutdown's flush reused a packet id while its acknowledgement was outstanding'''
+guard       = "flush_stops_at_deadline"
+
+# Codex 2: a disable still to be validated, with a committed driver waiting, touches neither the
+# stop's destination nor that driver.
+[[control]]
+name        = "an_unvalidated_disable_takes_over_the_stop"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        if instance.ready.is_some() && matches!(&want, Want::Disable(config) if Self::needs_validation(instance, config)) {'''
+replacement = '''        if false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "an_invalid_disable_during_a_replacement_keeps_the_committed_config", "--exact"]
+expect_text = '''the committed Config was not kept in force when an invalid disable came during the replacement'''
+guard       = "disable_validated_before_takeover"
+
+# ...and once validated, it takes over the stop.
+[[control]]
+name        = "a_validated_disable_leaves_the_stop_as_it_was"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                    self.set_want(name, Want::Disable(config));'''
+replacement = '''                    let _ = config;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_valid_disable_during_a_replacement_disables_the_instance", "--exact"]
+expect_text = '''the validated disable did not take over the stop'''
+guard       = "validated_disable_takes_over"
+
+# Claude minor 3: an instance acquired again drops its cleanup's retractions still in the outbox.
+[[control]]
+name        = "an_acquired_instance_keeps_its_queued_retractions"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        let dropped = outputs.outbox.discard(Part::Model, |out| out.retracts(&status, &prefix));'''
+replacement = '''        let _ = (&status, &prefix, &outputs);
+        let dropped = 0;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "lifecycle::tests::an_instance_acquired_again_drops_its_queued_sweep_retractions", "--exact"]
+expect_text = '''an instance acquired again kept its sweep's retractions queued'''
+guard       = "reacquire_drops_retractions"

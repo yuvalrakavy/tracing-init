@@ -589,6 +589,13 @@ async fn a_valid_disable_during_a_replacement_disables_the_instance() {
         let committed = h.fleet.devices(&lamp).get(1).cloned().expect("the committed Config's device was built");
         assert!(committed.calls_of(Op::Connect).is_empty(), "the committed driver started though a disable replaced it");
         assert_eq!(h.status(&lamp).as_deref(), Some("disabled"), "{:?}", h.statuses(&lamp));
+        // The stop itself ended disabled: no successor bootstrapped (`connecting`) in between.
+        let statuses = h.statuses(&lamp);
+        let served = statuses.iter().position(|s| s == "connected").expect("the first device served");
+        assert!(
+            statuses[served..].iter().all(|s| s != "connecting"),
+            "the validated disable did not take over the stop — a successor bootstrapped first: {statuses:?}"
+        );
         assert!(h.errors(&lamp).is_empty(), "{:?}", h.errors(&lamp));
         assert!(h.stop().await);
     })

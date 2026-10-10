@@ -2286,8 +2286,8 @@ guard       = "stop_refuses_waiting"
 [[control]]
 name        = "the_flush_drops_what_is_pending"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                slot.batch.publish(shared, client, &[part], usize::MAX).await;'''
-replacement = '''                let _ = (&slot.batch, part);'''
+anchor      = '''                    left -= slot.batch.publish(shared, client, &[part], left).await;'''
+replacement = '''                    let _ = (&slot.batch, part);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_what_is_pending_before_its_last_words", "--exact"]
 expect_text = '''the flush dropped what was pending'''
