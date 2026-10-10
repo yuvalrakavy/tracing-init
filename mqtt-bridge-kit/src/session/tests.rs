@@ -72,6 +72,56 @@ async fn a_refused_publish_is_one_message_dropped() {
     );
 }
 
+/// The publication rotation (multi-device spec §4.7): at most a quantum (32) of one device's
+/// messages a turn; the next turn the next device with output, the cursor kept; and a device's batch
+/// sealed when taken — its reply goes out with that batch, ahead of State reported after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rotation_turns_quanta_round_robin_over_sealed_batches() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(5);
+    let mut rig = rig_on(broker.port());
+    let (shared, first) = (rig.shared.clone(), rig.device.clone());
+    let second = Arc::new(Device {
+        topics: Topics::new("T", "second").expect("topics"),
+        commands: Vec::new().into(),
+        mailbox: Mailbox::new(),
+        reports: Reports::with_ready(shared.ready.clone()),
+        tag: None,
+        span: tracing::Span::none(),
+    });
+    rig.outputs.add(&shared, 1, second.clone());
+    let (client, events) = client(&shared);
+    let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
+    let connected = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
+    assert!(matches!(connected, Some(PumpEvent::Connected)));
+    assert!(rig.outputs.announce(0) && rig.outputs.announce(1));
+    let state = |n: usize| serde_json::json!({"n": n}).as_object().unwrap().clone();
+    for t in 0..100 {
+        first.reports.state(&format!("m{t:03}"), state(t), false);
+    }
+    first.reports.event(Outbound { topic: Some("Store/replies/sealed".into()), payload: b"{}".to_vec(), correlation: None });
+    second.reports.state("s1", state(1), false);
+    let handed = |shared: &Shared| shared.enqueued.load(std::sync::atomic::Ordering::SeqCst);
+    let mut served = Vec::new();
+    served.push(rig.outputs.turn(&shared, &client).await);
+    assert_eq!(handed(&shared), 32, "a turn handed over more than a quantum of one device's messages");
+    served.push(rig.outputs.turn(&shared, &client).await);
+    // State reported after the first device's batch was taken: the next batch's.
+    for t in 0..50 {
+        first.reports.state(&format!("n{t:03}"), state(t), false);
+    }
+    for _ in 0..5 {
+        served.push(rig.outputs.turn(&shared, &client).await);
+    }
+    assert_eq!(&served[..2], &[Some(0), Some(1)], "the second turn was not the next device's: the cursor stayed");
+    let total = 100 + 1 + 1 + 50;
+    assert!(broker.wait_until(Duration::from_secs(5), |b| b.received().len() >= total).await, "not everything was published");
+    let received = broker.received();
+    let reply = received.iter().position(|r| r.topic == "Store/replies/sealed").expect("the reply");
+    let later = received.iter().position(|r| r.topic == first.topics.state("n000")).expect("the later State");
+    assert!(reply < later, "the reply went out behind State reported after its batch was taken: the batch was not sealed");
+}
+
 /// Only a retained `State` is read back: a live one — the bridge's own publish coming back on its
 /// read-back subscription, or another client's — is no record of what the previous run knew, and
 /// no "before" value for the conflict rule.

@@ -95,6 +95,40 @@ async fn a_refused_instance_subscription_ends_the_session() {
     .await
 }
 
+/// An overdue SUBACK (10 s) ends the session — time alone never establishes a grant — and the next
+/// session bootstraps again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overdue_subscription_ends_the_session() {
+    within(DEADLINE, async {
+        let broker = broker().await;
+        let lamp = instance_name("Lamp");
+        let bridge = instance_name("overdue");
+        broker.retain(
+            &format!("{ROOT}/Config/{lamp}"),
+            json!({"bridge": KIND, "via": bridge}).to_string(),
+            &SendOptions::default().retained(),
+        );
+        // The instance's requests' SUBACK never comes on this connection (a new one answers again).
+        broker.hold_subacks_matching(&format!("{ROOT}/Desired/{lamp}"));
+        let h = HostHarness::join(broker, &bridge, Fleet::new(acknowledged()), |host| host).await;
+        let started = std::time::Instant::now();
+        assert!(h.eventually(BOUND, |h| h.subscribed(&h.topics(&lamp).command())).await, "S3 was never asked for");
+        assert!(h.eventually(Duration::from_secs(15), |h| h.broker.connections() >= 2).await, "an overdue SUBACK did not end the session");
+        let took = started.elapsed();
+        assert!(took >= Duration::from_secs(9), "the session ended before the grant was overdue: {took:?}");
+        assert!(
+            h.log.of_kind("subscription_refused").iter().any(|r| r.field("overdue_ms").is_some()),
+            "the overdue grant was not said: {:#?}",
+            h.log.of_kind("subscription_refused")
+        );
+        assert_eq!(actives(&h), 0, "Active=true was published with a grant pending");
+        h.broker.release_subacks();
+        assert!(h.eventually(BOUND, |h| actives(h) == 1).await, "the next session never completed its bootstrap");
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// After a reconnect, every owned instance's current `Status` is published again before
 /// `Active=true`.
 #[tokio::test(flavor = "multi_thread")]

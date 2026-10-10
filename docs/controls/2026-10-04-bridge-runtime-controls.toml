@@ -152,9 +152,11 @@ guard       = "broker_outage_proof_of_life"
 [[control]]
 name        = "the_connack_duties_are_done_once_per_session"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client, &mut incoming).await.map(|goes_on| {'''
-replacement = '''                Step::Event(Some(PumpEvent::Connected)) if shared.read_back_requested.load(Ordering::SeqCst) => Ok(None),
-                Step::Event(Some(PumpEvent::Connected)) => connected(shared, &client, &mut incoming).await.map(|goes_on| {'''
+anchor      = '''                (Step::Event(Some(PumpEvent::Connected)), Mode::Fixed(fixed)) => {
+                    let device = outputs.slots[0].device.clone();'''
+replacement = '''                (Step::Event(Some(PumpEvent::Connected)), Mode::Fixed(fixed)) if fixed.read_back_requested => Ok(None),
+                (Step::Event(Some(PumpEvent::Connected)), Mode::Fixed(fixed)) => {
+                    let device = outputs.slots[0].device.clone();'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the state was not published again after the reconnect'''
@@ -176,9 +178,10 @@ guard       = "connack_order"
 [[control]]
 name        = "the_version_is_not_published"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    emit(shared, client, topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
+anchor      = '''    emit(shared, client, shared.topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
 '''
-replacement = ''''''
+replacement = '''
+'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''was not published again'''
@@ -188,9 +191,10 @@ guard       = "connack_version"
 [[control]]
 name        = "the_model_is_not_republished_at_connack"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    republish(shared, client, shared.reports.model()).await;
+anchor      = '''    republish(shared, client, device, device.reports.model()).await;
 '''
-replacement = ''''''
+replacement = '''
+'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_broker_restarted_without_persistence_gets_the_retained_model_again", "--exact"]
 expect_text = '''the retained model was not restored'''
@@ -200,40 +204,10 @@ guard       = "connack_republish"
 [[control]]
 name        = "reports_are_published_before_the_connack"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        let step = if reads_owed > 0 {
-            // WAIT: session-events
-            tokio::select! {
-                biased;
-                _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
-                event = incoming.recv() => Step::Event(event),
-                () = shared.reports.reported(), if announced => Step::Reported,
-            }
-        } else {
-            // WAIT: session-events
-            tokio::select! {
-                biased;
-                _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
-                () = shared.reports.reported(), if announced => Step::Reported,
-                event = incoming.recv() => Step::Event(event),
-            }
-        };'''
-replacement = '''        let step = if reads_owed > 0 {
-            // WAIT: session-events
-            tokio::select! {
-                biased;
-                _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
-                event = incoming.recv() => Step::Event(event),
-                () = shared.reports.reported() => Step::Reported,
-            }
-        } else {
-            // WAIT: session-events
-            tokio::select! {
-                biased;
-                _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
-                () = shared.reports.reported() => Step::Reported,
-                event = incoming.recv() => Step::Event(event),
-            }
-        };'''
+anchor      = '''            slot.announced = false;
+            slot.batch = Batch::default();'''
+replacement = '''            slot.announced = true;
+            slot.batch = Batch::default();'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
 expect_text = '''no Error said the request was superseded'''
@@ -267,7 +241,7 @@ guard       = "read_back_retained_only"
 [[control]]
 name        = "malformed_payloads_are_not_answered"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        shared.reports.error(ErrorReport { error, ..report });
+anchor      = '''        device.reports.error(ErrorReport { error, ..report });
 '''
 replacement = '''        let _ = (error, report);
 '''
@@ -294,8 +268,8 @@ guard       = "target_write_never_retained"
 [[control]]
 name        = "a_reply_loses_its_correlation_data"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation)'''
-replacement = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, None)'''
+anchor      = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation, None)'''
+replacement = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, None, None)'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
 expect_text = '''the reply lost the correlation data'''
@@ -305,8 +279,8 @@ guard       = "reply_correlation"
 [[control]]
 name        = "a_reply_goes_to_the_event_lane"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation)'''
-replacement = '''Out::new(topics.event(), false, r.payload, r.correlation)'''
+anchor      = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation, None)'''
+replacement = '''Out::new(topics.event(), false, r.payload, r.correlation, None)'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
 expect_text = '''no reply on the response topic'''
@@ -327,8 +301,8 @@ guard       = "refresh"
 [[control]]
 name        = "assume_is_not_assumed"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''shared.reports.state(t, call.params.clone(), true);'''
-replacement = '''shared.reports.state(t, call.params.clone(), false);'''
+anchor      = '''device.reports.state(t, call.params.clone(), true);'''
+replacement = '''device.reports.state(t, call.params.clone(), false);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "refresh_reads_the_device_and_assume_sets_the_assumed_state_without_it", "--exact"]
 expect_text = '''assume did not set the assumed state'''
@@ -909,8 +883,11 @@ guard       = "blocking_bounded"
 [[control]]
 name        = "abandoned_blocking_calls_are_not_capped"
 file        = "mqtt-bridge-kit/src/link.rs"
-anchor      = '''(running < cap).then_some(running + 1)'''
-replacement = '''Some(running + 1)'''
+anchor      = '''            if running >= cap {
+                break None;
+            }
+'''
+replacement = ''''''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "link::tests::abandoned_blocking_calls_are_capped", "--exact"]
 expect_text = '''a blocking call past the cap was run'''
@@ -931,36 +908,32 @@ guard       = "helpers_cancelled"
 [[control]]
 name        = "the_signals_are_taken_after_the_logging_start"
 file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''        let mut signals = StopSignals::register();
-        let app = self.app();
-        let log_config = self.settings.log_config.clone();
-        let starting = tokio::task::spawn_blocking(move || crate::logging::start(&app, log_config.as_deref()));
-        let logging = match &mut signals {
-            Ok(signals) => {
-                // WAIT: logging-start
-                tokio::select! {
-                    started = starting => started,
-                    _ = signals.next() => {
-                        // Stopped before there is a log to say so in.
-                        return ExitCode::SUCCESS;
-                    }
+anchor      = '''    let mut signals = StopSignals::register();
+    let starting = tokio::task::spawn_blocking(move || crate::logging::start(&app, log_config.as_deref()));
+    let logging = match &mut signals {
+        Ok(signals) => {
+            // WAIT: logging-start
+            tokio::select! {
+                started = starting => started,
+                _ = signals.next() => {
+                    // Stopped before there is a log to say so in.
+                    return ExitCode::SUCCESS;
                 }
             }
-            Err(_) => {
-                // The bridge will not start; the wait is only to say why, so it is bounded.
-                // WAIT: logging-start
-                match tokio::time::timeout(SHUTDOWN_GRACE, starting).await {
-                    Ok(started) => started,
-                    // No log to say it in: the status says it.
-                    Err(_) => return ExitCode::FAILURE,
-                }
+        }
+        Err(_) => {
+            // The bridge will not start; the wait is only to say why, so it is bounded.
+            // WAIT: logging-start
+            match tokio::time::timeout(SHUTDOWN_GRACE, starting).await {
+                Ok(started) => started,
+                // No log to say it in: the status says it.
+                Err(_) => return ExitCode::FAILURE,
             }
-        };'''
-replacement = '''        let app = self.app();
-        let log_config = self.settings.log_config.clone();
-        let starting = tokio::task::spawn_blocking(move || crate::logging::start(&app, log_config.as_deref()));
-        let logging = starting.await;
-        let signals = StopSignals::register();'''
+        }
+    };'''
+replacement = '''    let starting = tokio::task::spawn_blocking(move || crate::logging::start(&app, log_config.as_deref()));
+    let logging = starting.await;
+    let signals = StopSignals::register();'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
 expect_text = '''did not stop cleanly within its bound on SIGTERM while its logging start was held'''
@@ -970,14 +943,14 @@ guard       = "signals_first"
 [[control]]
 name        = "the_logging_start_is_not_raced"
 file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''                tokio::select! {
-                    started = starting => started,
-                    _ = signals.next() => {
-                        // Stopped before there is a log to say so in.
-                        return ExitCode::SUCCESS;
-                    }
-                }'''
-replacement = '''                starting.await'''
+anchor      = '''            tokio::select! {
+                started = starting => started,
+                _ = signals.next() => {
+                    // Stopped before there is a log to say so in.
+                    return ExitCode::SUCCESS;
+                }
+            }'''
+replacement = '''            starting.await'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
 expect_text = '''did not stop cleanly within its bound on SIGTERM while its logging start was held'''
@@ -987,9 +960,9 @@ guard       = "logging_start_raced"
 [[control]]
 name        = "the_runtime_is_dropped"
 file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''        runtime.shutdown_timeout(RUNTIME_GRACE);
+anchor      = '''    runtime.shutdown_timeout(RUNTIME_GRACE);
 '''
-replacement = '''        drop(runtime);
+replacement = '''    drop(runtime);
 '''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
@@ -1000,13 +973,13 @@ guard       = "runtime_shutdown_timeout"
 [[control]]
 name        = "a_blocking_print_on_the_start"
 file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''        if let Some(guard) = &_logging {
-            info!(logging = %guard, "Logging started");
-        }'''
-replacement = '''        if let Some(guard) = &_logging {
-            info!(logging = %guard, "Logging started");
-        }
-        println!("{}", "x".repeat(1 << 20));'''
+anchor      = '''    if let Some(guard) = &_logging {
+        info!(logging = %guard, "Logging started");
+    }'''
+replacement = '''    if let Some(guard) = &_logging {
+        info!(logging = %guard, "Logging started");
+    }
+    println!("{}", "x".repeat(1 << 20));'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_stdout_and_stderr_nobody_reads_hold_neither_the_start_nor_the_stop", "--exact"]
 expect_text = '''the bridge never announced itself: its start waited on a stdout or stderr nobody reads'''
@@ -1028,9 +1001,9 @@ guard       = "shutdown_timeout"
 # A part of the bridge that ends is seen (ERROR `worker_died`, a failure status).
 [[control]]
 name        = "a_dead_device_worker_goes_unseen"
-file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''                    Some(worker) => worker.await,'''
-replacement = '''                    Some(_) => std::future::pending::<Result<WorkerEnd, oneshot::error::RecvError>>().await,'''
+file        = "mqtt-bridge-kit/src/devices.rs"
+anchor      = '''                    let _ = spawner.deaths.send(died(match ended {'''
+replacement = '''                    let _ = (&spawner.deaths, died(match ended {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_panic_ends_the_device_worker", "--exact"]
 expect_text = '''the driver's panic went unseen'''
@@ -1155,9 +1128,9 @@ guard       = "panic_hook_off_thread"
 [[control]]
 name        = "run_installs_no_panic_hook"
 file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''        install_panic_hook();
-        // No runtime, no bridge'''
-replacement = '''        // No runtime, no bridge'''
+anchor      = '''    install_panic_hook();
+    // No runtime, no bridge'''
+replacement = '''    // No runtime, no bridge'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_connection", "--exact"]
 expect_text = '''a session panic with a stderr nobody reads did not end the bridge with a failure'''
@@ -1339,10 +1312,10 @@ guard       = "logging_failure_off_thread"
 [[control]]
 name        = "without_signals_the_logging_start_is_awaited_unbounded"
 file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''                match tokio::time::timeout(SHUTDOWN_GRACE, starting).await {
-                    Ok(started) => started,'''
-replacement = '''                match Ok::<_, ()>(starting.await) {
-                    Ok(started) => started,'''
+anchor      = '''            match tokio::time::timeout(SHUTDOWN_GRACE, starting).await {
+                Ok(started) => started,'''
+replacement = '''            match Ok::<_, ()>(starting.await) {
+                Ok(started) => started,'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "without_its_stop_signals_the_bridge_ends_within_a_bound_whatever_its_logging_start_does", "--exact"]
 expect_text = '''without its stop signals the bridge did not end with a failure within its bound'''
@@ -1403,13 +1376,13 @@ guard       = "reported_names_validated"
 name        = "a_refused_publish_ends_the_connack_duties"
 file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''    for (target, document) in model.states {
-        emit(shared, client, shared.topics.state(&target), true, document, properties()).await;
+        emit(shared, client, device.topics.state(&target), true, document, tagged(tag)).await;
     }'''
 replacement = '''    for (target, document) in model.states {
         if target.contains('#') {
             return;
         }
-        emit(shared, client, shared.topics.state(&target), true, document, properties()).await;
+        emit(shared, client, device.topics.state(&target), true, document, tagged(tag)).await;
     }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_refused_publish_is_one_message_dropped", "--exact"]
@@ -1625,7 +1598,7 @@ guard       = "copy_window"
 [[control]]
 name        = "requests_are_subscribed_before_the_read_back_is_acknowledged"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        match read_back_acknowledged(shared, incoming).await {'''
+anchor      = '''        match read_back_acknowledged(device, incoming).await {'''
 replacement = '''        match ReadBack::Granted {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "requests_are_subscribed_only_once_the_read_back_is_acknowledged", "--exact"]
@@ -1742,9 +1715,8 @@ guard       = "config_subscribed_first"
 [[control]]
 name        = "the_expiry_counts_from_the_session"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    span.in_scope(|| route(shared, &topic, publish, received));'''
-replacement = '''    let _ = received;
-    span.in_scope(|| route(shared, &topic, publish, Instant::now()));'''
+anchor      = '''                    span.in_scope(|| route(device, &topic, &publish, received));'''
+replacement = '''                    span.in_scope(|| route(device, &topic, &publish, Instant::now()));'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_reads_it", "--exact"]
 expect_text = '''a command executed past its expiry, counted from when the session read it'''
@@ -1952,14 +1924,11 @@ guard       = "written_known"
 [[control]]
 name        = "the_drivers_info_holds_the_stop"
 file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''        let describing = tokio::task::spawn_blocking(move || {
-            let info = driver.info();
-            (driver, info)
-        });'''
-replacement = '''        let describing = {
-            let info = driver.info();
-            async move { Ok::<_, tokio::task::JoinError>((driver, info)) }
-        };'''
+anchor      = '''    let describing = tokio::task::spawn_blocking(describe);'''
+replacement = '''    let describing = {
+        let described = describe();
+        async move { Ok::<_, tokio::task::JoinError>(described) }
+    };'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_while_the_drivers_info_has_not_returned_stops_the_bridge_within_its_bound", "--exact"]
 expect_text = '''did not stop cleanly within its bound on SIGTERM while its driver's info() was held'''
@@ -2072,13 +2041,11 @@ guard       = "worker_heartbeat"
 [[control]]
 name        = "the_watchdog_restarts_with_each_read"
 file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''                    // WAIT: bridge-parts
-                    Some(supervisor) => supervisor.await,'''
-replacement = '''                    // WAIT: bridge-parts
-                    Some(supervisor) => {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        supervisor.await
-                    }'''
+anchor      = '''            Some(died) = self.deaths.recv() => died,'''
+replacement = '''            Some(died) = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                self.deaths.recv().await
+            } => died,'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline", "--exact"]
 expect_text = '''went unseen for 7 s, read in slices'''
@@ -2279,8 +2246,8 @@ guard       = "catch_up_configs_first"
 [[control]]
 name        = "the_stop_answers_nothing_waiting"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        crate::worker::report_refused(&shared.reports, shared.mailbox.disconnected(), STOPPED_BEFORE);'''
-replacement = '''        let _ = STOPPED_BEFORE;'''
+anchor      = '''            crate::worker::report_refused(&slot.device.reports, slot.device.mailbox.disconnected(), STOPPED_BEFORE);'''
+replacement = '''            let _ = STOPPED_BEFORE;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_answers_the_commands_waiting_for_the_device", "--exact"]
 expect_text = '''the command waiting at SIGTERM was not answered'''
@@ -2290,12 +2257,8 @@ guard       = "stop_refuses_waiting"
 [[control]]
 name        = "the_flush_drops_what_is_pending"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        batch.add(shared, shared.reports.take());
-        // WAIT: mqtt-request
-        batch.publish(shared, client, true).await;
-        emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
-replacement = '''        let _ = &mut batch;
-        emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;'''
+anchor      = '''                slot.batch.publish(shared, client, &[part], usize::MAX).await;'''
+replacement = '''                let _ = (&slot.batch, part);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_what_is_pending_before_its_last_words", "--exact"]
 expect_text = '''the flush dropped what was pending'''
@@ -2448,7 +2411,7 @@ guard       = "cap_stamp_cleared"
 [[control]]
 name        = "a_retraction_leaves_the_assumption_unproven"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                        shared.reports.assumption_settled(&target, &property);'''
+anchor      = '''                        device.reports.assumption_settled(&target, &property);'''
 replacement = '''                        let _ = &property;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_retraction_settles_the_keys_unproven_assumption", "--exact"]
@@ -2517,9 +2480,11 @@ guard       = "refusal_stamp_rechecked"
 # Re-gate 4 minor 4: a stop after a verdict not read does not wait for the worker it found blocked.
 [[control]]
 name        = "a_finished_verdict_is_aborted"
-file        = "mqtt-bridge-kit/src/process.rs"
-anchor      = '''                        } => worker_blocked = true,'''
-replacement = '''                        }, if false => worker_blocked = true,'''
+file        = "mqtt-bridge-kit/src/devices.rs"
+anchor      = '''                        if blocked {
+                            break;
+                        }'''
+replacement = '''                        let _ = blocked;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_stop_after_an_unread_verdict_does_not_wait_for_the_blocked_worker", "--exact"]
 expect_text = '''the stop did not end in time'''
@@ -2541,8 +2506,8 @@ guard       = "retraction_keeps_unproven"
 [[control]]
 name        = "a_retraction_settles_an_unproven_write"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                    if !shared.mailbox.retract(&target, &property) {'''
-replacement = '''                    if { shared.mailbox.retract(&target, &property); true } {'''
+anchor      = '''                    if !device.mailbox.retract(&target, &property) {'''
+replacement = '''                    if { device.mailbox.retract(&target, &property); true } {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_retraction_of_an_unproven_write_leaves_its_assumption_unproven", "--exact"]
 expect_text = '''a retraction proved a write the device never proved taken'''
@@ -2593,8 +2558,8 @@ guard       = "reads_between_report_batches"
 [[control]]
 name        = "the_read_back_stays_subscribed"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                Step::Event(Some(PumpEvent::SubAck { .. })) if read_back_done => {'''
-replacement = '''                Step::Event(Some(PumpEvent::SubAck { .. })) if false && read_back_done => {'''
+anchor      = '''                (Step::Event(Some(PumpEvent::SubAck { .. })), Mode::Fixed(_)) if read_back_done => {'''
+replacement = '''                (Step::Event(Some(PumpEvent::SubAck { .. })), Mode::Fixed(_)) if false && read_back_done => {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the read-back's subscription was kept once it was done'''
@@ -2655,7 +2620,7 @@ guard       = "abandoned_reheld_withdrawn"
 [[control]]
 name        = "the_fake_broker_sends_its_unsuback_first"
 file        = "mqtt-test-broker/src/lib.rs"
-anchor      = '''                held.push(unsuback);'''
+anchor      = '''                held.push((tx.clone(), unsuback));'''
 replacement = '''                let _ = tx.send(unsuback);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::an_unsuback_waits_behind_a_held_suback", "--exact"]
@@ -2780,8 +2745,8 @@ guard       = "flush_ack_watermark"
 [[control]]
 name        = "a_reply_goes_before_its_state"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                self.model.pop_front().or_else(|| self.answers.pop_front())'''
-replacement = '''                self.answers.pop_front().or_else(|| self.model.pop_front())'''
+anchor      = '''pub(crate) const IN_TURN: [Part; 3] = [Part::Model, Part::Answers, Part::Unsolicited];'''
+replacement = '''pub(crate) const IN_TURN: [Part; 3] = [Part::Answers, Part::Model, Part::Unsolicited];'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_reply_follows_the_state_its_command_produced", "--exact"]
 expect_text = '''a reply went out before the State its refresh produced'''
@@ -2818,8 +2783,8 @@ guard       = "read_back_view_complete"
 [[control]]
 name        = "the_flush_puts_state_first"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        batch.publish(shared, client, true).await;'''
-replacement = '''        batch.publish(shared, client, false).await;'''
+anchor      = '''        for part in [Part::Answers, Part::Model, Part::Unsolicited] {'''
+replacement = '''        for part in [Part::Model, Part::Answers, Part::Unsolicited] {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_answers_before_state", "--exact"]
 expect_text = '''the refusal was not published within the flush'''
@@ -2846,16 +2811,16 @@ guard       = "read_back_one_snapshot"
 name        = "the_replacements_withdrawal_comes_after"
 file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''    post(&mut |target, property| {
-        if shared.reports.withdraw_assumption(target, property) {
+        if device.reports.withdraw_assumption(target, property) {
             withdrawn.push((target.to_owned(), property.to_owned()));
         }
     });
-    after_post(shared);'''
+    after_post(device);'''
 replacement = '''    let mut keys: Vec<(String, String)> = Vec::new();
     post(&mut |target, property| keys.push((target.to_owned(), property.to_owned())));
-    after_post(shared);
+    after_post(device);
     for (target, property) in keys {
-        if shared.reports.withdraw_assumption(&target, &property) {
+        if device.reports.withdraw_assumption(&target, &property) {
             withdrawn.push((target, property));
         }
     }'''
@@ -2869,13 +2834,9 @@ guard       = "replacement_withdrawal_atomic"
 [[control]]
 name        = "a_stop_drops_the_batch_it_cut_short"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                    batch.add(shared, shared.reports.take());
-                    // WAIT: mqtt-request
-                    batch.publish(shared, &client, false).await;'''
-replacement = '''                    let mut taken = Batch::default();
-                    taken.add(shared, shared.reports.take());
-                    // WAIT: mqtt-request
-                    taken.publish(shared, &client, false).await;'''
+anchor      = '''            slot.batch.publish(shared, client, &IN_TURN, QUANTUM).await;'''
+replacement = '''            let mut taken = std::mem::take(&mut slot.batch);
+            taken.publish(shared, client, &IN_TURN, usize::MAX).await;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_stop_mid_batch_still_publishes_the_batchs_reply", "--exact"]
 expect_text = '''the reply of a batch the stop cut short was never published'''

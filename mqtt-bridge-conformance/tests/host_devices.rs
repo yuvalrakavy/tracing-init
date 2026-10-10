@@ -176,55 +176,89 @@ async fn the_read_back_freezes_at_the_setup_subscriptions_suback() {
     .await
 }
 
-/// Scenario 7. Fairness: a device producing State without pause never delays its own reply, nor
-/// another device's. The chatty device reports a hundred targets over and over, more than one
-/// turn's quantum, on a broker slow but steady to acknowledge.
+/// Scenario 7. Fairness: a device producing State without pause never delays another device's
+/// reply — devices are served round-robin, at most a quantum of messages a turn — nor starves its
+/// own: its batch is sealed when taken, so its reply goes out with that batch, never behind State
+/// reported later — at most after the batch under way and its own batch's State. The chatty device
+/// reports 1200 targets over and over: each batch it gives takes the broker, slow but steady to
+/// acknowledge, some 2-3 s.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_reporting_without_pause_delays_no_reply() {
     within(DEADLINE, async {
         let fleet = Fleet::new(acknowledged());
-        // The chatty one first in any order by name.
+        // The chatty one is acquired first: first in the rotation.
         let (chatty, quiet) = (instance_name("Achatty"), instance_name("Bquiet"));
         fleet.prepare(&chatty, |d| d.set("t0", "n", json!(0)));
         fleet.prepare(&quiet, |d| d.set("t0", "n", json!(0)));
         let h = HostHarness::start("fair", fleet).await;
-        h.configure(&chatty, json!({}));
-        h.configure(&quiet, json!({}));
-        assert!(
-            h.eventually(BOUND, |h| h.status(&chatty).as_deref() == Some("connected") && h.status(&quiet).as_deref() == Some("connected"))
-                .await,
-            "the devices never connected"
-        );
-        h.broker.delay_acks(Duration::from_millis(2));
+        assert!(h.configure(&chatty, json!({})));
+        assert!(h.eventually(BOUND, |h| h.status(&chatty).as_deref() == Some("connected")).await, "the chatty device never connected");
+        assert!(h.configure(&quiet, json!({})));
+        assert!(h.eventually(BOUND, |h| h.status(&quiet).as_deref() == Some("connected")).await, "the quiet device never connected");
+        h.broker.delay_acks(Duration::from_millis(10));
         let device = h.fleet.device(&chatty).expect("built");
         let flood = tokio::spawn(async move {
             let mut n = 0u64;
-            let until = Instant::now() + Duration::from_secs(8);
-            while Instant::now() < until {
-                for t in 0..100 {
+            loop {
+                for t in 0..1200 {
                     let mut values = mqtt_bridge_kit::PropertyMap::new();
                     values.insert("n".into(), json!(n));
                     device.report(&format!("t{t}"), values);
-                    n += 1;
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
         tokio::time::sleep(Duration::from_millis(500)).await;
-        for round in 0..4 {
-            for (instance, name) in [(&chatty, "chatty"), (&quiet, "quiet")] {
-                let reply = format!("Store/replies/fair-{name}-{round}");
-                let sent = Instant::now();
-                assert!(h.command(instance, json!({"command": "learn"}), Some((&reply, b"r"))));
-                assert!(
-                    h.eventually(Duration::from_secs(1), |h| !h.replies(&reply).is_empty()).await,
-                    "the {name} device's reply was delayed past 1 s by the chatty device's State (round {round})"
-                );
-                assert!(sent.elapsed() < Duration::from_secs(1));
-            }
+        for round in 0..2 {
+            // Another device's reply: within 1 s, a few quanta of the chatty one's batch.
+            let reply = format!("Store/replies/fair-quiet-{round}");
+            assert!(h.command(&quiet, json!({"command": "learn"}), Some((&reply, b"q"))));
+            assert!(
+                h.eventually(Duration::from_secs(1), |h| !h.replies(&reply).is_empty()).await,
+                "the quiet device's reply was delayed past 1 s by the chatty device's State (round {round})"
+            );
+            // Its own: after the batch under way and its own batch's State — about two batches —
+            // never behind State reported after it.
+            let reply = format!("Store/replies/fair-chatty-{round}");
+            assert!(h.command(&chatty, json!({"command": "learn"}), Some((&reply, b"c"))));
+            assert!(
+                h.eventually(Duration::from_secs(12), |h| !h.replies(&reply).is_empty()).await,
+                "the chatty device's own reply was starved by the State it reported after it (round {round})"
+            );
         }
         flood.abort();
         h.broker.delay_acks(Duration::ZERO);
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// The read-back of a configured instance takes only a `State` that carries exactly one `via`
+/// (multi-device spec §3): an untagged retained `State` is no "before" value — here the request is
+/// applied as a first install (no "before"), where reading it would have superseded it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untagged_retained_state_is_no_read_back() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let porch = instance_name("Porch");
+        fleet.prepare(&porch, |d| d.set("t1", "power", json!(true)));
+        let h = HostHarness::start("untagged-read-back", fleet).await;
+        let t = h.topics(&porch);
+        h.broker.retain(&t.state("t1"), json!({"power": false}).to_string(), &SendOptions::default().retained());
+        h.broker.retain(
+            &t.desired("t1", "power"),
+            json!(false).to_string(),
+            &SendOptions::default().retained().user_property("conflict", "DeviceWins"),
+        );
+        assert!(h.configure(&porch, json!({})));
+        let device = h.built(&porch).await;
+        assert!(
+            h.eventually(BOUND, |_| device.get("t1", "power") == Some(json!(false))).await,
+            "an untagged State was read back as a \"before\" value: errors {:?}",
+            h.errors(&porch)
+        );
+        assert!(h.errors_for(&porch, "superseded").is_empty(), "{:?}", h.errors(&porch));
         assert!(h.stop().await);
     })
     .await

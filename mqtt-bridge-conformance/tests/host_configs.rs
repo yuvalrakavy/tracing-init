@@ -214,10 +214,15 @@ async fn many_instances_bootstrap_at_once() {
         for name in &names {
             fleet.prepare(name, |d| d.set("t1", "power", json!(true)));
         }
-        let h = HostHarness::start("many", fleet).await;
+        // Every Config in the one replay: every read-back subscribed before any SUBACK is read.
+        let broker = Arc::new(FakeBroker::start_multi().await);
+        broker.cap_connections(80);
+        let bridge = instance_name("many");
         for name in &names {
-            assert!(h.configure(name, json!({})));
+            let config = json!({"bridge": KIND, "via": bridge}).to_string();
+            broker.retain(&format!("{ROOT}/Config/{name}"), config, &SendOptions::default().retained());
         }
+        let h = HostHarness::join(broker, &bridge, fleet, |host| host).await;
         assert!(
             h.eventually(BOUND, |h| names.iter().all(|n| h.status(n).as_deref() == Some("connected") && h.state(n, "t1").is_some())).await,
             "not every instance was served: {:?}",
@@ -227,6 +232,30 @@ async fn many_instances_bootstrap_at_once() {
         let actives = h.published(&h.active_topic()).iter().filter(|r| &r.payload[..] == b"true").count();
         assert_eq!(actives, 1, "the session ended and came again: Active=true {actives} times");
         assert!(h.stop().await);
+    })
+    .await
+}
+
+/// The host's stop stops every device's worker — its driver disconnected — before the flush's last
+/// words, within the bounded shutdown.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_hosts_stop_stops_every_device() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let (a, b) = (instance_name("Aone"), instance_name("Btwo"));
+        let mut h = HostHarness::start("stop-all", fleet).await;
+        assert!(h.configure(&a, json!({})) && h.configure(&b, json!({})));
+        assert!(
+            h.eventually(BOUND, |h| h.status(&a).as_deref() == Some("connected") && h.status(&b).as_deref() == Some("connected")).await,
+            "the instances never connected"
+        );
+        let devices = [h.fleet.device(&a).expect("built"), h.fleet.device(&b).expect("built")];
+        assert!(h.stop_host().await, "the host did not stop in time");
+        for device in &devices {
+            assert!(!device.calls_of(Op::Disconnect).is_empty(), "a device's worker was not stopped by the host's stop");
+        }
+        assert_eq!(h.broker.retained_on(&h.active_topic()).as_deref(), Some(&b"false"[..]), "the stop did not say Active=false");
+        h.check_lanes();
     })
     .await
 }

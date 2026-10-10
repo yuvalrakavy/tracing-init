@@ -305,6 +305,12 @@ impl HostHarness {
         }
     }
 
+    /// The latest device built for `instance`, once one is (within [`BOUND`]).
+    pub async fn built(&self, instance: &str) -> Device {
+        assert!(self.eventually(BOUND, |h| h.fleet.device(instance).is_some()).await, "no device was built for {instance}");
+        self.fleet.device(instance).expect("built")
+    }
+
     /// The host's running handle.
     pub fn running(&mut self) -> &mut Running {
         self.running.as_mut().expect("the host is running")

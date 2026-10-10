@@ -123,9 +123,15 @@ async fn a_config_change_closes_admission_stops_retires_and_unsubscribes_before_
         let late_reply = "Store/replies/change-late";
         assert!(h.command(&lamp, json!({"command": "learn"}), Some((late_reply, b"l"))));
         assert!(h.desire(&lamp, "t1", "power", json!(true), Req::default()));
+        // Refused by the terminal policy as it arrives — not posted to the old mailbox, whose stop
+        // would refuse it too, later, as one waiting.
         assert!(
-            h.eventually(BOUND, |h| h.replies(late_reply).iter().any(|r| r["reason"] == "refused")).await,
-            "a command delivered while the device stopped was not refused with its reply: {:?}",
+            h.eventually(BOUND, |h| h
+                .replies(late_reply)
+                .iter()
+                .any(|r| r["reason"] == "refused" && r["error"].as_str().is_some_and(|e| e.contains("being stopped"))))
+                .await,
+            "a command delivered while the device stopped was not refused with its reply by the terminal policy: {:?}",
             h.replies(late_reply)
         );
         assert!(
@@ -161,6 +167,38 @@ async fn a_config_change_closes_admission_stops_retires_and_unsubscribes_before_
             "the late Desired did not reach the successor from its replay"
         );
         assert!(new.calls_of(Op::Execute).is_empty(), "the successor ran the refused command");
+        // The late property write was ignored, not answered: it replayed to the successor.
+        assert!(
+            h.errors(&lamp).iter().all(|e| e.get("property").is_none()),
+            "the late property Desired was answered, not left to replay: {:?}",
+            h.errors(&lamp)
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// Stopping a device answers what waited for it (multi-device spec §4.4 step 2): a property request
+/// held while the device was down is refused when the instance is deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_device_answers_its_held_requests() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| d.set_up(false));
+        let h = HostHarness::start("held-at-stop", fleet).await;
+        assert!(h.configure(&lamp, json!({})));
+        let t = h.topics(&lamp);
+        assert!(h.eventually(BOUND, |h| h.subscribed(&t.command())).await, "the instance's requests were never subscribed");
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("unreachable")).await, "{:?}", h.statuses(&lamp));
+        assert!(h.desire(&lamp, "t1", "power", json!(true), Req { expiry: Some(60), conflict: None }));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(h.delete(&lamp));
+        assert!(
+            h.eventually(BOUND, |h| h.errors_for(&lamp, "refused").iter().any(|e| e["target"] == "t1" && e["property"] == "power")).await,
+            "the request held for the stopped device was never answered: {:?}",
+            h.errors(&lamp)
+        );
         assert!(h.stop().await);
     })
     .await
@@ -275,7 +313,12 @@ async fn disable_stops_the_worker_keeps_the_read_back_and_heals_its_status() {
             "the foreign write was not healed: {:?}",
             h.status_via(&lamp)
         );
-        assert_eq!(h.log.of_kind("slot_reasserted").len(), 1, "{:#?}", h.log.records());
+        assert_eq!(
+            h.log.of_kind("slot_reasserted").len(),
+            1,
+            "a slot was reasserted other than over the one foreign write (the owner's own echo?): {:#?}",
+            h.log.of_kind("slot_reasserted")
+        );
         // Re-enabled: a new device, from a fresh bootstrap of S2 and S3.
         assert!(h.configure(&lamp, json!({"address": "a"})));
         assert!(
@@ -371,8 +414,11 @@ async fn an_incomplete_replay_releases_nothing() {
             h.broker.hold_subacks_matching(&format!("{ROOT}/_barrier/"));
         })
         .await;
+        // Not before the fallback: the barrier's SUBACK is awaited 5 s from the Config/+ grant.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(actives(&h), first, "Active=true came before the barrier's SUBACK or the replay's fallback");
         assert!(
-            h.eventually(Duration::from_secs(8), |h| actives(h) > first).await,
+            h.eventually(Duration::from_secs(5), |h| actives(h) > first).await,
             "Active=true never came on the fallback with the barrier's SUBACK held"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
