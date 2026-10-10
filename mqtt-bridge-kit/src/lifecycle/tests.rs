@@ -105,12 +105,42 @@ fn a_deleted_or_unreadable_config() {
     assert!(matches!(read(json!({"bridge": "gc", "via": 7})), Verdict::Unreadable(_)), "a `via` that is no string was read");
 }
 
-/// The effective owner: `via`, else the kind's default bridge id — the kind (§4.2).
+/// The effective owner: `via`, else the default bridge id of the kind the Config names (§4.2).
 #[test]
 fn the_effective_owner_is_via_or_the_kind() {
     assert_eq!(read(json!({"bridge": "gc", "via": "gc-lan2"})), Verdict::Foreign("gc-lan2".into()));
     assert_eq!(read(json!({"bridge": "gc"})), Verdict::Foreign("gc".into()), "an omitted `via` was not the kind's default id");
     assert!(matches!(classify(json!({"bridge": "gc"}).to_string().as_bytes(), "gc", "gc"), Verdict::Ours { .. }));
+}
+
+/// An omitted `via` is the default bridge id of the kind the Config itself names (`bridge`), not
+/// the reading process's kind: a default `globalcache` process sharing `IRemitter` with a default
+/// `rti` one ignores RTI's instance, and says no kind mismatch for it (R2 gate, Codex 9).
+#[test]
+fn an_omitted_via_is_the_default_id_of_the_configs_own_kind() {
+    let classified = |config: serde_json::Value| classify(config.to_string().as_bytes(), "globalcache", "globalcache");
+    assert_eq!(classified(json!({"bridge": "rti"})), Verdict::Foreign("rti".into()), "another kind's instance was read as this process's");
+    assert!(matches!(classified(json!({"bridge": "globalcache"})), Verdict::Ours { .. }));
+    assert!(
+        matches!(classified(json!({"address": "a"})), Verdict::Unreadable(_)),
+        "a Config naming neither a process nor a kind named this one"
+    );
+}
+
+/// Config equality is on the parsed, validated value — the owner, `disabled` and the driver fields
+/// (§3): `disabled: false` written out or left out, an explicit default `via` or an omitted one, is
+/// no change (R2 gate, Claude minor 1).
+#[test]
+fn config_equality_is_on_the_owner_the_disabled_flag_and_the_driver_fields() {
+    let ours = |config: serde_json::Value| match classify(config.to_string().as_bytes(), "gc", "gc") {
+        Verdict::Ours { config, .. } => config,
+        other => panic!("not this process's: {other:?}"),
+    };
+    let plain = ours(json!({"bridge": "gc", "x": 1}));
+    assert_eq!(ours(json!({"bridge": "gc", "x": 1, "disabled": false})), plain, "`disabled: false` written out was a change");
+    assert_eq!(ours(json!({"bridge": "gc", "via": "gc", "x": 1})), plain, "the default `via` written out was a change");
+    assert_ne!(ours(json!({"bridge": "gc", "x": 1, "disabled": true})), plain);
+    assert_ne!(ours(json!({"bridge": "gc", "x": 2})), plain);
 }
 
 /// Named, but another kind, or the host's own fields invalid: rejected, never served.

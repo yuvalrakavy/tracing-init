@@ -53,7 +53,8 @@ exactly one `via` user property; none or several → ignored (DEBUG) by the Stor
 
 Rules:
 - **Bridge id** (`--name`, default = the kind) is unique on the root. `via` omitted in a Config = the
-  kind's default id.
+  default id of the kind the Config names (`bridge`), so a process of another kind ignores it and says
+  nothing (R2 gate, Codex 9); a Config naming neither `via` nor `bridge` names no owner (unreadable).
 - **Instance names are unique on the root** (all kinds, all managers; the Store enforces it on create
   and rename). An instance's **kind never changes in place** (a different kind = a new object).
 - **Ownership:** a process owns an instance iff its last *accepted* Config has `via` = its bridge id.
@@ -66,7 +67,9 @@ Rules:
   - an unparseable Config whose `via` cannot be read: no owner identifiable; the process that owned the
     instance before keeps its last accepted Config and logs one WARN `device_config_invalid`; other
     processes ignore it.
-- **Config equality** is on the parsed, validated value; identical = no-op in every state.
+- **Config equality** is on the parsed, validated value — the owner, `disabled` and the driver fields,
+  so `"disabled": false` written out or an explicit default `via` is no change; identical = no-op in
+  every state.
 
 ## 4. Runtime: the host (R2)
 
@@ -99,7 +102,8 @@ MQTT broker ◄──►│ pump ─► session: router · per-instance subscrip
 One rule, used for routing, read-back, filtering and cleanup:
 - a **fixed** (single-device) instance → its owner is the process itself; no Config, no `via` needed;
   it is never subject to Config-absence cleanup;
-- a **configured** instance → `via` if present, else the kind's default bridge id.
+- a **configured** instance → `via` if present, else the default bridge id of the kind its Config
+  names (`bridge`).
 
 ### 4.3 Ownership, per-instance subscriptions, and bootstrap
 - **Root-wide:** `Config/+`, then a **barrier** subscription `{Root}/_barrier/{bridge id}` (never

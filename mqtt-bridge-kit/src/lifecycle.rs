@@ -5,7 +5,8 @@
 //!
 //! **Ownership** (§3, §4.2). `Config/+` and then a barrier, `{Root}/_barrier/{bridge id}`, are
 //! subscribed on every CONNACK; the barrier's SUBACK closes the root replay. An instance is owned
-//! iff its last accepted Config names this process (`via`, or omitted, the kind) and its kind.
+//! iff its last accepted Config names this process (`via`, or omitted, the kind the Config names)
+//! and its kind.
 //!
 //! **Bootstrap** (§4.3). S1 (`State/{i}/+`, `Status/{i}`: the read-back, kept for healing), then
 //! S2 (`Config/{i}/+`; its SUBACK closes S1's replay and freezes the read-back), then S3 (the
@@ -71,14 +72,16 @@ pub(crate) enum Verdict {
     /// Its `via` cannot be read (not JSON, not an object, a `via` that is not a string): no owner
     /// can be identified.
     Unreadable(String),
-    /// It names another process (`via`, or the kind's default bridge id).
+    /// It names another process (`via`, or the default bridge id of the kind it names).
     Foreign(String),
     /// It names this process, and another kind.
     KindMismatch { config: Value, kind: String },
     /// It names this process, and the host's own fields are invalid.
     Malformed { config: Value, error: String },
-    /// This process's: the parsed Config (compared whole), whether it is disabled, and the driver's
-    /// fields.
+    /// This process's: the parsed, validated Config — its owner, `disabled` and the driver's fields,
+    /// in one canonical form, so that equality is on what it says (§3: `disabled: false` written
+    /// out or left out, an explicit default `via` or an omitted one, are the same Config) — whether
+    /// it is disabled, and the driver's fields.
     Ours { config: Value, disabled: bool, fields: PropertyMap },
 }
 
@@ -94,11 +97,15 @@ pub(crate) fn classify(payload: &[u8], kind: &str, id: &str) -> Verdict {
     let Value::Object(fields) = &config else {
         return Verdict::Unreadable("not a JSON object".into());
     };
-    // The effective owner: `via`, else the kind's default bridge id — the kind itself.
-    let owner = match fields.get("via") {
-        None => kind.to_owned(),
-        Some(Value::String(via)) => via.clone(),
-        Some(_) => return Verdict::Unreadable("its `via` is not a string".into()),
+    // The effective owner: `via`, else the default bridge id of the kind the Config names — that
+    // kind itself (§4.2). Not this process's kind: a default process of another kind sharing the
+    // root would take the instance for its own (R2 gate, Codex 9). Naming neither, it names no
+    // owner.
+    let owner = match (fields.get("via"), fields.get("bridge")) {
+        (Some(Value::String(via)), _) => via.clone(),
+        (Some(_), _) => return Verdict::Unreadable("its `via` is not a string".into()),
+        (None, Some(Value::String(named))) => named.clone(),
+        (None, _) => return Verdict::Unreadable("it names neither a process (`via`) nor a kind (`bridge`, a string)".into()),
     };
     if owner != id {
         return Verdict::Foreign(owner);
@@ -117,7 +124,12 @@ pub(crate) fn classify(payload: &[u8], kind: &str, id: &str) -> Verdict {
     };
     let fields: PropertyMap =
         fields.iter().filter(|(k, _)| !HOST_FIELDS.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
-    Verdict::Ours { config, disabled, fields }
+    // The canonical form: every host field written out.
+    let mut canonical = fields.clone();
+    canonical.insert("bridge".into(), Value::String(named));
+    canonical.insert("via".into(), Value::String(owner));
+    canonical.insert("disabled".into(), Value::Bool(disabled));
+    Verdict::Ours { config: Value::Object(canonical), disabled, fields }
 }
 
 /// The driver's fields of an accepted Config.

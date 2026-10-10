@@ -156,6 +156,29 @@ async fn an_identical_config_is_a_no_op() {
     .await
 }
 
+/// Config equality is on the parsed, validated value — the owner, `disabled` and the driver fields
+/// (§3): the same Config with `"disabled": false` written out is no change, and stops nothing (R2
+/// gate, Claude minor 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_differing_only_in_a_default_host_field_is_a_no_op() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        let h = HostHarness::start("default-field", fleet).await;
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.configure(&lamp, json!({"address": "a", "disabled": false})));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(h.fleet.builds(&lamp), 1, "a Config differing only in `disabled: false` was built again");
+        assert!(
+            h.fleet.device(&lamp).expect("built").calls_of(Op::Disconnect).is_empty(),
+            "a Config differing only in `disabled: false` stopped the device"
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// A Config whose `via` cannot be read: the owner keeps its last accepted Config and logs one WARN
 /// `device_config_invalid` — once for the same payload.
 #[tokio::test(flavor = "multi_thread")]

@@ -30,8 +30,8 @@
 //!
 //! **What an instance is.** The Store publishes, retained, `{Root}/Config/{instance}` =
 //! `{"bridge": "<kind>", "via": "<bridge id>", …driver fields…, "disabled"?: bool}`. A process owns
-//! the instance iff its last accepted Config names it (`via`, or — omitted — the kind's default
-//! bridge id, the kind itself) and the kind matches (§3, §4.2). It then subscribes the instance's
+//! the instance iff its last accepted Config names it (`via`, or — omitted — the default bridge
+//! id of the kind the Config names in `bridge`, that kind itself) and the kind matches (§3, §4.2). It then subscribes the instance's
 //! own lanes in three steps (S1 its read-back: `State/{i}/+` and `Status/{i}`; S2 its target
 //! Configs; S3 its requests), each SUBACK matched by packet id, builds the driver off to the side
 //! within `--factory-timeout`, and starts the device — R1's worker, mailbox and reports, its own
