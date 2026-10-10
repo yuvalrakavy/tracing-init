@@ -681,9 +681,11 @@ decided (each one for the owner to confirm or overturn):
 - **Re-enabling** a disabled instance seeds its read-back from the instance's retained slots the
   session saw.
 - **Untagged non-empty writes** on an owned slot are foreign and reasserted (`slot_reasserted`).
-- **A disabled or stopping instance ignores property `Desired`** (the multi-device spec §4.4 says
-  "refused"; the build drops them rather than publishing an `Error` per retained request at each
-  bootstrap) — for the owner to decide.
+- **A disabled or stopping instance ignores property `Desired`** — the owner's decision
+  (2026-10-10), now in the multi-device spec §4.4: it stays retained, replays on re-enable or to a
+  successor, and expires on its own deadline; a refusal would repeat at every replay and never
+  settle, and `Status=disabled` already says why. Commands and target-level `Desired` are refused
+  with a reply.
 - **An overdue grant** (no SUBACK within 10 s) logs `subscription_refused` with `overdue_ms`.
 - **A `Host`'s defaults:** the root is the kind, the bridge id is the kind, the `Version` text is
   `<kind> <version>`, and with no version set `<kind> (mqtt-bridge-kit <its version>)`.

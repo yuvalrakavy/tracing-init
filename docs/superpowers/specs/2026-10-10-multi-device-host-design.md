@@ -146,7 +146,9 @@ In order:
 1. **Close admission:** the instance enters **stopping**. Deliveries for it from now on (late replay,
    pump backlog) get a terminal policy: Commands and reads with a response topic → refused, with
    reply; target-level Desired → refused; property Desired → ignored (retained; it replays to a
-   successor). Nothing is posted to the old mailbox or a successor.
+   successor, or on re-enable, and expires on its own deadline: a refusal would repeat at every
+   replay and never settle — owner decision, 2026-10-10). Nothing is posted to the old mailbox or a
+   successor.
 2. **Stop the worker:** R1's stop (waiting requests answered — held Desired `superseded` on a Config
    change, `refused` otherwise — in-flight commands "cut off"), with R1's disconnect bound (2 s). A
    worker the watchdog finds **blocked** ends the process (D4 = a); a cooperative disconnect that runs
@@ -160,7 +162,12 @@ In order:
    bootstrap (§4.3) starts only after the UNSUBACKs, so no old replay reaches it.
 5. **Disable** stops the worker and unsubscribes only S2 and S3; the instance stays **owned**, its S1
    read-back stays subscribed, and it keeps healing its slot with `Status=disabled` (§4.5). Requests
-   that still arrive (none should: S3 is gone) are refused. Re-enable runs §4.3's bootstrap from S2.
+   that still arrive (none should: S3 is gone) get step 1's terminal policy: Commands and reads with
+   a response topic refused with a reply, target-level Desired refused; **property Desired ignored**
+   (owner decision, 2026-10-10) — it stays retained, replays on re-enable (or to a successor) and
+   expires on its own deadline. A refusal would repeat at every replay and never settle, and
+   `Status=disabled` already tells the Store why nothing is applied. Re-enable runs §4.3's bootstrap
+   from S2.
    Delete / release-as-deleted unsubscribes all three, then cleanup (§4.5). A `via` move unsubscribes
    all three and keeps no claim.
 
