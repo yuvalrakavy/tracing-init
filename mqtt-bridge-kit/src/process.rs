@@ -589,6 +589,17 @@ impl Running {
     }
 }
 
+/// Dropped unstopped — the runtime living on — a bridge or host closes admission and asks every
+/// device to stop, as R1's `Running` did when its worker's stop sender went with it (R2 gate, Codex
+/// 8): each keeper holds the registry, so without this its stop request never closes, and a healthy
+/// worker would keep its device's link and poll on for nobody. After [`Running::stop`] it does
+/// nothing more.
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.registry.close();
+    }
+}
+
 /// The watchdog, until the device worker is dead: an operation past its deadline by
 /// [`BLOCKED_GRACE`]; with none running, a heartbeat silent past [`IDLE_BOUND`]; or a blocking
 /// budget — the operations' or the helpers' — full for `cap_bound`. A worker whose thread is

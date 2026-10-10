@@ -105,3 +105,23 @@ async fn a_process_death_makes_only_its_own_instances_unavailable() {
     })
     .await
 }
+
+/// Dropping a running host's handle — its parts dropped unstopped while the runtime lives on —
+/// closes admission and asks every device to stop, as R1's dropped `Running` did (its worker's stop
+/// sender went with it): no worker keeps its device's link, polling on for nobody.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_running_handle_stops_every_device() {
+    within(DEADLINE, async {
+        let lamp = instance_name("Lamp");
+        let mut h = HostHarness::start("dropped", Fleet::new(acknowledged())).await;
+        assert!(h.configure(&lamp, json!({})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await, "the instance never connected");
+        let device = h.fleet.device(&lamp).expect("built");
+        h.abort();
+        assert!(
+            h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await,
+            "a dropped host's device kept its link: its worker was never asked to stop"
+        );
+    })
+    .await
+}
