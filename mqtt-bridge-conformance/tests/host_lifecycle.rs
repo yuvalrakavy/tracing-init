@@ -391,6 +391,13 @@ async fn a_delete_clears_only_the_topics_this_process_tagged() {
         );
         assert!(h.broker.retained_on(&t.state("t3")).is_some(), "another process's topic was cleared");
         assert!(!h.subscribed(&t.state_target_filter()) && !h.subscribed(&t.command()), "the deleted instance stayed subscribed");
+        // The stop ended on its UNSUBACKs, in this session: not on an overdue grant that ended it
+        // (the cleanup would come all the same, after the reconnect).
+        assert!(
+            h.log.of_kind("subscription_refused").is_empty(),
+            "the delete's UNSUBACKs were never matched; the session ended on them: {:#?}",
+            h.log.of_kind("subscription_refused")
+        );
         assert!(h.stop().await);
     })
     .await

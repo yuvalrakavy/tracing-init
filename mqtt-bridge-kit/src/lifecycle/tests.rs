@@ -5,10 +5,9 @@ use serde_json::json;
 
 use super::*;
 
-/// A lifecycle with no instance, for its timers.
-fn lifecycle() -> Lifecycle {
-    let ready = Arc::new(Notify::new());
-    let shared = Arc::new(session::Shared {
+/// A host's session part, with no broker behind it.
+fn session_part() -> Arc<session::Shared> {
+    Arc::new(session::Shared {
         topics: Topics::new("T", "host").expect("topics"),
         broker_host: "127.0.0.1".into(),
         broker_port: 1,
@@ -16,9 +15,15 @@ fn lifecycle() -> Lifecycle {
         version: "kind test".into(),
         outage: Arc::new(crate::pump::BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         enqueued: std::sync::atomic::AtomicU64::new(0),
-        ready: ready.clone(),
+        ready: Arc::new(Notify::new()),
         devices: lock_order::sync::Mutex::new("session-devices", Vec::new()),
-    });
+    })
+}
+
+/// A lifecycle with no instance, for its timers.
+fn lifecycle() -> Lifecycle {
+    let shared = session_part();
+    let ready = shared.ready.clone();
     let factory: Factory = Arc::new(|_: &DeviceConfig| Err(FactoryError::Unusable("no driver in this test".into())));
     let settings = Settings {
         kind: "kind".into(),
@@ -33,6 +38,45 @@ fn lifecycle() -> Lifecycle {
     };
     let (spawner, _, _) = Spawner::new();
     Lifecycle::new(settings, shared, spawner, Span::none(), ready)
+}
+
+/// A device runtime that leaves the rotation (multi-device spec §4.4 step 3) leaves its answers and
+/// unsolicited reports — refusals of deliveries that reached it as it unsubscribed — in the
+/// session's outbox, not with its runtime; with no connection they are dropped. (Which reports are
+/// still in the slot at that instant is a race end to end, so the conformance scenario cannot see
+/// this; here it is direct.)
+#[test]
+fn a_retired_runtimes_answers_go_to_the_outbox() {
+    let shared = session_part();
+    let device = || {
+        Arc::new(Device {
+            topics: Topics::new("T", "Lamp").expect("topics"),
+            commands: Vec::new().into(),
+            mailbox: Mailbox::new(),
+            reports: Reports::with_ready(shared.ready.clone()),
+            tag: Some("host".into()),
+            span: Span::none(),
+        })
+    };
+    let answered = |device: &Device| {
+        let reply = Outbound { topic: Some("Store/replies/r".into()), payload: b"{}".to_vec(), correlation: None };
+        device.reports.refused(Vec::new(), vec![reply]);
+        device.reports.event(Outbound { topic: None, payload: br#"{"kind":"x"}"#.to_vec(), correlation: None });
+    };
+    let mut outputs = Outputs::new();
+    let live = device();
+    outputs.add(&shared, 7, live.clone());
+    answered(&live);
+    retire_slot(&shared, &mut outputs, 7, "Lamp", true);
+    assert!(outputs.slots.is_empty(), "the retired runtime stayed in the rotation");
+    assert_eq!(outputs.outbox.len(), 2, "a retired runtime's answer and unsolicited report went with it");
+
+    let mut outputs = Outputs::new();
+    let offline = device();
+    outputs.add(&shared, 8, offline.clone());
+    answered(&offline);
+    retire_slot(&shared, &mut outputs, 8, "Lamp", false);
+    assert_eq!(outputs.outbox.len(), 0, "with no connection, nothing waits for the next session's model");
 }
 
 /// The replay's fallback is a timer only until it passes: past it, with a grant still pending,

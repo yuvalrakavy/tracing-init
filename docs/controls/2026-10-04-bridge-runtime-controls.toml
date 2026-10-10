@@ -2218,8 +2218,8 @@ guard       = "read_back_frozen"
 [[control]]
 name        = "held_subacks_reach_a_new_connection"
 file        = "mqtt-test-broker/src/lib.rs"
-anchor      = '''    shared.held_subacks.lock().unwrap().clear();'''
-replacement = '''    let _ = &shared.held_subacks;'''
+anchor      = '''        shared.held_subacks.lock().unwrap().clear();'''
+replacement = '''        let _ = &shared.held_subacks;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::held_subacks_do_not_outlive_their_connection", "--exact"]
 expect_text = '''a retained message held for an earlier connection reached the new one'''

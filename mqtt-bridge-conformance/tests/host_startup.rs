@@ -110,7 +110,10 @@ async fn an_overdue_subscription_ends_the_session() {
         );
         // The instance's requests' SUBACK never comes on this connection (a new one answers again).
         broker.hold_subacks_matching(&format!("{ROOT}/Desired/{lamp}"));
-        let h = HostHarness::join(broker, &bridge, Fleet::new(acknowledged()), |host| host).await;
+        // A keep-alive long enough that the pump's own stall bound (twice it) cannot be what ends
+        // the session first: only the lifecycle's grant bound can, within the 15 s below.
+        let slow_pings = mqtt_bridge_kit::MqttTiming { keep_alive: Duration::from_secs(30), ..quick_mqtt() };
+        let h = HostHarness::join(broker, &bridge, Fleet::new(acknowledged()), |host| host.mqtt_timing(slow_pings)).await;
         let started = std::time::Instant::now();
         assert!(h.eventually(BOUND, |h| h.subscribed(&h.topics(&lamp).command())).await, "S3 was never asked for");
         assert!(h.eventually(Duration::from_secs(15), |h| h.broker.connections() >= 2).await, "an overdue SUBACK did not end the session");

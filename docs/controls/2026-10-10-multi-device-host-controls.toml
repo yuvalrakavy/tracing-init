@@ -22,7 +22,8 @@ expect_text = '''the UNSUBACK's packet id was not the UNSUBSCRIBE's'''
 guard       = "pump_forwards_unsubscribing"
 
 # The UNSUBACK is forwarded: a device's stop waits for its unsubscriptions before cleanup or a
-# successor.
+# successor. (Without it the cleanup still comes, after the grant bound ends the session and the
+# next one finishes the stop: the scenario asserts no subscription_refused, 2026-10-10 run.)
 [[control]]
 name        = "the_pump_drops_the_unsuback"
 file        = "mqtt-bridge-kit/src/pump.rs"
@@ -30,7 +31,7 @@ anchor      = '''                Event::Incoming(Packet::UnsubAck(ack)) => PumpE
 replacement = '''                Event::Incoming(Packet::UnsubAck(ack)) if ack.pkid == 0 => PumpEvent::UnsubAck {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_delete_clears_only_the_topics_this_process_tagged", "--exact"]
-expect_text = '''the bridge's own tagged topics were not cleared'''
+expect_text = '''the delete's UNSUBACKs were never matched'''
 guard       = "pump_forwards_unsuback"
 
 # ---- The reports and the mailbox -----------------------------------------------------------------
@@ -43,7 +44,7 @@ anchor      = '''        let reports = Reports::with_ready(self.ready.clone());'
 replacement = '''        let reports = Reports::new();'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_devices", "--", "a_device_that_never_replies_leaves_the_other_answering", "--exact"]
-expect_text = '''the other device did not answer within 1 s'''
+expect_text = '''the answering device never connected'''
 guard       = "shared_readiness"
 
 # Healing a Status: the owner's current status published again (§4.5).
@@ -187,6 +188,8 @@ guard       = "retire_announced"
 
 # ---- Tags (§3, §4.5) -----------------------------------------------------------------------------
 
+# A configured instance's batch output, its Status and its State, carries `via` (the scenario sees
+# the Status first).
 [[control]]
 name        = "a_configured_instances_state_is_untagged"
 file        = "mqtt-bridge-kit/src/session.rs"
@@ -194,7 +197,7 @@ anchor      = '''        let mut properties = tagged(tag);'''
 replacement = '''        let mut properties = tagged(tag.filter(|_| false));'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_devices", "--", "a_device_that_never_replies_leaves_the_other_answering", "--exact"]
-expect_text = '''`via` user properties, not one'''
+expect_text = '''the Status was not tagged'''
 guard       = "batch_tagged"
 
 [[control]]
@@ -301,7 +304,8 @@ argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformanc
 expect_text = '''the session did not end on a refused Config/+'''
 guard       = "refused_ends_session"
 
-# An overdue SUBACK ends the session.
+# An overdue SUBACK ends the session. (The scenario's 30 s keep-alive keeps the pump's own stall
+# bound, twice the keep-alive, from ending it first: with 5 s it did, and this row was GREEN.)
 [[control]]
 name        = "an_overdue_grant_goes_on"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
@@ -636,7 +640,8 @@ guard       = "fake_held_prefix"
 
 # ---- The adversarial review's findings (M1-M3, minor 2) ------------------------------------------
 
-# M1: a runtime leaving the rotation hands its answers to the outbox.
+# M1: a runtime leaving the rotation hands its answers to the outbox. (A unit test: which reports
+# are still in the slot at retirement is a race end to end, and the scenario never entered it.)
 [[control]]
 name        = "a_retired_runtimes_answers_go_with_it"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
@@ -645,8 +650,8 @@ anchor      = '''    if connected {
 replacement = '''    if connected && answers.is_empty() && unsolicited.is_empty() {
         for out in answers {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "answers_refused_while_unsubscribing_are_published", "--exact"]
-expect_text = '''an answer refused while the device unsubscribed was lost with its runtime'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "lifecycle::tests::a_retired_runtimes_answers_go_to_the_outbox", "--exact"]
+expect_text = '''a retired runtime's answer and unsolicited report went with it'''
 guard       = "retired_answers_kept"
 
 # M2: a stop that ends disabled (or deleted) reads its slot on a newer connection.
