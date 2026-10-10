@@ -33,8 +33,10 @@ expect_text = '''the UNSUBACK's packet id was not the UNSUBSCRIBE's'''
 guard       = "pump_forwards_unsubscribing"
 
 # The UNSUBACK is forwarded: a device's stop waits for its unsubscriptions before cleanup or a
-# successor. (Without it the cleanup still comes, after the grant bound ends the session and the
-# next one finishes the stop: the scenario asserts no subscription_refused, 2026-10-10 run.)
+# successor. (Without it the cleanup came, after the grant bound ended the session and the next one
+# finished the stop: the scenario asserts no subscription_refused, 2026-10-10 run. Since the R2 gate's
+# fix round the deferred cleanup is a sweep whose own UNSUBACKs are lost too, so it never comes: the
+# earlier assertion sees the same guard, and the expected text follows it.)
 [[control]]
 name        = "the_pump_drops_the_unsuback"
 file        = "mqtt-bridge-kit/src/pump.rs"
@@ -42,7 +44,7 @@ anchor      = '''                Event::Incoming(Packet::UnsubAck(ack)) => PumpE
 replacement = '''                Event::Incoming(Packet::UnsubAck(ack)) if ack.pkid == 0 => PumpEvent::UnsubAck {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_delete_clears_only_the_topics_this_process_tagged", "--exact"]
-expect_text = '''the delete's UNSUBACKs were never matched'''
+expect_text = '''the bridge's own tagged topics were not cleared'''
 guard       = "pump_forwards_unsuback"
 
 # ---- The reports and the mailbox -----------------------------------------------------------------
@@ -713,17 +715,69 @@ guard       = "failed_holds_through_a_retry"
 # so no single anchor brings it back; its test was RED at 7769cfd. The events' half of Codex 1 has no
 # test short of an inbound overload.
 
-# R2 gate, Codex 1: a due timer goes first at every pass, whatever the publication does.
+# R2 gate, Codex 1: a due timer goes first at every pass, whatever the publication does (the timer
+# put back last in both selects). A grant overdue under a steady publication is not the test: the
+# publication budget of an outstanding request already lets its timer through (2026-10-10 run).
 [[control]]
 name        = "a_due_timer_waits_behind_the_publication"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        let step = if due {
-            Step::Tick'''
-replacement = '''        let step = if false && due {
-            Step::Tick'''
+anchor      = '''        let step = if reads_owed > 0 {
+            // WAIT: session-events
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
+                () = sleep_until(wake) => Step::Tick,
+                () = std::future::ready(()), if line_cleared => Step::Line,
+                Some(event) = events.recv() => Step::Lifecycle(event),
+                event = incoming.recv() => Step::Event(event),
+                () = std::future::ready(()), if owed => Step::Reported,
+                () = shared.ready.notified(), if open => Step::Reported,
+                () = &mut progress, if line_wait => Step::Line,
+            }
+        } else {
+            // WAIT: session-events
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
+                () = sleep_until(wake) => Step::Tick,
+                () = std::future::ready(()), if line_cleared => Step::Line,
+                () = std::future::ready(()), if owed => Step::Reported,
+                () = shared.ready.notified(), if open => Step::Reported,
+                Some(event) = events.recv() => Step::Lifecycle(event),
+                event = incoming.recv() => Step::Event(event),
+                () = &mut progress, if line_wait => Step::Line,
+            }
+        };'''
+replacement = '''        let step = if reads_owed > 0 {
+            // WAIT: session-events
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
+                () = std::future::ready(()), if line_cleared => Step::Line,
+                Some(event) = events.recv() => Step::Lifecycle(event),
+                event = incoming.recv() => Step::Event(event),
+                () = std::future::ready(()), if owed => Step::Reported,
+                () = shared.ready.notified(), if open => Step::Reported,
+                () = &mut progress, if line_wait => Step::Line,
+                () = sleep_until(wake) => Step::Tick,
+            }
+        } else {
+            // WAIT: session-events
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
+                () = std::future::ready(()), if line_cleared => Step::Line,
+                () = std::future::ready(()), if owed => Step::Reported,
+                () = shared.ready.notified(), if open => Step::Reported,
+                Some(event) = events.recv() => Step::Lifecycle(event),
+                event = incoming.recv() => Step::Event(event),
+                () = &mut progress, if line_wait => Step::Line,
+                () = sleep_until(wake) => Step::Tick,
+            }
+        };'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "an_overdue_grant_ends_the_session_under_a_steady_publication", "--exact"]
-expect_text = '''an overdue grant never ended the session while the publication was owed'''
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "a_retry_comes_due_under_a_steady_publication", "--exact"]
+expect_text = '''a failed construction's retry never came due while the publication was owed'''
 guard       = "due_timer_first"
 
 # R2 gate, Codex 3: while a request is outstanding the publication is budgeted below the id space.

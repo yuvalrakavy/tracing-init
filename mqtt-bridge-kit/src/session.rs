@@ -574,37 +574,36 @@ async fn session(
         // events — a construction done, a worker stopped — get their service whatever the inbound
         // traffic and the publication do (R2 gate, Codex 1: a steady stream of reports kept the
         // rotation owed at every pass, and an overdue SUBACK never ended the session; a steady
-        // inbound stream could strand a construction's end). A due timer goes first, and each
-        // handler clears what it served; the events are finite, made only by the lifecycle's own
-        // work, so ahead of the inbound they cannot starve it.
-        let due = wake.is_some_and(|at| at <= Instant::now());
-        let step = if due {
-            Step::Tick
-        } else if line_cleared {
-            Step::Line
-        } else if reads_owed > 0 {
+        // inbound stream could strand a construction's end). The timer comes right after the stop,
+        // so a due one goes first — through tokio's timer, which keeps the task cooperative should
+        // a handler ever leave a timer due — and each handler clears what it served; the events are
+        // finite, made only by the lifecycle's own work, so ahead of the inbound they cannot starve
+        // it.
+        let step = if reads_owed > 0 {
             // WAIT: session-events
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
+                () = sleep_until(wake) => Step::Tick,
+                () = std::future::ready(()), if line_cleared => Step::Line,
                 Some(event) = events.recv() => Step::Lifecycle(event),
                 event = incoming.recv() => Step::Event(event),
                 () = std::future::ready(()), if owed => Step::Reported,
                 () = shared.ready.notified(), if open => Step::Reported,
                 () = &mut progress, if line_wait => Step::Line,
-                () = sleep_until(wake) => Step::Tick,
             }
         } else {
             // WAIT: session-events
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
+                () = sleep_until(wake) => Step::Tick,
+                () = std::future::ready(()), if line_cleared => Step::Line,
                 () = std::future::ready(()), if owed => Step::Reported,
                 () = shared.ready.notified(), if open => Step::Reported,
                 Some(event) = events.recv() => Step::Lifecycle(event),
                 event = incoming.recv() => Step::Event(event),
                 () = &mut progress, if line_wait => Step::Line,
-                () = sleep_until(wake) => Step::Tick,
             }
         };
         drop(progress);

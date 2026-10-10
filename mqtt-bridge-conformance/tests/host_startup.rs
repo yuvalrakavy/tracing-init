@@ -133,6 +133,50 @@ async fn an_overdue_subscription_ends_the_session() {
 }
 
 /// A due timer gets its service whatever the publication does: with a device reporting without
+/// pause — the rotation always owed, no request outstanding — another instance's failed
+/// construction is still retried at its pacing, and serves (R2 gate, Codex 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_comes_due_under_a_steady_publication() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let (chatty, failing) = (instance_name("Achatty"), instance_name("Bfailing"));
+        fleet.prepare(&chatty, |d| d.set("t0", "n", json!(0)));
+        fleet.script(&failing, &[Build::Unusable]);
+        let retry = mqtt_bridge_kit::TimingOverrides { retry: Some(Duration::from_secs(1)), ..quick_timing() };
+        let h = HostHarness::join(broker().await, &instance_name("retry-starved"), fleet, |host| host.timing(retry)).await;
+        assert!(h.configure(&chatty, json!({})));
+        assert!(h.eventually(BOUND, |h| h.status(&chatty).as_deref() == Some("connected")).await, "the chatty device never connected");
+        h.broker.delay_acks(Duration::from_millis(10));
+        let device = h.fleet.device(&chatty).expect("built");
+        let flood = tokio::spawn(async move {
+            let mut n = 0u64;
+            loop {
+                for t in 0..1200 {
+                    let mut values = mqtt_bridge_kit::PropertyMap::new();
+                    values.insert("n".into(), json!(n));
+                    device.report(&format!("t{t}"), values);
+                }
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(h.configure(&failing, json!({})));
+        let retried = h.eventually(Duration::from_secs(8), |h| h.fleet.builds(&failing) >= 2).await;
+        flood.abort();
+        h.broker.delay_acks(Duration::ZERO);
+        assert!(
+            retried,
+            "a failed construction's retry never came due while the publication was owed: builds {}",
+            h.fleet.builds(&failing)
+        );
+        assert!(h.eventually(BOUND, |h| h.status(&failing).as_deref() == Some("connected")).await, "the retried instance never served");
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// A due timer gets its service whatever the publication does: with a device reporting without
 /// pause — the rotation always owed — another instance's overdue SUBACK still ends the session at
 /// its 10 s bound (R2 gate, Codex 1).
 #[tokio::test(flavor = "multi_thread")]
