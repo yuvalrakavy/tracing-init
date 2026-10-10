@@ -921,6 +921,11 @@ impl Out {
     pub(crate) fn first(self) -> Out {
         Out { first: true, ..self }
     }
+
+    /// Whether it is an empty retained message — a retraction — on `topic`, or under `prefix`.
+    pub(crate) fn retracts(&self, topic: &str, prefix: &str) -> bool {
+        self.retain && self.payload.is_empty() && (self.topic == topic || self.topic.starts_with(prefix))
+    }
 }
 
 /// A publish under way: its topic, for the refusal's line, and rumqttc's request.
@@ -1003,6 +1008,14 @@ impl Batch {
         for (target, document) in model.states {
             self.push(Part::Model, Out::new(topics.state(&target), true, document, None, tag).first());
         }
+    }
+
+    /// Drop the waiting messages of `part` that `pick` picks; how many.
+    pub(crate) fn discard(&mut self, part: Part, pick: impl Fn(&Out) -> bool) -> usize {
+        let (dropped, kept): (VecDeque<Out>, VecDeque<Out>) = std::mem::take(self.queue(part)).into_iter().partition(pick);
+        self.firsts -= dropped.iter().filter(|out| out.first).count();
+        *self.queue(part) = kept;
+        dropped.len()
     }
 
     /// Whether a message to be said before `Active=true` waits.

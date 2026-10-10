@@ -224,7 +224,9 @@ In order:
   - **A cleanup that cannot be done at once** (the delete ended while the broker was away, its
     retractions were lost with their connection before the broker acknowledged them) stays pending
     and is done after the next root replay (closed by the barrier), if the instance is not the
-    process's again — by a **sweep**: a short per-instance read-back (`State/{i}/+`, `Status/{i}`
+    process's again (acquired again, its retractions not yet handed to the broker are dropped: its
+    own healing covers its slot, as for an instance acquired before the sweep's replay closed) — by a
+    **sweep**: a short per-instance read-back (`State/{i}/+`, `Status/{i}`
     subscribed, then unsubscribed; the last UNSUBACK closes the replay) enumerates the topics and
     their current tags, and only those still carrying the process's own tag are retracted. A
     cleanup's topics are never cleared from a list cached at the delete (R2 gate, Codex 7). A

@@ -80,6 +80,32 @@ fn a_retired_runtimes_answers_go_to_the_outbox() {
     assert_eq!(outputs.outbox.len(), 0, "with no connection, nothing waits for the next session's model");
 }
 
+/// An instance acquired again while its sweep's retractions still wait in the outbox: they are
+/// dropped with the cleanup they belong to (multi-device spec §4.5: the owner's own healing covers a
+/// cleanup still pending) — sent after the new owner's read-back was subscribed, its replay would
+/// read the stale own-tagged value as a "before" value and then see it cleared (the R2 confirming
+/// reviews, Claude minor 3). Another instance's retractions stay.
+#[tokio::test]
+async fn an_instance_acquired_again_drops_its_queued_sweep_retractions() {
+    let mut host = lifecycle();
+    let mut outputs = Outputs::new();
+    for name in ["Lamp", "Other"] {
+        let seen = [(format!("T/State/{name}/t1"), Some("host".to_owned())), (format!("T/Status/{name}"), Some("host".to_owned()))];
+        host.sweeps.insert(name.to_owned(), Sweep { seen: seen.into_iter().collect(), closing: 0 });
+        host.sweep_done(&mut outputs, name);
+    }
+    assert_eq!(outputs.outbox.len(), 4, "the sweeps queued no retractions, so this test proves nothing");
+    let config = json!({"bridge": "kind", "via": "host"}).to_string();
+    let publish = Publish::new("T/Config/Lamp", QoS::AtLeastOnce, config, None);
+    host.config(None, &mut outputs, "Lamp", &publish).await.expect("the Config is handled");
+    assert!(host.instances.contains_key("Lamp"), "the instance was not acquired, so this test proves nothing");
+    assert_eq!(
+        outputs.outbox.len(),
+        2,
+        "an instance acquired again kept its sweep's retractions queued: they would clear its slot after its read-back"
+    );
+}
+
 /// The replay's fallback is a timer only until it passes: past it, with a grant still pending,
 /// `Active=true` waits for that grant's SUBACK — a wake at the past instant would have the session
 /// spin until then.

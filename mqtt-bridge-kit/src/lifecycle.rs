@@ -1191,7 +1191,7 @@ impl Lifecycle {
                 if self.instances.get(name).is_some_and(|i| i.last_seen.as_ref() == Some(&config)) {
                     return Ok(());
                 }
-                self.own(name);
+                self.own(outputs, name);
                 if let Some(instance) = self.instances.get_mut(name) {
                     instance.last_seen = Some(config);
                     // The last accepted Config stays in force; none — the instance is failed.
@@ -1210,7 +1210,7 @@ impl Lifecycle {
                     return Ok(());
                 }
                 self.rejected.remove(name);
-                self.own(name);
+                self.own(outputs, name);
                 if let Some(instance) = self.instances.get_mut(name) {
                     instance.last_seen = Some(config.clone());
                     instance.invalid = None;
@@ -1281,7 +1281,7 @@ impl Lifecycle {
     }
 
     /// Own `name`, if this process does not yet.
-    fn own(&mut self, name: &str) {
+    fn own(&mut self, outputs: &mut Outputs, name: &str) {
         if self.instances.contains_key(name) {
             return;
         }
@@ -1289,9 +1289,20 @@ impl Lifecycle {
             return;
         };
         info!(instance = name, "The instance's Config names this process; acquired");
-        // Its own healing covers a cleanup still pending from an earlier delete.
+        // Its own healing covers a cleanup still pending from an earlier delete — its retractions
+        // still in the outbox included: sent after the new runtime's read-back is subscribed,
+        // its replay would read the old own-tagged value as a "before" value and see it cleared
+        // just after (the R2 confirming reviews, Claude minor 3). Dropped here, the outcome is the
+        // one of an instance owned again before its sweep's replay closed (`sweep_done`).
+        // Retractions already handed to rumqttc are acknowledged before the read-back is
+        // subscribed: a SUBSCRIBE waits for the line to clear (`Conn`).
         self.cleanups.remove(name);
         self.queued_cleanups.retain(|(queued, _)| queued != name);
+        let (status, prefix) = (topics.status(), format!("{}/", topics.state_target_filter().trim_end_matches("/+")));
+        let dropped = outputs.outbox.discard(Part::Model, |out| out.retracts(&status, &prefix));
+        if dropped > 0 {
+            debug!(instance = name, dropped, "A pending cleanup's retractions dropped: the instance is this process's again");
+        }
         self.instances.insert(
             name.to_owned(),
             Instance {
