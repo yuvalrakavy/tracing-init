@@ -354,6 +354,45 @@ async fn a_cleanup_lost_with_its_connection_is_done_on_the_next() {
     .await
 }
 
+/// An instance configured again while its delete's stop is still under way: it is this process's
+/// again before the stop ends, so the delete's cleanup is cancelled — the instance's own healing
+/// covers its slot — and nothing retracts the slot its new runtime's read-back reads (§4.5; the R2
+/// confirming reviews 2, Codex 2).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_configured_again_while_its_delete_stops_keeps_its_slot() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| d.set("t1", "power", json!(true)));
+        let h = serving("recreate-stopping", &lamp, fleet).await;
+        let t = h.topics(&lamp);
+        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
+        // The UNSUBACKs held: the delete's stop stays at its unsubscriptions.
+        h.broker.hold_subacks();
+        assert!(h.delete(&lamp));
+        assert!(
+            h.eventually(BOUND, |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.status()))).await,
+            "the deleted instance's read-back was never unsubscribed"
+        );
+        // Configured again while the original is still stopping.
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.broker.release_subacks();
+        assert!(
+            h.eventually(BOUND, |h| h.fleet.devices(&lamp).len() == 2 && h.status(&lamp).as_deref() == Some("connected")).await,
+            "the instance configured again never served: {:?}",
+            h.statuses(&lamp)
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let retracted: Vec<String> =
+            [t.status(), t.state("t1")].into_iter().filter(|topic| h.published(topic).iter().any(|r| r.payload.is_empty())).collect();
+        assert!(retracted.is_empty(), "the delete's cleanup retracted the slot of the instance configured again: {retracted:?}");
+        assert!(h.broker.retained_on(&t.state("t1")).is_some(), "the instance configured again lost its State");
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// Whether `filter` was subscribed after `unsubscribed` was unsubscribed, in the broker's events.
 fn subscribed_since(h: &HostHarness, filter: &str, unsubscribed: &str) -> bool {
     let labels = h.labels();

@@ -500,15 +500,30 @@ guard       = "stop_closes_registry"
 
 # ---- Retained topics (§4.5) ----------------------------------------------------------------------
 
+# Re-anchored in the R2 confirming reviews 2's fix round: the cleanup is skipped for an instance
+# owned again before its stop ended.
 [[control]]
 name        = "a_delete_clears_nothing"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                if let Then::Release { cleanup: true } = then {'''
+anchor      = '''                if let (Then::Release { cleanup: true }, false) = (then, kept) {'''
 replacement = '''                if false {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_delete_clears_only_the_topics_this_process_tagged", "--exact"]
 expect_text = '''the bridge's own tagged topics were not cleared'''
 guard       = "delete_cleanup"
+
+# The R2 confirming reviews 2, Codex 2: an instance configured again while its delete's stop is
+# still under way is kept, and the delete's cleanup is cancelled; queued, its retractions reach the
+# new runtime's read-back just after the old values.
+[[control]]
+name        = "a_delete_stopping_cleans_the_instance_owned_again"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                let kept = !matches!(instance.want, Want::Leave { .. });'''
+replacement = '''                let kept = false;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "an_instance_configured_again_while_its_delete_stops_keeps_its_slot", "--exact"]
+expect_text = '''the delete's cleanup retracted the slot of the instance configured again'''
+guard       = "renewed_ownership_cancels_cleanup"
 
 [[control]]
 name        = "a_delete_clears_another_processs_topic"

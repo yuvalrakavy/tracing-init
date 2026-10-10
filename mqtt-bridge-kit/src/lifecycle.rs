@@ -2184,7 +2184,16 @@ impl Lifecycle {
                 if let Some(old) = instance.rt.take() {
                     retire_slot(&self.shared, outputs, old.id, name, connected);
                 }
-                if let Then::Release { cleanup: true } = then {
+                // Owned again before the stop ended — a Config naming this process came after the
+                // delete — the instance is kept, and a new runtime bootstraps it below: the
+                // delete's cleanup is cancelled, as `own` cancels a pending one. Its own healing
+                // covers the slot; queued now, its retractions would reach the new read-back's
+                // replay just after the old values (the R2 confirming reviews 2, Codex 2).
+                let kept = !matches!(instance.want, Want::Leave { .. });
+                if kept && then == (Then::Release { cleanup: true }) {
+                    debug!(instance = name, "A deleted instance is this process's again before its stop ended: its cleanup is cancelled");
+                }
+                if let (Then::Release { cleanup: true }, false) = (then, kept) {
                     // Its own tagged topics, as its read-back last saw them, retracted — now, or
                     // after the next root replay if the broker is away.
                     let own: Vec<String> =

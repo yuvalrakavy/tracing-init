@@ -1,6 +1,6 @@
 # Multi-device bridges — design v7 (Bridge Runtime R2 + Bridge Kit S4)
 
-Status: APPROVED by the owner 2026-10-10 (v7) (v6 + its gate's 3 findings; that gate closed the rest and found no new shape issue). Amended after the R2 build's gate (2026-10-10), as the lead decided: §3 (omitted `via`, Config equality, kind mismatch, disable validation, read-back tag), D4 and §4.1 (driver panic), §4.3 (packet ids, failed state, committed Config, S2 window), §4.4 (frozen retirement; the owner's decision on property Desired while disabled), §4.5 (sweeps, first-replay litter), §4.6, §4.7; and after its confirming reviews (2026-10-10): §3 (a disable during a replacement), §4.3 (every publish budgeted, the shutdown's flush), §4.5 (a cleanup's queued retractions), §4.6, §4.7. Three design gates (v1, v3, v4) kept finding races in the
+Status: APPROVED by the owner 2026-10-10 (v7) (v6 + its gate's 3 findings; that gate closed the rest and found no new shape issue). Amended after the R2 build's gate (2026-10-10), as the lead decided: §3 (omitted `via`, Config equality, kind mismatch, disable validation, read-back tag), D4 and §4.1 (driver panic), §4.3 (packet ids, failed state, committed Config, S2 window), §4.4 (frozen retirement; the owner's decision on property Desired while disabled), §4.5 (sweeps, first-replay litter), §4.6, §4.7; and after its confirming reviews (2026-10-10): §3 (a disable during a replacement), §4.3 (every publish budgeted, the shutdown's flush), §4.5 (a cleanup's queued retractions; one cancelled by a renewed Config during the stop), §4.6, §4.7, §4.9. Three design gates (v1, v3, v4) kept finding races in the
 per-device isolation machinery (generations, input cache, revocation, cross-process cleanup). The
 owner switched D4 to (a): a stuck device worker restarts the process; every other device failure stays
 per device. With that, v5 drops generations, the input cache, revocation and the leaked-thread ledger,
@@ -228,7 +228,10 @@ In order:
 - **Bridge cleanup:** on delete (a deleted Config, or an instance released as deleted by reconnect
   reconciliation), the bridge retracts the `Status/{i}` and `State/{i}/…` topics whose **current**
   retained value carries its own tag (from its read-back). A clear that races a successor's write is
-  repaired by the successor's healing.
+  repaired by the successor's healing. An instance whose Config names the process again while its
+  delete's stop is still under way is kept, and the delete's cleanup is cancelled at the stop's end:
+  its own healing covers its slot, and the new runtime's read-back meets no retraction of the values
+  it reads (the R2 confirming reviews 2, Codex 2).
   - **A cleanup that cannot be done at once** (the delete ended while the broker was away, its
     retractions were lost with their connection before the broker acknowledged them) stays pending
     and is done after the next root replay (closed by the barrier), if the instance is not the
