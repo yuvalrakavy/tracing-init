@@ -3,7 +3,9 @@
 //! A bridge logs from its MQTT tasks (the test's runtime threads) and from its device worker's
 //! thread, all inside its `bridge` span, whose `instance` field names it. One global recorder —
 //! installed once, so no callsite's interest is cached against another test's subscriber — routes
-//! each event to the capture of the instance it was logged under.
+//! each event to the capture of the instance it was logged under. A multi-device host logs inside
+//! its `host` span, whose `bridge` field is its bridge id: an event under it goes to the capture of
+//! that bridge id, and, logged under one of its devices, to that device's instance's as well.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Once, OnceLock};
