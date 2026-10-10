@@ -248,7 +248,9 @@ async fn the_flush_publishes_what_is_pending_before_its_last_words() {
 
 /// The stop's flush publishes answers first: with a thousand States pending and a broker slow but
 /// steady to acknowledge, a refusal and its reply still go out within the flush's bound
-/// (confirming review 3: the States went first, and the answers were cut with the flush).
+/// (confirming review 3: the States went first, and the answers were cut with the flush). The
+/// device is announced: the flush publishes no model of a device not announced (the R2 confirming
+/// reviews 2), and with no States to go first the order would go unseen.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_flush_publishes_answers_before_state() {
     let broker = FakeBroker::start().await;
@@ -259,6 +261,8 @@ async fn the_flush_publishes_answers_before_state() {
     let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
+    // The fixed device's id is 0.
+    assert!(rig.outputs.announce(0), "the fixed device has no slot");
     broker.delay_acks(Duration::from_millis(500));
     for t in 0..1000 {
         let values = serde_json::json!({"n": t}).as_object().unwrap().clone();
@@ -279,6 +283,10 @@ async fn the_flush_publishes_answers_before_state() {
         "the refusal was not published within the flush: the States went first"
     );
     assert!(!broker.received_on("Store/replies/flush").is_empty(), "the reply was not published within the flush");
+    assert!(
+        !broker.received_on(&shared.topics.state("m0000")).is_empty(),
+        "the flush published none of the States: the order between them and the answers went unseen"
+    );
 }
 
 /// A write of level 40 held again before proof, its assumption published.
