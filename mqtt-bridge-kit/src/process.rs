@@ -39,19 +39,18 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn, Instrument, Span};
 
-use crate::config::{self, Problem, Settings, TimingOverrides};
-use crate::devices::{all_ended, Built, Registry, Spawner};
-use crate::driver::{DeviceDriver, DriverInfo};
+use crate::config::{Settings, TimingOverrides};
+use crate::devices::{all_ended, Built, Registry};
+use crate::driver::DeviceDriver;
+use crate::host::Host;
 use crate::link::{Abandoned, OpClock};
 use crate::mailbox::Mailbox;
-use crate::pump::BrokerOutage;
 use crate::reports::{LinkStatus, Reports};
-use crate::session::{self, MqttTiming};
-use crate::topics::Topics;
+use crate::session::MqttTiming;
 use crate::worker;
 
 /// How long the bridge's parts get to stop before the process ends anyway.
@@ -178,20 +177,14 @@ impl PanicReports {
 /// Everything the command line sets can also be set in code (`root`, `instance`, `broker`,
 /// `timing`, `device_stable`, `mqtt_timing`), which is how the conformance suite and in-process
 /// users ([`start`](Bridge::start)) configure a bridge.
+///
+/// **One runtime.** A `Bridge` is the multi-device [`Host`]'s N = 1 mode (multi-device spec §4.1):
+/// one fixed instance, named from `--instance`, served by the driver given to
+/// [`run`](Bridge::run) — no Config, no `via` tag, its own `Active/{instance}`, and R1's CONNACK
+/// duties and wire (see [`crate::host`]). The session, the publication rotation, the packet-id
+/// budget and the shutdown flush are the host's own.
 #[derive(Debug, Clone)]
-pub struct Bridge {
-    family: String,
-    program: String,
-    app_name: Option<String>,
-    version: Option<String>,
-    declared: Vec<(String, String)>,
-    /// The declared options the command line must give.
-    required: Vec<String>,
-    /// Whether a command line has been read.
-    parsed: bool,
-    settings: Settings,
-    problem: Option<Problem>,
-}
+pub struct Bridge(Host);
 
 impl Bridge {
     /// A bridge of `family`, which is also the default MQTT root (`Aircondition`, `Lutron`, `IR`;
@@ -200,21 +193,7 @@ impl Bridge {
     /// Nothing is read from the command line until [`from_cli`](Self::from_cli) or
     /// [`args`](Self::args).
     pub fn new(family: &str) -> Bridge {
-        let program = std::env::args_os()
-            .next()
-            .and_then(|a| std::path::Path::new(&a).file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| family.to_lowercase());
-        Bridge {
-            family: family.to_owned(),
-            program,
-            app_name: None,
-            version: None,
-            declared: Vec::new(),
-            required: Vec::new(),
-            parsed: false,
-            settings: Settings::new(family),
-            problem: None,
-        }
+        Bridge(Host::fixed(family))
     }
 
     /// Declare an option the driver takes: `--<name> <value>` (or `--<name>=<value>`; `name` is
@@ -222,141 +201,96 @@ impl Bridge {
     /// [`from_cli`](Self::from_cli), or the parser rejects the flag as unknown; read the value
     /// with [`value`](Self::value) after it. An option is optional unless
     /// [`require`](Self::require)d, and takes a value always (there are no switches).
-    pub fn option(mut self, name: &str, help: &str) -> Bridge {
-        self.declared.push((name.to_owned(), help.to_owned()));
-        self
+    pub fn option(self, name: &str, help: &str) -> Bridge {
+        Bridge(self.0.option(name, help))
     }
 
     /// Make a declared option required: a command line without it is a usage error (exit 2, with
     /// the usage text). Before or after [`from_cli`](Self::from_cli). `--instance` and `--broker`
     /// are always required.
-    pub fn require(mut self, name: &str) -> Bridge {
-        self.required.push(name.to_owned());
-        if self.parsed {
-            self.check_required();
-        }
-        self
+    pub fn require(self, name: &str) -> Bridge {
+        Bridge(self.0.require(name))
     }
 
     /// A usage error the driver found in its options (an address it cannot use): `run`, or
     /// [`usage_exit`](Self::usage_exit), says it with the usage text and exits 2. A problem the
     /// command line already had stands.
-    pub fn usage_error(mut self, message: impl Into<String>) -> Bridge {
-        if self.problem.is_none() {
-            self.problem = Some(Problem::Usage(message.into()));
-        }
-        self
+    pub fn usage_error(self, message: impl Into<String>) -> Bridge {
+        Bridge(self.0.usage_error(message))
     }
 
     /// The command line's own end, before any driver is built: `--help` (said on stdout, exit 0)
     /// or a usage error (said on stderr with the usage text, exit 2). `None` when the bridge is to
     /// run. `main` returns it: `if let Some(code) = bridge.usage_exit() { return code; }`.
     pub fn usage_exit(&self) -> Option<ExitCode> {
-        match &self.problem {
-            Some(Problem::Help) => {
-                // The command line's own output, before anything has started: exempt.
-                print!("{}", config::usage(&self.program, &self.family, &self.declared));
-                Some(ExitCode::SUCCESS)
-            }
-            Some(Problem::Usage(message)) => {
-                eprint!("{}: {message}\n\n{}", self.program, config::usage(&self.program, &self.family, &self.declared));
-                Some(ExitCode::from(2))
-            }
-            None => None,
-        }
-    }
-
-    fn check_required(&mut self) {
-        if self.problem.is_some() {
-            return;
-        }
-        if let Some(missing) = self.required.iter().find(|name| !self.settings.options.contains_key(*name)) {
-            self.problem = Some(Problem::Usage(format!("`--{missing}` is required")));
-        }
+        self.0.usage_exit()
     }
 
     /// The logging's application name (the log file's prefix, GELF's `_app`); by default the
     /// program's name.
-    pub fn app_name(mut self, name: &str) -> Bridge {
-        self.app_name = Some(name.to_owned());
-        self
+    pub fn app_name(self, name: &str) -> Bridge {
+        Bridge(self.0.app_name(name))
     }
 
     /// The text of the bridge's retained `Version`.
-    pub fn version(mut self, version: &str) -> Bridge {
-        self.version = Some(version.to_owned());
-        self
+    pub fn version(self, version: &str) -> Bridge {
+        Bridge(self.0.version(version))
     }
 
     /// Read the process's command line.
     pub fn from_cli(self) -> Bridge {
-        self.args(std::env::args().skip(1))
+        Bridge(self.0.from_cli())
     }
 
     /// Read `args` as the command line (without the program's name).
-    pub fn args(mut self, args: impl IntoIterator<Item = String>) -> Bridge {
-        self.parsed = true;
-        if let Err(problem) = config::parse(args, &mut self.settings, &self.declared) {
-            self.problem = Some(problem);
-        }
-        self.check_required();
-        self
+    pub fn args(self, args: impl IntoIterator<Item = String>) -> Bridge {
+        Bridge(self.0.args(args))
     }
 
     /// A declared option's value, if the command line gave one.
     pub fn value(&self, name: &str) -> Option<&str> {
-        self.settings.options.get(name).map(String::as_str)
+        self.0.value(name)
     }
 
     /// The driver's options the command line gave.
     pub fn values(&self) -> &BTreeMap<String, String> {
-        &self.settings.options
+        self.0.values()
     }
 
     /// Set the root (in code; `--root` on the command line).
-    pub fn root(mut self, root: &str) -> Bridge {
-        self.settings.root = root.to_owned();
-        self
+    pub fn root(self, root: &str) -> Bridge {
+        Bridge(self.0.root(root))
     }
 
     /// Set the instance (in code; `--instance` on the command line).
-    pub fn instance(mut self, instance: &str) -> Bridge {
-        self.settings.instance = Some(instance.to_owned());
-        self
+    pub fn instance(self, instance: &str) -> Bridge {
+        Bridge(self.0.instance(instance))
     }
 
     /// Set the broker, `host[:port]` (in code; `--broker` on the command line).
-    pub fn broker(mut self, broker: &str) -> Bridge {
-        self.settings.broker = Some(broker.to_owned());
-        self
+    pub fn broker(self, broker: &str) -> Bridge {
+        Bridge(self.0.broker(broker))
     }
 
     /// Override the driver's timing (in code; one flag each on the command line).
-    pub fn timing(mut self, overrides: TimingOverrides) -> Bridge {
-        self.settings.timing = overrides;
-        self
+    pub fn timing(self, overrides: TimingOverrides) -> Bridge {
+        Bridge(self.0.timing(overrides))
     }
 
     /// A device link that lasts this long ends its outage (in code; `--device-stable` on the
     /// command line): overrides the driver's `Timing::stable`.
-    pub fn device_stable(mut self, stable: Duration) -> Bridge {
-        self.settings.device_stable = Some(stable);
-        self
+    pub fn device_stable(self, stable: Duration) -> Bridge {
+        Bridge(self.0.device_stable(stable))
     }
 
     /// Set the MQTT side's timing (in code; `--mqtt-…` on the command line).
-    pub fn mqtt_timing(mut self, timing: MqttTiming) -> Bridge {
-        self.settings.mqtt = timing;
-        self
+    pub fn mqtt_timing(self, timing: MqttTiming) -> Bridge {
+        Bridge(self.0.mqtt_timing(timing))
     }
 
     /// The settings as given.
     pub fn settings(&self) -> &Settings {
-        &self.settings
-    }
-
-    fn app(&self) -> String {
-        self.app_name.clone().unwrap_or_else(|| self.program.clone())
+        self.0.settings()
     }
 
     /// `main`'s whole body: `Bridge::new("Aircondition").from_cli().run(Coolmaster::new())`. It
@@ -373,20 +307,35 @@ impl Bridge {
         if let Some(code) = self.usage_exit() {
             return code;
         }
-        let app = self.app();
-        let log_config = self.settings.log_config.clone();
+        let app = self.0.app();
+        let log_config = self.0.settings().log_config.clone();
         // `info()` should be pure; one that is not must not hold up the stop: it runs on a
         // blocking thread raced against the stop signals (Codex, process.rs:251).
         let describe = move || {
             let info = driver.info();
             (driver, info)
         };
-        run_with(app, log_config, describe, move |(driver, info)| self.launch(driver, Some(info)))
+        run_with(app, log_config, describe, move |(driver, info)| self.0.launch(Some((Box::new(Built(driver)), Some(info)))))
+    }
+
+    /// Start the bridge on the current tokio runtime, in-process: the MQTT side as tasks, the
+    /// device worker on a thread of its own, and the watchdog. No logging start, no signals and no
+    /// panic hook — [`run`](Self::run) adds those; a process that runs bridges this way calls
+    /// [`install_panic_hook`] itself (the conformance suite uses this directly, and keeps the test
+    /// harness's own hook).
+    ///
+    /// A part's death — the watchdog's verdict on a blocked device worker included — reaches the
+    /// caller only through [`Running::ended`]: an in-process user must poll it (in any slices it
+    /// likes) and take the dead-part path itself, [`Running::stop`] and a restart. The watchdog runs
+    /// whether or not it is polled, and says the device unreachable and refuses the waiting
+    /// commands at once.
+    pub fn start<D: DeviceDriver>(self, driver: D) -> Result<Running, String> {
+        self.0.launch(Some((Box::new(Built(driver)), None)))
     }
 }
 
-/// [`Host::run`](crate::Host::run)'s process: a [`Bridge::run`]'s, with nothing to describe before
-/// the start (a host's drivers are built per instance, each `info()` under the factory's bound).
+/// [`Host::run`]'s process: a [`Bridge::run`]'s, with nothing to describe before the start (a
+/// host's drivers are built per instance, each `info()` under the factory's bound).
 pub(crate) fn run_process(
     app: String,
     log_config: Option<std::path::PathBuf>,
@@ -490,77 +439,6 @@ async fn serve_with<P: Send + 'static>(
     match serve(running, signals.next()).instrument(span).await {
         Ending::Stopped => ExitCode::SUCCESS,
         Ending::WorkerDied => ExitCode::FAILURE,
-    }
-}
-
-impl Bridge {
-    /// Start the bridge on the current tokio runtime, in-process: the MQTT side as tasks, the
-    /// device worker on a thread of its own, and the watchdog. No logging start, no signals and no
-    /// panic hook — [`run`](Self::run) adds those; a process that runs bridges this way calls
-    /// [`install_panic_hook`] itself (the conformance suite uses this directly, and keeps the test
-    /// harness's own hook).
-    ///
-    /// A part's death — the watchdog's verdict on a blocked device worker included — reaches the
-    /// caller only through [`Running::ended`]: an in-process user must poll it (in any slices it
-    /// likes) and take the dead-part path itself, [`Running::stop`] and a restart. The watchdog runs
-    /// whether or not it is polled, and says the device unreachable and refuses the waiting
-    /// commands at once.
-    pub fn start<D: DeviceDriver>(self, driver: D) -> Result<Running, String> {
-        self.launch(driver, None)
-    }
-
-    /// [`start`](Self::start), with the driver's `info()` already taken (by [`run`](Self::run), off
-    /// the runtime) or taken here.
-    fn launch<D: DeviceDriver>(self, driver: D, info: Option<DriverInfo>) -> Result<Running, String> {
-        if let Some(problem) = &self.problem {
-            return Err(match problem {
-                Problem::Help => "--help".to_owned(),
-                Problem::Usage(m) => m.clone(),
-            });
-        }
-        let instance = self.settings.instance.clone().ok_or("no instance")?;
-        let topics = Topics::new(&self.settings.root, &instance)?;
-        let (broker_host, broker_port) = config::broker_host_port(self.settings.broker.as_deref().ok_or("no broker")?)?;
-        let span = tracing::info_span!("bridge", root = %topics.root(), instance = %instance);
-        let info: DriverInfo = info.unwrap_or_else(|| driver.info());
-        let mut timing = self.settings.timing.apply(info.timing);
-        timing.stable = self.settings.device_stable.unwrap_or(timing.stable);
-        let info = DriverInfo { timing, ..info };
-        config::check_timing(&info.timing, &self.settings.mqtt)?;
-        // The host with one fixed device (multi-device spec §4.1): untagged, R1's CONNACK duties.
-        let ready = Arc::new(Notify::new());
-        let mailbox = Mailbox::new();
-        let reports = Reports::with_ready(ready.clone());
-        let device = Arc::new(session::Device {
-            topics: topics.clone(),
-            commands: info.commands.clone().into(),
-            mailbox: mailbox.clone(),
-            reports: reports.clone(),
-            tag: None,
-            span: span.clone(),
-        });
-        let shared = Arc::new(session::Shared {
-            topics,
-            broker_host,
-            broker_port,
-            timing: self.settings.mqtt,
-            version: self.version.clone().unwrap_or_else(|| format!("{} (mqtt-bridge-kit {})", self.app(), env!("CARGO_PKG_VERSION"))),
-            outage: Arc::new(BrokerOutage::new(self.settings.mqtt.warn_after, self.settings.mqtt.stable_after)),
-            enqueued: std::sync::atomic::AtomicU64::new(0),
-            ready,
-            devices: lock_order::sync::Mutex::new("session-devices", Vec::new()),
-        });
-        let (shutdown, shutdown_rx) = watch::channel(false);
-        let (spawner, deaths, events) = Spawner::new();
-        let registry = spawner.registry.clone();
-        spawner.start(0, &instance, false, Box::new(Built(driver)), info, mailbox, reports, span.clone())?;
-        let mut outputs = session::Outputs::new();
-        outputs.add(&shared, 0, device);
-        let mut tasks = JoinSet::new();
-        let _entered = span.enter();
-        session::spawn(shared, session::Mode::Fixed(session::Fixed::default()), outputs, events, shutdown_rx, &mut tasks);
-        drop(_entered);
-        Ok(Running { tasks, shutdown, span, registry, deaths })
     }
 }
 

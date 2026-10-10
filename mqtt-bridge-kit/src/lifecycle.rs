@@ -21,6 +21,19 @@
 //! **Retained topics** (§4.5): every `Status`/`State` of an instance carries the `via` tag; a
 //! foreign write to, or a retraction of, an owned slot is healed; a delete retracts the topics whose
 //! current value carries this process's own tag.
+//!
+//! **The fixed instance — the host's N = 1 mode** (§4.1, §4.2). A [`Bridge`](crate::Bridge) is
+//! this lifecycle with one fixed instance, named from `--instance` and served from the start
+//! (`Lifecycle::start_fixed`): its owner is the process itself, so it has no Config, no `via`
+//! tag, no healing and no cleanup, and a fixed host subscribes no `Config/+`, no barrier and no
+//! `Status/+`. Its CONNACK duties are R1's (Bridge Runtime spec §5, §9), in R1's order: once per
+//! process the read-back, `State/{i}/#`, alone, its SUBACK awaited within
+//! [`READ_BACK_WAIT`](crate::session::READ_BACK_WAIT) (refused or late: WARN `read_back_incomplete`
+//! and on without it; the next SUBACK completes it, and it is unsubscribed); then its four request
+//! subscriptions, `Config/{i}/#`, `Desired/{i}/+`, `Desired/{i}/+/+`, `Command/{i}`; once they are
+//! handed over, `Active=true`, the `Version`, and its whole retained model. Every SUBSCRIBE,
+//! UNSUBSCRIBE and publish of it goes through the same packet-id budget as a configured instance's
+//! (`Conn`): one runtime, one budget.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -153,6 +166,8 @@ enum Want {
     /// Release it: deleted (`cleanup`: its own tagged topics retracted) or no longer this
     /// process's.
     Leave { cleanup: bool },
+    /// The fixed instance (N = 1): served from the start, never configured, never stopped.
+    Fixed,
 }
 
 /// One of an instance's subscriptions, on the current connection.
@@ -259,6 +274,27 @@ struct Instance {
 }
 
 impl Instance {
+    /// A newly owned instance: no Config accepted yet, no runtime, its slot unread.
+    fn new(name: &str, topics: Topics, want: Want) -> Instance {
+        Instance {
+            name: name.to_owned(),
+            topics,
+            accepted: None,
+            last_seen: None,
+            invalid: None,
+            want,
+            rt: None,
+            build: None,
+            ready: None,
+            failed_config: None,
+            retry_at: None,
+            validated: None,
+            slot: BTreeMap::new(),
+            installed: BTreeSet::new(),
+            replayed: BTreeSet::new(),
+        }
+    }
+
     /// Failed: a live runtime with no worker and no driver waiting to start — nothing serves the
     /// instance — whose construction has failed (or whose Config naming this process is malformed,
     /// with none accepted before). A retry's construction under way is no service: the failed
@@ -408,12 +444,28 @@ impl Conn {
     }
 }
 
+/// The device id of the fixed instance's runtime: `Lifecycle::next` never hands it out.
+const FIXED_ID: u64 = 0;
+
+/// The fixed instance of a [`Bridge`](crate::Bridge) (the host's N = 1 mode; see the module
+/// documentation): its name, and its read-back's progress — once per process, as R1's.
+struct Fixed {
+    name: String,
+    /// The read-back's SUBACK has come, granted or refused, or did not come in time: it is not
+    /// asked again. A session that ends before either leaves it to the next.
+    read_back_done: bool,
+    /// The read-back asked on this connection waits for its SUBACK until then.
+    read_back_until: Option<Instant>,
+}
+
 /// What a host is, for its lifecycle.
 pub(crate) struct Settings {
     pub kind: String,
+    /// The bridge id: a fixed host's is its instance.
     pub id: String,
     pub root: String,
-    pub factory: Factory,
+    /// The factory a configured instance's driver is built by; none for a fixed host.
+    pub factory: Option<Factory>,
     pub factory_timeout: Duration,
     /// The pacing of a failed construction's retries.
     pub retry: Duration,
@@ -450,6 +502,8 @@ pub(crate) struct Lifecycle {
     sweeps: BTreeMap<String, Sweep>,
     /// The first root replay's `Status/+` read.
     scan: Scan,
+    /// A fixed host's one instance (N = 1).
+    fixed: Option<Fixed>,
 }
 
 impl Lifecycle {
@@ -469,6 +523,73 @@ impl Lifecycle {
             queued_cleanups: Vec::new(),
             sweeps: BTreeMap::new(),
             scan: Scan::Pending,
+            fixed: None,
+        }
+    }
+
+    /// Serve the one fixed instance `name` (a [`Bridge`](crate::Bridge), N = 1): R1's device —
+    /// untagged, in `span` — its worker started now, whatever the broker does (R1: the device side
+    /// runs from the start, its reports waiting for `Active`).
+    pub(crate) fn start_fixed(
+        &mut self,
+        outputs: &mut Outputs,
+        name: &str,
+        driver: Box<dyn Startable>,
+        info: DriverInfo,
+        span: Span,
+    ) -> Result<(), String> {
+        let device = Arc::new(Device {
+            topics: Topics::new(&self.settings.root, name)?,
+            commands: info.commands.clone().into(),
+            mailbox: Mailbox::new(),
+            reports: Reports::with_ready(self.ready.clone()),
+            tag: None,
+            span: span.clone(),
+        });
+        self.spawner.start(FIXED_ID, name, false, driver, info, device.mailbox.clone(), device.reports.clone(), span)?;
+        self.insert_fixed(outputs, device);
+        Ok(())
+    }
+
+    /// The fixed instance, its device's worker running (or, in a unit test, none): owned by the
+    /// process itself from the start, a live runtime that needs no bootstrap.
+    pub(crate) fn insert_fixed(&mut self, outputs: &mut Outputs, device: Arc<Device>) {
+        let name = device.topics.instance().to_owned();
+        outputs.add(&self.shared, FIXED_ID, device.clone());
+        let rt = Rt {
+            id: FIXED_ID,
+            device: device.clone(),
+            phase: Phase::Live,
+            worker: true,
+            read: Sub::None,
+            setup: Sub::None,
+            requests: Sub::None,
+            bootstrapped: true,
+            unsubscribing: 0,
+        };
+        let instance = Instance { rt: Some(rt), ..Instance::new(&name, device.topics.clone(), Want::Fixed) };
+        self.instances.insert(name.clone(), instance);
+        self.fixed = Some(Fixed { name, read_back_done: false, read_back_until: None });
+    }
+
+    /// The fixed instance's name, for a fixed host.
+    fn fixed_name(&self) -> Option<String> {
+        self.fixed.as_ref().map(|f| f.name.clone())
+    }
+
+    /// Whether `name` is the fixed instance.
+    fn is_fixed(&self, name: &str) -> bool {
+        self.fixed.as_ref().is_some_and(|f| f.name == name)
+    }
+
+    /// Whether `purpose` is one of the fixed instance's subscriptions.
+    fn fixed_purpose(&self, purpose: &Purpose) -> bool {
+        match purpose {
+            Purpose::Read { instance, .. }
+            | Purpose::Setup { instance, .. }
+            | Purpose::Requests { instance, .. }
+            | Purpose::Unsub { instance, .. } => self.is_fixed(instance),
+            _ => false,
         }
     }
 
@@ -487,7 +608,8 @@ impl Lifecycle {
             .flatten()
             .filter(|at| *at > Instant::now());
         let retries = self.instances.values().filter_map(|i| i.retry_at);
-        [self.conn.next_deadline(), fallback, self.next_sweep].into_iter().flatten().chain(retries).min()
+        let read_back = self.fixed.as_ref().and_then(|f| f.read_back_until);
+        [self.conn.next_deadline(), fallback, self.next_sweep, read_back].into_iter().flatten().chain(retries).min()
     }
 
     // ---- Subscriptions ---------------------------------------------------------------------
@@ -555,7 +677,7 @@ impl Lifecycle {
                 Request::Unsubscribe(filter) => ctx.client.unsubscribe(filter).await?,
             }
         }
-        self.maybe_active(ctx, outputs.firsts_waiting()).await;
+        self.maybe_active(ctx, outputs).await;
         outputs.set_budget(self.budget(ctx));
         Ok(())
     }
@@ -630,6 +752,7 @@ impl Lifecycle {
     }
 
     /// S1, the read-back: the instance's targets' `State` and its `Status`, kept while it is owned.
+    /// The fixed instance's is R1's: its own `State/{i}/#` alone, until its replay is in.
     async fn request_read(&mut self, ctx: Option<&Ctx<'_>>, name: &str) -> Result<(), Failed> {
         let Some((id, topics)) = self.rt_of(name).map(|(rt, topics)| (rt.id, topics.clone())) else {
             return Ok(());
@@ -638,8 +761,40 @@ impl Lifecycle {
             return Ok(());
         }
         self.set_sub(name, |rt| rt.read = Sub::Requested);
-        let filters = vec![Self::filter(topics.state_target_filter(), false), Self::filter(topics.status(), false)];
+        let filters = match self.fixed.as_mut().filter(|f| f.name == name) {
+            Some(fixed) => {
+                fixed.read_back_until = Some(Instant::now() + session::READ_BACK_WAIT);
+                vec![Self::filter(topics.state_filter(), false)]
+            }
+            None => vec![Self::filter(topics.state_target_filter(), false), Self::filter(topics.status(), false)],
+        };
         self.request_subscription(ctx, Purpose::Read { instance: name.to_owned(), rt: id }, filters).await
+    }
+
+    /// The fixed instance's requests: R1's four SUBSCRIBEs, in R1's order. Configs first, so a
+    /// target's retained setup is queued ahead of its retained values (review M4); target-level
+    /// writes and commands retain-as-published (never retained: a live retained one is refused),
+    /// property writes without (only a replay arrives flagged; review C10).
+    async fn request_fixed_lanes(&mut self, ctx: Option<&Ctx<'_>>, name: &str) -> Result<(), Failed> {
+        let Some((id, topics)) = self.rt_of(name).map(|(rt, topics)| (rt.id, topics.clone())) else {
+            return Ok(());
+        };
+        if !self.conn.connected {
+            return Ok(());
+        }
+        self.set_sub(name, |rt| {
+            rt.setup = Sub::Requested;
+            rt.requests = Sub::Requested;
+        });
+        let instance = name.to_owned();
+        let setup = Purpose::Setup { instance: instance.clone(), rt: id };
+        self.request_subscription(ctx, setup, vec![Self::filter(topics.config_filter(), false)]).await?;
+        let requests = [(topics.desired_target_filter(), true), (topics.desired_property_filter(), false), (topics.command(), true)];
+        for (filter, retain_as_published) in requests {
+            let purpose = Purpose::Requests { instance: instance.clone(), rt: id };
+            self.request_subscription(ctx, purpose, vec![Self::filter(filter, retain_as_published)]).await?;
+        }
+        Ok(())
     }
 
     /// S2, the target Configs.
@@ -694,6 +849,17 @@ impl Lifecycle {
     pub(crate) async fn on_connack(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<(), Failed> {
         self.conn = Conn { connected: true, ..Conn::default() };
         outputs.outbox_open = true;
+        // A fixed host (N = 1) owns no instance by Config: no `Config/+`, no barrier, no
+        // `Status/+`. Its instance's read-back, once per process, then its requests (R1).
+        if let Some(fixed) = &self.fixed {
+            let (name, read_back) = (fixed.name.clone(), !fixed.read_back_done);
+            if read_back {
+                self.request_read(Some(ctx), &name).await?;
+            } else {
+                self.request_fixed_lanes(Some(ctx), &name).await?;
+            }
+            return self.drive(ctx, outputs).await;
+        }
         let root = self.settings.root.clone();
         let configs = Self::filter(format!("{root}/Config/+"), false);
         let barrier = Self::filter(format!("{root}/_barrier/{}", self.settings.id), false);
@@ -750,6 +916,11 @@ impl Lifecycle {
                 let Some(pending) = self.number(&event) else {
                     return Ok(Flow::Continue);
                 };
+                if !granted && self.fixed_purpose(&pending.purpose) {
+                    self.fixed_refused(ctx, outputs, pending.purpose).await?;
+                    self.maybe_active(ctx, outputs).await;
+                    return Ok(Flow::Continue);
+                }
                 if !granted {
                     warn!(
                         kind = "subscription_refused",
@@ -764,11 +935,77 @@ impl Lifecycle {
                 } else {
                     self.granted(ctx, outputs, pending.purpose).await?;
                 }
-                self.maybe_active(ctx, outputs.firsts_waiting()).await;
+                self.maybe_active(ctx, outputs).await;
                 Ok(Flow::Continue)
             }
             _ => Ok(Flow::Continue),
         }
+    }
+
+    /// A refusal of one of the fixed instance's subscriptions, taken as R1 took it — the session
+    /// goes on. The read-back's is no read-back: said, WARN `read_back_incomplete`, and the
+    /// requests subscribed without it. A request's reason code is not read (R1 never read them):
+    /// as a grant, so the next SUBACK still completes the read-back.
+    async fn fixed_refused(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs, purpose: Purpose) -> Result<(), Failed> {
+        match purpose {
+            Purpose::Read { instance, rt } => {
+                if !self.fixed_read_back_awaited(&instance, rt) {
+                    return Ok(());
+                }
+                if let Some(rt) = self.instances.get_mut(&instance).and_then(|i| i.rt.as_mut()) {
+                    rt.read = Sub::None;
+                    rt.device.reports.read_back_incomplete();
+                }
+                warn!(
+                    kind = "read_back_incomplete",
+                    refused = true,
+                    "The broker refused the read-back's subscription; subscribing to requests without it — a replay may meet no \"before\" values"
+                );
+                self.request_fixed_lanes(Some(ctx), &instance).await
+            }
+            Purpose::Unsub { .. } => Ok(()),
+            purpose => self.granted(ctx, outputs, purpose).await,
+        }
+    }
+
+    /// Whether the fixed instance's read-back asked on this connection still waits for its SUBACK
+    /// — not refused, granted or late yet. Its SUBACK, the first to come, settles it: once per
+    /// process.
+    fn fixed_read_back_awaited(&mut self, instance: &str, rt: u64) -> bool {
+        let awaited = self.current(instance, rt).is_some_and(|rt| rt.read == Sub::Requested);
+        if let Some(fixed) = self.fixed.as_mut().filter(|_| awaited) {
+            fixed.read_back_done = true;
+            fixed.read_back_until = None;
+        }
+        awaited
+    }
+
+    /// The fixed instance's read-back did not get its SUBACK within
+    /// [`READ_BACK_WAIT`](session::READ_BACK_WAIT): done, as far as the conflict rule goes —
+    /// unsubscribed, its own State coming back would only queue ahead of the requests (Codex
+    /// final gate 1) — and the requests subscribed without it (R1). Its SUBACK, should it still
+    /// come, completes nothing; it is awaited, as every request is, within [`GRANT_BOUND`].
+    async fn fixed_read_back_late(&mut self, ctx: &Ctx<'_>) -> Result<(), Failed> {
+        let Some(name) = self.fixed_name() else {
+            return Ok(());
+        };
+        let Some((id, topics)) = self.rt_of(&name).map(|(rt, topics)| (rt.id, topics.clone())) else {
+            return Ok(());
+        };
+        if !self.fixed_read_back_awaited(&name, id) {
+            return Ok(());
+        }
+        if let Some(rt) = self.instances.get_mut(&name).and_then(|i| i.rt.as_mut()) {
+            rt.read = Sub::None;
+            rt.device.reports.read_back_incomplete();
+        }
+        self.request_unsubscription(Some(ctx), Purpose::Unsub { instance: name.clone(), rt: id }, topics.state_filter()).await?;
+        warn!(
+            kind = "read_back_incomplete",
+            waited_ms = session::READ_BACK_WAIT.as_millis() as u64,
+            "The broker did not acknowledge the read-back's subscription in time; subscribing to requests without it — a replay may meet no \"before\" values"
+        );
+        self.request_fixed_lanes(Some(ctx), &name).await
     }
 
     async fn granted(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs, purpose: Purpose) -> Result<(), Failed> {
@@ -788,6 +1025,14 @@ impl Lifecycle {
                 }
                 self.hand_over_cleanups(ctx).await?;
             }
+            Purpose::Read { instance, rt } if self.is_fixed(&instance) => {
+                // The fixed instance's read-back is granted: its retained State follows, and the
+                // next SUBACK — its requests' first, asked now — comes behind it (R1).
+                if self.fixed_read_back_awaited(&instance, rt) {
+                    self.set_sub(&instance, |rt| rt.read = Sub::Granted);
+                    self.request_fixed_lanes(Some(ctx), &instance).await?;
+                }
+            }
             Purpose::Read { instance, rt } => {
                 let Some(device) = self.current(&instance, rt).map(|rt| rt.device.clone()) else {
                     return Ok(());
@@ -801,7 +1046,7 @@ impl Lifecycle {
                 // reviews).
                 if self.current(&instance, rt).is_some_and(|rt| matches!(rt.phase, Phase::Live | Phase::Disabled)) {
                     if let Some(slot) = outputs.slot(rt) {
-                        slot.batch.add_model(&device, device.reports.model());
+                        slot.batch.add_model(&device, device.reports.model(), true);
                     }
                     outputs.announce(rt);
                 }
@@ -823,6 +1068,19 @@ impl Lifecycle {
                     return Ok(());
                 };
                 self.set_sub(&instance, |rt| rt.setup = Sub::Granted);
+                if self.is_fixed(&instance) {
+                    // The fixed instance's requests' first SUBACK, behind the read-back's replay,
+                    // completes it; then its subscription goes — kept, it would only bring the
+                    // bridge's own State back, a publish for each one it makes, ahead of every
+                    // request (Codex final gate 1).
+                    if self.current(&instance, rt).is_some_and(|rt| rt.read == Sub::Granted) {
+                        device.reports.read_back_complete();
+                        self.set_sub(&instance, |rt| rt.read = Sub::None);
+                        let unsub = Purpose::Unsub { instance: instance.clone(), rt };
+                        self.request_unsubscription(Some(ctx), unsub, device.topics.state_filter()).await?;
+                    }
+                    return Ok(());
+                }
                 // S2's SUBACK closes S1's replay: the conflict snapshot freezes.
                 device.reports.read_back_complete();
                 if self.current(&instance, rt).is_some_and(|rt| rt.phase == Phase::Live) {
@@ -830,7 +1088,8 @@ impl Lifecycle {
                 }
             }
             Purpose::Requests { instance, rt } => {
-                if self.current(&instance, rt).is_none() {
+                // The fixed instance serves from the start: nothing waits for its requests' grants.
+                if self.current(&instance, rt).is_none() || self.is_fixed(&instance) {
                     return Ok(());
                 }
                 // S3's SUBACK closes S2's replay: a target Config no longer retained is retracted
@@ -909,32 +1168,53 @@ impl Lifecycle {
     /// the root replay is closed by the barrier — or [`REPLAY_FALLBACK`] has passed since the
     /// `Config/+` grant — and every owned instance's current Status and State said at its
     /// read-back's grant has gone out (multi-device spec §4.6). A pending grant is never bypassed.
-    async fn maybe_active(&mut self, ctx: &Ctx<'_>, firsts_waiting: bool) {
+    ///
+    /// The fixed instance's `Active=true` is R1's: once its requests are subscribed — handed over,
+    /// not granted — and before its model, which follows `Active` and the `Version` through the
+    /// rotation (Bridge Runtime spec §9: nothing published before the subscriptions, the first
+    /// publish `Active=true`). No barrier: a fixed host owns nothing by Config.
+    async fn maybe_active(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) {
         // `Active` and `Version` within the publication's budget (`Conn`): a request outstanding
         // has ids to spare for them — the barrier's, on the fallback — or its acknowledgement
         // checks again. The statuses before it: they go through the rotation, and the turn that
         // publishes the last of them checks again (`on_turn_done`).
-        if self.conn.active
-            || !self.conn.connected
-            || self.conn.pending_subscriptions() > 0
-            || self.budget(ctx).is_some_and(|b| b < 2)
-            || firsts_waiting
-        {
+        if self.conn.active || !self.conn.connected || self.budget(ctx).is_some_and(|b| b < 2) {
             return;
         }
-        let Some(granted) = self.conn.configs_granted else {
-            return;
-        };
-        if !self.conn.barrier_acked && Instant::now() < granted + REPLAY_FALLBACK {
-            return;
-        }
-        if !self.conn.barrier_acked {
-            info!("The root replay's barrier is not acknowledged yet; Active=true goes without it — releasing nothing until it is");
+        let fixed = self.fixed_name().and_then(|name| self.rt_of(&name).map(|(rt, _)| (rt.id, rt.requests, rt.device.clone())));
+        match &fixed {
+            Some((_, requests, _)) => {
+                if *requests == Sub::None || self.conn.waiting.iter().any(|c| !c.is_unsubscribe()) {
+                    return;
+                }
+            }
+            None => {
+                if self.conn.pending_subscriptions() > 0 || outputs.firsts_waiting() {
+                    return;
+                }
+                let Some(granted) = self.conn.configs_granted else {
+                    return;
+                };
+                if !self.conn.barrier_acked && Instant::now() < granted + REPLAY_FALLBACK {
+                    return;
+                }
+                if !self.conn.barrier_acked {
+                    info!("The root replay's barrier is not acknowledged yet; Active=true goes without it — releasing nothing until it is");
+                }
+            }
         }
         self.conn.active = true;
         let shared = ctx.shared;
         session::emit(shared, ctx.client, shared.topics.active(), true, b"true".to_vec(), session::properties()).await;
         session::emit(shared, ctx.client, shared.topics.version(), true, shared.version.clone().into_bytes(), session::properties()).await;
+        // The fixed instance's whole retained model again, from its own state — a broker restarted
+        // without persistence lost it (the fleet's F4) — then its reports from now on.
+        if let Some((id, _, device)) = fixed {
+            if let Some(slot) = outputs.slot(id) {
+                slot.batch.add_model(&device, device.reports.model(), false);
+            }
+            outputs.announce(id);
+        }
     }
 
     /// The root replay is closed by the barrier's SUBACK (multi-device spec §4.3, reconnect
@@ -964,6 +1244,13 @@ impl Lifecycle {
         publish: &Publish,
         received: Instant,
     ) -> Result<Flow, Failed> {
+        // The fixed instance takes every publish, as R1's one device did: its own grammar answers
+        // what is none of its lanes (on `Error`); no Config, slot or tag is read.
+        if let Some(device) = self.fixed_name().and_then(|name| self.rt_of(&name).map(|(rt, _)| rt.device.clone())) {
+            session::route(&device, topic, publish, received);
+            self.drive(ctx, outputs).await?;
+            return Ok(Flow::Continue);
+        }
         let Some(rest) = topic.strip_prefix(self.settings.root.as_str()).and_then(|r| r.strip_prefix('/')) else {
             debug!(topic, "A publish off the root; ignored");
             return Ok(Flow::Continue);
@@ -1025,10 +1312,13 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// A timer: an overdue grant ends the session; the replay's fallback; a failed instance's
-    /// retry; the sweep of failed instances' held requests.
+    /// A timer: the fixed instance's read-back, late; an overdue grant ends the session; the
+    /// replay's fallback; a failed instance's retry; the sweep of failed instances' held requests.
     pub(crate) async fn on_timer(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<Flow, Failed> {
         let now = Instant::now();
+        if self.fixed.as_ref().and_then(|f| f.read_back_until).is_some_and(|until| until <= now) {
+            self.fixed_read_back_late(ctx).await?;
+        }
         if let Some(overdue) = self.conn.outstanding().find(|p| p.deadline <= now) {
             warn!(
                 kind = "subscription_refused",
@@ -1039,7 +1329,7 @@ impl Lifecycle {
             );
             return Ok(Flow::End);
         }
-        self.maybe_active(ctx, outputs.firsts_waiting()).await;
+        self.maybe_active(ctx, outputs).await;
         let due: Vec<String> = self.instances.values().filter(|i| i.retry_at.is_some_and(|at| at <= now)).map(|i| i.name.clone()).collect();
         for name in due {
             if let Some(instance) = self.instances.get_mut(&name) {
@@ -1109,6 +1399,11 @@ impl Lifecycle {
         self.cleanups.extend(sweeping.into_keys());
         if matches!(self.scan, Scan::Reading(_)) {
             self.scan = Scan::Pending;
+        }
+        // The fixed instance's read-back asked and not answered is asked again on the next
+        // connection; one granted and not complete is incomplete (below), and done (R1).
+        if let Some(fixed) = self.fixed.as_mut() {
+            fixed.read_back_until = None;
         }
         let names: Vec<String> = self.instances.keys().cloned().collect();
         for name in names {
@@ -1303,26 +1598,7 @@ impl Lifecycle {
         if dropped > 0 {
             debug!(instance = name, dropped, "A pending cleanup's retractions dropped: the instance is this process's again");
         }
-        self.instances.insert(
-            name.to_owned(),
-            Instance {
-                name: name.to_owned(),
-                topics,
-                accepted: None,
-                last_seen: None,
-                invalid: None,
-                want: Want::Broken,
-                rt: None,
-                build: None,
-                ready: None,
-                failed_config: None,
-                retry_at: None,
-                validated: None,
-                slot: BTreeMap::new(),
-                installed: BTreeSet::new(),
-                replayed: BTreeSet::new(),
-            },
-        );
+        self.instances.insert(name.to_owned(), Instance::new(name, topics, Want::Broken));
     }
 
     /// What the instance's latest Config asks. A stop under way not yet unsubscribing ends as the
@@ -1383,6 +1659,8 @@ impl Lifecycle {
         }
         let phase = instance.rt.as_ref().map(|rt| (rt.phase, rt.worker));
         match instance.want.clone() {
+            // Never configured: nothing to bring it towards.
+            Want::Fixed => {}
             Want::Leave { cleanup } => match phase {
                 Some(_) => self.begin_stop(ctx, outputs, name, Then::Release { cleanup }).await?,
                 None => {
@@ -1466,7 +1744,8 @@ impl Lifecycle {
     /// Start a construction for `config`, unless one is under way for it.
     fn ensure_build(&mut self, name: &str, config: Value) {
         let id = self.next();
-        let Some(instance) = self.instances.get_mut(name) else {
+        // A fixed host has no factory, and no Config to build from.
+        let (Some(instance), Some(factory)) = (self.instances.get_mut(name), self.settings.factory.clone()) else {
             return;
         };
         if instance.build.as_ref().is_some_and(|(_, c)| *c == config) {
@@ -1475,7 +1754,7 @@ impl Lifecycle {
         instance.build = Some((id, config.clone()));
         let span = instance.rt.as_ref().map_or_else(|| self.span.clone(), |rt| rt.device.span.clone());
         let device = DeviceConfig::new(name, driver_fields(&config));
-        self.spawner.build(self.settings.factory.clone(), device, id, self.settings.factory_timeout, span);
+        self.spawner.build(factory, device, id, self.settings.factory_timeout, span);
     }
 
     /// A construction is done.
@@ -1500,10 +1779,8 @@ impl Lifecycle {
         // The driver's timing, with the host's overrides; timings that cannot run are the Config's
         // failure.
         let result = result.and_then(|(driver, info)| {
-            let mut timing = self.settings.overrides.apply(info.timing);
-            timing.stable = self.settings.device_stable.unwrap_or(timing.stable);
-            match config::check_timing(&timing, &self.settings.mqtt) {
-                Ok(()) => Ok((driver, DriverInfo { timing, ..info })),
+            match config::device_info(info, &self.settings.overrides, self.settings.device_stable, &self.settings.mqtt) {
+                Ok(info) => Ok((driver, info)),
                 Err(e) => {
                     drop_off_thread(driver);
                     Err(FactoryError::Unusable(format!("the driver's timing cannot run: {e}")))
@@ -2112,6 +2389,28 @@ fn retire_slot(shared: &session::Shared, outputs: &mut Outputs, id: u64, name: &
 
 /// What a device stop refuses: a command still waiting for it.
 const STOPPED_BEFORE: &str = "the device was stopped before it ran (its Config changed, or the instance was disabled, deleted or moved)";
+
+/// (tests) A fixed host's lifecycle serving `device` (its instance the bridge id), no worker
+/// behind it: the session's own tests drive a fixed bridge with it.
+#[cfg(test)]
+pub(crate) fn fixed_for_test(shared: Arc<session::Shared>, outputs: &mut Outputs, device: Arc<Device>) -> Lifecycle {
+    let ready = shared.ready.clone();
+    let settings = Settings {
+        kind: "test".into(),
+        id: device.topics.instance().to_owned(),
+        root: device.topics.root().to_owned(),
+        factory: None,
+        factory_timeout: config::FACTORY_TIMEOUT,
+        retry: Duration::from_secs(1),
+        overrides: TimingOverrides::default(),
+        device_stable: None,
+        mqtt: shared.timing,
+    };
+    let (spawner, _, _) = Spawner::new();
+    let mut host = Lifecycle::new(settings, shared, spawner, Span::none(), ready);
+    host.insert_fixed(outputs, device);
+    host
+}
 
 #[cfg(test)]
 mod tests;

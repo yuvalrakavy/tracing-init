@@ -11,12 +11,12 @@ use crate::pump::BrokerOutage;
 use crate::reports::Reports;
 
 /// A fixed bridge's session parts on `port`: the session part, its one device, the rotation and
-/// the mode.
+/// the lifecycle (the host's N = 1 mode).
 struct Rig {
     shared: Arc<Shared>,
     device: Arc<Device>,
     outputs: Outputs,
-    mode: Mode,
+    host: Lifecycle,
     events: tokio::sync::mpsc::UnboundedReceiver<crate::devices::Event>,
     _events: tokio::sync::mpsc::UnboundedSender<crate::devices::Event>,
 }
@@ -44,9 +44,9 @@ fn rig_on(port: u16) -> Rig {
         span: tracing::Span::none(),
     });
     let mut outputs = Outputs::new();
-    outputs.add(&shared, 0, device.clone());
+    let host = crate::lifecycle::fixed_for_test(shared.clone(), &mut outputs, device.clone());
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
-    Rig { shared, device, outputs, mode: Mode::Fixed(Fixed::default()), events, _events: events_tx }
+    Rig { shared, device, outputs, host, events, _events: events_tx }
 }
 
 /// A publish rumqttc refuses (a topic holding a wildcard) is one message dropped: the ones after it
@@ -63,7 +63,9 @@ async fn a_refused_publish_is_one_message_dropped() {
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     let model = Model { status: None, states: vec![("a#b".to_owned(), b"{}".to_vec()), ("t1".to_owned(), br#"{"x":1}"#.to_vec())] };
-    let republished = tokio::time::timeout(Duration::from_secs(5), republish(&shared, &client, &device, model)).await;
+    let mut batch = Batch::default();
+    batch.add_model(&device, model, false);
+    let republished = tokio::time::timeout(Duration::from_secs(5), batch.publish(&shared, &client, &IN_TURN, usize::MAX)).await;
     assert!(republished.is_ok(), "the republish did not end");
     let t1 = shared.topics.state("t1");
     assert!(
@@ -232,11 +234,8 @@ async fn the_flush_publishes_what_is_pending_before_its_last_words() {
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     device.reports.error(crate::wire::ErrorReport::new(crate::wire::Reason::Rejected, "pending at the stop").target(Some("t1")));
-    let flushed = tokio::time::timeout(
-        Duration::from_secs(5),
-        flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut Mode::Fixed(Fixed::default())),
-    )
-    .await;
+    let flushed =
+        tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut rig.host)).await;
     assert!(flushed.is_ok(), "the flush did not end");
     let (error, active) = (shared.topics.error(), shared.topics.active());
     assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&active).is_empty()).await, "the flush never said Active=false");
@@ -268,11 +267,7 @@ async fn the_flush_publishes_answers_before_state() {
     let refusal = crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop").target(Some("t1"));
     let reply = Outbound { topic: Some("Store/replies/flush".into()), payload: b"{}".to_vec(), correlation: None };
     device.reports.refused(vec![refusal], vec![reply]);
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut Mode::Fixed(Fixed::default())),
-    )
-    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut rig.host)).await;
     let error = shared.topics.error();
     assert!(
         broker
@@ -387,8 +382,7 @@ async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
         vec![Outbound { topic: Some("Store/replies/held".into()), payload: b"{}".to_vec(), correlation: None }],
     );
     let disconnected = |b: &FakeBroker| b.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Disconnected));
-    let mut fixed = Mode::Fixed(Fixed::default());
-    let flushing = flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut fixed);
+    let flushing = flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut rig.host);
     tokio::pin!(flushing);
     // Half a second in, the acks still held: no DISCONNECT yet.
     let early = tokio::time::timeout(Duration::from_millis(500), flushing.as_mut()).await;
@@ -416,10 +410,14 @@ async fn a_stop_mid_batch_still_publishes_the_batchs_reply() {
     let (stop, mut stopped) = watch::channel(false);
     let running = tokio::spawn(async move {
         let mut rig = rig;
-        session(&rig.shared, &mut rig.mode, &mut rig.outputs, &mut rig.events, &mut stopped).await
+        session(&rig.shared, &mut rig.host, &mut rig.outputs, &mut rig.events, &mut stopped).await
     });
     let active = shared.topics.active();
     assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&active).is_empty()).await, "the session never announced itself");
+    // The read-back's UNSUBSCRIBE handed over first: one still waiting for the line to clear of
+    // publishes holds the publication (MQTT §2.2.1), and the States would never reach the window.
+    let unsubscribed = |b: &FakeBroker| b.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Unsubscribed(_)));
+    assert!(broker.wait_until(Duration::from_secs(5), unsubscribed).await, "the read-back was never unsubscribed");
     // One batch (the session does not run between these): 400 States, then a reply. The broker
     // acknowledges nothing, so the States back up — rumqttc's window, then its request channel —
     // and the session waits in the batch's publish.
@@ -460,8 +458,8 @@ async fn a_stop_ahead_of_a_connack_the_pump_has_read_still_flushes() {
     let mut rig = rig_on(broker.port());
     let (shared, _device) = (rig.shared.clone(), rig.device.clone());
     let (stop, mut stopped) = watch::channel(false);
-    let Rig { shared: ref session_shared, ref mut mode, ref mut outputs, ref mut events, .. } = rig;
-    let running = session(session_shared, mode, outputs, events, &mut stopped);
+    let Rig { shared: ref session_shared, ref mut host, ref mut outputs, ref mut events, .. } = rig;
+    let running = session(session_shared, host, outputs, events, &mut stopped);
     tokio::pin!(running);
     // Polled once: the pump starts, and the session waits on it. Not polled again until the stop,
     // so the CONNACK the pump reads meanwhile waits on the session's queue.
@@ -507,9 +505,8 @@ async fn the_ack_wait_ends_with_the_connection() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         broker.drop_connection();
     };
-    let mut fixed = Mode::Fixed(Fixed::default());
     let (flushed, ()) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut fixed)),
+        tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut rig.host)),
         dropping
     );
     assert!(flushed.is_ok(), "the flush did not end");
@@ -534,11 +531,8 @@ async fn the_ack_wait_and_the_linger_fit_in_the_flushs_bound() {
     let capture = crate::test_support::Capture::start();
     broker.stop_reading();
     device.reports.refused(vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")], Vec::new());
-    let flushed = tokio::time::timeout(
-        Duration::from_secs(5),
-        flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut Mode::Fixed(Fixed::default())),
-    )
-    .await;
+    let flushed =
+        tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut rig.host)).await;
     assert!(flushed.is_ok(), "the flush did not end");
     let cut = capture.records().into_iter().filter_map(|r| r.field("message").map(str::to_owned)).find(|m| m.contains("ran out its bound"));
     assert!(cut.is_none(), "the flush ran out its bound: its ack wait and linger do not fit in it ({cut:?})");

@@ -53,7 +53,6 @@ selects on, and a death goes to a channel `Running::ended` reads.
 | `session-work` | acyclic | one event's handling, raced against the shutdown (`select!`) | The handling waits only on the request channel (`mqtt-request`); the race lets a stop through while the broker stalls a publish, so the shutdown never waits behind it. |
 | `session-retry` | acyclic | the pause between MQTT sessions, raced against the shutdown and a host's lifecycle events | A timer (`poll_retry`, and `retry` after every fifth failed connect in a row), a watch channel and an unbounded channel: nothing here waits on the session. A lifecycle event taken meanwhile is handled with no client (`Lifecycle::on_event_offline`): nothing is subscribed, nothing waits, and the pause goes on. |
 | `shutdown-flush` | bounded | `Active=false`, every publish of the session written and acknowledged, DISCONNECT, and the pump's word that it was written | `FLUSH_BOUND`, 2 s; the acknowledgement wait ends 750 ms before it (INFO `bridge_shutdown_cut`), or when the pump ends, and the DISCONNECT goes anyway, best effort; the DISCONNECT's write and the pump's linger after it (`LINGER_BOUND`, 500 ms) fit in what is left. On expiry one INFO `bridge_shutdown_cut`, and the last will says `Active=false` when the broker notices the connection gone. Skipped at once when the broker is out of reach. A host with a SUBSCRIBE or UNSUBSCRIBE outstanding publishes only the ids left before its packet id would come round, and waits on the pump's queue for an acknowledgement for the rest, until the same ack deadline; past it nothing more is published and no DISCONNECT is sent (INFO `bridge_shutdown_cut`): the last will says `Active=false`. |
-| `read-back-suback` | bounded | the read-back's SUBACK, on the pump's queue (`read_back_acknowledged`, the process's first CONNACK) | `READ_BACK_WAIT`, 5 s; publishes that arrive meanwhile are handled as ever. On expiry the requests are subscribed without it, with WARN `read_back_incomplete`; a session that ends meanwhile ends the wait. The pump never waits on the session (`mqtt-pump-queue`), and a broker that acknowledges nothing at all ends the session within `stall_bound` (`mqtt-poll`). |
 | `reports-ready` | acyclic | the next report (`Reports::reported`) | An idle wait for work, the session's. A report never waits — a short lock, then `Notify::notify_one`, which keeps a permit when nobody is waiting — so no reporter waits on the session. The retained model coalesces per target; `Error` and `Event` are capped (64 each), the oldest displaced past it, one WARN per episode. |
 | `reports-lock` | acyclic | the reports' state (`lock-order` mutex, class `reports-lock`) | Held only to change or copy what waits for the session: never across an await, no other lock taken under it, nothing logged under it — the displacement lines are logged after the guard is dropped. |
 | `mailbox-posted` | acyclic | the mailbox, read by the worker (`Mailbox::take`) | An idle wait for work. A post never waits — a short lock, then a notify — so no poster waits on the worker. The worker takes only while the device is up; while it is down nothing takes: state waits (the latest per key, so bounded), momentary commands are refused at once, reads dropped. |
@@ -131,13 +130,10 @@ mqtt-pump-queue src/session.rs flush
 mqtt-request src/lifecycle.rs Lifecycle::drive
 mqtt-request src/session.rs Batch::publish
 mqtt-request src/session.rs Outputs::turn
-mqtt-request src/session.rs connected
 mqtt-request src/session.rs emit
 mqtt-request src/session.rs flush
-mqtt-request src/session.rs session
 panic-report src/process.rs PanicReports::report
 panic-report src/process.rs PanicReports::start
-read-back-suback src/session.rs read_back_acknowledged
 reports-lock src/reports.rs Reports::locked
 reports-ready src/reports.rs Reports::reported
 runtime src/process.rs run_with

@@ -30,7 +30,7 @@ fn lifecycle() -> Lifecycle {
         kind: "kind".into(),
         id: "host".into(),
         root: "T".into(),
-        factory,
+        factory: Some(factory),
         factory_timeout: Duration::from_secs(10),
         retry: Duration::from_secs(5),
         overrides: TimingOverrides::default(),

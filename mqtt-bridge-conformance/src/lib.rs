@@ -117,7 +117,17 @@ impl Harness {
         timing: TimingOverrides,
         prepare: impl FnOnce(&FakeBroker, &Topics, &Device),
     ) -> Harness {
-        let broker = FakeBroker::start().await;
+        Harness::start_unwaited_on(FakeBroker::start().await, name, info, timing, prepare).await
+    }
+
+    /// The same, on `broker` (one advertising a small receive maximum, say).
+    pub async fn start_unwaited_on(
+        broker: FakeBroker,
+        name: &str,
+        info: DriverInfo,
+        timing: TimingOverrides,
+        prepare: impl FnOnce(&FakeBroker, &Topics, &Device),
+    ) -> Harness {
         broker.cap_connections(50);
         let instance = instance_name(name);
         let topics = Topics::new(ROOT, &instance).expect("the scenario's topics");

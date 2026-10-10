@@ -177,10 +177,9 @@ fn mqtt_side_through(relay: &Relay, timing: MqttTiming, stop: tokio::sync::watch
         span: tracing::Span::none(),
     });
     let mut outputs = crate::session::Outputs::new();
-    outputs.add(&shared, 0, device);
+    let host = crate::lifecycle::fixed_for_test(shared.clone(), &mut outputs, device);
     let (_events, events) = tokio::sync::mpsc::unbounded_channel();
-    let mode = crate::session::Mode::Fixed(crate::session::Fixed::default());
-    (topics.command(), tokio::spawn(crate::session::run(shared, mode, outputs, events, stop)))
+    (topics.command(), tokio::spawn(crate::session::run(shared, host, outputs, events, stop)))
 }
 
 fn direct_client(broker: &FakeBroker, id: &str, capacity: usize) -> (AsyncClient, rumqttc::v5::EventLoop) {

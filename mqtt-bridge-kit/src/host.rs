@@ -48,6 +48,13 @@
 //! foreign write or a retraction of its slot (healing), and on a delete retracts the topics whose
 //! current value carries its own tag (§4.5).
 //!
+//! **One runtime.** A [`Bridge`](crate::Bridge) — a controller-fronted bridge, one device per
+//! process — is this host's N = 1 mode: one fixed instance, named from `--instance`, built from the
+//! driver `main` hands it rather than from a Config. Its owner is the process itself (§4.2), so it
+//! has no `Config/+` ownership and no barrier, carries no `via` tag, and says `Active/{instance}`;
+//! its CONNACK duties, routing and wire are R1's, through the same session, lifecycle, publication
+//! rotation, packet-id budget and shutdown flush as a configured instance's.
+//!
 //! The session side of all this is in [`crate::session`], and the per-instance lifecycle in the
 //! crate's private `lifecycle` module; this module is the public builder and the factory's types.
 
@@ -60,12 +67,12 @@ use tokio::sync::{watch, Notify};
 use tokio::task::JoinSet;
 
 use crate::config::{self, Problem, Settings, TimingOverrides};
-use crate::devices::Spawner;
-use crate::driver::{DeviceDriver, PropertyMap, Timing};
+use crate::devices::{Spawner, Startable};
+use crate::driver::{DeviceDriver, DriverInfo, PropertyMap, Timing};
 use crate::lifecycle::{self, Lifecycle};
 use crate::process::Running;
 use crate::pump::BrokerOutage;
-use crate::session::{self, MqttTiming};
+use crate::session::{self, MqttTiming, Outputs};
 use crate::topics::Topics;
 
 /// An instance's Config as the factory gets it: the instance's name and its driver fields — every
@@ -123,7 +130,7 @@ pub(crate) type Factory = Arc<dyn Fn(&DeviceConfig) -> Result<Box<dyn crate::dev
 /// A multi-device bridge process, as `main` builds it: its kind, its command line and its drivers'
 /// options, then the factory ([`device`](Host::device)) and [`run`](Host::run). Every setter takes
 /// and returns `self`. (A controller-fronted bridge — one device per process — is a
-/// [`Bridge`](crate::Bridge).)
+/// [`Bridge`](crate::Bridge): this host with one fixed instance, N = 1.)
 ///
 /// The command line is a [`Bridge`](crate::Bridge)'s, with `--name <id>` (this process's bridge id,
 /// unique on the root; by default the kind) and `--factory-timeout <d>` (the bound on a device's
@@ -141,12 +148,28 @@ pub struct Host {
     settings: Settings,
     problem: Option<Problem>,
     factory: Option<Factory>,
+    /// N = 1: a [`Bridge`](crate::Bridge)'s one fixed instance (`--instance`), its driver handed
+    /// over at the start; no factory, no Configs.
+    fixed: bool,
 }
 
 impl std::fmt::Debug for Host {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Host").field("kind", &self.kind).field("settings", &self.settings).field("problem", &self.problem).finish()
+        f.debug_struct("Host")
+            .field("kind", &self.kind)
+            .field("fixed", &self.fixed)
+            .field("settings", &self.settings)
+            .field("problem", &self.problem)
+            .finish()
     }
+}
+
+/// The program's name: its executable's file name, else `fallback`.
+fn program(fallback: String) -> String {
+    std::env::args_os()
+        .next()
+        .and_then(|a| std::path::Path::new(&a).file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or(fallback)
 }
 
 impl Host {
@@ -155,13 +178,9 @@ impl Host {
     /// ([`root`](Self::root) sets the family's root in code, `--root` overrides it). Nothing is read
     /// from the command line until [`from_cli`](Self::from_cli) or [`args`](Self::args).
     pub fn new(kind: &str) -> Host {
-        let program = std::env::args_os()
-            .next()
-            .and_then(|a| std::path::Path::new(&a).file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| kind.to_owned());
         Host {
             kind: kind.to_owned(),
-            program,
+            program: program(kind.to_owned()),
             app_name: None,
             version: None,
             declared: Vec::new(),
@@ -170,7 +189,14 @@ impl Host {
             settings: Settings::new(kind),
             problem: None,
             factory: None,
+            fixed: false,
         }
+    }
+
+    /// A [`Bridge`](crate::Bridge)'s host: one fixed instance of `family` (the default root), its
+    /// command line R1's (`--instance`, no `--name`), its `Version` text R1's.
+    pub(crate) fn fixed(family: &str) -> Host {
+        Host { program: program(family.to_lowercase()), fixed: true, ..Host::new(family) }
     }
 
     /// The kind.
@@ -205,7 +231,10 @@ impl Host {
     /// anything starts; `None` when the host is to run. As
     /// [`Bridge::usage_exit`](crate::Bridge::usage_exit).
     pub fn usage_exit(&self) -> Option<ExitCode> {
-        let usage = || config::usage_host(&self.program, &self.kind, &self.settings.root, &self.declared);
+        let usage = || match self.fixed {
+            true => config::usage(&self.program, &self.kind, &self.declared),
+            false => config::usage_host(&self.program, &self.kind, &self.settings.root, &self.declared),
+        };
         match &self.problem {
             Some(Problem::Help) => {
                 // The command line's own output, before anything has started: exempt.
@@ -251,7 +280,8 @@ impl Host {
     /// Read `args` as the command line (without the program's name).
     pub fn args(mut self, args: impl IntoIterator<Item = String>) -> Host {
         self.parsed = true;
-        if let Err(problem) = config::parse_host(args, &mut self.settings, &self.declared) {
+        let parse = if self.fixed { config::parse } else { config::parse_host };
+        if let Err(problem) = parse(args, &mut self.settings, &self.declared) {
             self.problem = Some(problem);
         }
         self.check_required();
@@ -271,6 +301,12 @@ impl Host {
     /// Set the root (in code — the family's, e.g. `IRemitter`; `--root` on the command line).
     pub fn root(mut self, root: &str) -> Host {
         self.settings.root = root.to_owned();
+        self
+    }
+
+    /// Set the fixed instance (a [`Bridge`](crate::Bridge)'s; `--instance` on its command line).
+    pub(crate) fn instance(mut self, instance: &str) -> Host {
+        self.settings.instance = Some(instance.to_owned());
         self
     }
 
@@ -333,7 +369,8 @@ impl Host {
         self
     }
 
-    fn app(&self) -> String {
+    /// The logging's application name.
+    pub(crate) fn app(&self) -> String {
         self.app_name.clone().unwrap_or_else(|| self.program.clone())
     }
 
@@ -357,24 +394,55 @@ impl Host {
     /// panic hook — [`run`](Self::run) adds those), as [`Bridge::start`](crate::Bridge::start). A
     /// part's death reaches the caller only through [`Running::ended`].
     pub fn start(self) -> Result<Running, String> {
+        self.launch(None)
+    }
+
+    /// Start either mode on the current runtime: a configured host, whose factory builds each
+    /// instance's driver; or a [`Bridge`](crate::Bridge)'s fixed instance (N = 1), with `fixed`'s
+    /// driver — and its `info()`, if [`Bridge::run`](crate::Bridge::run) took it off the runtime
+    /// already, else taken here. One session, one lifecycle, either way.
+    pub(crate) fn launch(self, fixed: Option<(Box<dyn Startable>, Option<DriverInfo>)>) -> Result<Running, String> {
         if let Some(problem) = &self.problem {
             return Err(match problem {
                 Problem::Help => "--help".to_owned(),
                 Problem::Usage(m) => m.clone(),
             });
         }
-        let factory = self.factory.clone().ok_or("no factory: `device` names one before the host starts")?;
-        // The bridge id stands where a fixed bridge's instance does: `Active/{bridge id}`, the
-        // client id.
-        let id = self.settings.name.clone().unwrap_or_else(|| self.kind.clone());
+        // The bridge id: a fixed host's is its instance — `Active/{instance}`, the client id — and
+        // a configured host's stands where it would.
+        let id = match self.fixed {
+            true => self.settings.instance.clone().ok_or("no instance")?,
+            false => self.settings.name.clone().unwrap_or_else(|| self.kind.clone()),
+        };
         let topics = Topics::new(&self.settings.root, &id)?;
         let (broker_host, broker_port) = config::broker_host_port(self.settings.broker.as_deref().ok_or("no broker")?)?;
-        // Each device's timing is checked once its driver says it; the MQTT side's, and the
-        // overrides on a default timing, now.
-        config::check_timing(&self.settings.timing.apply(Timing::default()), &self.settings.mqtt)?;
-        let span = tracing::info_span!("host", root = %topics.root(), bridge = %id);
-        let version =
-            format!("{} {}", self.kind, self.version.clone().unwrap_or_else(|| format!("(mqtt-bridge-kit {})", env!("CARGO_PKG_VERSION"))));
+        let (span, version, factory, fixed) = match (self.fixed, fixed) {
+            (true, Some((driver, info))) => {
+                let span = tracing::info_span!("bridge", root = %topics.root(), instance = %id);
+                let info = info.unwrap_or_else(|| driver.info());
+                // The driver's timing, with the command line's overrides: timings that cannot run
+                // are the start's failure.
+                let info = config::device_info(info, &self.settings.timing, self.settings.device_stable, &self.settings.mqtt)?;
+                let version =
+                    self.version.clone().unwrap_or_else(|| format!("{} (mqtt-bridge-kit {})", self.app(), env!("CARGO_PKG_VERSION")));
+                (span, version, None, Some((driver, info)))
+            }
+            (false, None) => {
+                let factory = self.factory.clone().ok_or("no factory: `device` names one before the host starts")?;
+                // Each device's timing is checked once its driver says it; the MQTT side's, and the
+                // overrides on a default timing, now.
+                config::check_timing(&self.settings.timing.apply(Timing::default()), &self.settings.mqtt)?;
+                let span = tracing::info_span!("host", root = %topics.root(), bridge = %id);
+                let version = format!(
+                    "{} {}",
+                    self.kind,
+                    self.version.clone().unwrap_or_else(|| format!("(mqtt-bridge-kit {})", env!("CARGO_PKG_VERSION")))
+                );
+                (span, version, Some(factory), None)
+            }
+            (true, None) => return Err("a fixed bridge starts with its driver".to_owned()),
+            (false, Some(_)) => return Err("a host builds its drivers with its factory".to_owned()),
+        };
         let ready = Arc::new(Notify::new());
         let shared = Arc::new(session::Shared {
             topics,
@@ -391,7 +459,7 @@ impl Host {
         let registry = spawner.registry.clone();
         let settings = lifecycle::Settings {
             kind: self.kind.clone(),
-            id,
+            id: id.clone(),
             root: self.settings.root.clone(),
             factory,
             factory_timeout: self.settings.factory_timeout.unwrap_or(config::FACTORY_TIMEOUT),
@@ -401,11 +469,15 @@ impl Host {
             device_stable: self.settings.device_stable,
             mqtt: self.settings.mqtt,
         };
-        let lifecycle = Lifecycle::new(settings, shared.clone(), spawner, span.clone(), ready);
+        let mut lifecycle = Lifecycle::new(settings, shared.clone(), spawner, span.clone(), ready);
+        let mut outputs = Outputs::new();
+        if let Some((driver, info)) = fixed {
+            lifecycle.start_fixed(&mut outputs, &id, driver, info, span.clone())?;
+        }
         let (shutdown, shutdown_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
         let _entered = span.enter();
-        session::spawn(shared, session::Mode::Host(Box::new(lifecycle)), session::Outputs::new(), events, shutdown_rx, &mut tasks);
+        session::spawn(shared, lifecycle, outputs, events, shutdown_rx, &mut tasks);
         drop(_entered);
         Ok(Running::new(tasks, shutdown, span, registry, deaths))
     }

@@ -177,6 +177,21 @@ pub fn check_timing(timing: &Timing, mqtt: &MqttTiming) -> Result<(), String> {
     }
 }
 
+/// A driver's `info()` with the command line's timing — its overrides, and `--device-stable` over
+/// `Timing::stable` — or why that timing cannot run ([`check_timing`]). A fixed bridge's driver at
+/// the start, and each of a host's drivers once built.
+pub(crate) fn device_info(
+    info: crate::driver::DriverInfo,
+    overrides: &TimingOverrides,
+    stable: Option<Duration>,
+    mqtt: &MqttTiming,
+) -> Result<crate::driver::DriverInfo, String> {
+    let mut timing = overrides.apply(info.timing);
+    timing.stable = stable.unwrap_or(timing.stable);
+    check_timing(&timing, mqtt)?;
+    Ok(crate::driver::DriverInfo { timing, ..info })
+}
+
 /// `host` or `host:port`, the port defaulting to 1883.
 pub fn broker_host_port(broker: &str) -> Result<(String, u16), String> {
     match broker.rsplit_once(':') {

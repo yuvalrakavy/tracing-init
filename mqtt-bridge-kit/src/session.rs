@@ -1,6 +1,7 @@
 //! The MQTT side (lifted from mqtt_ac's `service.rs`, `mqtt_subscriber.rs` and
-//! `mqtt_publisher.rs`; Store no-hang §14.3, §14.8–§14.9), for a fixed bridge's one device and for
-//! a multi-device host's many (multi-device spec §4.1).
+//! `mqtt_publisher.rs`; Store no-hang §14.3, §14.8–§14.9): one runtime for a fixed bridge's one
+//! device and a multi-device host's many — a [`Bridge`](crate::Bridge) is the host's N = 1 mode
+//! (multi-device spec §4.1).
 //!
 //! One session per connection, each with a client of its own: the pump polls in a task of its own
 //! and forwards what arrives; the session reads it, posts requests to a device's mailbox — a post
@@ -14,14 +15,15 @@
 //! session's — the broker, the bridge's own `Active` and `Version`, the outage episode, the
 //! publication rotation's readiness signal; `Device` is one device's — its lanes, mailbox and
 //! reports, and, for a host's configured instance, the `via` tag its `Status` and `State` carry.
-//! A fixed bridge (`Mode::Fixed`) has one device, untagged, and R1's CONNACK duties; a host
-//! (`Mode::Host`) has the per-instance lifecycle of [`crate::host`].
+//! Every session serves the host's lifecycle (the crate's private `lifecycle` module): a fixed
+//! bridge's one instance, untagged, with R1's CONNACK duties, or a host's configured instances.
 //!
-//! **On every CONNACK** (the broker keeps no session) of a fixed bridge: subscribe, then
-//! `Active=true`, then the version, then the whole retained model again from the bridge's own
-//! state — a broker restarted without persistence lost the retained messages (the fleet's F4).
+//! **On every CONNACK** (the broker keeps no session) the lifecycle subscribes, then says
+//! `Active=true` and the version, and the whole retained model goes out again from each device's
+//! own state — a broker restarted without persistence lost the retained messages (the fleet's F4).
 //! Nothing a previous connection queued goes out: its client went with it. A publish rumqttc
-//! refuses is that one message dropped. (A host's CONNACK is its own: [`crate::host`].)
+//! refuses is that one message dropped. Every SUBSCRIBE, UNSUBSCRIBE and publish is handed to
+//! rumqttc within the lifecycle's packet-id budget (MQTT §2.2.1; multi-device spec §4.3).
 //!
 //! **The start-up read-back** (a fixed bridge): the process's first CONNACK subscribes to the
 //! bridge's own retained `State` before anything else, and subscribes to its requests only once
@@ -30,7 +32,7 @@
 //! stream ahead of every retained request (review C9). It is kept as the outage conflict rule's
 //! "before" values after a restart (Store kit spec §4.5). Only retained deliveries count: the
 //! bridge's own later publishes come back unflagged, and are ignored. A session that ends before
-//! the SUBACK leaves the read-back to the next.
+//! the SUBACK leaves the read-back to the next. (A configured instance's read-back is its S1.)
 //!
 //! **Publication and fairness** (multi-device spec §4.7): each device's output is R1's
 //! cancellation-safe `Batch`, *sealed* when taken — later State goes to the next batch — so a
@@ -40,7 +42,7 @@
 //!
 //! **Shutdown:** what waits refused, every device's answers first, then the rest; `Active=false`,
 //! then DISCONNECT, polling until it is written — within [`FLUSH_BOUND`]; past it the last will says
-//! `Active=false` instead (INFO `bridge_shutdown_cut`). A host's flush publishes within its packet-id
+//! `Active=false` instead (INFO `bridge_shutdown_cut`). The flush publishes within the packet-id
 //! budget while a SUBSCRIBE or UNSUBSCRIBE is outstanding, and past its ack wait publishes nothing
 //! more: no `Active=false`, no DISCONNECT — the last will says it (multi-device spec §4.3).
 
@@ -50,7 +52,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lock_order::sync::Mutex;
-use rumqttc::v5::mqttbytes::v5::{Filter, LastWill, Publish, PublishProperties};
+use rumqttc::v5::mqttbytes::v5::{LastWill, Publish, PublishProperties};
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, MqttOptions};
 use tokio::sync::{mpsc, watch, Notify};
@@ -58,6 +60,7 @@ use tracing::{debug, info, warn, Instrument, Span};
 
 use crate::devices::Event;
 use crate::driver::{CommandClass, CommandSpec};
+use crate::lifecycle::Lifecycle;
 use crate::mailbox::{Check, Mailbox, Posted, ReadKey, StateValue};
 use crate::pump::{stall_bound, BrokerOutage, Incoming, Pump, PumpEvent, MAX_CONSECUTIVE_ERRORS};
 use crate::replies::{reply_payload, Answer, ReplyTo};
@@ -76,8 +79,8 @@ const DISCONNECT_PART: Duration = Duration::from_millis(750);
 // The linger and the DISCONNECT's write fit in their part, with 250 ms for the write.
 const _: () = assert!(crate::pump::LINGER_BOUND.as_millis() + 250 <= DISCONNECT_PART.as_millis());
 
-/// How long the first CONNACK waits for the read-back's SUBACK before it subscribes to the
-/// requests without it (WARN `read_back_incomplete`).
+/// How long a fixed bridge's first CONNACK waits for the read-back's SUBACK before it subscribes to
+/// the requests without it (WARN `read_back_incomplete`).
 pub const READ_BACK_WAIT: Duration = Duration::from_secs(5);
 
 /// The largest packet the bridge takes, advertised in its CONNECT, so a broker discards a larger
@@ -210,64 +213,16 @@ impl Ctx<'_> {
     }
 }
 
-/// What the session serves.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum Mode {
-    /// A fixed bridge (`Bridge`): one device, untagged, R1's CONNACK duties and read-back.
-    Fixed(Fixed),
-    /// A multi-device host (`Host`): instances acquired and released by their Configs.
-    Host(Box<crate::lifecycle::Lifecycle>),
-}
-
-/// A fixed bridge's read-back, once per process.
-#[derive(Default)]
-pub(crate) struct Fixed {
-    /// The read-back's subscription has been made.
-    read_back_requested: bool,
-    /// The read-back's SUBACK granted it, and the retained `State` it replays follow it: the next
-    /// SUBACK — the next subscription's, sent after it — comes behind them, and completes the
-    /// read-back.
-    read_back_next: bool,
-}
-
-impl Mode {
-    /// When a timer of the mode's falls due: none for a fixed bridge.
-    fn next_wake(&self) -> Option<Instant> {
-        match self {
-            Mode::Fixed(_) => None,
-            Mode::Host(host) => host.next_wake(),
-        }
-    }
-
-    /// How many more messages the shutdown's flush may publish now (`None`: no limit): a host's,
-    /// the ids left while a SUBSCRIBE or UNSUBSCRIBE is outstanding (MQTT §2.2.1).
-    fn flush_budget(&self, ctx: &Ctx<'_>) -> Option<usize> {
-        match self {
-            Mode::Fixed(_) => None,
-            Mode::Host(host) => host.flush_budget(ctx),
-        }
-    }
-
-    /// A host's SUBSCRIBE or UNSUBSCRIBE waits for the line to clear of publishes: the pump's
-    /// progress is worth a pass.
-    fn line_wait(&self) -> bool {
-        match self {
-            Mode::Fixed(_) => false,
-            Mode::Host(host) => host.line_wait(),
-        }
-    }
-}
-
 /// One device's place in the publication rotation.
 pub(crate) struct Slot {
     pub id: u64,
     pub device: Arc<Device>,
     /// What was taken from its reports and is not published yet: sealed until it is.
     pub batch: Batch,
-    /// Its output may go out on this connection: a fixed bridge's CONNACK duties are done, or a
-    /// host instance's read-back is granted (published sooner, a State would overwrite the retained
-    /// one its read-back is there to read) — or it is stopping, when its read-back no longer
-    /// matters.
+    /// Its output may go out on this connection: the fixed instance's `Active=true` is said, or a
+    /// configured instance's read-back is granted (published sooner, a State would overwrite the
+    /// retained one its read-back is there to read) — or it is stopping, when its read-back no
+    /// longer matters.
     pub announced: bool,
 }
 
@@ -447,18 +402,18 @@ impl Outputs {
 
 /// The MQTT side, for the life of the bridge: sessions one after another, one per connection,
 /// until `shutdown` turns true. The pause before the next is `poll_retry`, and `retry` after every
-/// `MAX_CONSECUTIVE_ERRORS`th failed connect in a row. A host's lifecycle events go on between
+/// `MAX_CONSECUTIVE_ERRORS`th failed connect in a row. The lifecycle's events go on between
 /// sessions.
 pub(crate) async fn run(
     shared: Arc<Shared>,
-    mut mode: Mode,
+    mut host: Lifecycle,
     mut outputs: Outputs,
     mut events: mpsc::UnboundedReceiver<Event>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut failed: u32 = 0;
     loop {
-        let connected = match session(&shared, &mut mode, &mut outputs, &mut events, &mut shutdown).await {
+        let connected = match session(&shared, &mut host, &mut outputs, &mut events, &mut shutdown).await {
             SessionEnd::Shutdown => return,
             SessionEnd::Ended { connected } => connected,
         };
@@ -478,9 +433,7 @@ pub(crate) async fn run(
                 _ = shutdown.wait_for(|stop| *stop) => return,
                 Some(event) = events.recv() => event,
             };
-            if let Mode::Host(host) = &mut mode {
-                host.on_event_offline(&mut outputs, event).await;
-            }
+            host.on_event_offline(&mut outputs, event).await;
         }
     }
 }
@@ -546,7 +499,7 @@ fn enqueued(shared: &Shared, topic: &str, sent: Result<(), Failed>) {
 /// One session: a fresh client and its pump, for one connection, until it ends or the shutdown.
 async fn session(
     shared: &Arc<Shared>,
-    mode: &mut Mode,
+    host: &mut Lifecycle,
     outputs: &mut Outputs,
     events: &mut mpsc::UnboundedReceiver<Event>,
     shutdown: &mut watch::Receiver<bool>,
@@ -559,9 +512,9 @@ async fn session(
     let lost = shared.clone();
     let (_pump, mut incoming) =
         Pump::start(pump_events, shared.outage.clone(), stall_bound(shared.timing.keep_alive), move || lost.broker_lost());
-    // Nothing is published before the first CONNACK's duties are done: the subscriptions come
-    // first, and a state published ahead of the read-back's subscription would overwrite the
-    // retained state it is there to read.
+    // Nothing is published before the CONNACK's duties allow it: the subscriptions come first,
+    // and a state published ahead of the read-back's subscription would overwrite the retained
+    // state it is there to read.
     outputs.session_started();
     // When the broker accepted this session's connection, if it did.
     let mut accepted: Option<Instant> = None;
@@ -569,12 +522,12 @@ async fn session(
     let mut reads_owed: u32 = 0;
     let ctx = Ctx { shared, client: &client, line: incoming.line() };
     loop {
-        let wake = mode.next_wake();
+        let wake = host.next_wake();
         let open = outputs.open();
         let owed = open && outputs.owed;
-        // A host's SUBSCRIBE or UNSUBSCRIBE waiting for the line to clear of publishes: the pump's
-        // next event may clear it (enabled before the check, so no clearing is missed).
-        let line_wait = mode.line_wait();
+        // A SUBSCRIBE or UNSUBSCRIBE waiting for the line to clear of publishes: the pump's next
+        // event may clear it (enabled before the check, so no clearing is missed).
+        let line_wait = host.line_wait();
         let mut progress = Box::pin(incoming.progress());
         progress.as_mut().enable();
         let line_cleared = line_wait && ctx.line_clear();
@@ -633,93 +586,38 @@ async fn session(
         if connack && accepted.is_none() {
             accepted = Some(Instant::now());
         }
-        // A fixed bridge: the next subscription's SUBACK, behind the read-back's replay, completes
-        // it.
-        let read_back_done = match mode {
-            Mode::Fixed(ref mut fixed) => {
-                let done = matches!(step, Step::Event(Some(PumpEvent::SubAck { .. }))) && std::mem::take(&mut fixed.read_back_next);
-                if done {
-                    outputs.slots[0].device.reports.read_back_complete();
-                }
-                done
-            }
-            Mode::Host(_) => false,
-        };
         let work = async {
-            match (step, &mut *mode) {
-                (Step::Event(Some(PumpEvent::Connected)), Mode::Fixed(fixed)) => {
-                    let device = outputs.slots[0].device.clone();
-                    connected(&ctx, fixed, &device, &mut incoming).await.map(|goes_on| {
-                        if goes_on {
-                            outputs.slots[0].announced = true;
-                            None
-                        } else {
-                            Some(SessionEnd::Ended { connected: None })
-                        }
-                    })
-                }
-                (Step::Event(Some(PumpEvent::Connected)), Mode::Host(host)) => host.on_connack(&ctx, outputs).await.map(|_| None),
-                (Step::Event(Some(PumpEvent::Publish(publish, received))), Mode::Fixed(_)) => {
-                    let device = &outputs.slots[0].device;
-                    let (topic, span) = traced(&publish);
-                    span.in_scope(|| route(device, &topic, &publish, received));
-                    Ok(None)
-                }
-                (Step::Event(Some(PumpEvent::Publish(publish, received))), Mode::Host(host)) => {
+            match step {
+                Step::Event(Some(PumpEvent::Connected)) => host.on_connack(&ctx, outputs).await.map(|()| None),
+                Step::Event(Some(PumpEvent::Publish(publish, received))) => {
                     let (topic, span) = traced(&publish);
                     let flow = host.on_publish(&ctx, outputs, &topic, &publish, received).instrument(span).await;
                     flow.map(ended)
                 }
-                // The read-back is done: its subscription would only bring the bridge's own State
-                // back, a publish for each one it makes, ahead of every request (Codex final gate 1).
-                (Step::Event(Some(PumpEvent::SubAck { .. })), Mode::Fixed(_)) if read_back_done => {
-                    // WAIT: mqtt-request
-                    client.unsubscribe(outputs.slots[0].device.topics.state_filter()).await.map(|()| None)
-                }
-                (
-                    Step::Event(Some(
-                        PumpEvent::Disconnected
-                        | PumpEvent::SubAck { .. }
-                        | PumpEvent::Subscribing(_)
-                        | PumpEvent::Unsubscribing(_)
-                        | PumpEvent::UnsubAck { .. },
-                    )),
-                    Mode::Fixed(_),
-                ) => Ok(None),
-                (Step::Event(Some(PumpEvent::Disconnected)), Mode::Host(_)) => Ok(None),
-                (
-                    Step::Event(Some(
-                        event @ (PumpEvent::SubAck { .. }
-                        | PumpEvent::Subscribing(_)
-                        | PumpEvent::Unsubscribing(_)
-                        | PumpEvent::UnsubAck { .. }),
-                    )),
-                    Mode::Host(host),
-                ) => host.on_ack(&ctx, outputs, event).await.map(ended),
-                (Step::Event(Some(PumpEvent::Ended(_))), _) => Ok(Some(SessionEnd::Ended { connected: None })),
+                Step::Event(Some(PumpEvent::Disconnected)) => Ok(None),
+                Step::Event(Some(
+                    event @ (PumpEvent::SubAck { .. }
+                    | PumpEvent::Subscribing(_)
+                    | PumpEvent::Unsubscribing(_)
+                    | PumpEvent::UnsubAck { .. }),
+                )) => host.on_ack(&ctx, outputs, event).await.map(ended),
+                Step::Event(Some(PumpEvent::Ended(_))) => Ok(Some(SessionEnd::Ended { connected: None })),
                 // The pump went without a word — it panicked — so it never said the connection was
                 // lost: the broker snapshot is taken here (Claude's re-gate minor 14).
-                (Step::Event(None), _) => {
+                Step::Event(None) => {
                     if accepted.is_some() {
                         shared.broker_lost();
                     }
                     Ok(Some(SessionEnd::Ended { connected: None }))
                 }
-                (Step::Lifecycle(event), Mode::Host(host)) => host.on_event(&ctx, outputs, event).await.map(ended),
-                (Step::Lifecycle(_), Mode::Fixed(_)) => Ok(None),
-                (Step::Tick, Mode::Host(host)) => host.on_timer(&ctx, outputs).await.map(ended),
-                (Step::Tick, Mode::Fixed(_)) => Ok(None),
-                (Step::Line, Mode::Host(host)) => host.on_line(&ctx, outputs).await.map(ended),
-                (Step::Line, Mode::Fixed(_)) => Ok(None),
-                (Step::Reported, Mode::Fixed(_)) => {
-                    outputs.turn(shared, &client).await;
-                    Ok(None)
-                }
-                (Step::Reported, Mode::Host(host)) => {
+                Step::Lifecycle(event) => host.on_event(&ctx, outputs, event).await.map(ended),
+                Step::Tick => host.on_timer(&ctx, outputs).await.map(ended),
+                Step::Line => host.on_line(&ctx, outputs).await.map(ended),
+                Step::Reported => {
                     outputs.turn(shared, &client).await;
                     host.on_turn_done(&ctx, outputs).await.map(ended)
                 }
-                (Step::Shutdown, _) => Ok(Some(SessionEnd::Shutdown)),
+                Step::Shutdown => Ok(Some(SessionEnd::Shutdown)),
             }
         };
         // A publish waits while the broker stalls; the shutdown does not wait behind it.
@@ -731,19 +629,11 @@ async fn session(
         match done {
             Ok(None) => {}
             Ok(Some(SessionEnd::Ended { .. })) => {
-                match mode {
-                    // A replay cut short is what there is.
-                    Mode::Fixed(fixed) => {
-                        if std::mem::take(&mut fixed.read_back_next) {
-                            outputs.slots[0].device.reports.read_back_incomplete();
-                        }
-                    }
-                    Mode::Host(host) => host.on_session_lost(outputs).await,
-                }
+                host.on_session_lost(outputs).await;
                 return SessionEnd::Ended { connected: accepted };
             }
             Ok(Some(SessionEnd::Shutdown)) => {
-                flush(shared, &client, &mut incoming, outputs, mode).await;
+                flush(shared, &client, &mut incoming, outputs, host).await;
                 return SessionEnd::Shutdown;
             }
             // The event loop is gone (the pump ended): the next event says so.
@@ -776,126 +666,9 @@ enum Step {
     Lifecycle(Event),
     Reported,
     Tick,
-    /// The line has cleared of publishes for a host's waiting SUBSCRIBE or UNSUBSCRIBE.
+    /// The line has cleared of publishes for a waiting SUBSCRIBE or UNSUBSCRIBE.
     Line,
     Shutdown,
-}
-
-/// A fixed bridge's CONNACK duties, in order: the subscriptions (the read-back's first, once per
-/// process), then `Active=true`, the version, and the whole retained model.
-// The error is rumqttc's `ClientError` (it carries the refused request), returned once per CONNACK;
-// boxing it buys nothing on a path this cold.
-#[allow(clippy::result_large_err)]
-async fn connected(ctx: &Ctx<'_>, fixed: &mut Fixed, device: &Device, incoming: &mut Incoming) -> Result<bool, Failed> {
-    let (shared, client) = (ctx.shared, ctx.client);
-    let topics = &device.topics;
-    if !fixed.read_back_requested {
-        // WAIT: mqtt-request
-        client.subscribe(topics.state_filter(), QoS::AtLeastOnce).await?;
-        match read_back_acknowledged(device, incoming).await {
-            ReadBack::Ended => return Ok(false),
-            // Complete once its replay is in: at the next SUBACK, behind it.
-            ReadBack::Granted => fixed.read_back_next = true,
-            ReadBack::Refused => {
-                device.reports.read_back_incomplete();
-                warn!(
-                    kind = "read_back_incomplete",
-                    refused = true,
-                    "The broker refused the read-back's subscription; subscribing to requests without it — a replay may meet no \"before\" values"
-                );
-            }
-            ReadBack::Late => {
-                device.reports.read_back_incomplete();
-                // Done, as far as the conflict rule goes: its own State coming back would only
-                // queue ahead of the requests (Codex final gate 1).
-                // WAIT: mqtt-request
-                client.unsubscribe(topics.state_filter()).await?;
-                warn!(
-                    kind = "read_back_incomplete",
-                    waited_ms = READ_BACK_WAIT.as_millis() as u64,
-                    "The broker did not acknowledge the read-back's subscription in time; subscribing to requests without it — a replay may meet no \"before\" values"
-                );
-            }
-        }
-        fixed.read_back_requested = true;
-    }
-    // Configs first, so a target's retained setup is queued ahead of its retained values (review
-    // M4). Target-level writes and commands are never retained: subscribed retain-as-published, a
-    // live retained one keeps its flag and is refused like a replayed one. Property writes are
-    // retained by design: their subscription clears the flag on a live delivery, so only a replay
-    // arrives flagged (review C10).
-    let requests = [
-        (topics.config_filter(), false),
-        (topics.desired_target_filter(), true),
-        (topics.desired_property_filter(), false),
-        (topics.command(), true),
-    ];
-    for (filter, retain_as_published) in requests {
-        let filter = Filter { preserve_retain: retain_as_published, ..Filter::new(filter, QoS::AtLeastOnce) };
-        // WAIT: mqtt-request
-        client.subscribe_many(vec![filter]).await?;
-    }
-    emit(shared, client, shared.topics.active(), true, b"true".to_vec(), properties()).await;
-    emit(shared, client, shared.topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
-    republish(shared, client, device, device.reports.model()).await;
-    Ok(true)
-}
-
-/// What came of the read-back's subscription.
-enum ReadBack {
-    /// Its SUBACK granted it: every retained State has been read.
-    Granted,
-    /// Its SUBACK refused it (an ACL): there is no read-back.
-    Refused,
-    /// No SUBACK within [`READ_BACK_WAIT`].
-    Late,
-    /// The session ended.
-    Ended,
-}
-
-/// The read-back's SUBACK — told by its packet id — within [`READ_BACK_WAIT`], handling what
-/// arrives meanwhile.
-async fn read_back_acknowledged(device: &Device, incoming: &mut Incoming) -> ReadBack {
-    let deadline = Instant::now() + READ_BACK_WAIT;
-    let mut read_back: Option<u16> = None;
-    loop {
-        // WAIT: read-back-suback
-        match tokio::time::timeout_at(deadline.into(), incoming.recv()).await {
-            Err(_) => return ReadBack::Late,
-            // The read-back's is the session's first SUBSCRIBE.
-            Ok(Some(PumpEvent::Subscribing(pkid))) => {
-                read_back.get_or_insert(pkid);
-            }
-            Ok(Some(PumpEvent::SubAck { pkid, granted })) if Some(pkid) == read_back => {
-                return if granted { ReadBack::Granted } else { ReadBack::Refused };
-            }
-            Ok(Some(
-                PumpEvent::SubAck { .. }
-                | PumpEvent::Connected
-                | PumpEvent::Disconnected
-                | PumpEvent::Unsubscribing(_)
-                | PumpEvent::UnsubAck { .. },
-            )) => {}
-            Ok(Some(PumpEvent::Publish(publish, received))) => {
-                let (topic, span) = traced(&publish);
-                span.in_scope(|| route(device, &topic, &publish, received));
-            }
-            Ok(Some(PumpEvent::Ended(_)) | None) => return ReadBack::Ended,
-        }
-    }
-}
-
-/// Everything a device knows, again — tagged, for a configured instance. A message refused is
-/// dropped alone.
-pub(crate) async fn republish(shared: &Shared, client: &AsyncClient, device: &Device, model: Model) {
-    debug!(targets = model.states.len(), "Publishing the retained model again after a CONNACK");
-    let tag = device.tag.as_deref();
-    if let Some(status) = model.status {
-        emit(shared, client, device.topics.status(), true, status.as_str().as_bytes().to_vec(), tagged(tag)).await;
-    }
-    for (target, document) in model.states {
-        emit(shared, client, device.topics.state(&target), true, document, tagged(tag)).await;
-    }
 }
 
 /// One message of a batch, ready to publish.
@@ -995,18 +768,19 @@ impl Batch {
     }
 
     /// A device's whole retained model — its `Status`, then every target's `State` — behind what
-    /// waits, to be said before `Active=true`: a host's republish once an instance's read-back is
-    /// granted, published through the rotation within its packet-id budget (multi-device spec
-    /// §4.3, §4.6; the R2 confirming reviews: the model went out by direct publishes, outside the
-    /// budget).
-    pub(crate) fn add_model(&mut self, device: &Device, model: Model) {
+    /// waits, published through the rotation within the packet-id budget (multi-device spec §4.3;
+    /// the R2 confirming reviews: the model went out by direct publishes, outside the budget).
+    /// `first`: said before `Active=true` — a configured instance's, once its read-back is granted
+    /// (§4.6); the fixed instance's goes after it, as R1's did.
+    pub(crate) fn add_model(&mut self, device: &Device, model: Model, first: bool) {
         let (topics, tag) = (&device.topics, device.tag.as_deref());
         debug!(targets = model.states.len(), "Publishing the retained model again after a CONNACK");
+        let said = |out: Out| if first { out.first() } else { out };
         if let Some(status) = model.status {
-            self.push(Part::Model, Out::new(topics.status(), true, status.as_str().as_bytes().to_vec(), None, tag).first());
+            self.push(Part::Model, said(Out::new(topics.status(), true, status.as_str().as_bytes().to_vec(), None, tag)));
         }
         for (target, document) in model.states {
-            self.push(Part::Model, Out::new(topics.state(&target), true, document, None, tag).first());
+            self.push(Part::Model, said(Out::new(topics.state(&target), true, document, None, tag)));
         }
     }
 
@@ -1099,7 +873,7 @@ impl Batch {
 /// [`FLUSH_BOUND`]. Skipped when the session holds no connection: the last will says it then.
 /// `outputs` holds what the stop cut short of each device's last batch: published with what is
 /// pending.
-async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, outputs: &mut Outputs, mode: &mut Mode) {
+async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, outputs: &mut Outputs, host: &mut Lifecycle) {
     // A connection the broker accepted is one to flush on, whether or not its recovery has lasted
     // long enough to close the outage episode (second confirming review 2: a stop within the
     // stability window skipped every answer). The pump's word, not the session's: a CONNACK the
@@ -1124,14 +898,14 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
             crate::worker::report_refused(&slot.device.reports, slot.device.mailbox.disconnected(), STOPPED_BEFORE);
             slot.batch.add(&slot.device, slot.device.reports.take());
         }
-        // A host's SUBSCRIBE or UNSUBSCRIBE outstanding: no more is published than the ids left
-        // before its packet id would come round (MQTT §2.2.1; R2 gate, Codex 3). What does not fit
-        // waits for an acknowledgement, until the ack wait's deadline; past it nothing more goes —
-        // no `Active=false` and no DISCONNECT, so the last will says `Active=false` — rather than
-        // the rest on ids still in use (the R2 confirming reviews). A fixed bridge has no budget.
+        // A SUBSCRIBE or UNSUBSCRIBE outstanding: no more is published than the ids left before its
+        // packet id would come round (MQTT §2.2.1; R2 gate, Codex 3) — a fixed bridge's as a host's.
+        // What does not fit waits for an acknowledgement, until the ack wait's deadline; past it
+        // nothing more goes — no `Active=false` and no DISCONNECT, so the last will says
+        // `Active=false` — rather than the rest on ids still in use (the R2 confirming reviews).
         loop {
             let ctx = Ctx { shared, client, line: incoming.line() };
-            let mut left = mode.flush_budget(&ctx).unwrap_or(usize::MAX);
+            let mut left = host.flush_budget(&ctx).unwrap_or(usize::MAX);
             for part in [Part::Answers, Part::Model, Part::Unsolicited] {
                 // WAIT: mqtt-request
                 left -= outputs.outbox.publish(shared, client, &[part], left).await;
@@ -1144,9 +918,6 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
             if published && left > 0 {
                 break;
             }
-            let Mode::Host(host) = &mut *mode else {
-                break;
-            };
             // WAIT: shutdown-flush
             match tokio::time::timeout_at(ack_deadline.into(), incoming.recv()).await {
                 Ok(Some(
@@ -1490,13 +1261,13 @@ pub(crate) const STOPPED_BEFORE: &str = "the bridge stopped before it ran";
 /// Spawn the MQTT side on the current runtime.
 pub(crate) fn spawn(
     shared: Arc<Shared>,
-    mode: Mode,
+    host: Lifecycle,
     outputs: Outputs,
     events: mpsc::UnboundedReceiver<Event>,
     shutdown: watch::Receiver<bool>,
     set: &mut tokio::task::JoinSet<()>,
 ) {
-    set.spawn(run(shared, mode, outputs, events, shutdown).in_current_span());
+    set.spawn(run(shared, host, outputs, events, shutdown).in_current_span());
 }
 
 #[cfg(test)]
