@@ -630,10 +630,12 @@ inputs:
   it and caps the number abandoned.
 - **A plugin is a second process to deploy.** The host supervises it.
 - **The read-back can miss.** A connection lost before the read-back's SUBACK leaves it to the next
-  session, which subscribes again; but past 5 s without the SUBACK, or with a SUBACK that refuses it
-  (an ACL), the requests are subscribed without it (WARN `read_back_incomplete`), and a replay that
+  session, which subscribes again; but past 5 s without the SUBACK (the session then ends, and the
+  next connection goes without it), or with a SUBACK that refuses it (an ACL), the requests are
+  subscribed without it (WARN `read_back_incomplete`), and a replay that
   meets no "before" values is applied. The read-back's SUBACK is told by its packet id, and only one
-  that grants it counts. The read-back is complete at the next SUBACK, behind its retained replay;
+  that grants it counts. The read-back is complete at the next SUBACK, behind its retained replay,
+  whichever request it acknowledges;
   incomplete, it stays so: the conflict rule's read-back is frozen as it stood when it was first
   done, so a `State` arriving later — a late SUBACK's replay — does not change "before" values in
   mid-process. After a broker-only outage, replayed requests are checked
@@ -645,7 +647,8 @@ inputs:
   SUBACK has come, so a broker that writes a subscription's retained messages right behind its
   SUBACK (Mosquitto does) queues the retained `State` ahead of every retained request. A broker
   that sent retained messages later, on its own schedule, could still interleave them; and past
-  5 s without the SUBACK the requests are subscribed anyway (WARN `read_back_incomplete`).
+  5 s without the SUBACK the requests are subscribed anyway, on the next connection (WARN
+  `read_back_incomplete`).
 
 
 ### Notes from the documentation pass (2026-10-10)
@@ -731,3 +734,15 @@ decided (each one for the owner to confirm or overturn):
   the host's 10 s grant bound; R1 never waited for its requests' SUBACKs at all.
 - **The read-back's UNSUBSCRIBE** waits, as every request does, for the line to clear of publishes
   (nothing published meanwhile), so it may go out ahead of the model rather than behind it.
+- **A late read-back ends the session** (the R2 confirming reviews 2, Claude minor 2): past
+  `READ_BACK_WAIT` without its SUBACK, the read-back is incomplete (WARN `read_back_incomplete`) and
+  the session ends there, rather than going on as R1 did. The abandoned SUBSCRIBE's packet id stays
+  in use until its SUBACK, and only a new connection frees it: going on, the budget held the
+  publication behind it until the 10 s grant bound ended the session anyway. The next connection
+  subscribes the requests at once, without the read-back.
+- **The read-back completes at the first request SUBACK** behind its replay, whichever request it
+  acknowledges, granted or refused, as R1's did (the R2 confirming reviews 2, Codex 1).
+- **The shutdown's flush skips the model of a slot not announced** on the connection (the fixed
+  instance's before `Active=true`, a configured instance's before its read-back's grant): published,
+  it would overwrite the retained State its read-back is still reading. R1's flush published it (the
+  R2 confirming reviews 2, Claude minor 3); its answers and unsolicited reports still go.

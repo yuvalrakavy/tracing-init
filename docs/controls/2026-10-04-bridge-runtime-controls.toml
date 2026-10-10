@@ -139,6 +139,11 @@
 # rows, 209 RED, the same GREEN, and `the_pump_reconnects_inside_its_event_loop` WRONG-REASON (the
 # reused client now shows in either of the scenario's two reconnect assertions: its expected text
 # covers both; RED three runs in three at its fix) (1 h 18 min).
+#
+# The R2 confirming reviews 2's fix round (2026-10-10, on the one-runtime branch): 4 rows added
+# (`the_fixed_read_back_waits_for_the_config_suback`, `a_refused_request_suback_completes_nothing`,
+# `a_late_read_back_goes_on`, `the_flush_publishes_an_unannounced_model`), 1 re-anchored
+# (`the_read_back_stays_subscribed`, into `fixed_read_back_complete`). Runs: see the runner's record.
 
 # The forward queue's high-water WARN (`mqtt_backlog_high`).
 [[control]]

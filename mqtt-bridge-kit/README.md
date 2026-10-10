@@ -135,7 +135,10 @@ named from `--instance`, served by the driver `main` hands to `run`, and owned b
 (multi-device spec §4.1, §4.2). So the fixed instance has no `Config/{instance}` and no `Config/+`
 subscription, no root barrier, no `via` tag, no healing or cleanup, and its `Active` is
 `Active/{instance}`; its CONNACK duties are R1's, in R1's order (the read-back `State/{instance}/#`
-once per process and alone, then its requests, then `Active=true`, the `Version` and the model).
+once per process and alone, then its requests, then `Active=true`, the `Version` and the model). A
+read-back refused, or unacknowledged past its 5 s wait, is said incomplete and the bridge goes on
+without it — past the wait, from a new connection: the session ends there, since only a new
+connection frees the abandoned SUBSCRIBE's packet id.
 Everything else — the session, the per-instance lifecycle that carries those duties, the publication
 rotation, the packet-id budget (MQTT §2.2.1: no SUBSCRIBE, UNSUBSCRIBE or publish takes an id still
 awaiting its acknowledgement) and the bounded shutdown flush — is the host's own code, the same for
@@ -335,7 +338,8 @@ it guarantees to a bridge (details and arguments in the spec's §5.2 and
   waits for the broker's acknowledgements and sends DISCONNECT, within a 2 s flush, inside a 5 s
   shutdown (with a subscription unacknowledged, a bridge or a host publishes only what its packet
   ids allow; what still waits past the flush's ack wait is not published, and the last will says
-  `Active=false`); the runtime is shut down within 1 s more, never dropped (dropping waits on blocking
+  `Active=false`; the model of a device not yet announced on the connection, its read-back still
+  reading, is not published at all); the runtime is shut down within 1 s more, never dropped (dropping waits on blocking
   threads without limit). `main` returns an `ExitCode`.
 - **Nothing blocks on stdout or stderr.** The runtime writes nothing there on a lifecycle path; a
   panic report goes through one bounded, lossy queue to one thread, waited for at most 200 ms, so a

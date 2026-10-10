@@ -37,6 +37,9 @@
 # to direct emits (`session::republish` is gone); none added or retired. `--touched 105283c` at
 # 291d032: 71 rows, 70 RED, `active_before_the_barrier` ANCHOR-MISS (its line moved into
 # `maybe_active`'s configured arm): re-anchored, RED.
+# The R2 confirming reviews 2's fix round (2026-10-10): 1 row added
+# (`a_delete_stopping_cleans_the_instance_owned_again`), 3 re-anchored (`a_delete_clears_nothing`,
+# `a_refused_grant_goes_on`, `an_overdue_grant_goes_on`). Runs: see the runner's record.
 
 # ---- The pump ------------------------------------------------------------------------------------
 

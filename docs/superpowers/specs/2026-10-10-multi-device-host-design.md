@@ -277,7 +277,10 @@ a reply follows the State its command produced and is never starved by later Sta
 round-robin with a persistent cursor, at most 32 messages per device per turn, then ready inbound and
 lifecycle work, then the next device. The session's outbox (instance-level `Error`s, terminal
 answers, a retired runtime's answers, cleanups) is one member of that rotation, after the devices. A stopping device's flush (§4.4) takes its turns until done. At
-process stop, answers first (R1), within the packet-id budget (§4.3). A due timer (a grant's bound, a retry, the sweep) is served before
+process stop, answers first (R1), within the packet-id budget (§4.3); the model of a device not
+announced on the connection (its read-back not yet granted — the fixed instance's, `Active=true`
+not yet said) is not published: it would overwrite the retained State its read-back is still
+reading (the R2 confirming reviews 2, Claude minor 3). A due timer (a grant's bound, a retry, the sweep) is served before
 anything else at every pass, and the lifecycle's events (a construction done, a worker stopped) go
 ahead of the inbound traffic: neither a steady publication nor a steady inbound stream can starve
 them (R2 gate, Codex 1).
@@ -301,9 +304,12 @@ line is R1's: `--instance`, no `--name`, no `--factory-timeout`), and the host s
   waiting for `Active`.
 - **Its CONNACK duties are R1's, in R1's order** (Bridge Runtime spec §5, §9), carried by the host's
   lifecycle: once per process the read-back `State/{instance}/#`, alone; its SUBACK awaited within
-  `READ_BACK_WAIT` (5 s) — refused or late: WARN `read_back_incomplete` and on without it — and the
-  next SUBACK (behind its replay), whichever request it acknowledges, granted or refused, completes
-  it, after which it is unsubscribed; a session that ends
+  `READ_BACK_WAIT` (5 s) — refused or late: WARN `read_back_incomplete` and on without it; late, the
+  session ends at the wait, since only a new connection frees the abandoned SUBSCRIBE's packet id,
+  and the next connection subscribes the requests at once (the R2 confirming reviews 2, Claude
+  minor 2; R1 went on on the same connection) — and, granted, the next SUBACK (behind its replay),
+  whichever request it acknowledges, granted or refused, completes it, after which it is
+  unsubscribed; a session that ends
   before its SUBACK leaves it to the next, one that ends mid-replay leaves it incomplete. Then the
   four request SUBSCRIBEs, `Config/{instance}/#`, `Desired/{instance}/+` (retain-as-published),
   `Desired/{instance}/+/+`, `Command/{instance}` (retain-as-published); once they are handed over
@@ -313,10 +319,12 @@ line is R1's: `--instance`, no `--name`, no `--factory-timeout`), and the host s
 - **The same machinery:** every SUBSCRIBE, UNSUBSCRIBE and publish of it goes through §4.3's
   packet-id budget, which closes R1's own MQTT §2.2.1 risk (`Active`, `Version` and the model used to
   go out right behind the subscriptions, on ids a SUBSCRIBE still held); its output goes through
-  §4.7's rotation; the shutdown's flush is §4.7's, budgeted. As every request does, an outstanding
-  SUBSCRIBE of it is bounded by §4.3's 10 s (an overdue one ends the session — otherwise the budget
-  would freeze publication once the id space wraps); a refusal of one of its request subscriptions
-  is not read, as R1 did not.
+  §4.7's rotation; the shutdown's flush is §4.7's, budgeted (the model of a slot not yet announced —
+  before `Active=true` — is not published at the stop: it would overwrite the retained State the
+  read-back is still reading). As every request does, an outstanding SUBSCRIBE or UNSUBSCRIBE of it
+  is bounded by §4.3's 10 s (an overdue one ends the session — otherwise the budget would freeze
+  publication once the id space wraps); a refusal of one of its request subscriptions is not read,
+  as R1 did not.
 
 ## 5. Store kit (S4)
 
@@ -410,9 +418,10 @@ LinkStatus reset on `Via` change; availability truth table; IR shapes.
 - The 5 s Config-replay fallback (§4.6) can show a stale Status for an instance whose Config has not
   yet arrived.
 - YNCA: one connection per receiver; live testing needs the old system's session released.
-- A fixed bridge (§4.9) whose broker never acknowledges one of its SUBSCRIBEs now ends the session
-  after 10 s and reconnects (R1 went on regardless); with a broker that answers its SUBACKs, nothing
-  differs. A publication held while an UNSUBSCRIBE waits for the line to clear of publishes (the
+- A fixed bridge (§4.9) whose broker never acknowledges one of its SUBSCRIBEs or UNSUBSCRIBEs now
+  ends the session after 10 s and reconnects (R1 went on regardless) — its read-back's SUBACK, after
+  its 5 s wait, so that a broker slow on it (5 to 10 s) costs one reconnect; with a broker that
+  answers its acknowledgements, nothing differs. A publication held while an UNSUBSCRIBE waits for the line to clear of publishes (the
   read-back's, just after `Active`) resumes once the broker acknowledges what is in flight.
 
 ## 9. Documentation (every level, both sides)
