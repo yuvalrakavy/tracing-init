@@ -359,6 +359,16 @@ impl Outputs {
             slot.announced = false;
             slot.batch = Batch::default();
         }
+        // A host's outbox not yet published — instance-level Errors, terminal answers, a retired
+        // runtime's answers, cleanups (pending again in the lifecycle until acknowledged) — is lost
+        // with its connection, and said (multi-device spec §4.4 step 3; R2 gate, Claude minor 2).
+        if !self.outbox.is_empty() {
+            warn!(
+                kind = "output_lost_at_session_end",
+                lost = self.outbox.len(),
+                "Messages of no device were not published before the session ended; dropped"
+            );
+        }
         self.outbox = Batch::default();
         self.outbox_open = false;
         self.owed = true;

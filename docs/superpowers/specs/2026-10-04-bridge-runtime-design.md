@@ -694,9 +694,14 @@ decided (each one for the owner to confirm or overturn):
 - **An overdue grant** (no SUBACK within 10 s) logs `subscription_refused` with `overdue_ms`.
 - **A `Host`'s defaults:** the root is the kind, the bridge id is the kind, the `Version` text is
   `<kind> <version>`, and with no version set `<kind> (mqtt-bridge-kit <its version>)`.
-- **Cleanups survive a session loss:** a delete finished while disconnected keeps its cleanup
-  pending and hands it over at the next session's root barrier. Answers and unsolicited reports of
-  a device that is retired go to a session outbox, published in the next turn.
-- **Known minors, not fixed:** a request flood can keep a stopping device's retire step busy
-  (bounded only by the flood); there is no periodic healing backstop beyond the per-message one;
-  the broker-lost snapshot ignores the read-back (inherited from R1).
+- **Cleanups survive a session loss:** a delete finished while disconnected, or one whose
+  retractions the broker had not acknowledged when the connection went, keeps its cleanup pending
+  and, after the next root barrier, sweeps the instance (a short read-back) and retracts only what
+  still carries its own tag (R2 gate, Codex 7, Claude minor 2). At its first root replay a process
+  also reads `Status/+` and sweeps every instance whose Status carries its tag but which it does not
+  own (Claude 3: a delete made while it was down). Answers and unsolicited reports of a device that
+  is retired go to the session's outbox, a member of the publication rotation; an outbox dropped
+  with its connection is said (WARN `output_lost_at_session_end`).
+- **Known minors, not fixed:** there is no periodic healing backstop beyond the per-message one;
+  the broker-lost snapshot ignores the read-back (inherited from R1). (The retire-step flood is
+  fixed: R2 gate, Codex 2.)

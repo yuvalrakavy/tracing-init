@@ -543,3 +543,24 @@ async fn the_ack_wait_and_the_linger_fit_in_the_flushs_bound() {
     let cut = capture.records().into_iter().filter_map(|r| r.field("message").map(str::to_owned)).find(|m| m.contains("ran out its bound"));
     assert!(cut.is_none(), "the flush ran out its bound: its ack wait and linger do not fit in it ({cut:?})");
 }
+
+/// A host's outbox — instance-level `Error`s, terminal answers, cleanups — still holding messages
+/// when a new session starts is dropped with one WARN `output_lost_at_session_end`, never silently
+/// (multi-device spec §4.4 step 3; R2 gate, Claude minor 2).
+#[test]
+fn an_outbox_dropped_at_a_new_session_is_said() {
+    let capture = crate::test_support::Capture::start();
+    let mut outputs = Outputs::new();
+    outputs.queue_outbox(Part::Answers, Out::new("T/Error/Lamp".into(), false, b"{}".to_vec(), None, None));
+    outputs.queue_outbox(Part::Model, Out::new("T/Status/Lamp".into(), true, Vec::new(), None, Some("host")));
+    outputs.session_started();
+    let lost = capture.of_kind("output_lost_at_session_end");
+    assert!(
+        lost.len() == 1 && lost[0].level == tracing::Level::WARN && lost[0].field("lost") == Some("2"),
+        "an outbox dropped at a new session was not said: {:#?}",
+        capture.records()
+    );
+    assert!(outputs.outbox.is_empty());
+    outputs.session_started();
+    assert_eq!(capture.of_kind("output_lost_at_session_end").len(), 1, "an empty outbox was said lost");
+}

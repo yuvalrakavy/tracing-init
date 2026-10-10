@@ -276,10 +276,54 @@ impl Instance {
 enum Purpose {
     Configs,
     Barrier,
-    Read { instance: String, rt: u64 },
-    Setup { instance: String, rt: u64 },
-    Requests { instance: String, rt: u64 },
-    Unsub { instance: String, rt: u64 },
+    Read {
+        instance: String,
+        rt: u64,
+    },
+    Setup {
+        instance: String,
+        rt: u64,
+    },
+    Requests {
+        instance: String,
+        rt: u64,
+    },
+    Unsub {
+        instance: String,
+        rt: u64,
+    },
+    /// The process's first root replay of `Status/+`, closed by the barrier: its own litter.
+    Statuses,
+    /// Its unsubscription, once read.
+    StatusesDone,
+    /// A cleanup's read-back of an instance this process does not own (`Sweep`).
+    Sweep {
+        instance: String,
+    },
+    /// Its unsubscriptions: the last closes its replay.
+    SweepDone {
+        instance: String,
+    },
+}
+
+/// A cleanup's short read-back of an instance this process does not own (§4.5): `State/{i}/+` and
+/// `Status/{i}` subscribed, then unsubscribed — the last UNSUBACK closes the replay — and only what
+/// still carries this process's own tag is retracted.
+#[derive(Default)]
+struct Sweep {
+    /// Each topic's retained value as replayed: its `via` (exactly one, or none).
+    seen: BTreeMap<String, Option<String>>,
+    /// UNSUBACKs awaited.
+    closing: usize,
+}
+
+/// The process's first root replay of `Status/+` (§4.5, litter of instances deleted while it was
+/// down): not read yet, being read (the instances whose retained `Status` carries its own tag), or
+/// done.
+enum Scan {
+    Pending,
+    Reading(BTreeSet<String>),
+    Done,
 }
 
 /// A SUBSCRIBE or UNSUBSCRIBE the lifecycle asks for.
@@ -393,13 +437,19 @@ pub(crate) struct Lifecycle {
     conn: Conn,
     next_id: u64,
     next_sweep: Option<Instant>,
-    /// The bridge cleanup of deleted instances not yet handed to a connection (a delete that ended
-    /// while the broker was away): each instance's own tagged topics, retracted once the next root
-    /// replay shows the instance is not this process's again (multi-device spec §4.5).
-    cleanups: BTreeMap<String, Vec<String>>,
-    /// The cleanups queued in this connection's outbox: back to `cleanups` if the connection is lost
-    /// before the outbox has gone out.
-    queued_cleanups: BTreeMap<String, Vec<String>>,
+    /// The bridge cleanups not yet done (a delete that ended while the broker was away, one lost
+    /// with its connection, an instance deleted while the process was down): swept after the next
+    /// root replay if the instance is not this process's again — its slot read afresh, and only
+    /// what still carries the own tag retracted (multi-device spec §4.5; R2 gate, Codex 7).
+    cleanups: BTreeSet<String>,
+    /// The cleanups whose retractions are in this connection's outbox, with the session's publish
+    /// count once the outbox has handed them over: done when the broker has acknowledged that many,
+    /// pending again (`cleanups`) if the connection is lost first (R2 gate, Claude minor 2).
+    queued_cleanups: Vec<(String, Option<u64>)>,
+    /// The cleanups' read-backs under way, by instance.
+    sweeps: BTreeMap<String, Sweep>,
+    /// The first root replay's `Status/+` read.
+    scan: Scan,
 }
 
 impl Lifecycle {
@@ -415,8 +465,10 @@ impl Lifecycle {
             conn: Conn::default(),
             next_id: 1,
             next_sweep: None,
-            cleanups: BTreeMap::new(),
-            queued_cleanups: BTreeMap::new(),
+            cleanups: BTreeSet::new(),
+            queued_cleanups: Vec::new(),
+            sweeps: BTreeMap::new(),
+            scan: Scan::Pending,
         }
     }
 
@@ -637,7 +689,7 @@ impl Lifecycle {
     pub(crate) async fn on_connack(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<(), Failed> {
         self.conn = Conn { connected: true, ..Conn::default() };
         outputs.outbox_open = true;
-        let root = &self.settings.root;
+        let root = self.settings.root.clone();
         let configs = Self::filter(format!("{root}/Config/+"), false);
         let barrier = Self::filter(format!("{root}/_barrier/{}", self.settings.id), false);
         self.request_subscription(Some(ctx), Purpose::Configs, vec![configs]).await?;
@@ -657,6 +709,14 @@ impl Lifecycle {
         // The barrier behind the instances already owned: their read-backs are asked for ahead of
         // it, so a late barrier SUBACK — holding the ids handed out after it (`Conn`) — delays
         // their bootstrap the least.
+        // The process's first root replay also reads `Status/+`, closed by the same barrier: the
+        // instances whose retained Status carries this process's tag though it does not own them
+        // (deleted while it was down) are swept (§4.5; R2 gate, Claude 3).
+        if matches!(self.scan, Scan::Pending) {
+            self.scan = Scan::Reading(BTreeSet::new());
+            let statuses = Self::filter(format!("{root}/Status/+"), false);
+            self.request_subscription(Some(ctx), Purpose::Statuses, vec![statuses]).await?;
+        }
         self.request_subscription(Some(ctx), Purpose::Barrier, vec![barrier]).await?;
         self.drive(ctx, outputs).await
     }
@@ -707,7 +767,16 @@ impl Lifecycle {
             Purpose::Barrier => {
                 self.conn.barrier_acked = true;
                 self.replay_complete(Some(ctx), outputs).await?;
-                self.hand_over_cleanups(outputs);
+                if let Scan::Reading(own) = std::mem::replace(&mut self.scan, Scan::Done) {
+                    let litter: Vec<String> = own.into_iter().filter(|name| !self.instances.contains_key(name)).collect();
+                    if !litter.is_empty() {
+                        info!(instances = litter.len(), "Retained Status tagged with this process for instances it does not own: swept");
+                    }
+                    self.cleanups.extend(litter);
+                    let statuses = format!("{}/Status/+", self.settings.root);
+                    self.request_unsubscription(Some(ctx), Purpose::StatusesDone, statuses).await?;
+                }
+                self.hand_over_cleanups(ctx).await?;
             }
             Purpose::Read { instance, rt } => {
                 let Some(device) = self.current(&instance, rt).map(|rt| rt.device.clone()) else {
@@ -758,12 +827,41 @@ impl Lifecycle {
                 }
                 self.start_if_ready(Some(ctx), outputs, &instance).await?;
             }
-            Purpose::Unsub { .. } => {}
+            Purpose::Sweep { instance } => {
+                // Owned again meanwhile: its own read-back needs these filters, and heals its slot.
+                if self.instances.contains_key(&instance) {
+                    self.sweeps.remove(&instance);
+                    return Ok(());
+                }
+                let Ok(topics) = Topics::new(&self.settings.root, &instance) else {
+                    return Ok(());
+                };
+                let mut closing = 0;
+                for filter in [topics.state_target_filter(), topics.status()] {
+                    if self.request_unsubscription(Some(ctx), Purpose::SweepDone { instance: instance.clone() }, filter).await? {
+                        closing += 1;
+                    }
+                }
+                if let Some(sweep) = self.sweeps.get_mut(&instance) {
+                    sweep.closing = closing;
+                }
+            }
+            Purpose::Unsub { .. } | Purpose::Statuses | Purpose::StatusesDone | Purpose::SweepDone { .. } => {}
         }
         Ok(())
     }
 
     async fn unsubscribed(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs, purpose: Purpose) -> Result<(), Failed> {
+        if let Purpose::SweepDone { instance } = &purpose {
+            let done = self.sweeps.get_mut(instance).is_some_and(|sweep| {
+                sweep.closing = sweep.closing.saturating_sub(1);
+                sweep.closing == 0
+            });
+            if done {
+                self.sweep_done(outputs, instance);
+            }
+            return Ok(());
+        }
         if let Purpose::Unsub { instance, rt } = purpose {
             let done = match self.instances.get_mut(&instance).and_then(|i| i.rt.as_mut()).filter(|r| r.id == rt) {
                 Some(rt) if matches!(rt.phase, Phase::Stopping { step: Step::Unsubscribe, .. }) => {
@@ -840,10 +938,26 @@ impl Lifecycle {
             return Ok(Flow::Continue);
         };
         let segments: Vec<&str> = rest.split('/').collect();
+        // The first root replay's `Status/+`: an instance whose retained Status carries the own tag.
+        if let (Scan::Reading(own), ["Status", instance]) = (&mut self.scan, segments.as_slice()) {
+            if publish.retain && !publish.payload.is_empty() && single_via(publish).as_deref() == Some(self.settings.id.as_str()) {
+                own.insert((*instance).to_owned());
+            }
+        }
         match segments.as_slice() {
             ["Config", instance] => self.config(Some(ctx), outputs, instance, publish).await?,
             ["_barrier", ..] => {}
             [_, instance, ..] if self.instances.contains_key(*instance) => self.route_instance(outputs, instance, topic, publish, received),
+            // A cleanup's read-back of an instance this process does not own.
+            ["State" | "Status", instance, ..] if self.sweeps.contains_key(*instance) => {
+                if let Some(sweep) = self.sweeps.get_mut(*instance) {
+                    if publish.payload.is_empty() {
+                        sweep.seen.remove(topic);
+                    } else {
+                        sweep.seen.insert(topic.to_owned(), single_via(publish));
+                    }
+                }
+            }
             _ => debug!(topic, "A publish for no instance this process owns; ignored"),
         }
         self.drive(ctx, outputs).await?;
@@ -928,9 +1042,15 @@ impl Lifecycle {
     /// After a turn of the rotation: a stopping device whose output has retired goes on to its
     /// unsubscriptions.
     pub(crate) async fn on_turn_done(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<Flow, Failed> {
+        // The cleanups the outbox has handed over are done once the broker has acknowledged them.
         if outputs.outbox.is_empty() {
-            self.queued_cleanups.clear();
+            let enqueued = ctx.shared.enqueued.load(std::sync::atomic::Ordering::SeqCst);
+            for (_, handed) in self.queued_cleanups.iter_mut().filter(|(_, handed)| handed.is_none()) {
+                *handed = Some(enqueued);
+            }
         }
+        let acked = ctx.line.acknowledged();
+        self.queued_cleanups.retain(|(_, handed)| handed.map_or(true, |handed| handed > acked));
         let retiring: Vec<String> = self
             .instances
             .values()
@@ -951,9 +1071,14 @@ impl Lifecycle {
         self.conn = Conn::default();
         outputs.outbox_open = false;
         outputs.set_budget(None);
-        // Cleanups queued in this connection's outbox may not have gone out: pending again.
+        // Cleanups not acknowledged on this connection, and the sweeps under way: pending again.
         let queued = std::mem::take(&mut self.queued_cleanups);
-        self.cleanups.extend(queued);
+        self.cleanups.extend(queued.into_iter().map(|(name, _)| name));
+        let sweeping = std::mem::take(&mut self.sweeps);
+        self.cleanups.extend(sweeping.into_keys());
+        if matches!(self.scan, Scan::Reading(_)) {
+            self.scan = Scan::Pending;
+        }
         let names: Vec<String> = self.instances.keys().cloned().collect();
         for name in names {
             let Some(rt) = self.instances.get_mut(&name).and_then(|i| i.rt.as_mut()) else {
@@ -1066,20 +1191,46 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// The root replay is complete: the pending cleanups of instances that are not this process's
-    /// again are queued in the outbox.
-    fn hand_over_cleanups(&mut self, outputs: &mut Outputs) {
-        let id = self.settings.id.clone();
-        for (name, topics) in std::mem::take(&mut self.cleanups) {
-            if self.instances.contains_key(&name) {
+    /// The root replay is complete: each pending cleanup of an instance that is not this process's
+    /// again is swept — its slot read afresh (`Sweep`), so only what still carries the own tag is
+    /// retracted (§4.5; R2 gate, Codex 7: the topics cached at the delete could be another owner's
+    /// by now).
+    async fn hand_over_cleanups(&mut self, ctx: &Ctx<'_>) -> Result<(), Failed> {
+        for name in std::mem::take(&mut self.cleanups) {
+            if self.instances.contains_key(&name) || self.sweeps.contains_key(&name) {
                 continue;
             }
-            info!(instance = %name, topics = topics.len(), "Clearing a deleted instance's retained topics after the reconnect");
-            for topic in &topics {
-                outputs.queue_outbox(Part::Model, Out::new(topic.clone(), true, Vec::new(), None, Some(&id)));
-            }
-            self.queued_cleanups.insert(name, topics);
+            let Ok(topics) = Topics::new(&self.settings.root, &name) else {
+                continue;
+            };
+            debug!(instance = %name, "A deleted instance's slot read again for its cleanup");
+            self.sweeps.insert(name.clone(), Sweep::default());
+            let filters = vec![Self::filter(topics.state_target_filter(), false), Self::filter(topics.status(), false)];
+            self.request_subscription(Some(ctx), Purpose::Sweep { instance: name }, filters).await?;
         }
+        Ok(())
+    }
+
+    /// A sweep's replay is closed: what still carries the own tag is retracted, unless the instance
+    /// is this process's again (its own healing then repairs its slot).
+    fn sweep_done(&mut self, outputs: &mut Outputs, name: &str) {
+        let Some(sweep) = self.sweeps.remove(name) else {
+            return;
+        };
+        if self.instances.contains_key(name) {
+            return;
+        }
+        let id = self.settings.id.clone();
+        let own: Vec<String> = sweep.seen.into_iter().filter(|(_, via)| via.as_deref() == Some(id.as_str())).map(|(t, _)| t).collect();
+        if own.is_empty() {
+            debug!(instance = %name, "A deleted instance's slot holds nothing tagged with this process");
+            return;
+        }
+        info!(instance = %name, topics = own.len(), "Clearing a deleted instance's retained topics this process tagged");
+        for topic in own {
+            outputs.queue_outbox(Part::Model, Out::new(topic, true, Vec::new(), None, Some(&id)));
+        }
+        self.queued_cleanups.push((name.to_owned(), None));
     }
 
     /// A Config naming this process was rejected: one `Error/{instance}` without a target, WARN
@@ -1109,7 +1260,7 @@ impl Lifecycle {
         info!(instance = name, "The instance's Config names this process; acquired");
         // Its own healing covers a cleanup still pending from an earlier delete.
         self.cleanups.remove(name);
-        self.queued_cleanups.remove(name);
+        self.queued_cleanups.retain(|(queued, _)| queued != name);
         self.instances.insert(
             name.to_owned(),
             Instance {
@@ -1689,14 +1840,14 @@ impl Lifecycle {
                         for topic in &own {
                             outputs.queue_outbox(Part::Model, Out::new(topic.clone(), true, Vec::new(), None, Some(&id)));
                         }
-                        self.queued_cleanups.insert(name.to_owned(), own);
+                        self.queued_cleanups.push((name.to_owned(), None));
                     } else {
                         info!(
                             instance = name,
                             topics = own.len(),
                             "A deleted instance's retained topics are cleared after the next root replay"
                         );
-                        self.cleanups.insert(name.to_owned(), own);
+                        self.cleanups.insert(name.to_owned());
                     }
                 }
                 let Some(instance) = self.instances.get_mut(name) else {
@@ -1779,12 +1930,7 @@ impl Lifecycle {
 /// retraction, makes the owner republish its current value for that topic, coalesced (multi-device
 /// spec §4.5). A topic it has no current value for is left as it is.
 fn observe_slot(instance: &mut Instance, id: &str, topic: &str, inbound: &Inbound, publish: &Publish) {
-    let vias: Vec<&str> = publish
-        .properties
-        .as_ref()
-        .map(|p| p.user_properties.iter().filter(|(k, _)| k == "via").map(|(_, v)| v.as_str()).collect())
-        .unwrap_or_default();
-    let via = (vias.len() == 1).then(|| vias[0].to_owned());
+    let via = single_via(publish);
     let payload = &publish.payload[..];
     if payload.is_empty() {
         instance.slot.remove(topic);
@@ -1821,6 +1967,16 @@ fn observe_slot(instance: &mut Instance, id: &str, topic: &str, inbound: &Inboun
     } else if reasserted {
         debug!(instance = %instance.name, topic, "An owned slot was retracted; republishing the owner's value");
     }
+}
+
+/// A publish's `via` user property: exactly one, or none (none or several — §3).
+fn single_via(publish: &Publish) -> Option<String> {
+    let vias: Vec<&str> = publish
+        .properties
+        .as_ref()
+        .map(|p| p.user_properties.iter().filter(|(k, _)| k == "via").map(|(_, v)| v.as_str()).collect())
+        .unwrap_or_default();
+    (vias.len() == 1).then(|| vias[0].to_owned())
 }
 
 /// The terminal policy of an instance that takes no requests — stopping, or disabled (multi-device

@@ -377,6 +377,13 @@ impl Line {
         self.written.load(Ordering::SeqCst) >= enqueued && self.inflight.load(Ordering::SeqCst) == 0
     }
 
+    /// How many of the session's publishes the broker has acknowledged: written, less those in
+    /// flight (QoS 1 acknowledgements come in order).
+    pub fn acknowledged(&self) -> u64 {
+        let inflight = u64::try_from(self.inflight.load(Ordering::SeqCst)).unwrap_or(u64::MAX);
+        self.written.load(Ordering::SeqCst).saturating_sub(inflight)
+    }
+
     /// How many packet ids rumqttc 0.25 cycles through on this connection — the broker's receive
     /// maximum from its CONNACK (none: 65535), as rumqttc takes it with no upper limit set — and so
     /// how many ids it hands out, publishes and requests alike, before one comes round again. Zero

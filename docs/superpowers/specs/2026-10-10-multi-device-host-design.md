@@ -209,6 +209,21 @@ In order:
   reconciliation), the bridge retracts the `Status/{i}` and `State/{i}/…` topics whose **current**
   retained value carries its own tag (from its read-back). A clear that races a successor's write is
   repaired by the successor's healing.
+  - **A cleanup that cannot be done at once** (the delete ended while the broker was away, its
+    retractions were lost with their connection before the broker acknowledged them) stays pending
+    and is done after the next root replay (closed by the barrier), if the instance is not the
+    process's again — by a **sweep**: a short per-instance read-back (`State/{i}/+`, `Status/{i}`
+    subscribed, then unsubscribed; the last UNSUBACK closes the replay) enumerates the topics and
+    their current tags, and only those still carrying the process's own tag are retracted. A
+    cleanup's topics are never cleared from a list cached at the delete (R2 gate, Codex 7). A
+    cleanup counts as done only once the broker has acknowledged its retractions.
+  - **Litter of a delete while the process was down** (amended, R2 gate, Claude 3; D4 = (a) makes a
+    restart routine): at the process's **first** root replay it also reads `Status/+`, closed by the
+    same barrier, then unsubscribes it. Every instance whose retained `Status` carries the process's
+    own tag but which it does not own is swept as above. So a delete made while the process was
+    down leaves no owner-tagged `Status`/`State` that a later re-creation under the same bridge id
+    would read as current. (An instance released by a kind mismatch is swept the same way at the
+    next restart.)
 - **The Store clears only what it publishes** (§5.1). Litter left by a bridge that is permanently gone
   (decommissioned) is removed by an explicit Admin UI action ("purge retained for instance"), a
   follow-up — not an automatic janitor.

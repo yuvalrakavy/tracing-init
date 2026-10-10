@@ -234,6 +234,126 @@ async fn a_delete_finished_while_disconnected_is_cleared_after_the_reconnect() {
     .await
 }
 
+/// A delete whose stop ends while the broker is away re-reads the instance's slot before its
+/// deferred cleanup, and clears only what still carries its own tag: a `State` another process
+/// wrote meanwhile (the instance's new owner) stays (§4.5; R2 gate, Codex 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deferred_cleanup_clears_only_what_still_carries_its_own_tag() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| {
+            d.set("t1", "power", json!(true));
+            d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(1000)));
+        });
+        let h = serving("deferred-recheck", &lamp, fleet).await;
+        let t = h.topics(&lamp);
+        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
+        let device = h.fleet.device(&lamp).expect("built");
+        assert!(h.delete(&lamp));
+        assert!(h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the worker was never stopped");
+        // Away until the stop has ended; meanwhile another process — the instance's new owner —
+        // writes its State.
+        let before = h.broker.connections();
+        h.broker.refuse_connections(true);
+        h.broker.drop_connection();
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let theirs = json!({"power": false}).to_string();
+        h.broker.retain(&t.state("t1"), theirs.clone(), &SendOptions::default().retained().user_property("via", "the-new-owner"));
+        h.broker.refuse_connections(false);
+        assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
+        assert!(
+            h.eventually(BOUND, |h| h.broker.retained_on(&t.status()).is_none()).await,
+            "the deleted instance's own Status was not cleared after the reconnect"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            h.broker.retained_on(&t.state("t1")).as_deref(),
+            Some(theirs.as_bytes()),
+            "a deferred cleanup cleared a State another process tagged"
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// An instance deleted while its owning process is down (D4's restart): at its first root replay
+/// the restarted process finds the retained `Status` tagged with its own id for an instance it does
+/// not own, re-reads that instance's slot and clears what carries its tag — so a re-creation under
+/// the same bridge id never reads the old `State` as its "before" (§4.5; R2 gate, Claude 3).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_deleted_while_its_process_was_down_is_cleaned_at_the_restart() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| d.set("t1", "power", json!(true)));
+        let mut h = HostHarness::start("restart-litter", fleet).await;
+        let t = h.topics(&lamp);
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
+        h.abort();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.broker.retain(&h.config_topic(&lamp), "", &SendOptions::default());
+        // The restart: the same bridge id, the same broker.
+        let restarted = HostHarness::join(h.broker.clone(), &h.bridge, Fleet::new(acknowledged()), |host| host).await;
+        let active = format!("{ROOT}/Active/{}", h.bridge);
+        assert!(restarted.eventually(BOUND, |r| r.broker.retained_on(&active).as_deref() == Some(&b"true"[..])).await);
+        assert!(
+            restarted
+                .eventually(BOUND, |r| r.broker.retained_on(&t.state("t1")).is_none() && r.broker.retained_on(&t.status()).is_none())
+                .await,
+            "a deleted instance's own tagged topics survived the restart: State/t1 {:?}, Status {:?}",
+            restarted.broker.retained_on(&t.state("t1")),
+            restarted.broker.retained_on(&t.status())
+        );
+        // Re-created, same bridge id; the new device reports only t2.
+        restarted.fleet.prepare(&lamp, |d| d.set("t2", "power", json!(false)));
+        assert!(restarted.configure(&lamp, json!({"address": "b"})));
+        assert!(restarted.eventually(BOUND, |r| r.status(&lamp).as_deref() == Some("connected")).await);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(restarted.broker.retained_on(&t.state("t1")).is_none(), "the old State came back");
+        assert!(restarted.stop().await);
+    })
+    .await
+}
+
+/// A delete's cleanup is pending until the broker has acknowledged it, not merely until it is
+/// handed to rumqttc: a connection lost first — its retractions written but never read — leaves it
+/// to the next connection, which clears the instance's own tagged topics (§4.5; R2 gate, Claude
+/// minor 2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleanup_lost_with_its_connection_is_done_on_the_next() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| d.set("t1", "power", json!(true)));
+        let h = serving("cleanup-lost", &lamp, fleet).await;
+        let t = h.topics(&lamp);
+        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
+        // The UNSUBACKs held; released with the broker no longer reading: the cleanup that follows
+        // them is written to a connection that never reads it.
+        h.broker.hold_subacks();
+        assert!(h.delete(&lamp));
+        assert!(
+            h.eventually(BOUND, |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.status()))).await,
+            "the deleted instance's read-back was never unsubscribed"
+        );
+        let before = h.broker.connections();
+        h.broker.release_subacks();
+        h.broker.stop_reading();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        h.broker.drop_connection();
+        assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
+        assert!(
+            h.eventually(BOUND, |h| [t.status(), t.state("t1")].iter().all(|topic| h.broker.retained_on(topic).is_none())).await,
+            "a cleanup lost with its connection was never done: {:?}",
+            h.broker.retained()
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// Whether `filter` was subscribed after `unsubscribed` was unsubscribed, in the broker's events.
 fn subscribed_since(h: &HostHarness, filter: &str, unsubscribed: &str) -> bool {
     let labels = h.labels();
@@ -384,7 +504,9 @@ async fn a_failing_new_factory_leaves_the_current_device_serving() {
             h.replies(reply)
         );
         assert!(old.calls_of(Op::Disconnect).is_empty(), "the current device was stopped");
-        assert!(!h.labels().iter().any(|l| l.starts_with("unsub ")), "something was unsubscribed: {:#?}", h.labels());
+        // (The first root replay's `Status/+` read is unsubscribed once read: no instance's.)
+        let instance_unsub = |l: &String| l.starts_with("unsub ") && !l.ends_with("/Status/+");
+        assert!(!h.labels().iter().any(instance_unsub), "something was unsubscribed: {:#?}", h.labels());
         assert_eq!(h.status(&lamp).as_deref(), Some("connected"));
         assert!(h.stop().await);
     })
