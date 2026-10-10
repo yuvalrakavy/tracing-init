@@ -232,7 +232,9 @@ In order:
 On every CONNACK: subscribe `Config/+`; acquire instances as their Configs replay (each with its
 §4.3 bootstrap). The session publishes, **before** `Active/{bridge id}=true`, the current lifecycle
 Status of every owned instance it has reconciled (`connecting`, `connected`, `unreachable`,
-`disabled`, or `unreachable` for a failed one). Then `Active=true` is published when
+`disabled`, or `unreachable` for a failed one; `connecting` for one whose device is stopping for a
+successor — the stop spanning the reconnect; R2 gate, Claude minor 4). Then `Active=true` is
+published when
 
 `all subscriptions requested so far are granted && (root barrier acknowledged || 5 s since the Config/+ grant)`.
 

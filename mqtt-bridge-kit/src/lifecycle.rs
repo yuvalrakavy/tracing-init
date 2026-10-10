@@ -697,10 +697,15 @@ impl Lifecycle {
         for name in names {
             let phase = self.instances.get(&name).and_then(|i| i.rt.as_ref()).map(|rt| rt.phase);
             // A stop that ends disabled keeps S1; one that ends deleted reads its slot afresh for
-            // its cleanup. A successor bootstraps its own.
+            // its cleanup; one for a successor says `connecting` before `Active=true` (§4.6; R2
+            // gate, Claude minor 4) — the successor then bootstraps its own.
             let read = matches!(
                 phase,
-                Some(Phase::Live | Phase::Disabled | Phase::Stopping { then: Then::Disable | Then::Release { cleanup: true }, .. })
+                Some(
+                    Phase::Live
+                        | Phase::Disabled
+                        | Phase::Stopping { then: Then::Disable | Then::Release { cleanup: true } | Then::Successor, .. }
+                )
             );
             if read {
                 self.request_read(Some(ctx), &name).await?;
@@ -789,6 +794,15 @@ impl Lifecycle {
                 if self.current(&instance, rt).is_some_and(|rt| matches!(rt.phase, Phase::Live | Phase::Disabled)) {
                     outputs.announce(rt);
                     session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;
+                }
+                // Stopping for a successor across a reconnect: the instance's lifecycle Status is
+                // the successor's to come, `connecting` — said before `Active=true`, so the old
+                // device's retained `connected` does not stand meanwhile (§4.6; R2 gate, Claude
+                // minor 4).
+                if self.current(&instance, rt).is_some_and(|rt| matches!(rt.phase, Phase::Stopping { then: Then::Successor, .. })) {
+                    let status = LinkStatus::Connecting.as_str().as_bytes().to_vec();
+                    let tag = session::tagged(Some(&self.settings.id));
+                    session::emit(ctx.shared, ctx.client, device.topics.status(), true, status, tag).await;
                 }
                 if self.current(&instance, rt).is_some_and(|rt| rt.phase == Phase::Live) {
                     self.request_setup(Some(ctx), &instance).await?;

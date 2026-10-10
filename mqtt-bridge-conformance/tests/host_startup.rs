@@ -214,3 +214,34 @@ async fn the_statuses_are_republished_before_active_after_a_reconnect() {
     })
     .await
 }
+
+/// A Config change whose stop spans a reconnect: the instance's current lifecycle Status —
+/// `connecting`, its successor coming — is published on the new connection before `Active=true`,
+/// so the old device's retained `connected` does not stand while it is replaced (§4.6; R2 gate,
+/// Claude minor 4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_spanning_a_reconnect_has_its_status_republished_before_active() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        // The old device's stop takes a while: its disconnect blocks the worker for 3 s.
+        fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(3000))));
+        let h = HostHarness::start("stop-reconnect", fleet).await;
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(BOUND, |h| actives(h) == 1).await);
+        let old = h.fleet.device(&lamp).expect("built");
+        assert!(h.configure(&lamp, json!({"address": "b"})));
+        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
+        let mark = h.labels().len();
+        h.broker.drop_connection();
+        assert!(h.eventually(BOUND, |h| actives(h) == 2).await, "Active=true never came after the reconnect");
+        let labels = h.labels()[mark..].to_vec();
+        let active = labels.iter().position(|l| *l == format!("pub {} true", h.active_topic())).expect("Active=true");
+        let status = labels.iter().position(|l| l.starts_with(&format!("pub {} ", h.topics(&lamp).status())));
+        assert!(status.is_some_and(|at| at < active), "the stopping instance's Status was not republished before Active=true: {labels:#?}");
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await, "the successor never connected");
+        assert!(h.stop().await);
+    })
+    .await
+}
