@@ -39,7 +39,7 @@ use crate::host::{DeviceConfig, Factory, FactoryError};
 use crate::mailbox::Mailbox;
 use crate::pump::PumpEvent;
 use crate::replies::{reply_payload, Answer, ReplyTo};
-use crate::reports::{LinkStatus, Outbound, Reports};
+use crate::reports::{LinkStatus, Reports};
 use crate::session::{self, Batch, Ctx, Device, Failed, Flow, Out, Outputs, Part};
 use crate::topics::{Inbound, Topics};
 use crate::wire::{self, ErrorReport, Reason};
@@ -682,7 +682,7 @@ impl Lifecycle {
         match segments.as_slice() {
             ["Config", instance] => self.config(Some(ctx), outputs, instance, publish).await?,
             ["_barrier", ..] => {}
-            [_, instance, ..] if self.instances.contains_key(*instance) => self.route_instance(instance, topic, publish, received),
+            [_, instance, ..] if self.instances.contains_key(*instance) => self.route_instance(outputs, instance, topic, publish, received),
             _ => debug!(topic, "A publish for no instance this process owns; ignored"),
         }
         Ok(Flow::Continue)
@@ -1407,6 +1407,13 @@ impl Lifecycle {
             device.reports.request_error(ErrorReport::new(reason, error).target(Some(&value.target)).property(&value.property));
         }
         rt.phase = Phase::Stopping { step: Step::Retire, then };
+        // Its retirement output is frozen now — finite: what its reports hold goes into its slot's
+        // batch, and the retirement waits for that batch alone. Later requests' terminal answers go
+        // to the outbox (`terminal`), so no flood can keep the stop open (R2 gate, Codex 2).
+        let (id, device) = (rt.id, rt.device.clone());
+        if let Some(slot) = outputs.slot(id) {
+            slot.batch.add(&device, device.reports.take());
+        }
         self.check_retired(ctx, outputs, name).await
     }
 
@@ -1426,7 +1433,8 @@ impl Lifecycle {
             // A stopping device's output may go out on any connection — this one may be newer than
             // the stop, and began with nothing announced.
             outputs.announce(id);
-            let pending = outputs.slot(id).is_some_and(|slot| !slot.batch.is_empty()) || device.reports.has_untaken();
+            // The frozen output alone (`worker_stopped`).
+            let pending = outputs.slot(id).is_some_and(|slot| !slot.batch.is_empty());
             if pending {
                 return Ok(());
             }
@@ -1548,7 +1556,7 @@ impl Lifecycle {
     // ---- Routing ---------------------------------------------------------------------------
 
     /// A publish on one of an owned instance's lanes.
-    fn route_instance(&mut self, name: &str, topic: &str, publish: &Publish, received: Instant) {
+    fn route_instance(&mut self, outputs: &mut Outputs, name: &str, topic: &str, publish: &Publish, received: Instant) {
         let id = self.settings.id.clone();
         let Some(instance) = self.instances.get_mut(name) else {
             return;
@@ -1567,11 +1575,12 @@ impl Lifecycle {
         match rt.phase {
             Phase::Stopping { .. } => terminal(
                 &device,
+                outputs,
                 topic,
                 publish,
                 "the instance's device is being stopped (its Config changed, or it was disabled, deleted or moved)",
             ),
-            Phase::Disabled => terminal(&device, topic, publish, "the instance is disabled"),
+            Phase::Disabled => terminal(&device, outputs, topic, publish, "the instance is disabled"),
             Phase::Live => {
                 if let Inbound::Config { target } = &inbound {
                     // Present on this connection: replayed, or written live since S2 was asked for
@@ -1587,7 +1596,7 @@ impl Lifecycle {
                 }
                 // A failed instance refuses target-level writes, as commands (multi-device spec §4.3).
                 if failed && matches!(inbound, Inbound::DesiredTarget { .. }) {
-                    return terminal(&device, topic, publish, "the instance's device could not be built from its Config");
+                    return terminal(&device, outputs, topic, publish, "the instance's device could not be built from its Config");
                 }
                 let _entered = device.span.enter();
                 session::route(&device, topic, publish, received);
@@ -1650,25 +1659,30 @@ fn observe_slot(instance: &mut Instance, id: &str, topic: &str, inbound: &Inboun
 /// spec §4.4 step 1): commands and reads refused, with their replies; target-level Desired refused;
 /// property Desired ignored (retained: it replays to a successor); target Configs ignored (they
 /// replay too). Nothing is posted to any mailbox.
-fn terminal(device: &Device, topic: &str, publish: &Publish, why: &str) {
+///
+/// The answers go to the session's outbox, a member of the fair rotation — not to the device's
+/// reports: a stopping device's retirement output is frozen at its worker's stop, so requests that
+/// keep arriving through its still-installed subscriptions can never hold the stop open (R2 gate,
+/// Codex 2).
+fn terminal(device: &Device, outputs: &mut Outputs, topic: &str, publish: &Publish, why: &str) {
     let _entered = device.span.enter();
     let payload = &publish.payload[..];
+    let error = |outputs: &mut Outputs, report: ErrorReport| {
+        outputs.queue_outbox(Part::Answers, Out::new(device.topics.error(), false, report.encode(), None, None));
+    };
     match device.topics.parse(topic) {
         Inbound::Command => {
             let (target, command) = wire::command_names(payload);
-            device.reports.request_error(ErrorReport::new(Reason::Refused, why).target(target.as_deref()).command(&command));
+            error(outputs, ErrorReport::new(Reason::Refused, why).target(target.as_deref()).command(&command));
             if let Ok(Some(reply)) = ReplyTo::from_properties(publish.properties.as_ref(), &device.topics) {
                 let answer = Answer::Failed { reason: Reason::Refused, error: why.to_owned() };
-                device.reports.event(Outbound {
-                    topic: Some(reply.topic),
-                    payload: reply_payload(target.as_deref(), &command, &answer),
-                    correlation: reply.correlation,
-                });
+                let payload = reply_payload(target.as_deref(), &command, &answer);
+                outputs.queue_outbox(Part::Answers, Out::new(reply.topic, false, payload, reply.correlation, None));
             }
             debug!(topic, command = %command, "A command for an instance that takes none; refused");
         }
         Inbound::DesiredTarget { target } => {
-            device.reports.request_error(ErrorReport::new(Reason::Refused, why).target(Some(&target)));
+            error(outputs, ErrorReport::new(Reason::Refused, why).target(Some(&target)));
             debug!(topic, "A target-level write for an instance that takes none; refused");
         }
         Inbound::DesiredProperty { .. } | Inbound::Config { .. } => {

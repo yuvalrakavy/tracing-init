@@ -283,7 +283,8 @@ impl Outputs {
         if self.cursor > i {
             self.cursor -= 1;
         }
-        if self.cursor >= self.slots.len() {
+        // Positions 0..n are the devices, n the outbox.
+        if self.cursor > self.slots.len() {
             self.cursor = 0;
         }
         Some(slot)
@@ -331,20 +332,27 @@ impl Outputs {
         self.slots.iter().any(|s| s.announced) || (self.outbox_open && !self.outbox.is_empty())
     }
 
-    /// One turn of the rotation: the outbox if it holds anything, else the next device after the
-    /// cursor with output — its sealed batch, or a new one taken from its reports when it is empty
-    /// — at most [`QUANTUM`] messages. Returns the device served, if any. Cancellation-safe: what is
+    /// One turn of the rotation: the next member after the cursor with output — a device's sealed
+    /// batch, or a new one taken from its reports when it is empty; or the outbox, the member after
+    /// the devices — at most [`QUANTUM`] messages. Returns the device served, if any. Cancellation-safe: what is
     /// taken stays in the slot's batch.
     async fn turn(&mut self, shared: &Shared, client: &AsyncClient) -> Option<u64> {
-        if self.outbox_open && !self.outbox.is_empty() {
-            // WAIT: mqtt-request
-            self.outbox.publish(shared, client, &IN_TURN, QUANTUM).await;
-            self.owed = true;
-            return None;
-        }
+        // The outbox is one member of the rotation, after the devices (position `n`): served in
+        // its turn, a quantum at a time, so neither a steady outbox — terminal answers to a flood
+        // of late requests — nor a steady device starves the other (R2 gate, Codex 2).
         let n = self.slots.len();
-        for k in 0..n {
-            let i = (self.cursor + k) % n;
+        for k in 0..=n {
+            let i = (self.cursor + k) % (n + 1);
+            if i == n {
+                if self.outbox_open && !self.outbox.is_empty() {
+                    // WAIT: mqtt-request
+                    self.outbox.publish(shared, client, &IN_TURN, QUANTUM).await;
+                    self.cursor = 0;
+                    self.owed = true;
+                    return None;
+                }
+                continue;
+            }
             let slot = &mut self.slots[i];
             if !slot.announced {
                 continue;
@@ -359,7 +367,7 @@ impl Outputs {
             let id = slot.id;
             // WAIT: mqtt-request
             slot.batch.publish(shared, client, &IN_TURN, QUANTUM).await;
-            self.cursor = (i + 1) % n;
+            self.cursor = (i + 1) % (n + 1);
             self.owed = true;
             return Some(id);
         }

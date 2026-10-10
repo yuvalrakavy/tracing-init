@@ -4,6 +4,7 @@
 use serde_json::json;
 
 use super::*;
+use crate::reports::Outbound;
 
 /// A host's session part, with no broker behind it.
 fn session_part() -> Arc<session::Shared> {

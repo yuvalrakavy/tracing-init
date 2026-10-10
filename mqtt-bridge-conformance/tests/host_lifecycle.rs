@@ -115,6 +115,44 @@ async fn answers_refused_while_unsubscribing_are_published() {
     .await
 }
 
+/// A stopping device's retirement is finite: requests that keep arriving through its
+/// still-installed subscriptions get their terminal answers through the session's fair queue, and
+/// cannot hold the stop open — the delete goes on to its unsubscriptions and its cleanup (R2 gate,
+/// Codex 2: builder gap 17's "minor" was a hang).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_flood_cannot_hold_a_stop_open() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        let h = serving("retire-flood", &lamp, fleet).await;
+        let t = h.topics(&lamp);
+        // A broker slow but steady: each turn of the rotation takes a while, and requests pile up.
+        h.broker.delay_acks(Duration::from_millis(20));
+        let (broker, command) = (h.broker.clone(), t.command());
+        let flood = tokio::spawn(async move {
+            let mut n = 0u32;
+            loop {
+                for _ in 0..20 {
+                    let options =
+                        SendOptions::default().expiry(30).response_topic("Store/replies/flood").correlation_data(n.to_be_bytes().to_vec());
+                    broker.publish(&command, json!({"command": "learn"}).to_string(), &options);
+                    n += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(h.delete(&lamp));
+        let unsubscribed = h.eventually(BOUND, |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.command()))).await;
+        flood.abort();
+        h.broker.delay_acks(Duration::ZERO);
+        assert!(unsubscribed, "a request flood held the deleted device's stop open: its subscriptions were never removed");
+        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.status()).is_none()).await, "the deleted instance was never cleaned up");
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// The labels since the broker's last accepted connection.
 fn since_last_connect(h: &HostHarness) -> Vec<String> {
     let labels = h.labels();

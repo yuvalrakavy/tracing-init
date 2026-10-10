@@ -167,7 +167,10 @@ In order:
    worker the watchdog finds **blocked** ends the process (D4 = a); a cooperative disconnect that runs
    its full bound is not a blocked verdict.
 3. **Retire its output:** the device's remaining batch and earned answers stay in the session's
-   rotation (State before reply, sealed as in §4.7) until published; it no longer needs the worker. A
+   rotation (State before reply, sealed as in §4.7) until published; it no longer needs the worker.
+   That output is **frozen** at the worker's stop — finite — and the retirement waits for it alone;
+   step 1's terminal answers to requests still arriving go to the session's outbox, a fair member of
+   the rotation (§4.7), so a request flood can never hold a stop open (R2 gate, Codex 2). A
    session loss before they are published drops them with one WARN `output_lost_at_session_end`, as
    R1 drops unpublished output at process shutdown.
 4. **Unsubscribe** S1–S3 (UNSUBACKs correlated by packet id; the pump forwards UNSUBACK events — an R2
@@ -217,7 +220,8 @@ their Status as they are acquired (accepted transient, §8).
 Per device, R1's cancellation-safe batch, **sealed** when taken (later State goes to the next batch), so
 a reply follows the State its command produced and is never starved by later State. Devices are served
 round-robin with a persistent cursor, at most 32 messages per device per turn, then ready inbound and
-lifecycle work, then the next device. A stopping device's flush (§4.4) takes its turns until done. At
+lifecycle work, then the next device. The session's outbox (instance-level `Error`s, terminal
+answers, a retired runtime's answers, cleanups) is one member of that rotation, after the devices. A stopping device's flush (§4.4) takes its turns until done. At
 process stop, answers first (R1). A due timer (a grant's bound, a retry, the sweep) is served before
 anything else at every pass, and the lifecycle's events (a construction done, a worker stopped) go
 ahead of the inbound traffic: neither a steady publication nor a steady inbound stream can starve
