@@ -2215,11 +2215,20 @@ expect_text = '''a late State changed the conflict rule's read-back'''
 guard       = "read_back_frozen"
 
 # Re-gate minor: FakeBroker's held SUBACKs do not outlive their connection.
+# (Re-targeted 2026-10-10, R2: each held packet now carries its connection's sender, which the
+# multi-client mode needs; the clear on a new connection was redundant with it, and its row GREEN.)
 [[control]]
 name        = "held_subacks_reach_a_new_connection"
 file        = "mqtt-test-broker/src/lib.rs"
-anchor      = '''        shared.held_subacks.lock().unwrap().clear();'''
-replacement = '''        let _ = &shared.held_subacks;'''
+anchor      = '''        for (tx, packet) in std::mem::take(&mut *held) {
+            let _ = tx.send(packet);
+        }'''
+replacement = '''        let current = self.shared.to_client.lock().unwrap().clone();
+        for (_, packet) in std::mem::take(&mut *held) {
+            if let Some(tx) = &current {
+                let _ = tx.send(packet);
+            }
+        }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-test-broker/Cargo.toml", "--lib", "--", "tests::held_subacks_do_not_outlive_their_connection", "--exact"]
 expect_text = '''a retained message held for an earlier connection reached the new one'''

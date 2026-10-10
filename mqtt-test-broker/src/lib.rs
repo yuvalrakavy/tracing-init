@@ -634,10 +634,11 @@ async fn connection(stream: TcpStream, shared: Arc<Shared>, number: usize) {
         shared.conns.lock().unwrap().push(Conn { number, tx: tx.clone(), active: Vec::new(), will: None });
     } else {
         lock_held(&shared).clear();
-        // A new connection starts without a session: no subscription carries over, nor a SUBACK or
-        // a replay held for an earlier connection (the R1 re-gate).
+        // A new connection starts without a session: no subscription carries over (the R1
+        // re-gate). Nor does a SUBACK or a replay held for an earlier connection: each held packet
+        // carries the sender of the connection that asked, so a release after a reconnect sends it
+        // nowhere — in either mode, as several clients need.
         shared.active.lock().unwrap().clear();
-        shared.held_subacks.lock().unwrap().clear();
     }
     let mut kick = shared.kick.subscribe();
     kick.mark_unchanged();
