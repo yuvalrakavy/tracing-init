@@ -28,7 +28,7 @@ async fn serving_tuned(
     let h = HostHarness::join(broker, &instance_name(name), fleet, tune).await;
     assert!(h.configure(instance, json!({"address": "a"})), "the Config reached no subscription");
     assert!(
-        h.eventually(BOUND, |h| h.status(instance).as_deref() == Some("connected")).await,
+        h.eventually(bound(), |h| h.status(instance).as_deref() == Some("connected")).await,
         "{instance} never connected: {:?}",
         h.statuses(instance)
     );
@@ -54,23 +54,23 @@ async fn a_stop_that_spans_a_reconnect_still_retires_its_output() {
         let old = h.fleet.device(&lamp).expect("built");
         let reply = "Store/replies/stop-reconnect";
         assert!(h.command(&lamp, json!({"command": "learn"}), Some((reply, b"r"))));
-        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Execute).is_empty()).await, "the old device never ran the command");
+        assert!(h.eventually(bound(), |_| !old.calls_of(Op::Execute).is_empty()).await, "the old device never ran the command");
         assert!(h.configure(&lamp, json!({"address": "b"})));
-        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the old device was never stopped");
+        assert!(h.eventually(bound(), |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the old device was never stopped");
         // The connection goes while the old worker's disconnect still blocks.
         let before = h.broker.connections();
         h.broker.refuse_connections(true);
         h.broker.drop_connection();
         tokio::time::sleep(Duration::from_millis(300)).await;
         h.broker.refuse_connections(false);
-        assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
+        assert!(h.eventually(bound(), |h| h.broker.connections() > before).await, "the host never reconnected");
         assert!(
-            h.eventually(BOUND, |h| h.replies(reply).iter().any(|r| r["error"].as_str().is_some_and(|e| e.contains("cut off")))).await,
+            h.eventually(bound(), |h| h.replies(reply).iter().any(|r| r["error"].as_str().is_some_and(|e| e.contains("cut off")))).await,
             "the stopped device's output never retired on the new connection: {:?}",
             h.replies(reply)
         );
         assert!(
-            h.eventually(BOUND, |h| h.fleet.devices(&lamp).len() == 2 && h.status(&lamp).as_deref() == Some("connected")).await,
+            h.eventually(bound(), |h| h.fleet.devices(&lamp).len() == 2 && h.status(&lamp).as_deref() == Some("connected")).await,
             "the successor never bootstrapped after the stop spanned a reconnect: {:?}",
             h.statuses(&lamp)
         );
@@ -92,7 +92,7 @@ async fn answers_refused_while_unsubscribing_are_published() {
         h.broker.hold_subacks();
         assert!(h.configure(&lamp, json!({"address": "b"})));
         assert!(
-            h.eventually(BOUND, |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.command()))).await,
+            h.eventually(bound(), |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.command()))).await,
             "the old device's subscriptions were never unsubscribed: {:#?}",
             h.labels()
         );
@@ -104,7 +104,7 @@ async fn answers_refused_while_unsubscribing_are_published() {
         }
         h.broker.release_subacks();
         assert!(
-            h.eventually(BOUND, |h| (0..10)
+            h.eventually(bound(), |h| (0..10)
                 .all(|n| h.replies(&format!("Store/replies/unsub-{n}")).iter().any(|r| r["reason"] == "refused")))
                 .await,
             "an answer refused while the device unsubscribed was lost with its runtime: {:?}",
@@ -143,11 +143,11 @@ async fn a_request_flood_cannot_hold_a_stop_open() {
         });
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(h.delete(&lamp));
-        let unsubscribed = h.eventually(BOUND, |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.command()))).await;
+        let unsubscribed = h.eventually(bound(), |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.command()))).await;
         flood.abort();
         h.broker.delay_acks(Duration::ZERO);
         assert!(unsubscribed, "a request flood held the deleted device's stop open: its subscriptions were never removed");
-        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.status()).is_none()).await, "the deleted instance was never cleaned up");
+        assert!(h.eventually(bound(), |h| h.broker.retained_on(&t.status()).is_none()).await, "the deleted instance was never cleaned up");
         assert!(h.stop().await);
     })
     .await
@@ -172,23 +172,23 @@ async fn a_disable_that_spans_a_reconnect_keeps_its_read_back() {
         let t = h.topics(&lamp);
         let device = h.fleet.device(&lamp).expect("built");
         assert!(h.configure(&lamp, json!({"address": "a", "disabled": true})));
-        assert!(h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the worker was never stopped");
+        assert!(h.eventually(bound(), |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the worker was never stopped");
         let before = h.broker.connections();
         h.broker.refuse_connections(true);
         h.broker.drop_connection();
         tokio::time::sleep(Duration::from_millis(300)).await;
         h.broker.refuse_connections(false);
-        assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("disabled")).await, "{:?}", h.statuses(&lamp));
+        assert!(h.eventually(bound(), |h| h.broker.connections() > before).await, "the host never reconnected");
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("disabled")).await, "{:?}", h.statuses(&lamp));
         assert!(
-            h.eventually(BOUND, |h| since_last_connect(h).iter().any(|l| *l == format!("sub {}", t.status()))).await,
+            h.eventually(bound(), |h| since_last_connect(h).iter().any(|l| *l == format!("sub {}", t.status()))).await,
             "the disabled instance did not subscribe its read-back on the new connection: {:#?}",
             since_last_connect(&h)
         );
         let marked = h.statuses(&lamp).len();
         h.broker.publish(&t.status(), "connected", &SendOptions::default().retained().user_property("via", "elsewhere"));
         assert!(
-            h.eventually(BOUND, |h| h.statuses(&lamp).len() > marked && h.status(&lamp).as_deref() == Some("disabled")).await,
+            h.eventually(bound(), |h| h.statuses(&lamp).len() > marked && h.status(&lamp).as_deref() == Some("disabled")).await,
             "the disabled instance did not heal its Status after the reconnect: {:?}",
             h.status_via(&lamp)
         );
@@ -211,21 +211,21 @@ async fn a_delete_finished_while_disconnected_is_cleared_after_the_reconnect() {
         let h = serving("delete-offline", &lamp, fleet).await;
         let t = h.topics(&lamp);
         assert!(
-            h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await,
+            h.eventually(bound(), |h| h.broker.retained_on(&t.state("t1")).is_some()).await,
             "the device's State never reached the broker"
         );
         let device = h.fleet.device(&lamp).expect("built");
         assert!(h.delete(&lamp));
-        assert!(h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the worker was never stopped");
+        assert!(h.eventually(bound(), |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the worker was never stopped");
         // Away until the stop has ended.
         let before = h.broker.connections();
         h.broker.refuse_connections(true);
         h.broker.drop_connection();
         tokio::time::sleep(Duration::from_millis(2000)).await;
         h.broker.refuse_connections(false);
-        assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
+        assert!(h.eventually(bound(), |h| h.broker.connections() > before).await, "the host never reconnected");
         assert!(
-            h.eventually(BOUND, |h| [t.status(), t.state("t1")].iter().all(|topic| h.broker.retained_on(topic).is_none())).await,
+            h.eventually(bound(), |h| [t.status(), t.state("t1")].iter().all(|topic| h.broker.retained_on(topic).is_none())).await,
             "a delete that ended while disconnected left its tagged topics behind: {:?}",
             h.broker.retained()
         );
@@ -248,10 +248,10 @@ async fn a_deferred_cleanup_clears_only_what_still_carries_its_own_tag() {
         });
         let h = serving("deferred-recheck", &lamp, fleet).await;
         let t = h.topics(&lamp);
-        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
+        assert!(h.eventually(bound(), |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
         let device = h.fleet.device(&lamp).expect("built");
         assert!(h.delete(&lamp));
-        assert!(h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the worker was never stopped");
+        assert!(h.eventually(bound(), |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the worker was never stopped");
         // Away until the stop has ended; meanwhile another process — the instance's new owner —
         // writes its State.
         let before = h.broker.connections();
@@ -261,9 +261,9 @@ async fn a_deferred_cleanup_clears_only_what_still_carries_its_own_tag() {
         let theirs = json!({"power": false}).to_string();
         h.broker.retain(&t.state("t1"), theirs.clone(), &SendOptions::default().retained().user_property("via", "the-new-owner"));
         h.broker.refuse_connections(false);
-        assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
+        assert!(h.eventually(bound(), |h| h.broker.connections() > before).await, "the host never reconnected");
         assert!(
-            h.eventually(BOUND, |h| h.broker.retained_on(&t.status()).is_none()).await,
+            h.eventually(bound(), |h| h.broker.retained_on(&t.status()).is_none()).await,
             "the deleted instance's own Status was not cleared after the reconnect"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -290,17 +290,17 @@ async fn an_instance_deleted_while_its_process_was_down_is_cleaned_at_the_restar
         let mut h = HostHarness::start("restart-litter", fleet).await;
         let t = h.topics(&lamp);
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
+        assert!(h.eventually(bound(), |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
         h.abort();
         tokio::time::sleep(Duration::from_millis(300)).await;
         h.broker.retain(&h.config_topic(&lamp), "", &SendOptions::default());
         // The restart: the same bridge id, the same broker.
         let restarted = HostHarness::join(h.broker.clone(), &h.bridge, Fleet::new(acknowledged()), |host| host).await;
         let active = format!("{ROOT}/Active/{}", h.bridge);
-        assert!(restarted.eventually(BOUND, |r| r.broker.retained_on(&active).as_deref() == Some(&b"true"[..])).await);
+        assert!(restarted.eventually(bound(), |r| r.broker.retained_on(&active).as_deref() == Some(&b"true"[..])).await);
         assert!(
             restarted
-                .eventually(BOUND, |r| r.broker.retained_on(&t.state("t1")).is_none() && r.broker.retained_on(&t.status()).is_none())
+                .eventually(bound(), |r| r.broker.retained_on(&t.state("t1")).is_none() && r.broker.retained_on(&t.status()).is_none())
                 .await,
             "a deleted instance's own tagged topics survived the restart: State/t1 {:?}, Status {:?}",
             restarted.broker.retained_on(&t.state("t1")),
@@ -309,7 +309,7 @@ async fn an_instance_deleted_while_its_process_was_down_is_cleaned_at_the_restar
         // Re-created, same bridge id; the new device reports only t2.
         restarted.fleet.prepare(&lamp, |d| d.set("t2", "power", json!(false)));
         assert!(restarted.configure(&lamp, json!({"address": "b"})));
-        assert!(restarted.eventually(BOUND, |r| r.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(restarted.eventually(bound(), |r| r.status(&lamp).as_deref() == Some("connected")).await);
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(restarted.broker.retained_on(&t.state("t1")).is_none(), "the old State came back");
         assert!(restarted.stop().await);
@@ -329,13 +329,13 @@ async fn a_cleanup_lost_with_its_connection_is_done_on_the_next() {
         fleet.prepare(&lamp, |d| d.set("t1", "power", json!(true)));
         let h = serving("cleanup-lost", &lamp, fleet).await;
         let t = h.topics(&lamp);
-        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
+        assert!(h.eventually(bound(), |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
         // The UNSUBACKs held; released with the broker no longer reading: the cleanup that follows
         // them is written to a connection that never reads it.
         h.broker.hold_subacks();
         assert!(h.delete(&lamp));
         assert!(
-            h.eventually(BOUND, |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.status()))).await,
+            h.eventually(bound(), |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.status()))).await,
             "the deleted instance's read-back was never unsubscribed"
         );
         let before = h.broker.connections();
@@ -343,9 +343,9 @@ async fn a_cleanup_lost_with_its_connection_is_done_on_the_next() {
         h.broker.stop_reading();
         tokio::time::sleep(Duration::from_millis(500)).await;
         h.broker.drop_connection();
-        assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
+        assert!(h.eventually(bound(), |h| h.broker.connections() > before).await, "the host never reconnected");
         assert!(
-            h.eventually(BOUND, |h| [t.status(), t.state("t1")].iter().all(|topic| h.broker.retained_on(topic).is_none())).await,
+            h.eventually(bound(), |h| [t.status(), t.state("t1")].iter().all(|topic| h.broker.retained_on(topic).is_none())).await,
             "a cleanup lost with its connection was never done: {:?}",
             h.broker.retained()
         );
@@ -366,12 +366,12 @@ async fn an_instance_configured_again_while_its_delete_stops_keeps_its_slot() {
         fleet.prepare(&lamp, |d| d.set("t1", "power", json!(true)));
         let h = serving("recreate-stopping", &lamp, fleet).await;
         let t = h.topics(&lamp);
-        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
+        assert!(h.eventually(bound(), |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
         // The UNSUBACKs held: the delete's stop stays at its unsubscriptions.
         h.broker.hold_subacks();
         assert!(h.delete(&lamp));
         assert!(
-            h.eventually(BOUND, |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.status()))).await,
+            h.eventually(bound(), |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.status()))).await,
             "the deleted instance's read-back was never unsubscribed"
         );
         // Configured again while the original is still stopping.
@@ -379,7 +379,7 @@ async fn an_instance_configured_again_while_its_delete_stops_keeps_its_slot() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         h.broker.release_subacks();
         assert!(
-            h.eventually(BOUND, |h| h.fleet.devices(&lamp).len() == 2 && h.status(&lamp).as_deref() == Some("connected")).await,
+            h.eventually(bound(), |h| h.fleet.devices(&lamp).len() == 2 && h.status(&lamp).as_deref() == Some("connected")).await,
             "the instance configured again never served: {:?}",
             h.statuses(&lamp)
         );
@@ -429,10 +429,10 @@ async fn a_config_change_closes_admission_stops_retires_and_unsubscribes_before_
         // A command the old device is running when the change commits.
         let running_reply = "Store/replies/change-running";
         assert!(h.command(&lamp, json!({"command": "learn"}), Some((running_reply, b"r"))));
-        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Execute).is_empty()).await, "the old device never ran the command");
+        assert!(h.eventually(bound(), |_| !old.calls_of(Op::Execute).is_empty()).await, "the old device never ran the command");
         h.broker.hold_subacks();
         assert!(h.configure(&lamp, json!({"address": "b"})));
-        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the old device was never stopped");
+        assert!(h.eventually(bound(), |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the old device was never stopped");
         // Admission is closed: these reach neither device.
         let late_reply = "Store/replies/change-late";
         assert!(h.command(&lamp, json!({"command": "learn"}), Some((late_reply, b"l"))));
@@ -440,7 +440,7 @@ async fn a_config_change_closes_admission_stops_retires_and_unsubscribes_before_
         // Refused by the terminal policy as it arrives — not posted to the old mailbox, whose stop
         // would refuse it too, later, as one waiting.
         assert!(
-            h.eventually(BOUND, |h| h
+            h.eventually(bound(), |h| h
                 .replies(late_reply)
                 .iter()
                 .any(|r| r["reason"] == "refused" && r["error"].as_str().is_some_and(|e| e.contains("being stopped"))))
@@ -449,14 +449,14 @@ async fn a_config_change_closes_admission_stops_retires_and_unsubscribes_before_
             h.replies(late_reply)
         );
         assert!(
-            h.eventually(BOUND, |h| h.replies(running_reply).iter().any(|r| r["error"].as_str().is_some_and(|e| e.contains("cut off"))))
+            h.eventually(bound(), |h| h.replies(running_reply).iter().any(|r| r["error"].as_str().is_some_and(|e| e.contains("cut off"))))
                 .await,
             "the command the old device was running was not answered as cut off: {:?}",
             h.replies(running_reply)
         );
         // UNSUBACKs held: the successor has not bootstrapped.
         assert!(
-            h.eventually(BOUND, |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.command()))).await,
+            h.eventually(bound(), |h| h.labels().iter().any(|l| *l == format!("unsub {}", t.command()))).await,
             "the old device's subscriptions were never unsubscribed: {:#?}",
             h.labels()
         );
@@ -470,14 +470,14 @@ async fn a_config_change_closes_admission_stops_retires_and_unsubscribes_before_
         assert!(old.calls_of(Op::Execute).len() == 1, "the old device took the late command");
         h.broker.release_subacks();
         assert!(
-            h.eventually(BOUND, |h| h.fleet.devices(&lamp).len() == 2 && h.status(&lamp).as_deref() == Some("connected")).await,
+            h.eventually(bound(), |h| h.fleet.devices(&lamp).len() == 2 && h.status(&lamp).as_deref() == Some("connected")).await,
             "the successor never connected: {:?}",
             h.statuses(&lamp)
         );
         assert_eq!(h.fleet.configs(&lamp).last().and_then(|c| c.get("address").cloned()), Some(json!("b")));
         let new = h.fleet.device(&lamp).expect("the successor");
         assert!(
-            h.eventually(BOUND, |_| new.get("t1", "power") == Some(json!(true))).await,
+            h.eventually(bound(), |_| new.get("t1", "power") == Some(json!(true))).await,
             "the late Desired did not reach the successor from its replay"
         );
         assert!(new.calls_of(Op::Execute).is_empty(), "the successor ran the refused command");
@@ -503,13 +503,13 @@ async fn a_stopped_device_answers_its_held_requests() {
         let h = HostHarness::start("held-at-stop", fleet).await;
         assert!(h.configure(&lamp, json!({})));
         let t = h.topics(&lamp);
-        assert!(h.eventually(BOUND, |h| h.subscribed(&t.command())).await, "the instance's requests were never subscribed");
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("unreachable")).await, "{:?}", h.statuses(&lamp));
+        assert!(h.eventually(bound(), |h| h.subscribed(&t.command())).await, "the instance's requests were never subscribed");
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("unreachable")).await, "{:?}", h.statuses(&lamp));
         assert!(h.desire(&lamp, "t1", "power", json!(true), Req { expiry: Some(60), conflict: None }));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(h.delete(&lamp));
         assert!(
-            h.eventually(BOUND, |h| h.errors_for(&lamp, "refused").iter().any(|e| e["target"] == "t1" && e["property"] == "power")).await,
+            h.eventually(bound(), |h| h.errors_for(&lamp, "refused").iter().any(|e| e["target"] == "t1" && e["property"] == "power")).await,
             "the request held for the stopped device was never answered: {:?}",
             h.errors(&lamp)
         );
@@ -530,7 +530,7 @@ async fn a_failing_new_factory_leaves_the_current_device_serving() {
         let old = h.fleet.device(&lamp).expect("built");
         assert!(h.configure(&lamp, json!({"address": "b"})));
         assert!(
-            h.eventually(BOUND, |h| h.errors_for(&lamp, "unusable").iter().any(|e| e.get("target").is_none())).await,
+            h.eventually(bound(), |h| h.errors_for(&lamp, "unusable").iter().any(|e| e.get("target").is_none())).await,
             "the factory's failure was not one instance-level Error: {:?}",
             h.errors(&lamp)
         );
@@ -538,7 +538,7 @@ async fn a_failing_new_factory_leaves_the_current_device_serving() {
         let reply = "Store/replies/failing-change";
         assert!(h.command(&lamp, json!({"command": "learn"}), Some((reply, b"1"))));
         assert!(
-            h.eventually(BOUND, |h| h.replies(reply).iter().any(|r| r["value"] == json!({"executed": "learn"}))).await,
+            h.eventually(bound(), |h| h.replies(reply).iter().any(|r| r["value"] == json!({"executed": "learn"}))).await,
             "the current device stopped serving after a failed change: {:?}",
             h.replies(reply)
         );
@@ -573,7 +573,7 @@ async fn a_delete_clears_only_the_topics_this_process_tagged() {
         );
         assert!(h.configure(&lamp, json!({})));
         assert!(
-            h.eventually(BOUND, |h| h.state(&lamp, "t1").is_some()
+            h.eventually(bound(), |h| h.state(&lamp, "t1").is_some()
                 && h.state(&lamp, "t2").is_some()
                 && h.status(&lamp).as_deref() == Some("connected"))
                 .await,
@@ -581,9 +581,9 @@ async fn a_delete_clears_only_the_topics_this_process_tagged() {
         );
         let device = h.fleet.device(&lamp).expect("built");
         assert!(h.delete(&lamp));
-        assert!(h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the device was not stopped on delete");
+        assert!(h.eventually(bound(), |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the device was not stopped on delete");
         assert!(
-            h.eventually(BOUND, |h| [t.status(), t.state("t1"), t.state("t2")].iter().all(|topic| h.broker.retained_on(topic).is_none()))
+            h.eventually(bound(), |h| [t.status(), t.state("t1"), t.state("t2")].iter().all(|topic| h.broker.retained_on(topic).is_none()))
                 .await,
             "the bridge's own tagged topics were not cleared: {:?}",
             h.broker.retained()
@@ -615,13 +615,13 @@ async fn disable_stops_the_worker_keeps_the_read_back_and_heals_its_status() {
         let device = h.fleet.device(&lamp).expect("built");
         assert!(h.configure(&lamp, json!({"address": "a", "disabled": true})));
         assert!(
-            h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("disabled")).await,
+            h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("disabled")).await,
             "the disabled instance never said so: {:?}",
             h.statuses(&lamp)
         );
         assert!(!device.calls_of(Op::Disconnect).is_empty(), "the worker was not stopped");
         assert!(
-            h.eventually(BOUND, |h| !h.subscribed(&t.command()) && !h.subscribed(&t.config_target_filter())).await,
+            h.eventually(bound(), |h| !h.subscribed(&t.command()) && !h.subscribed(&t.config_target_filter())).await,
             "S2 and S3 stayed: {:?}",
             h.broker.subscriptions()
         );
@@ -630,7 +630,7 @@ async fn disable_stops_the_worker_keeps_the_read_back_and_heals_its_status() {
         let before = h.statuses(&lamp).len();
         h.broker.publish(&t.status(), "connected", &SendOptions::default().retained().user_property("via", "elsewhere"));
         assert!(
-            h.eventually(BOUND, |h| h.statuses(&lamp).len() > before
+            h.eventually(bound(), |h| h.statuses(&lamp).len() > before
                 && h.status_via(&lamp) == Some(("disabled".into(), Some(h.bridge.clone()))))
                 .await,
             "the foreign write was not healed: {:?}",
@@ -645,7 +645,7 @@ async fn disable_stops_the_worker_keeps_the_read_back_and_heals_its_status() {
         // Re-enabled: a new device, from a fresh bootstrap of S2 and S3.
         assert!(h.configure(&lamp, json!({"address": "a"})));
         assert!(
-            h.eventually(BOUND, |h| h.fleet.devices(&lamp).len() == 2 && h.status(&lamp).as_deref() == Some("connected")).await,
+            h.eventually(bound(), |h| h.fleet.devices(&lamp).len() == 2 && h.status(&lamp).as_deref() == Some("connected")).await,
             "the re-enabled instance never connected again: {:?}",
             h.statuses(&lamp)
         );
@@ -664,7 +664,7 @@ async fn reconnected(h: &HostHarness, while_away: impl FnOnce(&HostHarness)) {
     tokio::time::sleep(Duration::from_millis(300)).await;
     while_away(h);
     h.broker.refuse_connections(false);
-    assert!(h.eventually(BOUND, |h| h.broker.connections() > before).await, "the host never reconnected");
+    assert!(h.eventually(bound(), |h| h.broker.connections() > before).await, "the host never reconnected");
 }
 
 /// Scenario 4b: an instance deleted while the host was disconnected is released after the replay
@@ -676,16 +676,16 @@ async fn an_instance_deleted_while_disconnected_is_released_after_the_replay() {
         let (gone, kept) = (instance_name("Gone"), instance_name("Kept"));
         let h = serving("reconcile-delete", &gone, fleet).await;
         assert!(h.configure(&kept, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&kept).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&kept).as_deref() == Some("connected")).await);
         let (gone_device, kept_device) = (h.fleet.device(&gone).expect("built"), h.fleet.device(&kept).expect("built"));
         reconnected(&h, |h| h.broker.retain(&h.config_topic(&gone), "", &SendOptions::default())).await;
         assert!(
-            h.eventually(BOUND, |_| !gone_device.calls_of(Op::Disconnect).is_empty()).await,
+            h.eventually(bound(), |_| !gone_device.calls_of(Op::Disconnect).is_empty()).await,
             "the instance deleted while disconnected was not released"
         );
         let t = h.topics(&gone);
         assert!(
-            h.eventually(BOUND, |h| h.broker.retained_on(&t.status()).is_none()).await,
+            h.eventually(bound(), |h| h.broker.retained_on(&t.status()).is_none()).await,
             "the released instance's Status was not cleared"
         );
         assert!(kept_device.calls_of(Op::Disconnect).is_empty(), "the other instance was stopped");
@@ -706,12 +706,15 @@ async fn a_target_config_removed_while_disconnected_is_retracted() {
         let t = h.topics(&lamp);
         h.broker.retain(&t.config("t1"), json!({"zone": 2}).to_string(), &SendOptions::default().retained());
         assert!(h.configure(&lamp, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
         let device = h.fleet.device(&lamp).expect("built");
-        assert!(h.eventually(BOUND, |_| device.calls_of(Op::Configure).iter().any(|c| c.values.is_some())).await, "never configured");
+        assert!(h.eventually(bound(), |_| device.calls_of(Op::Configure).iter().any(|c| c.values.is_some())).await, "never configured");
         reconnected(&h, |h| h.broker.retain(&t.config("t1"), "", &SendOptions::default())).await;
         assert!(
-            h.eventually(BOUND, |_| device.calls_of(Op::Configure).iter().any(|c| c.target.as_deref() == Some("t1") && c.values.is_none()))
+            h.eventually(bound(), |_| device
+                .calls_of(Op::Configure)
+                .iter()
+                .any(|c| c.target.as_deref() == Some("t1") && c.values.is_none()))
                 .await,
             "the target Config no longer retained was not retracted: {:#?}",
             device.calls_of(Op::Configure)
@@ -748,7 +751,7 @@ async fn an_incomplete_replay_releases_nothing() {
         assert!(device.calls_of(Op::Disconnect).is_empty(), "an incomplete replay released an instance");
         h.broker.release_subacks();
         assert!(
-            h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await,
+            h.eventually(bound(), |_| !device.calls_of(Op::Disconnect).is_empty()).await,
             "the barrier's late SUBACK did not complete the replay and release the deleted instance"
         );
         assert!(h.stop().await);
@@ -767,12 +770,12 @@ async fn a_target_config_created_live_in_the_setup_window_is_not_retracted() {
         let h = HostHarness::start("setup-window", fleet).await;
         let t = h.topics(&lamp);
         assert!(h.configure(&lamp, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
         let device = h.fleet.device(&lamp).expect("built");
         // Reconnect, S3's SUBACK held on the new connection.
         reconnected(&h, |h| h.broker.hold_subacks_matching(&format!("{ROOT}/Desired/{lamp}"))).await;
         assert!(
-            h.eventually(BOUND, |h| since_last_connect(h).iter().any(|l| *l == format!("sub {}", t.command()))).await,
+            h.eventually(bound(), |h| since_last_connect(h).iter().any(|l| *l == format!("sub {}", t.command()))).await,
             "S3 was never asked for on the new connection"
         );
         // The Store creates a target Config now: retained, delivered live (its retain flag cleared).

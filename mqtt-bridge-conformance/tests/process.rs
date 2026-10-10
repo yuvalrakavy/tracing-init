@@ -77,7 +77,7 @@ async fn stops_cleanly_on(sig: &str, name: &str) {
     let mut child = bridge(&dir, &broker, &[]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("start the bridge");
     let active = format!("Proc/Active/{INSTANCE}");
     assert!(
-        broker.wait_until(BOUND, |b| b.received_on(&active).iter().any(|r| &r.payload[..] == b"true")).await,
+        broker.wait_until(bound(), |b| b.received_on(&active).iter().any(|r| &r.payload[..] == b"true")).await,
         "the bridge never announced itself"
     );
     signal(&child, sig);
@@ -115,10 +115,10 @@ async fn sigterm_during_a_stalled_connect_stops_the_bridge_within_its_bound() {
         .stderr(Stdio::null())
         .spawn()
         .expect("start the bridge");
-    assert!(broker.wait_for_subscription(&format!("Proc/Command/{INSTANCE}"), BOUND).await, "the bridge never subscribed");
+    assert!(broker.wait_for_subscription(&format!("Proc/Command/{INSTANCE}"), bound()).await, "the bridge never subscribed");
     let status_topic = format!("Proc/Status/{INSTANCE}");
     assert!(
-        broker.wait_until(BOUND, |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connecting")).await,
+        broker.wait_until(bound(), |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connecting")).await,
         "the bridge never said it was connecting"
     );
     signal(&child, "-TERM");
@@ -226,7 +226,7 @@ async fn sigterm_answers_the_commands_waiting_for_the_device() {
         bridge(&dir, &broker, &["--device", "hang-apply"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("start the bridge");
     let status_topic = format!("Proc/Status/{INSTANCE}");
     assert!(
-        broker.wait_until(BOUND, |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connected")).await,
+        broker.wait_until(bound(), |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connected")).await,
         "the device never connected"
     );
     // A write that hangs, and a command waiting behind it.
@@ -261,7 +261,7 @@ async fn a_paused_process_is_no_dead_worker_when_it_wakes() {
     let mut child = bridge(&dir, &broker, &[]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("start the bridge");
     let status_topic = format!("Proc/Status/{INSTANCE}");
     assert!(
-        broker.wait_until(BOUND, |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connected")).await,
+        broker.wait_until(bound(), |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connected")).await,
         "the device never connected"
     );
     signal(&child, "-STOP");
@@ -378,7 +378,7 @@ async fn a_driver_panic_with_a_stderr_nobody_reads_ends_the_bridge_with_a_failur
         .spawn()
         .expect("start the bridge");
     let status_topic = format!("Proc/Status/{INSTANCE}");
-    let up = broker.wait_until(BOUND, |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connected")).await;
+    let up = broker.wait_until(bound(), |b| b.received_on(&status_topic).iter().any(|r| &r.payload[..] == b"connected")).await;
     assert!(broker.publish(&format!("Proc/Desired/{INSTANCE}/t1/power"), "false", &SendOptions::default()) || up);
     let status = exit_within(&mut child, Duration::from_secs(10)).await;
     drop(unread);
@@ -410,7 +410,7 @@ async fn a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_conn
         .spawn()
         .expect("start the bridge");
     let active = format!("Proc/Active/{INSTANCE}");
-    let up = broker.wait_until(BOUND, |b| b.received_on(&active).iter().any(|r| &r.payload[..] == b"true")).await;
+    let up = broker.wait_until(bound(), |b| b.received_on(&active).iter().any(|r| &r.payload[..] == b"true")).await;
     assert!(broker.publish(&poison, "{}", &SendOptions::default()) || up);
     let status = exit_within(&mut child, Duration::from_secs(10)).await;
     drop(unread);
@@ -421,7 +421,7 @@ async fn a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_conn
         logged(&dir)
     );
     assert!(
-        broker.wait_until(BOUND, |b| b.retained_on(&active).as_deref() == Some(&b"false"[..])).await,
+        broker.wait_until(bound(), |b| b.retained_on(&active).as_deref() == Some(&b"false"[..])).await,
         "Active=true stood after the session died: {:?}",
         broker.retained_on(&active)
     );
@@ -498,7 +498,7 @@ async fn without_its_stop_signals_the_bridge_ends_within_a_bound_whatever_its_lo
 async fn a_usage_error_is_said_and_ends_with_status_2() {
     let output =
         tokio::process::Command::new(env!("CARGO_BIN_EXE_fake-bridge")).args(["--broker", "127.0.0.1:9"]).stdin(Stdio::null()).output();
-    let output = tokio::time::timeout(BOUND, output).await.expect("the bridge did not exit on a usage error").expect("run the bridge");
+    let output = tokio::time::timeout(bound(), output).await.expect("the bridge did not exit on a usage error").expect("run the bridge");
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--instance"), "{}", String::from_utf8_lossy(&output.stderr));
 }

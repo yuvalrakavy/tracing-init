@@ -39,7 +39,7 @@ async fn a_connack_subscribes_before_active_then_republishes_the_model() {
     let h = Harness::start_with("connack", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "power", json!(true))).await;
     let t = h.topics.clone();
     assert!(
-        h.eventually(BOUND, |h| h.state("t1").is_some() && h.status().as_deref() == Some("connected")).await,
+        h.eventually(bound(), |h| h.state("t1").is_some() && h.status().as_deref() == Some("connected")).await,
         "the device's state never reached the broker"
     );
     let first = from_connection(&h.broker, 1);
@@ -56,14 +56,14 @@ async fn a_connack_subscribes_before_active_then_republishes_the_model() {
     // publishes, queued ahead of every request (Codex final gate 1).
     let unsubscribed = format!("unsub {}", t.state_filter());
     assert!(
-        h.eventually(BOUND, |h| position(&from_connection(&h.broker, 1), &unsubscribed).is_some()).await,
+        h.eventually(bound(), |h| position(&from_connection(&h.broker, 1), &unsubscribed).is_some()).await,
         "the read-back's subscription was kept once it was done: {:#?}",
         from_connection(&h.broker, 1)
     );
 
     h.broker.drop_connection();
     assert!(
-        h.eventually(BOUND, |h| {
+        h.eventually(bound(), |h| {
             let again = from_connection(&h.broker, 2);
             position(&again, &format!("pub {} ", t.state("t1"))).is_some()
         })
@@ -91,11 +91,11 @@ async fn a_connack_subscribes_before_active_then_republishes_the_model() {
 async fn a_broker_restarted_without_persistence_gets_the_retained_model_again() {
     let h = Harness::start_with("restart", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "power", json!(true))).await;
     let t = h.topics.clone();
-    assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some() && h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(bound(), |h| h.broker.retained_on(&t.state("t1")).is_some() && h.status().as_deref() == Some("connected")).await);
     h.broker.restart_without_persistence();
     assert!(h.broker.retained().is_empty());
     let restored = h
-        .eventually(BOUND, |h| {
+        .eventually(bound(), |h| {
             [t.active(), t.status(), t.version(), t.state("t1")].iter().all(|topic| h.broker.retained_on(topic).is_some())
         })
         .await;
@@ -112,7 +112,7 @@ async fn a_broker_restarted_without_persistence_gets_the_retained_model_again() 
 async fn a_reconnect_publishes_nothing_before_its_subscriptions() {
     let h = Harness::start_with("requeued", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "n", json!(0))).await;
     let t = h.topics.clone();
-    assert!(h.eventually(BOUND, |h| h.state("t1").is_some() && h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(bound(), |h| h.state("t1").is_some() && h.status().as_deref() == Some("connected")).await);
     h.broker.refuse_connections(true);
     h.broker.drop_connection();
     // While the broker is away, the device reports, every 10 ms, for 600 ms; the broker takes
@@ -129,7 +129,7 @@ async fn a_reconnect_publishes_nothing_before_its_subscriptions() {
     h.broker.refuse_connections(false);
     let _ = reporting.await;
     assert!(
-        h.eventually(BOUND, |h| position(&from_connection(&h.broker, 2), &format!("pub {} true", t.active())).is_some()).await,
+        h.eventually(bound(), |h| position(&from_connection(&h.broker, 2), &format!("pub {} true", t.active())).is_some()).await,
         "the bridge never announced itself again: {:#?}",
         from_connection(&h.broker, 2)
     );
@@ -152,12 +152,12 @@ async fn requests_are_subscribed_only_once_the_read_back_is_acknowledged() {
     })
     .await;
     let t = h.topics.clone();
-    assert!(h.broker.wait_for_subscription(&t.state_filter(), BOUND).await, "the read-back was never subscribed");
+    assert!(h.broker.wait_for_subscription(&t.state_filter(), bound()).await, "the read-back was never subscribed");
     h.settle(std::time::Duration::from_millis(500)).await;
     let early: Vec<String> = h.broker.subscriptions().into_iter().filter(|f| *f != t.state_filter()).collect();
     assert!(early.is_empty(), "requests were subscribed before the read-back was acknowledged: {early:?}");
     h.broker.release_subacks();
-    assert!(h.broker.wait_for_subscription(&t.command(), BOUND).await, "the requests were never subscribed");
+    assert!(h.broker.wait_for_subscription(&t.command(), bound()).await, "the requests were never subscribed");
     assert!(h.stop().await);
 }
 
@@ -171,7 +171,7 @@ async fn a_read_back_the_broker_refuses_is_said_incomplete() {
         broker.deny_subscriptions(&format!("{}/State/", topics.root()));
     })
     .await;
-    assert!(h.broker.wait_for_subscription(&h.topics.command(), BOUND).await, "the bridge never subscribed to its requests");
+    assert!(h.broker.wait_for_subscription(&h.topics.command(), bound()).await, "the bridge never subscribed to its requests");
     let warned = h.log.of_kind("read_back_incomplete");
     assert!(
         warned.len() == 1 && warned[0].level == tracing::Level::WARN,
@@ -187,7 +187,7 @@ async fn a_read_back_the_broker_refuses_is_said_incomplete() {
 #[tokio::test(flavor = "multi_thread")]
 async fn config_is_subscribed_before_desired() {
     let h = Harness::start("sub-order", acknowledged(), quick_timing()).await;
-    assert!(h.broker.wait_for_subscription(&h.topics.command(), BOUND).await, "the bridge never subscribed");
+    assert!(h.broker.wait_for_subscription(&h.topics.command(), bound()).await, "the bridge never subscribed");
     let subscribed: Vec<String> = h
         .broker
         .events()

@@ -21,7 +21,7 @@ fn down_at_20(_: &FakeBroker, _: &mqtt_bridge_kit::topics::Topics, device: &Devi
 }
 
 async fn connected(h: &Harness) -> bool {
-    h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await
+    h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await
 }
 
 /// A request made while the device is down is held, and applied when it is back, within its
@@ -34,12 +34,16 @@ async fn a_request_while_the_device_is_down_is_applied_on_recovery_within_its_ex
     assert!(h.device.applies().is_empty(), "a request was applied to a device that is down");
     h.device.set_up(true);
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(22))).await,
         "the held request was never applied: {:?}",
         h.device.calls()
     );
     assert_eq!(h.device.applies(), vec![("t1".to_owned(), values(&[("temp", json!(22))]))]);
-    assert!(h.eventually(BOUND, |h| h.log.of_kind("device_recovered").len() == 1).await, "the outage never ended: {:#?}", h.log.records());
+    assert!(
+        h.eventually(bound(), |h| h.log.of_kind("device_recovered").len() == 1).await,
+        "the outage never ended: {:#?}",
+        h.log.records()
+    );
     let recovered = h.log.of_kind("device_recovered");
     assert!(recovered[0].field("applied") == Some("1"), "the recovery did not count the applied request: {:#?}", h.log.records());
     assert!(h.stop().await);
@@ -65,7 +69,7 @@ async fn a_request_held_past_its_expiry_is_never_applied() {
 async fn a_momentary_command_while_the_device_is_down_is_refused_and_never_executed() {
     let h = Harness::start_with("momentary", acknowledged(), quick_timing(), down_at_20).await;
     assert!(h.command(json!({"target": "t1", "command": "pulse"}), None));
-    assert!(h.eventually(BOUND, |h| !h.errors_for("refused").is_empty()).await, "the refused command got no Error: {:?}", h.errors());
+    assert!(h.eventually(bound(), |h| !h.errors_for("refused").is_empty()).await, "the refused command got no Error: {:?}", h.errors());
     let refused = &h.errors_for("refused")[0];
     assert_eq!((refused["target"].as_str(), refused["command"].as_str()), (Some("t1"), Some("pulse")));
     // Refused as it came, not queued and refused by the next failed connect.
@@ -83,11 +87,11 @@ async fn a_momentary_command_while_the_device_is_down_is_refused_and_never_execu
 /// back.
 async fn outage_with_a_change_at_the_device(h: &Harness, conflict: &'static str) {
     assert!(
-        h.eventually(BOUND, |h| h.state("t1") == Some(json!({"temp": 20, "power": false}))).await,
+        h.eventually(bound(), |h| h.state("t1") == Some(json!({"temp": 20, "power": false}))).await,
         "the device's state was never observed"
     );
     h.device.set_up(false);
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "the outage was never seen");
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("unreachable")).await, "the outage was never seen");
     h.device.set("t1", "temp", json!(18));
     // Already at what is asked, a JSON number written another way: satisfied, never written.
     h.device.set("t1", "level", json!(40.0));
@@ -112,11 +116,11 @@ async fn the_outage_conflict_device_wins() {
     let h = Harness::start_with("devicewins", acknowledged(), quick_timing(), up_at_20).await;
     outage_with_a_change_at_the_device(&h, "DeviceWins").await;
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "power") == Some(json!(true))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "power") == Some(json!(true))).await,
         "the unchanged property's request was not applied"
     );
     assert!(
-        h.eventually(BOUND, |h| !h.errors_for("superseded").is_empty()).await,
+        h.eventually(bound(), |h| !h.errors_for("superseded").is_empty()).await,
         "no Error said the request was superseded: {:?}",
         h.errors()
     );
@@ -138,7 +142,7 @@ async fn the_outage_conflict_request_wins() {
     let h = Harness::start_with("requestwins", acknowledged(), quick_timing(), up_at_20).await;
     outage_with_a_change_at_the_device(&h, "RequestWins").await;
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(22))).await,
         "the request did not win: {:?}",
         h.device.calls()
     );
@@ -168,11 +172,11 @@ async fn the_outage_conflict_after_a_bridge_restart_uses_the_read_back() {
     })
     .await;
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "power") == Some(json!(true))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "power") == Some(json!(true))).await,
         "the unchanged property's request was not applied"
     );
     assert!(
-        h.eventually(BOUND, |h| !h.errors_for("superseded").is_empty()).await,
+        h.eventually(bound(), |h| !h.errors_for("superseded").is_empty()).await,
         "no Error said the request was superseded: {:?}; the calls: {:?}",
         h.errors(),
         h.device.calls().iter().map(|c| format!("{:?} {:?} {:?}", c.op, c.target, c.values)).collect::<Vec<_>>()
@@ -188,7 +192,7 @@ async fn a_target_level_write_reaches_apply_once_with_all_values() {
     let h = Harness::start_with("atomic", acknowledged(), quick_timing(), up_at_20).await;
     assert!(connected(&h).await);
     assert!(h.desire_many("t1", json!({"power": true, "temp": 22}), Req { expiry: Some(60), conflict: Some("DeviceWins") }));
-    assert!(h.eventually(BOUND, |h| !h.device.applies().is_empty()).await, "the target write was never applied");
+    assert!(h.eventually(bound(), |h| !h.device.applies().is_empty()).await, "the target write was never applied");
     h.settle(SETTLE).await;
     assert_eq!(
         h.device.applies(),
@@ -231,7 +235,7 @@ async fn a_request_made_during_a_broker_outage_is_decided_against_what_the_bridg
     assert!(connected(&h).await);
     // The Store sets 23; the device takes it; its State says 23; the Store retracts.
     assert!(h.desire("t1", "temp", json!(23), DEVICE_WINS));
-    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(23))).await);
+    assert!(h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(23))).await);
     // No read since: the published State still says 20 (the device may have clamped the write).
     assert_eq!(h.state("t1"), Some(json!({"temp": 20})), "an acknowledged write was published as State");
     assert!(h.retract("t1", "temp"));
@@ -243,7 +247,7 @@ async fn a_request_made_during_a_broker_outage_is_decided_against_what_the_bridg
     h.broker.retain(&h.topics.desired("t1", "temp"), "25", &SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins"));
     h.broker.refuse_connections(false);
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(25)) || !h.errors_for("superseded").is_empty()).await,
+        h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(25)) || !h.errors_for("superseded").is_empty()).await,
         "nothing became of the replayed request"
     );
     assert!(
@@ -266,10 +270,10 @@ async fn only_the_values_a_partial_apply_wrote_become_what_the_bridge_knows() {
     })
     .await;
     assert!(connected(&h).await);
-    assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
+    assert!(h.eventually(bound(), |h| h.state("t1").is_some()).await);
     h.device.answer_times(Op::Apply, None, Answer::RefuseProperty("temp"), 1);
     assert!(h.desire_many("t1", json!({"power": true, "temp": 22}), DEVICE_WINS));
-    assert!(h.eventually(BOUND, |h| !h.errors_for("rejected").is_empty()).await, "the refused property got no Error");
+    assert!(h.eventually(bound(), |h| !h.errors_for("rejected").is_empty()).await, "the refused property got no Error");
     assert_eq!(h.device.get("t1", "power"), Some(json!(true)));
     h.settle(Duration::from_millis(300)).await;
     // The broker goes away; meanwhile the Store asks for power off and 25, kept at the broker.
@@ -281,7 +285,7 @@ async fn only_the_values_a_partial_apply_wrote_become_what_the_bridge_knows() {
     h.broker.retain(&h.topics.desired("t1", "temp"), "25", &replay);
     h.broker.refuse_connections(false);
     assert!(
-        h.eventually(BOUND, |h| (h.device.get("t1", "power") == Some(json!(false)) && h.device.get("t1", "temp") == Some(json!(25)))
+        h.eventually(bound(), |h| (h.device.get("t1", "power") == Some(json!(false)) && h.device.get("t1", "temp") == Some(json!(25)))
             || !h.errors_for("superseded").is_empty())
             .await,
         "nothing became of the replayed requests"
@@ -301,18 +305,18 @@ async fn only_the_values_a_partial_apply_wrote_become_what_the_bridge_knows() {
 async fn an_acknowledged_write_is_a_device_outages_before_value() {
     let h = Harness::start_with("written-before", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
     assert!(connected(&h).await);
-    assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
+    assert!(h.eventually(bound(), |h| h.state("t1").is_some()).await);
     assert!(h.desire("t1", "temp", json!(23), DEVICE_WINS));
-    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(23))).await);
+    assert!(h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(23))).await);
     assert!(h.retract("t1", "temp"));
     h.settle(Duration::from_millis(200)).await;
     h.device.set_up(false);
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("unreachable")).await);
     assert!(h.desire("t1", "temp", json!(25), DEVICE_WINS));
     h.settle(Duration::from_millis(200)).await;
     h.device.set_up(true);
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(25)) || !h.errors_for("superseded").is_empty()).await,
+        h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(25)) || !h.errors_for("superseded").is_empty()).await,
         "nothing became of the held request"
     );
     assert!(
@@ -333,9 +337,9 @@ async fn a_link_lost_during_the_catch_up_does_not_forget_a_change_at_the_device(
         device.set("t2", "temp", json!(20));
     })
     .await;
-    assert!(h.eventually(BOUND, |h| h.state("t2").is_some() && h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(bound(), |h| h.state("t2").is_some() && h.status().as_deref() == Some("connected")).await);
     h.device.set_up(false);
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("unreachable")).await);
     // At the wall, during the outage: t2 to 18. Requests for both.
     h.device.set("t2", "temp", json!(18));
     assert!(h.desire("t1", "temp", json!(22), DEVICE_WINS));
@@ -344,7 +348,7 @@ async fn a_link_lost_during_the_catch_up_does_not_forget_a_change_at_the_device(
     // The catch-up's first write loses the link.
     h.device.answer_times(Op::Apply, Some("t1"), Answer::Link, 1);
     h.device.set_up(true);
-    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await, "t1 was never applied: {:?}", h.device.calls());
+    assert!(h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(22))).await, "t1 was never applied: {:?}", h.device.calls());
     h.settle(Duration::from_millis(600)).await;
     assert_eq!(
         h.device.get("t2", "temp"),
@@ -374,12 +378,12 @@ async fn a_live_request_grouped_with_a_replayed_one_is_not_checked() {
     // Keep the worker busy while a replay and a live write for t1 arrive.
     h.device.answer_times(Op::Apply, Some("t0"), Answer::Delay(Duration::from_millis(1500)), 1);
     assert!(h.desire("t0", "x", json!(1), Req::default()));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty()).await);
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Apply).is_empty()).await);
     // A replay (the broker brings back what was retained while the bridge was away)…
     h.broker.retain(&h.topics.desired("t1", "temp"), "22", &SendOptions::default().expiry(3600).user_property("conflict", "RequestWins"));
     let connects = h.broker.connections();
     h.broker.drop_connection();
-    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await);
+    assert!(h.eventually(bound(), |h| h.broker.connections() > connects && h.subscribed_again()).await);
     h.settle(Duration::from_millis(100)).await;
     // …and a live write, not retained, for the same target.
     assert!(h.broker.publish(
@@ -388,7 +392,7 @@ async fn a_live_request_grouped_with_a_replayed_one_is_not_checked() {
         &SendOptions::default().expiry(3600).user_property("conflict", "DeviceWins")
     ));
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "mode") == Some(json!("cool")) || !h.errors_for("superseded").is_empty()).await,
+        h.eventually(bound(), |h| h.device.get("t1", "mode") == Some(json!("cool")) || !h.errors_for("superseded").is_empty()).await,
         "nothing became of the live request"
     );
     assert!(h.errors_for("superseded").is_empty(), "a live request was superseded for its company: {:?}", h.errors());
@@ -417,15 +421,15 @@ async fn the_read_back_decides_replays_for_a_device_already_up() {
         device.set("t1", "power", json!(false));
     })
     .await;
-    assert!(h.eventually(BOUND, |h| h.device.connected() && !h.device.calls_of(Op::Read).is_empty()).await, "the device never connected");
+    assert!(h.eventually(bound(), |h| h.device.connected() && !h.device.calls_of(Op::Read).is_empty()).await, "the device never connected");
     h.settle(Duration::from_millis(200)).await;
     h.broker.release_subacks();
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "power") == Some(json!(true))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "power") == Some(json!(true))).await,
         "the unchanged property's request was not applied"
     );
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("superseded").iter().any(|e| e["property"] == "temp")).await,
+        h.eventually(bound(), |h| h.errors_for("superseded").iter().any(|e| e["property"] == "temp")).await,
         "the replayed request was not decided against the read-back: {:?}",
         h.errors()
     );
@@ -447,15 +451,15 @@ async fn the_read_back_decides_replays_held_for_a_device_down() {
         device.set_up(false);
     })
     .await;
-    assert!(h.broker.wait_for_subscription(&h.topics.desired_property_filter(), BOUND).await);
+    assert!(h.broker.wait_for_subscription(&h.topics.desired_property_filter(), bound()).await);
     h.settle(Duration::from_millis(300)).await;
     h.device.set_up(true);
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "power") == Some(json!(true))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "power") == Some(json!(true))).await,
         "the unchanged property's request was not applied"
     );
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("superseded").iter().any(|e| e["property"] == "temp")).await,
+        h.eventually(bound(), |h| h.errors_for("superseded").iter().any(|e| e["property"] == "temp")).await,
         "the held replay was not decided against the read-back: {:?}",
         h.errors()
     );
@@ -474,10 +478,10 @@ async fn the_catch_up_reads_a_target_the_proving_read_did_not_give() {
     })
     .await;
     // Seen at 20 before the outage.
-    assert!(h.eventually(BOUND, |h| h.state("t1").is_some() && h.state("t2").is_some()).await);
+    assert!(h.eventually(bound(), |h| h.state("t1").is_some() && h.state("t2").is_some()).await);
     h.device.answer_read_all(Answer::Unsupported);
     h.device.set_up(false);
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("unreachable")).await);
     // t1 changed at the wall during the outage, t2 not; a request for each.
     h.device.set("t1", "temp", json!(18));
     assert!(h.desire("t1", "temp", json!(22), DEVICE_WINS));
@@ -485,12 +489,12 @@ async fn the_catch_up_reads_a_target_the_proving_read_did_not_give() {
     h.settle(Duration::from_millis(200)).await;
     h.device.set_up(true);
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t2", "temp") == Some(json!(22))).await,
+        h.eventually(bound(), |h| h.device.get("t2", "temp") == Some(json!(22))).await,
         "the request for the target nobody touched was not applied: its current value was not read: {:?}",
         h.errors()
     );
     assert!(
-        h.eventually(BOUND, |h| !h.errors_for("superseded").is_empty() || h.device.get("t1", "temp") == Some(json!(22))).await,
+        h.eventually(bound(), |h| !h.errors_for("superseded").is_empty() || h.device.get("t1", "temp") == Some(json!(22))).await,
         "nothing became of the held request"
     );
     assert_eq!(h.device.get("t1", "temp"), Some(json!(18)), "DeviceWins reverted a change at the wall on a device read target by target");
@@ -521,14 +525,14 @@ async fn device_wins_does_not_apply_a_held_request_whose_current_value_is_unknow
     assert!(h.desire("t1", "swing", json!(true), DEVICE_WINS));
     h.settle(Duration::from_millis(300)).await;
     h.device.set_up(true);
-    assert!(h.eventually(BOUND, |h| h.device.get("t1", "mode") == Some(json!("cool"))).await, "the RequestWins request was not applied");
+    assert!(h.eventually(bound(), |h| h.device.get("t1", "mode") == Some(json!("cool"))).await, "the RequestWins request was not applied");
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "swing") == Some(json!(true))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "swing") == Some(json!(true))).await,
         "a DeviceWins request with no before value was not applied because the current value is unknown: {:?}",
         h.errors()
     );
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("superseded").iter().any(|e| e["property"] == "fan")).await,
+        h.eventually(bound(), |h| h.errors_for("superseded").iter().any(|e| e["property"] == "fan")).await,
         "the DeviceWins request on an unknown value was not reported superseded: {:?}",
         h.errors()
     );
@@ -557,12 +561,12 @@ async fn a_request_retracted_during_its_conflict_read_is_not_applied() {
     // The startup's order, gated: the replay held first, then the device up (the R1 re-gate's
     // minor: the test leaned on startup choosing the replay path, and on a 400 ms read within a
     // 500 ms bound).
-    assert!(h.broker.wait_for_subscription(&h.topics.desired_property_filter(), BOUND).await, "the bridge never subscribed");
+    assert!(h.broker.wait_for_subscription(&h.topics.desired_property_filter(), bound()).await, "the bridge never subscribed");
     h.settle(Duration::from_millis(300)).await;
     let disconnects = h.device.calls_of(Op::Disconnect).len();
     h.device.set_up(true);
     assert!(
-        h.eventually(BOUND, |h| h.device.calls_of(Op::Read).iter().any(|c| c.target.as_deref() == Some("t1"))).await,
+        h.eventually(bound(), |h| h.device.calls_of(Op::Read).iter().any(|c| c.target.as_deref() == Some("t1"))).await,
         "the replayed request was never checked"
     );
     assert!(h.retract("t1", "temp"));
@@ -590,7 +594,7 @@ async fn a_targets_config_is_configured_before_its_held_values_are_applied() {
     h.settle(Duration::from_millis(400)).await;
     h.device.set_up(true);
     assert!(
-        h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty() && !h.device.calls_of(Op::Configure).is_empty()).await,
+        h.eventually(bound(), |h| !h.device.calls_of(Op::Apply).is_empty() && !h.device.calls_of(Op::Configure).is_empty()).await,
         "the config or the value never reached the driver: {:?}",
         h.device.calls()
     );
@@ -612,7 +616,7 @@ async fn a_target_writes_copies_arriving_after_its_apply_are_skipped() {
         json!({"power": true, "temp": 22}).to_string(),
         &SendOptions::default().expiry(60)
     ));
-    assert!(h.eventually(BOUND, |h| !h.device.applies().is_empty()).await, "the target write was never applied");
+    assert!(h.eventually(bound(), |h| !h.device.applies().is_empty()).await, "the target write was never applied");
     h.settle(Duration::from_millis(100)).await;
     assert!(h.desire("t1", "power", json!(true), req));
     assert!(h.desire("t1", "temp", json!(22), req));
@@ -636,11 +640,11 @@ async fn a_targets_config_is_configured_before_its_replayed_values_for_a_device_
         );
     })
     .await;
-    assert!(h.eventually(BOUND, |h| h.device.connected() && !h.device.calls_of(Op::Read).is_empty()).await, "the device never connected");
+    assert!(h.eventually(bound(), |h| h.device.connected() && !h.device.calls_of(Op::Read).is_empty()).await, "the device never connected");
     h.settle(Duration::from_millis(200)).await;
     h.broker.release_subacks();
     assert!(
-        h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty() && !h.device.calls_of(Op::Configure).is_empty()).await,
+        h.eventually(bound(), |h| !h.device.calls_of(Op::Apply).is_empty() && !h.device.calls_of(Op::Configure).is_empty()).await,
         "the config or the value never reached the driver: {:?}",
         h.device.calls()
     );
@@ -665,13 +669,13 @@ async fn a_broker_disconnect_during_a_conflict_read_keeps_the_requests_basis() {
     })
     .await;
     assert!(
-        h.eventually(BOUND, |h| h.device.calls_of(Op::Read).iter().any(|c| c.target.as_deref() == Some("t1"))).await,
+        h.eventually(bound(), |h| h.device.calls_of(Op::Read).iter().any(|c| c.target.as_deref() == Some("t1"))).await,
         "no conflict read began"
     );
     // The broker connection drops while the read is under way.
     h.broker.drop_connection();
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22)) || !h.errors_for("superseded").is_empty()).await,
+        h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(22)) || !h.errors_for("superseded").is_empty()).await,
         "nothing became of the replayed request"
     );
     h.settle(Duration::from_millis(500)).await;
@@ -695,10 +699,14 @@ async fn a_request_superseded_in_one_session_is_not_applied_on_the_next_replay()
         device.set("t1", "temp", json!(18));
     })
     .await;
-    assert!(h.eventually(BOUND, |h| !h.errors_for("superseded").is_empty()).await, "the first replay was not superseded: {:?}", h.errors());
+    assert!(
+        h.eventually(bound(), |h| !h.errors_for("superseded").is_empty()).await,
+        "the first replay was not superseded: {:?}",
+        h.errors()
+    );
     let connects = h.broker.connections();
     h.broker.drop_connection();
-    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await);
+    assert!(h.eventually(bound(), |h| h.broker.connections() > connects && h.subscribed_again()).await);
     h.settle(Duration::from_millis(800)).await;
     assert_eq!(h.device.get("t1", "temp"), Some(json!(18)), "the change at the device was reverted by a replay already superseded");
     assert!(h.stop().await);

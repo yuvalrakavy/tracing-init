@@ -32,7 +32,7 @@ async fn a_blocked_worker_ends_the_process_and_the_restart_restores_every_status
         let mut h = HostHarness::start("blocked", fleet).await;
         assert!(h.configure(&calm, json!({})) && h.configure(&stuck, json!({})));
         assert!(
-            h.eventually(BOUND, |h| h.status(&calm).as_deref() == Some("connected") && h.status(&stuck).as_deref() == Some("connected"))
+            h.eventually(bound(), |h| h.status(&calm).as_deref() == Some("connected") && h.status(&stuck).as_deref() == Some("connected"))
                 .await,
             "the devices never connected"
         );
@@ -50,7 +50,7 @@ async fn a_blocked_worker_ends_the_process_and_the_restart_restores_every_status
         for (instance, mark) in [&calm, &stuck].into_iter().zip(marks) {
             assert!(
                 restarted
-                    .eventually(BOUND, |r| r.statuses(instance).len() > mark
+                    .eventually(bound(), |r| r.statuses(instance).len() > mark
                         && r.status_via(instance).is_some_and(|(_, via)| via.as_deref() == Some(r.bridge.as_str())))
                     .await,
                 "the restart did not publish {instance}'s Status again: {:?}",
@@ -58,7 +58,7 @@ async fn a_blocked_worker_ends_the_process_and_the_restart_restores_every_status
             );
         }
         assert!(
-            restarted.eventually(BOUND, |r| r.status(&calm).as_deref() == Some("connected")).await,
+            restarted.eventually(bound(), |r| r.status(&calm).as_deref() == Some("connected")).await,
             "the other device is not served again after the restart"
         );
         assert!(restarted.stop().await);

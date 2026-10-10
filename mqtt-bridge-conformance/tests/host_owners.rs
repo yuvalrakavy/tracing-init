@@ -33,16 +33,16 @@ async fn moving_via_hands_the_instance_over_and_heals_a_late_write() {
         two.fleet.prepare(&lamp, |d| d.set("t1", "power", json!(true)));
         assert!(one.configure(&lamp, json!({})));
         assert!(
-            one.eventually(BOUND, |h| h.status_via(&lamp) == Some(("connected".into(), Some(h.bridge.clone())))).await,
+            one.eventually(bound(), |h| h.status_via(&lamp) == Some(("connected".into(), Some(h.bridge.clone())))).await,
             "the first owner never served the instance: {:?}",
             one.status_via(&lamp)
         );
         let old = one.fleet.device(&lamp).expect("built by the first owner");
         // The Store moves the instance: its Config now names the second process.
         assert!(two.configure(&lamp, json!({})));
-        assert!(one.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the old owner did not release the instance");
+        assert!(one.eventually(bound(), |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the old owner did not release the instance");
         assert!(
-            two.eventually(BOUND, |h| h.status_via(&lamp) == Some(("connected".into(), Some(h.bridge.clone())))).await,
+            two.eventually(bound(), |h| h.status_via(&lamp) == Some(("connected".into(), Some(h.bridge.clone())))).await,
             "the new owner never served the instance: {:?}",
             two.status_via(&lamp)
         );
@@ -52,7 +52,7 @@ async fn moving_via_hands_the_instance_over_and_heals_a_late_write() {
         let marked = two.statuses(&lamp).len();
         two.broker.publish(&t.status(), "unreachable", &SendOptions::default().retained().user_property("via", &one.bridge));
         assert!(
-            two.eventually(BOUND, |h| h.statuses(&lamp).len() > marked
+            two.eventually(bound(), |h| h.statuses(&lamp).len() > marked
                 && h.status_via(&lamp) == Some(("connected".into(), Some(h.bridge.clone()))))
                 .await,
             "the new owner did not reassert its Status over the old owner's late write: {:?}",
@@ -84,22 +84,22 @@ async fn a_process_death_makes_only_its_own_instances_unavailable() {
         let (x, y) = (instance_name("X"), instance_name("Y"));
         assert!(one.configure(&x, json!({})) && two.configure(&y, json!({})));
         assert!(
-            one.eventually(BOUND, |h| h.status(&x).as_deref() == Some("connected") && h.status(&y).as_deref() == Some("connected")).await,
+            one.eventually(bound(), |h| h.status(&x).as_deref() == Some("connected") && h.status(&y).as_deref() == Some("connected")).await,
             "the instances never connected"
         );
         assert!(
-            one.eventually(BOUND, |h| h.broker.retained_on(&h.active_topic()).as_deref() == Some(&b"true"[..])).await,
+            one.eventually(bound(), |h| h.broker.retained_on(&h.active_topic()).as_deref() == Some(&b"true"[..])).await,
             "the first process never said Active=true"
         );
         one.abort();
         assert!(
-            one.eventually(BOUND, |h| h.broker.retained_on(&h.active_topic()).as_deref() == Some(&b"false"[..])).await,
+            one.eventually(bound(), |h| h.broker.retained_on(&h.active_topic()).as_deref() == Some(&b"false"[..])).await,
             "the dead process's last will did not say Active=false"
         );
         assert_eq!(two.broker.retained_on(&two.active_topic()).as_deref(), Some(&b"true"[..]), "the other process's Active changed");
         let reply = "Store/replies/death";
         assert!(two.command(&y, json!({"command": "learn"}), Some((reply, b"1"))));
-        assert!(two.eventually(BOUND, |h| !h.replies(reply).is_empty()).await, "the other process stopped answering");
+        assert!(two.eventually(bound(), |h| !h.replies(reply).is_empty()).await, "the other process stopped answering");
         assert_eq!(two.status(&y).as_deref(), Some("connected"));
         assert!(two.stop().await);
     })
@@ -115,11 +115,11 @@ async fn dropping_the_running_handle_stops_every_device() {
         let lamp = instance_name("Lamp");
         let mut h = HostHarness::start("dropped", Fleet::new(acknowledged())).await;
         assert!(h.configure(&lamp, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await, "the instance never connected");
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await, "the instance never connected");
         let device = h.fleet.device(&lamp).expect("built");
         h.abort();
         assert!(
-            h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await,
+            h.eventually(bound(), |_| !device.calls_of(Op::Disconnect).is_empty()).await,
             "a dropped host's device kept its link: its worker was never asked to stop"
         );
     })

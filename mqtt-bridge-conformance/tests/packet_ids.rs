@@ -28,9 +28,9 @@ async fn no_packet_id_is_reused_while_a_suback_is_outstanding() {
         })
         .await;
         let t = h.topics.clone();
-        assert!(h.broker.wait_for_subscription(&t.command(), BOUND).await, "the bridge never subscribed to its commands");
+        assert!(h.broker.wait_for_subscription(&t.command(), bound()).await, "the bridge never subscribed to its commands");
         assert!(
-            h.eventually(BOUND, |h| h.device.connected() && !h.device.calls_of(Op::Read).is_empty()).await,
+            h.eventually(bound(), |h| h.device.connected() && !h.device.calls_of(Op::Read).is_empty()).await,
             "the device never connected and reported, so this test proves nothing"
         );
         // Long enough for every message the bridge had to go out, were it not held.
@@ -39,7 +39,7 @@ async fn no_packet_id_is_reused_while_a_suback_is_outstanding() {
         assert!(reuses.is_empty(), "a packet id was reused while its SUBACK was outstanding: {reuses:#?}");
         h.broker.release_subacks();
         assert!(
-            h.eventually(BOUND, |h| h.status().as_deref() == Some("connected") && (0..8).all(|n| h.state(&format!("t{n}")).is_some()))
+            h.eventually(bound(), |h| h.status().as_deref() == Some("connected") && (0..8).all(|n| h.state(&format!("t{n}")).is_some()))
                 .await,
             "the model was not published once the SUBACK came: status {:?}",
             h.status()

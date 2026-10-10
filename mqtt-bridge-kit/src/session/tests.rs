@@ -374,7 +374,11 @@ fn an_expired_live_replacement_of_a_re_held_write_withdraws_its_assumption() {
 /// The flush waits until every publish it enqueued is written and acknowledged before the
 /// DISCONNECT, even a batch so small the in-flight count is still zero when it checks (the second
 /// confirming review's minor): with the acks held, no DISCONNECT goes out within the bound.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// It runs on `current_thread` on purpose: on `multi_thread` the pump task can write the publishes before
+/// the flush checks, and the mutant that checks only the in-flight count passes (a race in the test, not
+/// a clock: 30 of 30 RED on `current_thread`, and the guard passes 15 of 15).
+#[tokio::test(flavor = "current_thread")]
 async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
     let broker = FakeBroker::start().await;
     broker.cap_connections(5);

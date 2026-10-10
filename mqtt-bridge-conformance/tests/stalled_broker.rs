@@ -28,7 +28,7 @@ async fn the_device_side_works_while_the_broker_is_stalled() {
         assert!(h.command(json!({"target": format!("a{i}"), "command": "assume", "level": i}), None));
     }
     assert!(
-        h.eventually(BOUND, |h| h.broker.held_acks() >= 10).await,
+        h.eventually(bound(), |h| h.broker.held_acks() >= 10).await,
         "the broker's acknowledgements were never held: the path is not saturated — or the pump waits on the session"
     );
     h.settle(Duration::from_millis(300)).await;
@@ -51,7 +51,7 @@ async fn the_device_side_works_while_the_broker_is_stalled() {
     );
     h.broker.release_acks();
     assert!(
-        h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await,
+        h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await,
         "the bridge did not recover with the broker — the pump waits on the session, or its session does"
     );
     assert!(h.stop().await);
@@ -63,7 +63,7 @@ async fn the_device_side_works_while_the_broker_is_stalled() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_broker_that_acknowledges_nothing_is_left_for_a_fresh_session() {
     let h = Harness::start_with("unacked", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await);
     h.broker.hold_acks();
     // Something to publish, which the broker takes and never acknowledges.
     h.device.set("t1", "temp", json!(21));
@@ -82,7 +82,7 @@ async fn a_broker_that_acknowledges_nothing_is_left_for_a_fresh_session() {
     );
     h.broker.release_acks();
     assert!(
-        h.eventually(BOUND, |h| h.broker.retained_on(&h.topics.state("t1")).is_some_and(|s| &s[..] == br#"{"temp":21}"#)).await,
+        h.eventually(bound(), |h| h.broker.retained_on(&h.topics.state("t1")).is_some_and(|s| &s[..] == br#"{"temp":21}"#)).await,
         "the fresh session did not publish the model again: {:?}",
         h.broker.retained_on(&h.topics.state("t1"))
     );
@@ -95,7 +95,7 @@ async fn a_broker_that_acknowledges_nothing_is_left_for_a_fresh_session() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_broker_that_stops_reading_is_left_for_a_fresh_session() {
     let h = Harness::start("unread", acknowledged(), quick_timing()).await;
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await);
     h.broker.stop_reading();
     // More than the sockets' buffers hold: twelve states of a megabyte each.
     let blob = "x".repeat(1 << 20);
@@ -109,7 +109,7 @@ async fn a_broker_that_stops_reading_is_left_for_a_fresh_session() {
         h.log.of_kind("connection_lost")
     );
     assert!(
-        h.eventually(BOUND, |h| h.broker.retained_on(&h.topics.state("big11")).is_some()).await,
+        h.eventually(bound(), |h| h.broker.retained_on(&h.topics.state("big11")).is_some()).await,
         "the fresh session did not publish the model again"
     );
     assert!(h.stop().await);
@@ -121,12 +121,12 @@ async fn a_broker_that_stops_reading_is_left_for_a_fresh_session() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_reads_it() {
     let h = Harness::start_with("expiry-arrival", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await);
     // The CONNACK's republication of the model is done before the broker stops acknowledging: a
     // State still unacknowledged when the acks are held keeps the session waiting on it, reading
     // no command, until the pump's stall bound (10 s) ends the session, and 400 commands then find
     // a fresh one (the test took 14.7 s, one run in two).
-    assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
+    assert!(h.eventually(bound(), |h| h.state("t1").is_some()).await);
     park_the_session(&h).await;
     // One second to live, arriving while the session is parked.
     let command = json!({"target": "t1", "command": "pulse"}).to_string();
@@ -145,8 +145,8 @@ async fn a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_rea
 #[tokio::test(flavor = "multi_thread")]
 async fn an_assume_past_its_expiry_is_refused_not_taken() {
     let h = Harness::start_with("assume-expiry", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
-    assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(bound(), |h| h.state("t1").is_some()).await);
     park_the_session(&h).await;
     let assume = json!({"target": "t1", "command": "assume", "temp": 30}).to_string();
     assert!(h.broker.publish(&h.topics.command(), assume, &SendOptions::default().expiry(1)));
@@ -172,7 +172,7 @@ async fn park_the_session(h: &Harness) {
     for i in 0..400 {
         assert!(h.command(json!({"target": format!("a{i}"), "command": "assume", "level": i}), None));
     }
-    assert!(h.eventually(BOUND, |h| h.broker.held_acks() >= 10).await, "the path is not saturated");
+    assert!(h.eventually(bound(), |h| h.broker.held_acks() >= 10).await, "the path is not saturated");
     h.settle(Duration::from_millis(300)).await;
     let barrier = SendOptions::default().expiry(60).user_property("conflict", "RequestWins");
     assert!(h.broker.publish(&h.topics.desired_target("barrier"), r#"{"x": 1}"#, &barrier));

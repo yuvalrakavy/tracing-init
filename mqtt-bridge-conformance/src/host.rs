@@ -14,7 +14,7 @@ use mqtt_bridge_kit::{DeviceConfig, DriverInfo, FactoryError, Host, PropertyMap,
 use mqtt_test_broker::{BrokerEvent, FakeBroker, QoS, Received, SendOptions};
 use serde_json::json;
 
-use crate::{fake_device, quick_mqtt, quick_timing, schema, Capture, Device, FakeDevice, Req, BOUND, ROOT};
+use crate::{bound, fake_device, quick_mqtt, quick_timing, schema, Capture, Device, FakeDevice, Req, ROOT};
 
 /// The kind every scenario's host is.
 pub const KIND: &str = "fakekind";
@@ -160,7 +160,10 @@ impl HostHarness {
     pub async fn join(broker: Arc<FakeBroker>, bridge: &str, fleet: Fleet, tune: impl FnOnce(Host) -> Host) -> HostHarness {
         let harness = HostHarness::join_unwaited(broker, bridge, fleet, tune);
         let configs = format!("{ROOT}/Config/+");
-        assert!(harness.broker.wait_until(BOUND, |b| b.subscriptions().contains(&configs)).await, "the host never subscribed to {configs}");
+        assert!(
+            harness.broker.wait_until(bound(), |b| b.subscriptions().contains(&configs)).await,
+            "the host never subscribed to {configs}"
+        );
         harness
     }
 
@@ -305,9 +308,9 @@ impl HostHarness {
         }
     }
 
-    /// The latest device built for `instance`, once one is (within [`BOUND`]).
+    /// The latest device built for `instance`, once one is (within [`bound`]).
     pub async fn built(&self, instance: &str) -> Device {
-        assert!(self.eventually(BOUND, |h| h.fleet.device(instance).is_some()).await, "no device was built for {instance}");
+        assert!(self.eventually(bound(), |h| h.fleet.device(instance).is_some()).await, "no device was built for {instance}");
         self.fleet.device(instance).expect("built")
     }
 
@@ -326,7 +329,7 @@ impl HostHarness {
     /// time.
     pub async fn stop_host(&mut self) -> bool {
         let running = self.running.take().expect("the host is running");
-        tokio::time::timeout(BOUND, running.stop()).await.unwrap_or(false)
+        tokio::time::timeout(bound(), running.stop()).await.unwrap_or(false)
     }
 
     /// Stop the host (bounded) and check the lanes. Whether it stopped in time.

@@ -20,7 +20,7 @@ fn up_at_20(_: &FakeBroker, _: &mqtt_bridge_kit::topics::Topics, device: &Device
 }
 
 async fn connected(h: &Harness) -> bool {
-    h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await
+    h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await
 }
 
 const REQ: Req = Req { expiry: Some(60), conflict: Some("DeviceWins") };
@@ -33,7 +33,7 @@ async fn a_rejected_request_is_reported_and_the_link_stays_up() {
     assert!(connected(&h).await);
     h.device.answer(Op::Apply, None, Answer::Rejected);
     assert!(h.desire("t1", "temp", json!(22), REQ));
-    assert!(h.eventually(BOUND, |h| !h.errors_for("rejected").is_empty()).await, "the rejection got no Error: {:?}", h.errors());
+    assert!(h.eventually(bound(), |h| !h.errors_for("rejected").is_empty()).await, "the rejection got no Error: {:?}", h.errors());
     let rejected = &h.errors_for("rejected")[0];
     assert_eq!((rejected["target"].as_str(), rejected["property"].as_str()), (Some("t1"), Some("temp")));
     let warns = h.log.of_kind("command_rejected");
@@ -52,7 +52,7 @@ async fn an_unusable_answer_is_reported_once_and_passed_over() {
     assert!(connected(&h).await);
     h.device.answer(Op::Apply, None, Answer::Unusable);
     assert!(h.desire("t1", "temp", json!(22), REQ));
-    assert!(h.eventually(BOUND, |h| !h.errors_for("unusable").is_empty()).await, "the unusable answer got no Error: {:?}", h.errors());
+    assert!(h.eventually(bound(), |h| !h.errors_for("unusable").is_empty()).await, "the unusable answer got no Error: {:?}", h.errors());
     h.settle(SETTLE).await;
     assert_eq!(h.errors_for("unusable").len(), 1, "the Error was published more than once");
     assert_eq!(h.device.calls_of(Op::Apply).len(), 1, "an unusable answer was retried");
@@ -90,7 +90,7 @@ async fn a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_epis
     );
 
     h.device.answer_normally();
-    assert!(h.eventually(BOUND, |h| !h.log.of_kind("device_recovered").is_empty()).await, "the outage never ended");
+    assert!(h.eventually(bound(), |h| !h.log.of_kind("device_recovered").is_empty()).await, "the outage never ended");
     let recovered = &h.log.of_kind("device_recovered")[0];
     assert!(recovered.field("down_for_ms").is_some() && recovered.field("attempts").is_some_and(|a| a.parse::<u32>().unwrap_or(0) >= 4));
     assert!(connected(&h).await);
@@ -131,10 +131,14 @@ async fn unacknowledged_writes_are_held_again_when_the_link_dies_before_a_probe(
     assert!(connected(&h).await);
     h.device.set_deaf(true);
     assert!(h.desire("t1", "level", json!(40), REQ));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Probe).is_empty()).await, "the write was never probed: {:?}", h.device.calls());
+    assert!(
+        h.eventually(bound(), |h| !h.device.calls_of(Op::Probe).is_empty()).await,
+        "the write was never probed: {:?}",
+        h.device.calls()
+    );
     h.device.set_deaf(false);
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "level") == Some(json!(40))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "level") == Some(json!(40))).await,
         "the unproven write was not held again: {:?}",
         h.device.calls()
     );
@@ -153,7 +157,7 @@ async fn a_driver_call_that_never_returns_is_a_lost_link_within_its_deadline() {
     assert!(connected(&h).await);
     h.device.answer_times(Op::Apply, None, Answer::Hang, 1);
     assert!(h.desire("t1", "temp", json!(22), REQ));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Disconnect).is_empty()).await, "the hanging call never lost the link");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Disconnect).is_empty()).await, "the hanging call never lost the link");
     let hung = h.device.calls_of(Op::Apply)[0].at;
     let dropped = h.device.calls_of(Op::Disconnect)[0].at;
     assert!(
@@ -161,7 +165,7 @@ async fn a_driver_call_that_never_returns_is_a_lost_link_within_its_deadline() {
         "the link was lost {:?} after the call, past its 500 ms deadline",
         dropped - hung
     );
-    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await, "the request in the hanging call was lost");
+    assert!(h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(22))).await, "the request in the hanging call was lost");
     assert!(h.stop().await);
 }
 
@@ -173,7 +177,7 @@ async fn a_driver_panic_ends_the_device_worker() {
     assert!(connected(&h).await);
     h.device.answer(Op::Apply, None, Answer::Panic);
     assert!(h.desire("t1", "temp", json!(22), REQ));
-    let died = tokio::time::timeout(BOUND, h.running().ended()).await.expect("the driver's panic went unseen");
+    let died = tokio::time::timeout(bound(), h.running().ended()).await.expect("the driver's panic went unseen");
     assert_eq!(died.part, "device");
     // With the worker's end unseen, the blocked-thread watchdog still ends the bridge, past the
     // operation's deadline and its grace: the panic itself went unseen.
@@ -192,7 +196,7 @@ async fn a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline() {
     assert!(connected(&h).await);
     h.device.answer_times(Op::Apply, None, Answer::Block(Duration::from_secs(10)), 1);
     assert!(h.desire("t1", "temp", json!(22), REQ));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty()).await, "the apply never began");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Apply).is_empty()).await, "the apply never began");
     // Waiting behind the blocked apply.
     assert!(h.command(json!({"target": "t1", "command": "pulse"}), Some(("Store/r", b"p1"))));
     let blocked_at = h.device.calls_of(Op::Apply)[0].at;
@@ -212,13 +216,13 @@ async fn a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline() {
     assert_eq!(died.part, "device", "{died:?}");
     assert!(died.cause.contains("blocked"), "{died:?}");
     assert!(blocked_at.elapsed() < Duration::from_secs(8), "seen only once the driver let go: {:?}", blocked_at.elapsed());
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "Status still says {:?}", h.status());
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("unreachable")).await, "Status still says {:?}", h.status());
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("refused").iter().any(|e| e["command"] == "pulse")).await,
+        h.eventually(bound(), |h| h.errors_for("refused").iter().any(|e| e["command"] == "pulse")).await,
         "the momentary command waiting behind the blocked worker was not refused: {:?}",
         h.errors()
     );
-    assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the refused command was not answered");
+    assert!(h.eventually(bound(), |h| !h.published("Store/r").is_empty()).await, "the refused command was not answered");
     assert!(h.stop().await);
 }
 
@@ -325,18 +329,18 @@ async fn a_reported_name_that_is_no_topic_segment_is_dropped_and_the_session_goe
     })
     .await;
     assert!(connected(&h).await);
-    assert!(h.eventually(BOUND, |h| h.state("t2").is_some()).await, "the target beside the bad name was not published");
+    assert!(h.eventually(bound(), |h| h.state("t2").is_some()).await, "the target beside the bad name was not published");
     let connects = h.broker.connections();
     h.broker.drop_connection();
-    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await, "the bridge did not reconnect");
+    assert!(h.eventually(bound(), |h| h.broker.connections() > connects && h.subscribed_again()).await, "the bridge did not reconnect");
     h.device.set("t1", "temp", json!(25));
     assert!(h.command(json!({"target": "t1", "command": "refresh"}), Some(("Store/r", b"1"))));
     assert!(
-        h.eventually(BOUND, |h| h.state("t1").is_some_and(|s| s["temp"] == 25)).await,
+        h.eventually(bound(), |h| h.state("t1").is_some_and(|s| s["temp"] == 25)).await,
         "after a reconnect the session published nothing: state(t1) = {:?}",
         h.state("t1")
     );
-    assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the refresh was not answered");
+    assert!(h.eventually(bound(), |h| !h.published("Store/r").is_empty()).await, "the refresh was not answered");
     assert_eq!(h.state("t2"), Some(json!({"ok": 2})), "the bad property was published, or the good one dropped");
     let violations = h.log.of_kind("driver_contract_violation");
     assert!(
@@ -361,7 +365,7 @@ async fn an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violat
     assert!(connected(&h).await);
     for level in [40, 50] {
         assert!(h.desire("t1", "level", json!(level), REQ));
-        assert!(h.eventually(BOUND, |h| h.device.get("t1", "level") == Some(json!(level))).await);
+        assert!(h.eventually(bound(), |h| h.device.get("t1", "level") == Some(json!(level))).await);
         h.settle(Duration::from_millis(300)).await;
     }
     assert!(h.device.calls_of(Op::Probe).len() >= 2, "the writes were not probed: {:?}", h.device.calls());
@@ -390,7 +394,7 @@ async fn a_partial_apply_reports_only_the_properties_that_failed() {
     assert!(connected(&h).await);
     h.device.answer_times(Op::Apply, None, Answer::RefuseProperty("temp"), 1);
     assert!(h.desire_many("t1", json!({"power": true, "temp": 22}), REQ));
-    assert!(h.eventually(BOUND, |h| !h.errors_for("rejected").is_empty()).await, "the refused property got no Error: {:?}", h.errors());
+    assert!(h.eventually(bound(), |h| !h.errors_for("rejected").is_empty()).await, "the refused property got no Error: {:?}", h.errors());
     h.settle(SETTLE).await;
     let rejected = h.errors_for("rejected");
     assert_eq!(
@@ -419,14 +423,14 @@ async fn a_partial_applys_written_values_are_held_again_when_the_link_dies_befor
     h.device.answer_times(Op::Apply, None, Answer::RefuseProperty("temp"), 1);
     let req = Req { expiry: Some(3600), conflict: Some("RequestWins") };
     assert!(h.desire_many("t1", json!({"power": true, "temp": 22}), req));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty()).await, "the write never reached the device");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Apply).is_empty()).await, "the write never reached the device");
     h.settle(Duration::from_millis(100)).await;
     // The link dies before anything proves the write (if the probe has not lost it already).
     h.device.set_up(false);
     h.device.set_deaf(false);
     h.device.set_up(true);
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "power") == Some(json!(true))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "power") == Some(json!(true))).await,
         "the value a partial apply wrote was not held again when the link died before proof: {:?}",
         h.device.calls()
     );
@@ -451,7 +455,7 @@ async fn a_helper_that_blocks_the_worker_thread_while_idle_is_a_dead_worker() {
     assert_eq!(died.part, "device", "{died:?}");
     assert!(died.cause.contains("blocked"), "{died:?}");
     assert!(started.elapsed() < Duration::from_secs(10), "seen only once the helper let go: {:?}", started.elapsed());
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "Status still says {:?}", h.status());
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("unreachable")).await, "Status still says {:?}", h.status());
     assert!(h.stop().await, "the bridge did not stop within its bound with its worker blocked");
 }
 
@@ -505,8 +509,8 @@ async fn an_unproven_write_to_a_one_way_target_is_applied_again_after_the_link_d
     let probes = h.device.calls_of(Op::Probe).len();
     h.device.set_deaf(true);
     assert!(h.desire("dim", "level", json!(40), Req { expiry: Some(3600), conflict: Some("RequestWins") }));
-    assert!(h.eventually(BOUND, |h| h.device.calls_of(Op::Probe).len() > probes && !h.device.applies().is_empty()).await, "never probed");
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Disconnect).is_empty()).await, "the link never dropped");
+    assert!(h.eventually(bound(), |h| h.device.calls_of(Op::Probe).len() > probes && !h.device.applies().is_empty()).await, "never probed");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Disconnect).is_empty()).await, "the link never dropped");
     h.device.set_deaf(false);
     assert!(
         h.eventually(Duration::from_secs(4), |h| h.device.get("dim", "level") == Some(json!(40))).await,
@@ -528,7 +532,7 @@ async fn an_unproven_write_to_an_assumed_target_under_device_wins_is_applied_aga
     assert!(connected(&h).await);
     h.device.set_deaf(true);
     assert!(h.desire("dim", "level", json!(40), Req { expiry: Some(3600), conflict: Some("DeviceWins") }));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Probe).is_empty()).await, "never probed");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Probe).is_empty()).await, "never probed");
     h.device.set_deaf(false);
     assert!(
         h.eventually(Duration::from_secs(4), |h| h.device.get("dim", "level") == Some(json!(40))).await,
@@ -550,7 +554,7 @@ async fn long_helper_reads_do_not_end_the_bridge() {
     .await;
     assert!(connected(&h).await);
     assert!(h.desire("t1", "temp", json!(22), REQ));
-    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await, "a request waited behind the helpers' reads");
+    assert!(h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(22))).await, "a request waited behind the helpers' reads");
     let died = tokio::time::timeout(Duration::from_secs(3), h.running().ended()).await;
     assert!(died.is_err(), "the helpers' long reads ended the bridge: {died:?}");
     assert!(h.stop().await);
@@ -572,7 +576,7 @@ async fn a_helpers_budget_full_across_link_losses_is_a_dead_worker() {
         let connects = h.device.calls_of(Op::Connect).len();
         h.device.answer_times(Op::Execute, None, Answer::Link, 1);
         assert!(h.command(json!({"target": "t1", "command": "pulse"}), None));
-        assert!(h.eventually(BOUND, |h| h.device.calls_of(Op::Connect).len() > connects).await, "loss {i}: no reconnect");
+        assert!(h.eventually(bound(), |h| h.device.calls_of(Op::Connect).len() > connects).await, "loss {i}: no reconnect");
         h.settle(Duration::from_millis(400)).await;
     }
     let died = tokio::time::timeout(Duration::from_secs(8), h.running().ended()).await;
@@ -591,7 +595,7 @@ async fn a_stop_after_an_unread_verdict_does_not_wait_for_the_blocked_worker() {
     h.device.answer_times(Op::Execute, None, Answer::Block(Duration::from_secs(15)), 1);
     assert!(h.command(json!({"target": "t1", "command": "pulse"}), None));
     // The verdict comes at the deadline plus the grace (about 2.5 s); it is not read.
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await, "the watchdog did not judge the blocked worker");
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("unreachable")).await, "the watchdog did not judge the blocked worker");
     let stopping = std::time::Instant::now();
     assert!(h.stop_bridge().await, "the stop did not end in time");
     // A flush takes well under the worker's stop bound (2.5 s): waiting for the worker would show.
@@ -608,7 +612,7 @@ async fn an_unproven_write_that_expires_unapplied_withdraws_its_assumption() {
         device.answer(Op::Read, None, Answer::Unsupported);
     })
     .await;
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await);
     // The device never hears the write; the probe after it loses the link, and the device stays
     // out of reach past the request's expiry.
     h.device.answer_times(Op::Apply, None, Answer::Unheard, 1);
@@ -616,11 +620,11 @@ async fn an_unproven_write_that_expires_unapplied_withdraws_its_assumption() {
     h.device.answer(Op::Connect, None, Answer::Link);
     assert!(h.desire("dimmer", "level", json!(40), Req { expiry: Some(2), conflict: Some("RequestWins") }));
     assert!(
-        h.eventually(BOUND, |h| h.state("dimmer").is_some_and(|s| s["level"] == json!(40) && s["assumed"] == json!(true))).await,
+        h.eventually(bound(), |h| h.state("dimmer").is_some_and(|s| s["level"] == json!(40) && s["assumed"] == json!(true))).await,
         "the write was not assumed: {:?}",
         h.state("dimmer")
     );
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Disconnect).is_empty()).await, "the link was not lost before proof");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Disconnect).is_empty()).await, "the link was not lost before proof");
     h.settle(Duration::from_millis(2500)).await;
     h.device.answer_normally();
     assert!(
@@ -650,7 +654,7 @@ async fn a_rejected_request_of_many_properties_reports_every_one() {
     }
     h.settle(Duration::from_millis(500)).await;
     assert!(h.desire_many("t1", Value::Object(values), REQ));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Apply).is_empty()).await, "never applied");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Apply).is_empty()).await, "never applied");
     h.broker.delay_acks(Duration::ZERO);
     let rejected = |h: &Harness| h.errors_for("rejected").iter().filter(|e| e["target"] == "t1").count();
     assert!(

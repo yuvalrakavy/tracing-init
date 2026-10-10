@@ -40,11 +40,11 @@ async fn active_comes_only_after_every_grant_and_after_the_statuses() {
         broker.hold_subacks_matching(&format!("{ROOT}/Desired/{lamp}"));
         let h = HostHarness::join(broker, &bridge, Fleet::new(acknowledged()), |host| host).await;
         let t = h.topics(&lamp);
-        assert!(h.eventually(BOUND, |h| h.subscribed(&t.command())).await, "the instance's requests were never subscribed");
+        assert!(h.eventually(bound(), |h| h.subscribed(&t.command())).await, "the instance's requests were never subscribed");
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(actives(&h), 0, "Active=true was published with a grant pending");
         h.broker.release_subacks();
-        assert!(h.eventually(BOUND, |h| actives(h) == 1).await, "Active=true never came once every grant was in");
+        assert!(h.eventually(bound(), |h| actives(h) == 1).await, "Active=true never came once every grant was in");
         let labels = h.labels();
         let active = labels.iter().position(|l| *l == format!("pub {} true", h.active_topic())).expect("Active=true");
         let status =
@@ -65,7 +65,7 @@ async fn a_refused_config_subscription_ends_the_session() {
         let broker = broker().await;
         broker.deny_subscriptions(&format!("{ROOT}/Config/+"));
         let h = HostHarness::join_unwaited(broker, &instance_name("refused"), Fleet::new(acknowledged()), |host| host);
-        assert!(h.eventually(BOUND, |h| h.broker.connections() >= 3).await, "the session did not end on a refused Config/+");
+        assert!(h.eventually(bound(), |h| h.broker.connections() >= 3).await, "the session did not end on a refused Config/+");
         assert_eq!(actives(&h), 0, "Active=true was published without the Config/+ grant");
         assert!(!h.log.of_kind("subscription_refused").is_empty(), "{:#?}", h.log.records());
         assert!(h.stop().await);
@@ -87,7 +87,7 @@ async fn a_refused_instance_subscription_ends_the_session() {
         );
         broker.deny_subscriptions(&format!("{ROOT}/Command/{lamp}"));
         let h = HostHarness::join(broker, &bridge, Fleet::new(acknowledged()), |host| host).await;
-        assert!(h.eventually(BOUND, |h| h.broker.connections() >= 3).await, "the session did not end on a refused instance subscription");
+        assert!(h.eventually(bound(), |h| h.broker.connections() >= 3).await, "the session did not end on a refused instance subscription");
         assert_eq!(actives(&h), 0, "Active=true was published with an instance subscription refused");
         assert!(!h.log.of_kind("subscription_refused").is_empty(), "{:#?}", h.log.records());
         assert!(h.stop().await);
@@ -115,7 +115,7 @@ async fn an_overdue_subscription_ends_the_session() {
         let slow_pings = mqtt_bridge_kit::MqttTiming { keep_alive: Duration::from_secs(30), ..quick_mqtt() };
         let h = HostHarness::join(broker, &bridge, Fleet::new(acknowledged()), |host| host.mqtt_timing(slow_pings)).await;
         let started = std::time::Instant::now();
-        assert!(h.eventually(BOUND, |h| h.subscribed(&h.topics(&lamp).command())).await, "S3 was never asked for");
+        assert!(h.eventually(bound(), |h| h.subscribed(&h.topics(&lamp).command())).await, "S3 was never asked for");
         assert!(h.eventually(Duration::from_secs(15), |h| h.broker.connections() >= 2).await, "an overdue SUBACK did not end the session");
         let took = started.elapsed();
         assert!(took >= Duration::from_secs(9), "the session ended before the grant was overdue: {took:?}");
@@ -126,7 +126,7 @@ async fn an_overdue_subscription_ends_the_session() {
         );
         assert_eq!(actives(&h), 0, "Active=true was published with a grant pending");
         h.broker.release_subacks();
-        assert!(h.eventually(BOUND, |h| actives(h) == 1).await, "the next session never completed its bootstrap");
+        assert!(h.eventually(bound(), |h| actives(h) == 1).await, "the next session never completed its bootstrap");
         assert!(h.stop().await);
     })
     .await
@@ -145,7 +145,7 @@ async fn a_retry_comes_due_under_a_steady_publication() {
         let retry = mqtt_bridge_kit::TimingOverrides { retry: Some(Duration::from_secs(1)), ..quick_timing() };
         let h = HostHarness::join(broker().await, &instance_name("retry-starved"), fleet, |host| host.timing(retry)).await;
         assert!(h.configure(&chatty, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&chatty).as_deref() == Some("connected")).await, "the chatty device never connected");
+        assert!(h.eventually(bound(), |h| h.status(&chatty).as_deref() == Some("connected")).await, "the chatty device never connected");
         h.broker.delay_acks(Duration::from_millis(10));
         let device = h.fleet.device(&chatty).expect("built");
         let flood = tokio::spawn(async move {
@@ -170,7 +170,7 @@ async fn a_retry_comes_due_under_a_steady_publication() {
             "a failed construction's retry never came due while the publication was owed: builds {}",
             h.fleet.builds(&failing)
         );
-        assert!(h.eventually(BOUND, |h| h.status(&failing).as_deref() == Some("connected")).await, "the retried instance never served");
+        assert!(h.eventually(bound(), |h| h.status(&failing).as_deref() == Some("connected")).await, "the retried instance never served");
         assert!(h.stop().await);
     })
     .await
@@ -189,7 +189,7 @@ async fn an_overdue_grant_ends_the_session_under_a_steady_publication() {
         let slow_pings = mqtt_bridge_kit::MqttTiming { keep_alive: Duration::from_secs(30), ..quick_mqtt() };
         let h = HostHarness::join(broker().await, &instance_name("starved"), fleet, |host| host.mqtt_timing(slow_pings)).await;
         assert!(h.configure(&chatty, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&chatty).as_deref() == Some("connected")).await, "the chatty device never connected");
+        assert!(h.eventually(bound(), |h| h.status(&chatty).as_deref() == Some("connected")).await, "the chatty device never connected");
         h.broker.delay_acks(Duration::from_millis(10));
         let device = h.fleet.device(&chatty).expect("built");
         let flood = tokio::spawn(async move {
@@ -209,7 +209,7 @@ async fn an_overdue_grant_ends_the_session_under_a_steady_publication() {
         h.broker.hold_subacks_matching(&format!("{ROOT}/Desired/{quiet}"));
         let connections = h.broker.connections();
         assert!(h.configure(&quiet, json!({})));
-        assert!(h.eventually(BOUND, |h| h.subscribed(&h.topics(&quiet).command())).await, "S3 was never asked for");
+        assert!(h.eventually(bound(), |h| h.subscribed(&h.topics(&quiet).command())).await, "S3 was never asked for");
         assert!(
             h.eventually(Duration::from_secs(16), |h| h
                 .log
@@ -219,11 +219,11 @@ async fn an_overdue_grant_ends_the_session_under_a_steady_publication() {
                 .await,
             "an overdue grant never ended the session while the publication was owed"
         );
-        assert!(h.eventually(BOUND, |h| h.broker.connections() > connections).await, "the session never came again");
+        assert!(h.eventually(bound(), |h| h.broker.connections() > connections).await, "the session never came again");
         flood.abort();
         h.broker.delay_acks(Duration::ZERO);
         h.broker.release_subacks();
-        assert!(h.eventually(BOUND, |h| h.status(&quiet).as_deref() == Some("connected")).await, "the quiet instance never connected");
+        assert!(h.eventually(bound(), |h| h.status(&quiet).as_deref() == Some("connected")).await, "the quiet instance never connected");
         assert!(h.stop().await);
     })
     .await
@@ -239,13 +239,13 @@ async fn the_statuses_are_republished_before_active_after_a_reconnect() {
         let h = HostHarness::start("republish", fleet).await;
         assert!(h.configure(&a, json!({})) && h.configure(&b, json!({})));
         assert!(
-            h.eventually(BOUND, |h| h.status(&a).as_deref() == Some("connected") && h.status(&b).as_deref() == Some("connected")).await,
+            h.eventually(bound(), |h| h.status(&a).as_deref() == Some("connected") && h.status(&b).as_deref() == Some("connected")).await,
             "the instances never connected"
         );
-        assert!(h.eventually(BOUND, |h| actives(h) == 1).await);
+        assert!(h.eventually(bound(), |h| actives(h) == 1).await);
         let mark = h.labels().len();
         h.broker.drop_connection();
-        assert!(h.eventually(BOUND, |h| actives(h) == 2).await, "Active=true never came after the reconnect");
+        assert!(h.eventually(bound(), |h| actives(h) == 2).await, "Active=true never came after the reconnect");
         let labels = h.labels()[mark..].to_vec();
         let active = labels.iter().position(|l| *l == format!("pub {} true", h.active_topic())).expect("Active=true");
         for instance in [&a, &b] {
@@ -272,19 +272,19 @@ async fn a_stop_spanning_a_reconnect_has_its_status_republished_before_active() 
         fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(3000))));
         let h = HostHarness::start("stop-reconnect", fleet).await;
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
-        assert!(h.eventually(BOUND, |h| actives(h) == 1).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| actives(h) == 1).await);
         let old = h.fleet.device(&lamp).expect("built");
         assert!(h.configure(&lamp, json!({"address": "b"})));
-        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
+        assert!(h.eventually(bound(), |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
         let mark = h.labels().len();
         h.broker.drop_connection();
-        assert!(h.eventually(BOUND, |h| actives(h) == 2).await, "Active=true never came after the reconnect");
+        assert!(h.eventually(bound(), |h| actives(h) == 2).await, "Active=true never came after the reconnect");
         let labels = h.labels()[mark..].to_vec();
         let active = labels.iter().position(|l| *l == format!("pub {} true", h.active_topic())).expect("Active=true");
         let status = labels.iter().position(|l| l.starts_with(&format!("pub {} ", h.topics(&lamp).status())));
         assert!(status.is_some_and(|at| at < active), "the stopping instance's Status was not republished before Active=true: {labels:#?}");
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await, "the successor never connected");
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await, "the successor never connected");
         assert!(h.stop().await);
     })
     .await
@@ -303,20 +303,20 @@ async fn active_waits_for_the_statuses_said_through_the_rotation() {
         fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(3000))));
         let h = HostHarness::start("status-rotation", fleet).await;
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
-        assert!(h.eventually(BOUND, |h| actives(h) == 1).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| actives(h) == 1).await);
         let old = h.fleet.device(&lamp).expect("built");
         assert!(h.configure(&lamp, json!({"address": "b"})));
-        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
+        assert!(h.eventually(bound(), |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
         // On the next connection the read-back's SUBACK comes after the barrier's.
         h.broker.hold_subacks_matching(&format!("{ROOT}/State/{lamp}"));
         let (before, mark) = (h.broker.accepted(), h.labels().len());
         h.broker.drop_connection();
-        assert!(h.eventually(BOUND, |h| h.broker.accepted() > before).await, "no reconnect");
+        assert!(h.eventually(bound(), |h| h.broker.accepted() > before).await, "no reconnect");
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(actives(&h), 1, "Active=true came with the read-back's grant pending");
         h.broker.release_subacks();
-        assert!(h.eventually(BOUND, |h| actives(h) == 2).await, "Active=true never came after the reconnect");
+        assert!(h.eventually(bound(), |h| actives(h) == 2).await, "Active=true never came after the reconnect");
         let labels = h.labels()[mark..].to_vec();
         let active = labels.iter().position(|l| *l == format!("pub {} true", h.active_topic())).expect("Active=true");
         let status = labels.iter().position(|l| *l == format!("pub {} connecting", h.topics(&lamp).status()));

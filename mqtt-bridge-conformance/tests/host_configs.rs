@@ -37,24 +37,25 @@ async fn a_first_construction_failure_leaves_the_instance_failed_and_retried() {
         .await;
         assert!(h.configure(&lamp, json!({"address": "a"})));
         assert!(
-            h.eventually(BOUND, |h| h.status_via(&lamp) == Some(("unreachable".into(), Some(h.bridge.clone())))).await,
+            h.eventually(bound(), |h| h.status_via(&lamp) == Some(("unreachable".into(), Some(h.bridge.clone())))).await,
             "a failed instance did not say unreachable: {:?}",
             h.status_via(&lamp)
         );
-        assert!(h.eventually(BOUND, |h| !h.errors_for(&lamp, "unusable").is_empty()).await, "no Error said why");
+        assert!(h.eventually(bound(), |h| !h.errors_for(&lamp, "unusable").is_empty()).await, "no Error said why");
         assert!(h.errors_for(&lamp, "unusable").iter().all(|e| e.get("target").is_none()), "{:?}", h.errors(&lamp));
         let t = h.topics(&lamp);
-        assert!(h.eventually(BOUND, |h| h.subscribed(&t.command())).await, "a failed instance's requests were not subscribed");
+        assert!(h.eventually(bound(), |h| h.subscribed(&t.command())).await, "a failed instance's requests were not subscribed");
         let reply = "Store/replies/failed";
         assert!(h.command(&lamp, json!({"command": "learn"}), Some((reply, b"1"))));
         assert!(
-            h.eventually(BOUND, |h| h.replies(reply).iter().any(|r| r["reason"] == "refused")).await,
+            h.eventually(bound(), |h| h.replies(reply).iter().any(|r| r["reason"] == "refused")).await,
             "a command to a failed instance was not refused with its reply: {:?}",
             h.replies(reply)
         );
         assert!(h.broker.publish(&t.desired_target("t1"), json!({"power": true}).to_string(), &SendOptions::default()));
         assert!(
-            h.eventually(BOUND, |h| h.errors_for(&lamp, "refused").iter().any(|e| e["target"] == "t1" && e.get("command").is_none())).await,
+            h.eventually(bound(), |h| h.errors_for(&lamp, "refused").iter().any(|e| e["target"] == "t1" && e.get("command").is_none()))
+                .await,
             "a target-level write to a failed instance was not refused: {:?}",
             h.errors(&lamp)
         );
@@ -84,7 +85,7 @@ async fn a_changed_config_of_a_failed_instance_is_built_at_once() {
         })
         .await;
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| !h.errors_for(&lamp, "malformed").is_empty()).await, "the malformed fields were not said");
+        assert!(h.eventually(bound(), |h| !h.errors_for(&lamp, "malformed").is_empty()).await, "the malformed fields were not said");
         assert!(h.configure(&lamp, json!({"address": "b"})));
         assert!(
             h.eventually(Duration::from_secs(5), |h| h.status(&lamp).as_deref() == Some("connected")).await,
@@ -113,15 +114,15 @@ async fn a_change_whose_newest_construction_fails_keeps_the_last_accepted_config
         })
         .await;
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
         let old = h.fleet.device(&lamp).expect("built");
         assert!(h.configure(&lamp, json!({"address": "b"})));
-        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
+        assert!(h.eventually(bound(), |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
         assert!(h.configure(&lamp, json!({"address": "c"})));
-        assert!(h.eventually(BOUND, |h| !h.errors_for(&lamp, "unusable").is_empty()).await, "the newest Config's failure was not said");
+        assert!(h.eventually(bound(), |h| !h.errors_for(&lamp, "unusable").is_empty()).await, "the newest Config's failure was not said");
         let committed = h.fleet.devices(&lamp).get(1).cloned().expect("the committed Config's device was built");
         assert!(
-            h.eventually(BOUND, |h| committed.connected() && h.status(&lamp).as_deref() == Some("connected")).await,
+            h.eventually(bound(), |h| committed.connected() && h.status(&lamp).as_deref() == Some("connected")).await,
             "the last accepted Config was not kept in force when a newer one failed: statuses {:?}, errors {:?}",
             h.statuses(&lamp),
             h.errors(&lamp)
@@ -130,7 +131,7 @@ async fn a_change_whose_newest_construction_fails_keeps_the_last_accepted_config
         let reply = "Store/replies/change-then-fail";
         assert!(h.command(&lamp, json!({"command": "learn"}), Some((reply, b"1"))));
         assert!(
-            h.eventually(BOUND, |h| h.replies(reply).iter().any(|r| r.get("value").is_some())).await,
+            h.eventually(bound(), |h| h.replies(reply).iter().any(|r| r.get("value").is_some())).await,
             "the last accepted Config's device did not serve: {:?}",
             h.replies(reply)
         );
@@ -153,9 +154,9 @@ async fn a_failed_re_enable_is_failed_and_retried() {
         })
         .await;
         assert!(h.configure(&lamp, json!({"address": "a", "disabled": true})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("disabled")).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("disabled")).await);
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| !h.errors_for(&lamp, "unusable").is_empty()).await, "no Error for the failed build");
+        assert!(h.eventually(bound(), |h| !h.errors_for(&lamp, "unusable").is_empty()).await, "no Error for the failed build");
         assert!(
             h.eventually(Duration::from_secs(8), |h| h.fleet.builds(&lamp) >= 2 && h.status(&lamp).as_deref() == Some("connected")).await,
             "the enabled instance whose first build failed was never retried; builds {}, statuses {:?}",
@@ -187,9 +188,9 @@ async fn a_retry_keeps_the_failed_refusal_policy() {
         .await;
         let t = h.topics(&lamp);
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("unreachable")).await, "{:?}", h.statuses(&lamp));
-        assert!(h.eventually(BOUND, |h| h.subscribed(&t.desired_target_filter())).await);
-        assert!(h.eventually(BOUND, |h| h.fleet.builds(&lamp) == 2).await, "the failed instance was never retried");
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("unreachable")).await, "{:?}", h.statuses(&lamp));
+        assert!(h.eventually(bound(), |h| h.subscribed(&t.desired_target_filter())).await);
+        assert!(h.eventually(bound(), |h| h.fleet.builds(&lamp) == 2).await, "the failed instance was never retried");
         assert!(h.broker.publish(&t.desired_target("t1"), json!({"power": true}).to_string(), &SendOptions::default()));
         assert!(
             h.eventually(Duration::from_millis(1000), |h| h
@@ -218,7 +219,7 @@ async fn an_identical_config_is_a_no_op() {
         let h = HostHarness::start("identical", fleet).await;
         let bridge = h.bridge.clone();
         assert!(h.configure_raw(&lamp, format!(r#"{{"bridge":"{KIND}","via":"{bridge}","address":"a","port":1}}"#).as_bytes()));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
         assert!(h.configure_raw(&lamp, format!(r#"{{"port":1,"address":"a","via":"{bridge}","bridge":"{KIND}"}}"#).as_bytes()));
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(h.fleet.builds(&lamp), 1, "an identical Config was built again");
@@ -238,7 +239,7 @@ async fn a_config_differing_only_in_a_default_host_field_is_a_no_op() {
         let lamp = instance_name("Lamp");
         let h = HostHarness::start("default-field", fleet).await;
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
         assert!(h.configure(&lamp, json!({"address": "a", "disabled": false})));
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(h.fleet.builds(&lamp), 1, "a Config differing only in `disabled: false` was built again");
@@ -260,16 +261,16 @@ async fn an_unreadable_config_keeps_the_last_accepted_one() {
         let lamp = instance_name("Lamp");
         let h = HostHarness::start("unreadable", fleet).await;
         assert!(h.configure(&lamp, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
         assert!(h.configure_raw(&lamp, b"{not json"));
-        assert!(h.eventually(BOUND, |h| h.log.of_kind("device_config_invalid").len() == 1).await, "no WARN device_config_invalid");
+        assert!(h.eventually(bound(), |h| h.log.of_kind("device_config_invalid").len() == 1).await, "no WARN device_config_invalid");
         assert!(h.configure_raw(&lamp, b"{not json"));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(h.log.of_kind("device_config_invalid").len(), 1, "the same unreadable Config was said twice");
         assert!(h.fleet.device(&lamp).expect("built").calls_of(Op::Disconnect).is_empty(), "an unreadable Config stopped the device");
         let reply = "Store/replies/unreadable";
         assert!(h.command(&lamp, json!({"command": "learn"}), Some((reply, b"1"))));
-        assert!(h.eventually(BOUND, |h| h.replies(reply).iter().any(|r| r.get("value").is_some())).await, "the device stopped serving");
+        assert!(h.eventually(bound(), |h| h.replies(reply).iter().any(|r| r.get("value").is_some())).await, "the device stopped serving");
         assert!(h.stop().await);
     })
     .await
@@ -286,7 +287,7 @@ async fn a_config_of_another_kind_is_rejected_and_not_served() {
         let config = json!({"bridge": "otherkind", "via": h.bridge}).to_string();
         assert!(h.configure_raw(&lamp, config.as_bytes()));
         assert!(
-            h.eventually(BOUND, |h| h
+            h.eventually(bound(), |h| h
                 .errors_for(&lamp, "malformed")
                 .iter()
                 .any(|e| e["error"].as_str().is_some_and(|s| s.contains("kind mismatch"))))
@@ -316,11 +317,11 @@ async fn a_kind_mismatch_releases_without_cleanup() {
         let h = HostHarness::start("kind-release", fleet).await;
         let t = h.topics(&lamp);
         assert!(h.configure(&lamp, json!({})));
-        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
+        assert!(h.eventually(bound(), |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
         let device = h.fleet.device(&lamp).expect("built");
         assert!(h.configure_raw(&lamp, json!({"bridge": "otherkind", "via": h.bridge}).to_string().as_bytes()));
-        assert!(h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the mismatched instance was not released");
-        assert!(h.eventually(BOUND, |h| !h.subscribed(&t.status())).await, "the released instance's read-back stayed subscribed");
+        assert!(h.eventually(bound(), |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the mismatched instance was not released");
+        assert!(h.eventually(bound(), |h| !h.subscribed(&t.status())).await, "the released instance's read-back stayed subscribed");
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(h.broker.retained_on(&t.state("t1")).is_some(), "a kind mismatch retracted the instance's State");
         assert!(h.broker.retained_on(&t.status()).is_some(), "a kind mismatch retracted the instance's Status");
@@ -341,11 +342,11 @@ async fn a_disable_with_invalid_driver_fields_keeps_the_last_accepted_config() {
         fleet.script(&lamp, &[Build::Ok, Build::Malformed]);
         let h = HostHarness::start("disable-invalid", fleet).await;
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
         let device = h.fleet.device(&lamp).expect("built");
         assert!(h.configure(&lamp, json!({"address": "not an address", "disabled": true})));
         assert!(
-            h.eventually(BOUND, |h| !h.errors_for(&lamp, "malformed").is_empty()).await,
+            h.eventually(bound(), |h| !h.errors_for(&lamp, "malformed").is_empty()).await,
             "a disable with invalid driver fields was not refused: statuses {:?}, errors {:?}",
             h.statuses(&lamp),
             h.errors(&lamp)
@@ -368,7 +369,7 @@ async fn a_disabled_instance_refuses_what_still_arrives() {
         let lamp = instance_name("Lamp");
         let h = HostHarness::start("disabled", fleet).await;
         assert!(h.configure(&lamp, json!({"disabled": true})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("disabled")).await, "{:?}", h.statuses(&lamp));
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("disabled")).await, "{:?}", h.statuses(&lamp));
         assert_eq!(h.fleet.builds(&lamp), 0, "a disabled instance was built");
         let t = h.topics(&lamp);
         // Straight to the client, whatever it subscribed to: what "still arrives".
@@ -377,11 +378,12 @@ async fn a_disabled_instance_refuses_what_still_arrives() {
         assert!(h.broker.send_with(&t.desired_target("t1"), json!({"power": true}).to_string(), &SendOptions::default()));
         assert!(h.broker.send_with(&t.desired("t1", "level"), "3", &SendOptions::default()));
         assert!(
-            h.eventually(BOUND, |h| h.replies("Store/replies/disabled").iter().any(|r| r["reason"] == "refused")).await,
+            h.eventually(bound(), |h| h.replies("Store/replies/disabled").iter().any(|r| r["reason"] == "refused")).await,
             "a command to a disabled instance was not refused with its reply"
         );
         assert!(
-            h.eventually(BOUND, |h| h.errors_for(&lamp, "refused").iter().any(|e| e["target"] == "t1" && e.get("command").is_none())).await,
+            h.eventually(bound(), |h| h.errors_for(&lamp, "refused").iter().any(|e| e["target"] == "t1" && e.get("command").is_none()))
+                .await,
             "a target-level write to a disabled instance was not refused: {:?}",
             h.errors(&lamp)
         );
@@ -405,13 +407,13 @@ async fn no_packet_id_is_reused_while_its_acknowledgement_is_outstanding() {
         fleet.prepare(&busy, |d| d.set("t0", "n", json!(0)));
         let h = HostHarness::start("pkids", fleet).await;
         assert!(h.configure(&busy, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&busy).as_deref() == Some("connected")).await, "the busy instance never connected");
+        assert!(h.eventually(bound(), |h| h.status(&busy).as_deref() == Some("connected")).await, "the busy instance never connected");
         let device = h.fleet.device(&busy).expect("built");
         // The slow instance's read-back SUBACK is held: its packet id stays in use.
         h.broker.hold_subacks_matching(&format!("{ROOT}/State/{slow}"));
         assert!(h.configure(&slow, json!({})));
         assert!(
-            h.eventually(BOUND, |h| h.subscribed(&h.topics(&slow).status())).await,
+            h.eventually(bound(), |h| h.subscribed(&h.topics(&slow).status())).await,
             "the slow instance's read-back was never asked for"
         );
         // Enough State meanwhile for rumqttc's ids to come round more than once.
@@ -423,7 +425,7 @@ async fn no_packet_id_is_reused_while_its_acknowledgement_is_outstanding() {
         tokio::time::sleep(Duration::from_millis(800)).await;
         h.broker.release_subacks();
         assert!(
-            h.eventually(BOUND, |h| h.status(&slow).as_deref() == Some("connected") && h.state(&busy, "t29").is_some()).await,
+            h.eventually(bound(), |h| h.status(&slow).as_deref() == Some("connected") && h.state(&busy, "t29").is_some()).await,
             "the instances were not served once the SUBACK came: {:?}",
             h.statuses(&slow)
         );
@@ -451,26 +453,26 @@ async fn a_read_grants_republish_stays_within_the_packet_id_budget() {
         let h = HostHarness::start("pkids-rep", fleet).await;
         assert!(h.configure(&busy, json!({})));
         assert!(h.configure(&slow, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&busy).as_deref() == Some("connected")).await);
-        assert!(h.eventually(BOUND, |h| h.status(&slow).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&busy).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&slow).as_deref() == Some("connected")).await);
         let device = h.fleet.device(&busy).expect("built");
         for t in 0..30 {
             let mut values = mqtt_bridge_kit::PropertyMap::new();
             values.insert("n".into(), json!(1));
             device.report(&format!("t{t}"), values);
         }
-        assert!(h.eventually(BOUND, |h| h.state(&busy, "t29").is_some()).await);
+        assert!(h.eventually(bound(), |h| h.state(&busy, "t29").is_some()).await);
         h.broker.hold_subacks_matching(&format!("{ROOT}/State/{slow}"));
         let before = h.broker.accepted();
         let mark = h.published(&h.topics(&busy).state("t29")).len();
         h.broker.drop_connection();
-        assert!(h.eventually(BOUND, |h| h.broker.accepted() > before).await, "no reconnect");
+        assert!(h.eventually(bound(), |h| h.broker.accepted() > before).await, "no reconnect");
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let reuses = h.broker.pkid_reuses();
         h.broker.release_subacks();
         assert!(reuses.is_empty(), "a packet id was reused while its acknowledgement was outstanding: {reuses:#?}");
         assert!(
-            h.eventually(BOUND, |h| h.published(&h.topics(&busy).state("t29")).len() > mark
+            h.eventually(bound(), |h| h.published(&h.topics(&busy).state("t29")).len() > mark
                 && h.status(&slow).as_deref() == Some("connected"))
                 .await,
             "the model was not republished once the SUBACK came"
@@ -493,13 +495,13 @@ async fn the_shutdown_flush_stays_within_the_packet_id_budget() {
         fleet.prepare(&busy, |d| d.set("t0", "n", json!(0)));
         let mut h = HostHarness::start("pkids-flush", fleet).await;
         assert!(h.configure(&busy, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&busy).as_deref() == Some("connected")).await, "the busy instance never connected");
+        assert!(h.eventually(bound(), |h| h.status(&busy).as_deref() == Some("connected")).await, "the busy instance never connected");
         let device = h.fleet.device(&busy).expect("built");
         // The slow instance's read-back SUBACK is held for good: its packet id stays in use.
         h.broker.hold_subacks_matching(&format!("{ROOT}/State/{slow}"));
         assert!(h.configure(&slow, json!({})));
         assert!(
-            h.eventually(BOUND, |h| h.subscribed(&h.topics(&slow).status())).await,
+            h.eventually(bound(), |h| h.subscribed(&h.topics(&slow).status())).await,
             "the slow instance's read-back was never asked for"
         );
         // More State than the ids left: most of it still waits when the stop comes.
@@ -516,7 +518,7 @@ async fn the_shutdown_flush_stays_within_the_packet_id_budget() {
             h.broker.pkid_reuses()
         );
         assert!(
-            h.eventually(BOUND, |h| h.broker.retained_on(&h.active_topic()).as_deref() == Some(&b"false"[..])).await,
+            h.eventually(bound(), |h| h.broker.retained_on(&h.active_topic()).as_deref() == Some(&b"false"[..])).await,
             "neither the flush nor the last will said Active=false"
         );
         h.broker.release_subacks();
@@ -539,20 +541,20 @@ async fn an_invalid_disable_during_a_replacement_keeps_the_committed_config() {
         fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(1000))));
         let h = HostHarness::start("disable-in-change", fleet).await;
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
         let old = h.fleet.device(&lamp).expect("built");
         assert!(h.configure(&lamp, json!({"address": "b"})));
-        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
+        assert!(h.eventually(bound(), |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
         assert!(h.configure(&lamp, json!({"address": "not an address", "disabled": true})));
         assert!(
-            h.eventually(BOUND, |h| !h.errors_for(&lamp, "malformed").is_empty()).await,
+            h.eventually(bound(), |h| !h.errors_for(&lamp, "malformed").is_empty()).await,
             "the invalid disable's Error was not said: statuses {:?}, errors {:?}",
             h.statuses(&lamp),
             h.errors(&lamp)
         );
         let committed = h.fleet.devices(&lamp).get(1).cloned().expect("the committed Config's device was built");
         assert!(
-            h.eventually(BOUND, |h| committed.connected() && h.status(&lamp).as_deref() == Some("connected")).await,
+            h.eventually(bound(), |h| committed.connected() && h.status(&lamp).as_deref() == Some("connected")).await,
             "the committed Config was not kept in force when an invalid disable came during the replacement: statuses {:?}, errors {:?}",
             h.statuses(&lamp),
             h.errors(&lamp)
@@ -574,13 +576,13 @@ async fn a_valid_disable_during_a_replacement_disables_the_instance() {
         fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(1000))));
         let h = HostHarness::start("valid-disable-in-change", fleet).await;
         assert!(h.configure(&lamp, json!({"address": "a"})));
-        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("connected")).await);
         let old = h.fleet.device(&lamp).expect("built");
         assert!(h.configure(&lamp, json!({"address": "b"})));
-        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
+        assert!(h.eventually(bound(), |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
         assert!(h.configure(&lamp, json!({"address": "c", "disabled": true})));
         assert!(
-            h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("disabled")).await,
+            h.eventually(bound(), |h| h.status(&lamp).as_deref() == Some("disabled")).await,
             "the valid disable did not disable the instance: statuses {:?}, errors {:?}",
             h.statuses(&lamp),
             h.errors(&lamp)
@@ -622,7 +624,8 @@ async fn many_instances_bootstrap_at_once() {
         }
         let h = HostHarness::join(broker, &bridge, fleet, |host| host).await;
         assert!(
-            h.eventually(BOUND, |h| names.iter().all(|n| h.status(n).as_deref() == Some("connected") && h.state(n, "t1").is_some())).await,
+            h.eventually(bound(), |h| names.iter().all(|n| h.status(n).as_deref() == Some("connected") && h.state(n, "t1").is_some()))
+                .await,
             "not every instance was served: {:?}",
             names.iter().map(|n| (n.clone(), h.status(n))).collect::<Vec<_>>()
         );
@@ -644,7 +647,7 @@ async fn the_hosts_stop_stops_every_device() {
         let mut h = HostHarness::start("stop-all", fleet).await;
         assert!(h.configure(&a, json!({})) && h.configure(&b, json!({})));
         assert!(
-            h.eventually(BOUND, |h| h.status(&a).as_deref() == Some("connected") && h.status(&b).as_deref() == Some("connected")).await,
+            h.eventually(bound(), |h| h.status(&a).as_deref() == Some("connected") && h.status(&b).as_deref() == Some("connected")).await,
             "the instances never connected"
         );
         let devices = [h.fleet.device(&a).expect("built"), h.fleet.device(&b).expect("built")];
@@ -665,7 +668,7 @@ async fn a_fixed_bridge_is_never_tagged() {
     within(DEADLINE, async {
         let h =
             Harness::start_with("untagged", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "power", json!(true))).await;
-        assert!(h.eventually(BOUND, |h| h.state("t1").is_some() && h.status().as_deref() == Some("connected")).await);
+        assert!(h.eventually(bound(), |h| h.state("t1").is_some() && h.status().as_deref() == Some("connected")).await);
         for r in h.published(&h.topics.status()).iter().chain(h.published(&h.topics.state("t1")).iter()) {
             assert_eq!(r.user_property("via"), None, "a fixed bridge's {} was tagged", r.topic);
         }

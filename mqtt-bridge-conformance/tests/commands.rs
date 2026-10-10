@@ -15,7 +15,7 @@ fn up_at_20(_: &FakeBroker, _: &mqtt_bridge_kit::topics::Topics, device: &Device
 }
 
 async fn connected(h: &Harness) -> bool {
-    h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await
+    h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await
 }
 
 fn json_of(r: &Received) -> Value {
@@ -30,7 +30,7 @@ async fn a_commands_answer_goes_to_its_response_topic_with_its_correlation_data(
     assert!(connected(&h).await);
     let replies = "Store/replies/one";
     assert!(h.command(json!({"target": "t1", "command": "learn", "key": "Netflix"}), Some((replies, b"c-42"))));
-    assert!(h.eventually(BOUND, |h| !h.published(replies).is_empty()).await, "no reply on the response topic");
+    assert!(h.eventually(bound(), |h| !h.published(replies).is_empty()).await, "no reply on the response topic");
     let reply = &h.published(replies)[0];
     assert_eq!(reply.correlation_data(), Some(&Bytes::from_static(b"c-42")), "the reply lost the correlation data");
     assert_eq!(json_of(reply), json!({"kind": "reply", "command": "learn", "target": "t1", "value": {"executed": "learn"}}));
@@ -40,9 +40,9 @@ async fn a_commands_answer_goes_to_its_response_topic_with_its_correlation_data(
 
     // A refusal is answered too.
     h.device.set_up(false);
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("unreachable")).await);
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-43"))));
-    assert!(h.eventually(BOUND, |h| h.published(replies).len() == 2).await, "a refused command was not answered");
+    assert!(h.eventually(bound(), |h| h.published(replies).len() == 2).await, "a refused command was not answered");
     let refused = &h.published(replies)[1];
     assert_eq!(refused.correlation_data(), Some(&Bytes::from_static(b"c-43")));
     assert_eq!(json_of(refused)["reason"], "refused");
@@ -61,15 +61,15 @@ async fn refresh_reads_the_device_and_assume_sets_the_assumed_state_without_it()
     let reads_of_t1 = |h: &Harness| h.device.calls_of(Op::Read).iter().filter(|c| c.target.as_deref() == Some("t1")).count();
     let reads = reads_of_t1(&h);
     assert!(h.command(json!({"target": "t1", "command": "refresh"}), Some(("Store/r", b"1"))));
-    assert!(h.eventually(BOUND, |h| h.state("t1").is_some_and(|s| s["temp"] == 25)).await, "refresh did not publish what it read");
+    assert!(h.eventually(bound(), |h| h.state("t1").is_some_and(|s| s["temp"] == 25)).await, "refresh did not publish what it read");
     assert_eq!(reads_of_t1(&h), reads + 1, "refresh did not read its target once");
-    assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "refresh was not answered");
+    assert!(h.eventually(bound(), |h| !h.published("Store/r").is_empty()).await, "refresh was not answered");
 
     let not_a_poll = |h: &Harness| h.device.calls().iter().filter(|c| !(c.op == Op::Read && c.target.is_none())).count();
     let calls = not_a_poll(&h);
     assert!(h.command(json!({"target": "t1", "command": "assume", "power": true}), None));
     assert!(
-        h.eventually(BOUND, |h| h.state("t1") == Some(json!({"temp": 25, "power": true, "assumed": true}))).await,
+        h.eventually(bound(), |h| h.state("t1") == Some(json!({"temp": 25, "power": true, "assumed": true}))).await,
         "assume did not set the assumed state: {:?}",
         h.state("t1")
     );
@@ -83,12 +83,12 @@ async fn a_read_command_is_answered_while_up_and_dropped_while_down() {
     let h = Harness::start_with("read", acknowledged(), quick_timing(), up_at_20).await;
     assert!(connected(&h).await);
     assert!(h.command(json!({"target": "t1", "command": "status"}), Some(("Store/r", b"1"))));
-    assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the read command was not answered");
+    assert!(h.eventually(bound(), |h| !h.published("Store/r").is_empty()).await, "the read command was not answered");
     h.device.set_up(false);
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("unreachable")).await);
     let executed = h.device.calls_of(Op::Execute).len();
     assert!(h.command(json!({"target": "t1", "command": "status"}), Some(("Store/r", b"2"))));
-    assert!(h.eventually(BOUND, |h| h.published("Store/r").len() == 2).await, "the dropped read was not answered");
+    assert!(h.eventually(bound(), |h| h.published("Store/r").len() == 2).await, "the dropped read was not answered");
     let dropped = json_of(&h.published("Store/r")[1]);
     assert_eq!(dropped["reason"], "refused");
     // Dropped as it came, not queued and dropped by the next failed connect.
@@ -108,7 +108,7 @@ async fn a_drivers_event_reaches_the_event_lane() {
     let h = Harness::start_with("event", acknowledged(), quick_timing(), up_at_20).await;
     assert!(connected(&h).await);
     assert!(h.device.event(json!({"kind": "code", "target": "t1", "code": "0x20DF"})));
-    assert!(h.eventually(BOUND, |h| !h.published(&h.topics.event()).is_empty()).await, "the event never reached the Event lane");
+    assert!(h.eventually(bound(), |h| !h.published(&h.topics.event()).is_empty()).await, "the event never reached the Event lane");
     assert_eq!(json_of(&h.published(&h.topics.event())[0]), json!({"kind": "code", "target": "t1", "code": "0x20DF"}));
     assert!(h.stop().await);
 }
@@ -121,7 +121,7 @@ async fn assumed_feedback_publishes_applied_values_as_assumed_state() {
     assert!(connected(&h).await);
     assert!(h.desire("tv", "power", json!(true), Req::default()));
     assert!(
-        h.eventually(BOUND, |h| h.state("tv") == Some(json!({"power": true, "assumed": true}))).await,
+        h.eventually(bound(), |h| h.state("tv") == Some(json!({"power": true, "assumed": true}))).await,
         "the applied value was not published as assumed state: {:?}",
         h.state("tv")
     );
@@ -135,17 +135,17 @@ async fn a_targets_config_is_configured_and_may_override_the_feedback() {
     let h = Harness::start("config", acknowledged(), quick_timing()).await;
     assert!(connected(&h).await);
     assert!(h.config("ir", json!({"code_set": "lg", "feedback": "assumed"})));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Configure).is_empty()).await, "the config never reached the driver");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Configure).is_empty()).await, "the config never reached the driver");
     assert_eq!(h.device.calls_of(Op::Configure)[0].values, Some(json!({"code_set": "lg", "feedback": "assumed"})));
     assert!(h.desire("ir", "power", json!(true), Req::default()));
-    assert!(h.eventually(BOUND, |h| h.state("ir").is_some_and(|s| s["assumed"] == true)).await, "the config's feedback did not apply");
+    assert!(h.eventually(bound(), |h| h.state("ir").is_some_and(|s| s["assumed"] == true)).await, "the config's feedback did not apply");
     assert!(h.send_raw(&h.topics.config("ir"), b""));
-    assert!(h.eventually(BOUND, |h| h.device.calls_of(Op::Configure).len() == 2).await);
+    assert!(h.eventually(bound(), |h| h.device.calls_of(Op::Configure).len() == 2).await);
     assert_eq!(h.device.calls_of(Op::Configure)[1].values, None);
     let reported: PropertyMap = [("power".to_owned(), json!(false))].into_iter().collect();
     assert!(h.device.report("ir", reported));
     assert!(
-        h.eventually(BOUND, |h| h.state("ir") == Some(json!({"power": false}))).await,
+        h.eventually(bound(), |h| h.state("ir") == Some(json!({"power": false}))).await,
         "a driver's own report did not replace the assumed state"
     );
     assert!(h.stop().await);
@@ -180,7 +180,7 @@ async fn a_response_topic_on_the_bridges_own_request_lanes_is_refused() {
         assert!(h.command(json!({"target": "t1", "command": "pulse"}), Some((own, b"c"))));
     }
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("malformed").len() == reserved.len()).await,
+        h.eventually(bound(), |h| h.errors_for("malformed").len() == reserved.len()).await,
         "a response topic on the bridge's own lanes was not refused: {:?}",
         h.errors()
     );
@@ -207,11 +207,11 @@ async fn a_replayed_request_an_assumed_target_already_has_is_not_applied_again()
     assert!(connected(&h).await);
     // RequestWins, as an IR device's requests are: an unknown current value would be applied.
     assert!(h.desire("tv", "power", json!(true), Req { expiry: Some(3600), conflict: Some("RequestWins") }));
-    assert!(h.eventually(BOUND, |h| h.state("tv") == Some(json!({"power": true, "assumed": true}))).await, "the write was not assumed");
+    assert!(h.eventually(bound(), |h| h.state("tv") == Some(json!({"power": true, "assumed": true}))).await, "the write was not assumed");
     // A broker blip: the request, not retracted yet, comes back as a replay.
     let connects = h.broker.connections();
     h.broker.drop_connection();
-    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects).await);
+    assert!(h.eventually(bound(), |h| h.broker.connections() > connects).await);
     h.settle(Duration::from_millis(800)).await;
     assert_eq!(h.device.calls_of(Op::Apply).len(), 1, "a replayed request the assumed target already had was sent again");
     assert!(h.stop().await);
@@ -226,27 +226,27 @@ async fn an_unchanged_config_is_not_configured_again_while_the_link_stays_up() {
     assert!(connected(&h).await);
     let configures = |h: &Harness| h.device.calls_of(Op::Configure).len();
     assert!(h.config("ir", json!({"code_set": "lg"})));
-    assert!(h.eventually(BOUND, |h| configures(h) == 1).await, "the config never reached the driver");
+    assert!(h.eventually(bound(), |h| configures(h) == 1).await, "the config never reached the driver");
     let reconnect = |h: &Harness| {
         let connects = h.broker.connections();
         h.broker.drop_connection();
         connects
     };
     let connects = reconnect(&h);
-    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await);
+    assert!(h.eventually(bound(), |h| h.broker.connections() > connects && h.subscribed_again()).await);
     h.settle(Duration::from_millis(500)).await;
     assert_eq!(configures(&h), 1, "an unchanged config replayed on a reconnect was configured again");
     assert!(h.config("ir", json!({"code_set": "sony"})));
-    assert!(h.eventually(BOUND, |h| configures(h) == 2).await, "a changed config was not configured");
+    assert!(h.eventually(bound(), |h| configures(h) == 2).await, "a changed config was not configured");
     // The link lost and back: the same config, replayed, is the device's setup again.
     h.device.set_up(false);
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("unreachable")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("unreachable")).await);
     h.device.set_up(true);
     assert!(connected(&h).await);
     let connects = reconnect(&h);
-    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await);
+    assert!(h.eventually(bound(), |h| h.broker.connections() > connects && h.subscribed_again()).await);
     assert!(
-        h.eventually(BOUND, |h| configures(h) == 3).await,
+        h.eventually(bound(), |h| configures(h) == 3).await,
         "a config replayed after the link was lost was not configured: {}",
         configures(&h)
     );
@@ -264,7 +264,7 @@ async fn a_command_refused_on_arrival_answers_on_its_response_topic() {
     assert!(h.broker.publish(&h.topics.command(), "not json", &options(b"m-1")));
     assert!(h.broker.publish(&h.topics.command(), json!({"target": "t1", "command": "pulse"}).to_string(), &options(b"r-1").retained()));
     assert!(
-        h.eventually(BOUND, |h| h.published(replies).len() == 2).await,
+        h.eventually(bound(), |h| h.published(replies).len() == 2).await,
         "a command refused on arrival was not answered: {:?}",
         h.published(replies)
     );
@@ -272,7 +272,7 @@ async fn a_command_refused_on_arrival_answers_on_its_response_topic() {
         assert_eq!(reply.correlation_data().map(|c| &c[..]), Some(correlation), "the reply lost its correlation data");
         assert_eq!(json_of(reply)["reason"], "malformed", "{:?}", json_of(reply));
     }
-    assert!(h.eventually(BOUND, |h| h.errors_for("malformed").len() == 2).await, "{:?}", h.errors());
+    assert!(h.eventually(bound(), |h| h.errors_for("malformed").len() == 2).await, "{:?}", h.errors());
     assert!(h.device.calls_of(Op::Execute).is_empty());
     assert!(h.stop().await);
 }
@@ -287,11 +287,11 @@ async fn a_command_that_expires_while_queued_is_reported_and_answered() {
     assert!(connected(&h).await);
     h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(1500)), 1);
     assert!(h.command(json!({"target": "t1", "command": "learn"}), None));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await);
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Execute).is_empty()).await);
     let replies = "Store/replies/expired";
     let options = SendOptions::default().expiry(1).response_topic(replies).correlation_data(b"e-1".to_vec());
     assert!(h.broker.publish(&h.topics.command(), json!({"target": "t1", "command": "pulse"}).to_string(), &options));
-    assert!(h.eventually(BOUND, |h| !h.published(replies).is_empty()).await, "a command that expired while queued was not answered");
+    assert!(h.eventually(bound(), |h| !h.published(replies).is_empty()).await, "a command that expired while queued was not answered");
     let reply = &h.published(replies)[0];
     assert_eq!(reply.correlation_data().map(|c| &c[..]), Some(&b"e-1"[..]));
     assert_eq!(json_of(reply)["reason"], "refused");
@@ -308,9 +308,9 @@ async fn a_failed_refresh_goes_to_error_too() {
     assert!(connected(&h).await);
     h.device.answer(Op::Read, Some("t1"), Answer::Rejected);
     assert!(h.command(json!({"target": "t1", "command": "refresh"}), Some(("Store/r", b"f-1"))));
-    assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the failed refresh was not answered");
+    assert!(h.eventually(bound(), |h| !h.published("Store/r").is_empty()).await, "the failed refresh was not answered");
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("rejected").iter().any(|e| e["command"] == "refresh")).await,
+        h.eventually(bound(), |h| h.errors_for("rejected").iter().any(|e| e["command"] == "refresh")).await,
         "a failed refresh was not on Error: {:?}",
         h.errors()
     );
@@ -329,18 +329,21 @@ async fn a_driver_retracts_a_target_or_a_property() {
     })
     .await;
     let t = h.topics.clone();
-    assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("u2")).is_some() && h.state("t1").is_some()).await);
+    assert!(h.eventually(bound(), |h| h.broker.retained_on(&t.state("u2")).is_some() && h.state("t1").is_some()).await);
     assert!(h.device.remove("u2"));
     assert!(h.device.remove_property("t1", "mode"));
-    assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("u2")).is_none()).await, "the removed target's State is still retained");
     assert!(
-        h.eventually(BOUND, |h| h.state("t1") == Some(json!({"temp": 20}))).await,
+        h.eventually(bound(), |h| h.broker.retained_on(&t.state("u2")).is_none()).await,
+        "the removed target's State is still retained"
+    );
+    assert!(
+        h.eventually(bound(), |h| h.state("t1") == Some(json!({"temp": 20}))).await,
         "the removed property is still published: {:?}",
         h.state("t1")
     );
     let connects = h.broker.connections();
     h.broker.drop_connection();
-    assert!(h.eventually(BOUND, |h| h.broker.connections() > connects && h.subscribed_again()).await);
+    assert!(h.eventually(bound(), |h| h.broker.connections() > connects && h.subscribed_again()).await);
     h.settle(Duration::from_millis(300)).await;
     assert!(h.broker.retained_on(&t.state("u2")).is_none(), "the removed target came back with the model");
     assert!(h.stop().await);
@@ -353,7 +356,7 @@ async fn a_command_with_no_target_reaches_execute_with_none() {
     let h = Harness::start_with("notarget", acknowledged(), quick_timing(), up_at_20).await;
     assert!(connected(&h).await);
     assert!(h.command(json!({"command": "pulse"}), None));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "the command was never executed");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Execute).is_empty()).await, "the command was never executed");
     assert_eq!(h.device.calls_of(Op::Execute)[0].target, None, "a command with no target reached execute with one");
     assert!(h.stop().await);
 }
@@ -369,7 +372,7 @@ async fn a_command_queued_during_a_poll_that_loses_the_link_is_answered() {
     assert!(connected(&h).await);
     let reads = h.device.calls_of(Op::Read).len();
     h.device.answer_times(Op::Read, None, Answer::Hang, 1);
-    assert!(h.eventually(BOUND, |h| h.device.calls_of(Op::Read).len() > reads).await, "no poll began");
+    assert!(h.eventually(bound(), |h| h.device.calls_of(Op::Read).len() > reads).await, "no poll began");
     let replies = "Store/replies/poll-lost";
     let options = SendOptions::default().expiry(30).response_topic(replies).correlation_data(b"p-1".to_vec());
     assert!(h.broker.publish(&h.topics.command(), json!({"target": "t1", "command": "pulse"}).to_string(), &options));
@@ -377,7 +380,7 @@ async fn a_command_queued_during_a_poll_that_loses_the_link_is_answered() {
     // refused as waiting, before it ran — not taken off the mailbox by the failed poll and cut off
     // (re-gate 4: the wording was checked only if a reply came).
     assert!(
-        h.eventually(BOUND, |h| !h.published(replies).is_empty()).await,
+        h.eventually(bound(), |h| !h.published(replies).is_empty()).await,
         "a command queued during a poll that lost the link was not answered: {:?}",
         h.errors()
     );
@@ -397,11 +400,11 @@ async fn a_read_command_that_expires_while_queued_is_refused_not_executed() {
     assert!(connected(&h).await);
     h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(1500)), 1);
     assert!(h.command(json!({"target": "t1", "command": "learn"}), None));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await);
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Execute).is_empty()).await);
     let replies = "Store/replies/expired-read";
     let options = SendOptions::default().expiry(1).response_topic(replies).correlation_data(b"s-1".to_vec());
     assert!(h.broker.publish(&h.topics.command(), json!({"target": "t1", "command": "status"}).to_string(), &options));
-    assert!(h.eventually(BOUND, |h| !h.published(replies).is_empty()).await, "the read was never answered");
+    assert!(h.eventually(bound(), |h| !h.published(replies).is_empty()).await, "the read was never answered");
     h.settle(Duration::from_millis(300)).await;
     let statuses = h.device.calls_of(Op::Execute).iter().filter(|c| c.command.as_deref() == Some("status")).count();
     assert_eq!(statuses, 0, "a read-class command past its expiry was executed");
@@ -418,7 +421,7 @@ async fn an_assume_with_a_bad_property_name_is_malformed() {
     let h = Harness::start_with("assume-bad-name", acknowledged(), quick_timing(), up_at_20).await;
     assert!(connected(&h).await);
     assert!(h.command(json!({"target": "t1", "command": "assume", "a/b": 1}), Some(("Store/r", b"a-1"))));
-    assert!(h.eventually(BOUND, |h| !h.published("Store/r").is_empty()).await, "the assume was not answered");
+    assert!(h.eventually(bound(), |h| !h.published("Store/r").is_empty()).await, "the assume was not answered");
     assert_eq!(json_of(&h.published("Store/r")[0])["reason"], "malformed", "a bad assume was not refused as malformed");
     assert!(h.log.of_kind("driver_contract_violation").is_empty(), "the Store's input was taken for a driver bug");
     assert!(h.stop().await);
@@ -463,10 +466,10 @@ async fn a_command_executing_at_the_stop_is_answered() {
     let replies = "Store/replies/stop-in-flight";
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-1"))));
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-2"))));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
     assert!(h.stop_bridge().await);
     // The broker's reads may trail the stop by a little: waited for, not taken at once.
-    h.eventually(BOUND, |h| answers_by_correlation(h, replies).len() >= 2).await;
+    h.eventually(bound(), |h| answers_by_correlation(h, replies).len() >= 2).await;
     let answers = answers_by_correlation(&h, replies);
     assert_eq!(answers.len(), 2, "a command in flight at the stop got no reply: {answers:?}");
     for (id, errors) in &answers {
@@ -499,7 +502,7 @@ async fn a_command_cut_off_by_the_watchdog_is_answered_once() {
     h.device.answer_times(Op::Execute, None, Answer::Block(Duration::from_millis(3200)), 1);
     let replies = "Store/replies/watchdog-in-flight";
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"w-1"))));
-    assert!(h.eventually(BOUND, |h| !h.published(replies).is_empty()).await, "the command the watchdog cut off was not answered");
+    assert!(h.eventually(bound(), |h| !h.published(replies).is_empty()).await, "the command the watchdog cut off was not answered");
     // The blocked call returns at 3.2 s; its result must not be a second answer.
     h.settle(Duration::from_secs(2)).await;
     let answers = answers_by_correlation(&h, replies);
@@ -571,7 +574,7 @@ async fn a_stop_with_a_full_mailbox_answers_every_command() {
     h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(2500)), 1);
     let replies = "Store/replies/stop-full";
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-0"))));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
     for i in 1..=64 {
         let id = format!("c-{i}");
         assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, id.as_bytes()))));
@@ -579,7 +582,7 @@ async fn a_stop_with_a_full_mailbox_answers_every_command() {
     // Every one of them waits in the mailbox before the stop.
     h.settle(Duration::from_millis(500)).await;
     assert!(h.stop_bridge().await);
-    h.eventually(BOUND, |h| answers_by_correlation(h, replies).len() >= 65).await;
+    h.eventually(bound(), |h| answers_by_correlation(h, replies).len() >= 65).await;
     let answers = answers_by_correlation(&h, replies);
     let missing: Vec<String> = (0..=64).map(|i| format!("c-{i}")).filter(|id| !answers.contains_key(id)).collect();
     assert!(missing.is_empty(), "a stop with a full mailbox left commands unanswered: {missing:?}");
@@ -601,7 +604,7 @@ async fn a_watchdog_verdict_with_a_full_mailbox_answers_every_command() {
     h.device.answer_times(Op::Execute, None, Answer::Block(Duration::from_millis(4000)), 1);
     let replies = "Store/replies/watchdog-full";
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-0"))));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
     for i in 1..=64 {
         let id = format!("c-{i}");
         assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, id.as_bytes()))));
@@ -619,7 +622,7 @@ async fn a_watchdog_verdict_with_a_full_mailbox_answers_every_command() {
     }
     assert!(answers["c-0"][0].contains("cut off"), "the executing command was not said cut off: {:?}", answers["c-0"]);
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("refused").len() >= 65).await,
+        h.eventually(bound(), |h| h.errors_for("refused").len() >= 65).await,
         "a watchdog verdict with a full mailbox dropped refusal Errors: {}",
         h.errors_for("refused").len()
     );
@@ -637,7 +640,7 @@ async fn a_link_loss_with_a_full_mailbox_answers_every_caller() {
     h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(2500)), 1);
     let replies = "Store/replies/loss-full";
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"c-0"))));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
     let mut ids = vec!["c-0".to_owned()];
     for i in 1..=64 {
         let id = format!("c-{i}");
@@ -673,15 +676,15 @@ async fn a_stop_right_after_a_reconnect_answers_what_it_refuses() {
     assert!(connected(&h).await);
     let accepted = h.broker.accepted();
     h.broker.drop_connection();
-    assert!(h.broker.wait_until(BOUND, |b| b.accepted() > accepted).await, "the bridge did not reconnect");
-    assert!(h.broker.wait_until(BOUND, |b| b.subscriptions().iter().filter(|s| **s == h.topics.command()).count() >= 2).await);
+    assert!(h.broker.wait_until(bound(), |b| b.accepted() > accepted).await, "the bridge did not reconnect");
+    assert!(h.broker.wait_until(bound(), |b| b.subscriptions().iter().filter(|s| **s == h.topics.command()).count() >= 2).await);
     h.device.answer_times(Op::Execute, None, Answer::Delay(Duration::from_millis(2500)), 1);
     let replies = "Store/replies/stop-after-reconnect";
     assert!(h.command(json!({"target": "t1", "command": "learn"}), Some((replies, b"r-1"))));
-    assert!(h.eventually(BOUND, |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
+    assert!(h.eventually(bound(), |h| !h.device.calls_of(Op::Execute).is_empty()).await, "never executed");
     assert!(h.stop_bridge().await);
     assert!(
-        h.eventually(BOUND, |h| !h.published(replies).is_empty()).await,
+        h.eventually(bound(), |h| !h.published(replies).is_empty()).await,
         "a stop inside the reconnect's stability window answered nothing"
     );
 }
@@ -703,8 +706,8 @@ async fn a_reply_follows_the_state_its_command_produced() {
             r.topic == "Store/replies/order"
                 && r.properties.as_ref().and_then(|p| p.correlation_data.as_ref()).map(|c| &c[..]) == Some(corr.as_bytes())
         };
-        assert!(h.eventually(BOUND, |h| h.broker.received().iter().any(mine)).await, "refresh {i} was not answered");
-        assert!(h.eventually(BOUND, |h| h.state("t1").is_some_and(|s| s["temp"] == 100 + i)).await, "refresh {i} published no State");
+        assert!(h.eventually(bound(), |h| h.broker.received().iter().any(mine)).await, "refresh {i} was not answered");
+        assert!(h.eventually(bound(), |h| h.state("t1").is_some_and(|s| s["temp"] == 100 + i)).await, "refresh {i} published no State");
         let all = h.broker.received();
         let reply_at = all.iter().position(mine);
         let want = format!("\"temp\":{}", 100 + i);

@@ -25,7 +25,7 @@ async fn a_late_read_back_is_said_incomplete_and_the_requests_go_without_it() {
         })
         .await;
         let t = h.topics.clone();
-        assert!(h.broker.wait_for_subscription(&t.state_filter(), BOUND).await, "the read-back was never subscribed");
+        assert!(h.broker.wait_for_subscription(&t.state_filter(), bound()).await, "the read-back was never subscribed");
         let asked = std::time::Instant::now();
         h.settle(Duration::from_millis(3000)).await;
         assert!(
@@ -52,7 +52,7 @@ async fn a_late_read_back_is_said_incomplete_and_the_requests_go_without_it() {
             h.log.records()
         );
         assert!(
-            h.eventually(BOUND, |h| h.status().as_deref() == Some("connected") && h.state("t1").is_some()).await,
+            h.eventually(bound(), |h| h.status().as_deref() == Some("connected") && h.state("t1").is_some()).await,
             "the bridge did not go on without the read-back: status {:?}",
             h.status()
         );
@@ -85,7 +85,7 @@ async fn the_read_back_completes_at_the_first_request_suback(name: &str, refused
     .await;
     let t = h.topics.clone();
     // The first request, its SUBACK held (a refused subscription is not recorded as made).
-    assert!(h.broker.wait_for_subscription(&t.config_filter(), BOUND).await, "the requests were never subscribed");
+    assert!(h.broker.wait_for_subscription(&t.config_filter(), bound()).await, "the requests were never subscribed");
     let unsubscribed = |h: &Harness| h.broker.events().iter().any(|e| matches!(e, BrokerEvent::Unsubscribed(f) if *f == t.state_filter()));
     assert!(
         h.eventually(Duration::from_secs(3), unsubscribed).await,
@@ -95,7 +95,7 @@ async fn the_read_back_completes_at_the_first_request_suback(name: &str, refused
     assert!(h.log.of_kind("read_back_incomplete").is_empty(), "the read-back was said incomplete: {:#?}", h.log.records());
     h.broker.release_subacks();
     assert!(
-        h.eventually(BOUND, |h| h.status().as_deref() == Some("connected") && h.state("t1").is_some()).await,
+        h.eventually(bound(), |h| h.status().as_deref() == Some("connected") && h.state("t1").is_some()).await,
         "the bridge never published its model: status {:?}",
         h.status()
     );
@@ -131,8 +131,8 @@ async fn a_stop_during_the_read_back_wait_publishes_no_model() {
         })
         .await;
         let t = h.topics.clone();
-        assert!(h.broker.wait_for_subscription(&t.state_filter(), BOUND).await, "the read-back was never subscribed");
-        assert!(h.eventually(BOUND, |h| h.device.connected()).await, "the device never connected");
+        assert!(h.broker.wait_for_subscription(&t.state_filter(), bound()).await, "the read-back was never subscribed");
+        assert!(h.eventually(bound(), |h| h.device.connected()).await, "the device never connected");
         h.settle(Duration::from_millis(500)).await;
         assert!(h.stop_bridge().await, "the bridge did not stop in time");
         let state_prefix = t.state_filter().trim_end_matches('#').to_owned();
@@ -163,7 +163,7 @@ async fn a_stop_during_the_read_back_wait_publishes_no_model() {
 async fn a_fixed_bridge_subscribes_only_its_own_lanes() {
     let scenario = async {
         let h = Harness::start("own-lanes", acknowledged(), quick_timing()).await;
-        assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await, "the bridge never said it was connected");
+        assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await, "the bridge never said it was connected");
         let instance = h.instance().to_owned();
         let foreign: Vec<String> = h
             .broker

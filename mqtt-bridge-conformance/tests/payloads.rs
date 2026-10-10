@@ -10,7 +10,7 @@ use serde_json::json;
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_desired_and_command_payloads_are_answered_on_error() {
     let h = Harness::start_with("malformed", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await);
     let t = h.topics.clone();
     let malformed: Vec<(String, &[u8])> = vec![
         (t.desired("t1", "temp"), b"not json"),
@@ -36,7 +36,7 @@ async fn malformed_desired_and_command_payloads_are_answered_on_error() {
     assert!(h.command(json!({"target": "t1", "command": "dance"}), None));
     let expected = malformed.len() + 3;
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("malformed").len() == expected).await,
+        h.eventually(bound(), |h| h.errors_for("malformed").len() == expected).await,
         "not every malformed payload was answered on Error: {:#?}",
         h.errors()
     );
@@ -49,7 +49,7 @@ async fn malformed_desired_and_command_payloads_are_answered_on_error() {
         "no malformed property write named its target and property: {errors:?}"
     );
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("unsupported").len() == 1).await,
+        h.eventually(bound(), |h| h.errors_for("unsupported").len() == 1).await,
         "the unknown command was not answered: {:?}",
         h.errors()
     );
@@ -59,7 +59,7 @@ async fn malformed_desired_and_command_payloads_are_answered_on_error() {
     // The bridge goes on.
     assert!(h.desire("t1", "temp", json!(22), Req::default()));
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(22))).await,
         "the bridge stopped working after malformed payloads"
     );
     assert!(h.stop().await);
@@ -82,7 +82,7 @@ async fn a_large_retained_config_is_taken_and_one_past_the_limit_is_left_at_the_
     .await;
     let configured = |h: &Harness, target: &str| h.device.calls_of(Op::Configure).iter().any(|c| c.target.as_deref() == Some(target));
     assert!(
-        h.eventually(BOUND, |h| configured(h, "ir")).await,
+        h.eventually(bound(), |h| configured(h, "ir")).await,
         "the 20 KiB config never reached configure; {} connections",
         h.broker.connections()
     );
@@ -90,7 +90,7 @@ async fn a_large_retained_config_is_taken_and_one_past_the_limit_is_left_at_the_
     assert_eq!(h.broker.connections(), 1, "a large retained message made the bridge reconnect");
     assert!(!configured(&h, "huge"), "a config past the advertised maximum packet size reached the driver");
     assert!(h.desire("t1", "temp", json!(22), Req::default()));
-    assert!(h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await, "the bridge stopped working");
+    assert!(h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(22))).await, "the bridge stopped working");
     assert!(h.stop().await);
 }
 
@@ -103,19 +103,19 @@ async fn a_large_retained_config_is_taken_and_one_past_the_limit_is_left_at_the_
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken() {
     let h = Harness::start_with("liveretained", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
-    assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    assert!(h.eventually(bound(), |h| h.status().as_deref() == Some("connected")).await);
     let t = h.topics.clone();
     let retained = SendOptions::default().retained();
     assert!(h.broker.publish(&t.command(), r#"{"target": "t1", "command": "pulse"}"#, &retained));
     assert!(h.broker.publish(&t.desired_target("t1"), r#"{"temp": 30}"#, &retained));
     assert!(
-        h.eventually(BOUND, |h| h.errors_for("malformed").len() == 2).await,
+        h.eventually(bound(), |h| h.errors_for("malformed").len() == 2).await,
         "a live retained command or target-level write was not refused: {:?}",
         h.errors()
     );
     assert!(h.desire("t1", "temp", json!(22), Req { expiry: Some(60), conflict: Some("DeviceWins") }));
     assert!(
-        h.eventually(BOUND, |h| h.device.get("t1", "temp") == Some(json!(22))).await,
+        h.eventually(bound(), |h| h.device.get("t1", "temp") == Some(json!(22))).await,
         "a live retained property write was not taken: {:?}",
         h.device.calls()
     );

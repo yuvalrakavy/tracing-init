@@ -28,12 +28,12 @@ async fn a_device_that_never_replies_leaves_the_other_answering() {
         assert!(h.configure(&salon, json!({"address": "10.0.0.1"})), "the Config reached no subscription");
         assert!(h.configure(&bedroom, json!({"address": "10.0.0.2"})), "the Config reached no subscription");
         assert!(
-            h.eventually(BOUND, |h| h.status(&salon).as_deref() == Some("connected")).await,
+            h.eventually(bound(), |h| h.status(&salon).as_deref() == Some("connected")).await,
             "the answering device never connected: {:?}",
             h.statuses(&salon)
         );
         assert!(
-            h.eventually(BOUND, |h| h.status(&bedroom).as_deref() == Some("unreachable")).await,
+            h.eventually(bound(), |h| h.status(&bedroom).as_deref() == Some("unreachable")).await,
             "the device that never replies was not said unreachable: {:?}",
             h.statuses(&bedroom)
         );
@@ -48,7 +48,7 @@ async fn a_device_that_never_replies_leaves_the_other_answering() {
         assert!(sent.elapsed() < Duration::from_secs(1));
         // Progress: the silent device is retried, paced, as R1's outage machinery does.
         let silent = h.fleet.device(&bedroom).expect("the silent device was built");
-        assert!(h.eventually(BOUND, |_| silent.calls_of(Op::Connect).len() >= 2).await, "the silent device was never retried");
+        assert!(h.eventually(bound(), |_| silent.calls_of(Op::Connect).len() >= 2).await, "the silent device was never retried");
         assert_eq!(h.status_via(&salon).and_then(|(_, via)| via).as_deref(), Some(h.bridge.as_str()), "the Status was not tagged");
         assert!(h.stop().await, "the host did not stop in time");
     })
@@ -97,7 +97,7 @@ async fn a_config_naming_this_process_bootstraps_the_device_from_its_own_replay(
             let t = h.topics(instance);
             let command = format!("sub {}", t.command());
             assert!(
-                h.eventually(BOUND, |h| position(&h.labels(), &command).is_some()).await,
+                h.eventually(bound(), |h| position(&h.labels(), &command).is_some()).await,
                 "{instance}'s requests were never subscribed: {:#?}",
                 h.labels()
             );
@@ -113,7 +113,7 @@ async fn a_config_naming_this_process_bootstraps_the_device_from_its_own_replay(
         // DeviceWins: changed at the device since the read-back's `false` — superseded, never
         // applied.
         assert!(
-            h.eventually(BOUND, |h| h.errors_for(&kitchen, "superseded").iter().any(|e| e["target"] == "t1" && e["property"] == "power"))
+            h.eventually(bound(), |h| h.errors_for(&kitchen, "superseded").iter().any(|e| e["target"] == "t1" && e["property"] == "power"))
                 .await,
             "the replayed Desired was not decided against the read-back: {:?}",
             h.errors(&kitchen)
@@ -126,7 +126,7 @@ async fn a_config_naming_this_process_bootstraps_the_device_from_its_own_replay(
         );
         // RequestWins: applied — after the target's Config.
         let device = h.fleet.device(&hall).expect("built");
-        assert!(h.eventually(BOUND, |_| !device.calls_of(Op::Apply).is_empty()).await, "the RequestWins replay was never applied");
+        assert!(h.eventually(bound(), |_| !device.calls_of(Op::Apply).is_empty()).await, "the RequestWins replay was never applied");
         let calls = device.calls();
         let configured = calls.iter().position(|c| c.op == Op::Configure && c.target.as_deref() == Some("t1")).expect("configured");
         let applied = calls.iter().position(|c| c.op == Op::Apply).expect("applied");
@@ -152,7 +152,7 @@ async fn the_read_back_freezes_at_the_setup_subscriptions_suback() {
         // S3's SUBACK held: S2's has come by the time S3 is subscribed.
         h.broker.hold_subacks_matching(&format!("{ROOT}/Desired/{porch}"));
         h.configure(&porch, json!({}));
-        assert!(h.eventually(BOUND, |h| h.subscribed(&t.command())).await, "S3 was never subscribed: {:#?}", h.labels());
+        assert!(h.eventually(bound(), |h| h.subscribed(&t.command())).await, "S3 was never subscribed: {:#?}", h.labels());
         // A State flagged retained after S2's SUBACK — as a late replay would be — must not move the
         // "before" value: with it, the device's `true` would read as unchanged and the request apply.
         let late = SendOptions::default().retained().user_property("via", &h.bridge);
@@ -160,7 +160,7 @@ async fn the_read_back_freezes_at_the_setup_subscriptions_suback() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         h.broker.release_subacks();
         assert!(
-            h.eventually(BOUND, |h| !h.errors_for(&porch, "superseded").is_empty()).await,
+            h.eventually(bound(), |h| !h.errors_for(&porch, "superseded").is_empty()).await,
             "the replayed Desired was decided against a State that came after S2's SUBACK: errors {:?}",
             h.errors(&porch)
         );
@@ -192,9 +192,9 @@ async fn a_device_reporting_without_pause_delays_no_reply() {
         fleet.prepare(&quiet, |d| d.set("t0", "n", json!(0)));
         let h = HostHarness::start("fair", fleet).await;
         assert!(h.configure(&chatty, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&chatty).as_deref() == Some("connected")).await, "the chatty device never connected");
+        assert!(h.eventually(bound(), |h| h.status(&chatty).as_deref() == Some("connected")).await, "the chatty device never connected");
         assert!(h.configure(&quiet, json!({})));
-        assert!(h.eventually(BOUND, |h| h.status(&quiet).as_deref() == Some("connected")).await, "the quiet device never connected");
+        assert!(h.eventually(bound(), |h| h.status(&quiet).as_deref() == Some("connected")).await, "the quiet device never connected");
         h.broker.delay_acks(Duration::from_millis(10));
         let device = h.fleet.device(&chatty).expect("built");
         let flood = tokio::spawn(async move {
@@ -254,7 +254,7 @@ async fn an_untagged_retained_state_is_no_read_back() {
         assert!(h.configure(&porch, json!({})));
         let device = h.built(&porch).await;
         assert!(
-            h.eventually(BOUND, |_| device.get("t1", "power") == Some(json!(false))).await,
+            h.eventually(bound(), |_| device.get("t1", "power") == Some(json!(false))).await,
             "an untagged State was read back as a \"before\" value: errors {:?}",
             h.errors(&porch)
         );
@@ -285,7 +285,7 @@ async fn a_foreign_tagged_retained_state_is_no_read_back() {
         assert!(h.configure(&porch, json!({})));
         let device = h.built(&porch).await;
         assert!(
-            h.eventually(BOUND, |_| device.get("t1", "power") == Some(json!(false))).await,
+            h.eventually(bound(), |_| device.get("t1", "power") == Some(json!(false))).await,
             "a State another process tagged was read back as a \"before\" value: errors {:?}",
             h.errors(&porch)
         );
@@ -307,7 +307,7 @@ async fn a_re_enabled_instance_reads_back_only_its_own_tag() {
         let h = HostHarness::start("foreign-re-enable", fleet).await;
         let t = h.topics(&porch);
         assert!(h.configure(&porch, json!({"disabled": true})));
-        assert!(h.eventually(BOUND, |h| h.status(&porch).as_deref() == Some("disabled")).await, "{:?}", h.statuses(&porch));
+        assert!(h.eventually(bound(), |h| h.status(&porch).as_deref() == Some("disabled")).await, "{:?}", h.statuses(&porch));
         let foreign = SendOptions::default().retained().user_property("via", "another-process");
         assert!(h.broker.publish(&t.state("t1"), json!({"power": false}).to_string(), &foreign));
         h.broker.retain(
@@ -320,7 +320,7 @@ async fn a_re_enabled_instance_reads_back_only_its_own_tag() {
         assert!(h.configure(&porch, json!({})));
         let device = h.built(&porch).await;
         assert!(
-            h.eventually(BOUND, |_| device.get("t1", "power") == Some(json!(false))).await,
+            h.eventually(bound(), |_| device.get("t1", "power") == Some(json!(false))).await,
             "a State another process tagged was seeded into the re-enabled read-back: errors {:?}",
             h.errors(&porch)
         );

@@ -7,6 +7,17 @@
 # mqtt-bridge-conformance; give the table's path as an absolute one, or relative to Store).
 # Every row must come back RED.
 #
+# The harness bound. A row that runs a conformance test passes `--config
+# env.MQTT_CONFORMANCE_BOUND_MS="5000"` to cargo, which shortens the patience of every wait in the
+# suite (`mqtt_bridge_conformance::bound()`, 20 s by default) to 5 s: a mutated guard usually makes a
+# scenario wait out that bound before it fails, and a RED row used to cost its 20 s. Every row's test
+# was run unmutated at 5 s, 3 times each, before its RED counted (2026-10-10, 230 distinct commands);
+# the two that need more, `a_driver_panic_with_a_stderr_nobody_reads_ends_the_bridge_with_a_failure`
+# and `a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_connection` (6.7 s each,
+# waiting for a process that ends through its shutdown grace), carry 10000 in their own command. A
+# new row's test must pass 3 times unmutated at the bound its command names. The kit's own deadlines
+# are not scaled by it; a row whose RED text is a bound's own assertion keeps its `expect_text`.
+#
 # Runs, on 2026-10-04: the first, 62 RED, 2 GREEN, 5 WRONG-REASON — the GREEN rows
 # (`momentary_commands_wait_for_a_down_device`, `reads_are_queued_while_down`) could not tell a
 # refusal at once from the next failed connect's purge, and now require the refusal's own message;
@@ -178,7 +189,7 @@ replacement = '''                Event::Incoming(Packet::Publish(publish)) => {
                     PumpEvent::Publish(publish, Instant::now())
                 }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
 expect_text = '''the pump waits on the session'''
 guard       = "pump_never_waits"
 
@@ -210,7 +221,7 @@ replacement = '''            } else {
             }
             return self.drive(ctx, outputs).await;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the state was not published again after the reconnect'''
 guard       = "connack_every_time"
 
@@ -222,7 +233,7 @@ file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''                if *requests == Sub::None || self.conn.waiting.iter().any(|c| !c.is_unsubscribe()) {'''
 replacement = '''                if *requests == Sub::None && false {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the bridge published before it had subscribed'''
 guard       = "connack_order"
 
@@ -236,7 +247,7 @@ anchor      = '''        session::emit(shared, ctx.client, shared.topics.version
 replacement = '''
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''was not published again'''
 guard       = "connack_version"
 
@@ -250,7 +261,7 @@ anchor      = '''            if let Some(slot) = outputs.slot(id) {
             }'''
 replacement = '''            let _ = &device;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_broker_restarted_without_persistence_gets_the_retained_model_again", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_broker_restarted_without_persistence_gets_the_retained_model_again", "--exact"]
 expect_text = '''the retained model was not restored'''
 guard       = "connack_republish"
 
@@ -263,7 +274,7 @@ anchor      = '''            slot.announced = false;
 replacement = '''            slot.announced = true;
             slot.batch = Batch::default();'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
 expect_text = '''no Error said the request was superseded'''
 guard       = "nothing_before_connack"
 
@@ -275,7 +286,7 @@ file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''                vec![Self::filter(topics.state_filter(), false)]'''
 replacement = '''                vec![Self::filter(topics.state("never"), false)]'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
 expect_text = '''no Error said the request was superseded'''
 guard       = "read_back"
 
@@ -301,7 +312,7 @@ anchor      = '''        device.reports.error(ErrorReport { error, ..report });
 replacement = '''        let _ = (error, report);
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "malformed_desired_and_command_payloads_are_answered_on_error", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "malformed_desired_and_command_payloads_are_answered_on_error", "--exact"]
 expect_text = '''not every malformed payload was answered on Error'''
 guard       = "malformed_answered"
 
@@ -315,7 +326,7 @@ anchor      = '''            if publish.retain {
 '''
 replacement = ''''''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "malformed_desired_and_command_payloads_are_answered_on_error", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "malformed_desired_and_command_payloads_are_answered_on_error", "--exact"]
 expect_text = '''not every malformed payload was answered on Error'''
 guard       = "target_write_never_retained"
 
@@ -326,7 +337,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation, None)'''
 replacement = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, None, None)'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
 expect_text = '''the reply lost the correlation data'''
 guard       = "reply_correlation"
 
@@ -337,7 +348,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation, None)'''
 replacement = '''Out::new(topics.event(), false, r.payload, r.correlation, None)'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_commands_answer_goes_to_its_response_topic_with_its_correlation_data", "--exact"]
 expect_text = '''no reply on the response topic'''
 guard       = "reply_response_topic"
 
@@ -348,7 +359,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''        "refresh" => {'''
 replacement = '''        "refresh-disabled" => {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "refresh_reads_the_device_and_assume_sets_the_assumed_state_without_it", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "refresh_reads_the_device_and_assume_sets_the_assumed_state_without_it", "--exact"]
 expect_text = '''refresh did not publish what it read'''
 guard       = "refresh"
 
@@ -359,7 +370,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''device.reports.state(t, call.params.clone(), true);'''
 replacement = '''device.reports.state(t, call.params.clone(), false);'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "refresh_reads_the_device_and_assume_sets_the_assumed_state_without_it", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "refresh_reads_the_device_and_assume_sets_the_assumed_state_without_it", "--exact"]
 expect_text = '''assume did not set the assumed state'''
 guard       = "assume"
 
@@ -372,7 +383,7 @@ anchor      = '''    if !incoming.connected() {
 replacement = '''    if true {
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_stops_the_bridge_cleanly", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_stops_the_bridge_cleanly", "--exact"]
 expect_text = '''the bridge did not say Active=false on its way out'''
 guard       = "shutdown_flush"
 
@@ -385,7 +396,7 @@ anchor      = '''    let deadline = properties.and_then(|p| p.message_expiry_int
 replacement = '''    let deadline: Option<Instant> = None;
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_held_past_its_expiry_is_never_applied", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_held_past_its_expiry_is_never_applied", "--exact"]
 expect_text = '''a request was applied after its expiry'''
 guard       = "deadline_from_expiry"
 
@@ -396,7 +407,7 @@ file        = "mqtt-bridge-kit/src/wire.rs"
 anchor      = '''    let conflict = match properties.and_then(|p| p.user_properties.iter().find(|(k, _)| k == "conflict")) {'''
 replacement = '''    let conflict = match None::<&(String, String)> {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_request_wins", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_request_wins", "--exact"]
 expect_text = '''the request did not win'''
 guard       = "conflict_user_property"
 
@@ -407,7 +418,7 @@ file        = "mqtt-bridge-kit/src/wire.rs"
 anchor      = '''let mut document = json!({ "error": self.error, "reason": self.reason.as_str() });'''
 replacement = '''let mut document = json!({ "error": self.error, "reason": self.reason.as_str(), "extra": 1 });'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_momentary_command_while_the_device_is_down_is_refused_and_never_executed", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_momentary_command_while_the_device_is_down_is_refused_and_never_executed", "--exact"]
 expect_text = '''does not conform to its lane's schema'''
 guard       = "lane_schemas"
 
@@ -420,7 +431,7 @@ anchor      = '''        values.retain(|v| !v.expired(now));
 replacement = '''        values.retain(|_| true);
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_held_past_its_expiry_is_never_applied", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_held_past_its_expiry_is_never_applied", "--exact"]
 expect_text = '''a request was applied after its expiry'''
 guard       = "held_dropped_at_deadline"
 
@@ -436,7 +447,7 @@ replacement = '''                _ if !inner.connected => Posted::Dropped,
                     let held = !inner.connected;
                     value.check = Check { replayed: replay, held };'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_while_the_device_is_down_is_applied_on_recovery_within_its_expiry", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_while_the_device_is_down_is_applied_on_recovery_within_its_expiry", "--exact"]
 expect_text = '''the held request was never applied'''
 guard       = "state_held_while_down"
 
@@ -451,7 +462,7 @@ file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''Some((copy, until)) if copy == value.value && now < until => Posted::Skipped,'''
 replacement = '''Some((copy, until)) if false && copy == value.value && now < until => Posted::Skipped,'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_writes_copies_arriving_after_its_apply_are_skipped", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_writes_copies_arriving_after_its_apply_are_skipped", "--exact"]
 expect_text = '''a property copy arriving after the target write was applied again'''
 guard       = "target_write_copies"
 
@@ -462,7 +473,7 @@ file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''Entry::State { value, held: h, .. } if value.target == target && *h == held => indices.push(i),'''
 replacement = '''Entry::State { value, held: h, .. } if i == first && value.target == target && *h == held => indices.push(i),'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_level_write_reaches_apply_once_with_all_values", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_level_write_reaches_apply_once_with_all_values", "--exact"]
 expect_text = '''the target write did not reach apply once with all its values'''
 guard       = "target_values_together"
 
@@ -474,7 +485,7 @@ anchor      = '''        inner.pending.retain(|e| !matches!(e, Entry::State { va
 '''
 replacement = ''''''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_retraction_before_the_device_returns_is_never_applied", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_retraction_before_the_device_returns_is_never_applied", "--exact"]
 expect_text = '''a retracted request was applied'''
 guard       = "retraction"
 
@@ -487,7 +498,7 @@ anchor      = '''            let why = if !inner.connected {
 replacement = '''            let why = if false {
                 Some(Refusal::DeviceDown)'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_momentary_command_while_the_device_is_down_is_refused_and_never_executed", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_momentary_command_while_the_device_is_down_is_refused_and_never_executed", "--exact"]
 expect_text = '''the command was not refused at once'''
 guard       = "momentary_refused_while_down"
 
@@ -530,7 +541,7 @@ replacement = '''            if false {
                 Posted::Dropped
             } else {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_read_command_is_answered_while_up_and_dropped_while_down", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_read_command_is_answered_while_up_and_dropped_while_down", "--exact"]
 expect_text = '''the read was not dropped at once'''
 guard       = "reads_dropped_while_down"
 
@@ -544,7 +555,7 @@ replacement = '''            inner.unproven.clear();
             let mut again: Vec<StateValue> = Vec::new();
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "unacknowledged_writes_are_held_again_when_the_link_dies_before_a_probe", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "unacknowledged_writes_are_held_again_when_the_link_dies_before_a_probe", "--exact"]
 expect_text = '''the unproven write was not held again'''
 guard       = "unproven_held_again"
 
@@ -557,7 +568,7 @@ anchor      = '''            again.append(&mut inner.in_flight);
 replacement = '''            inner.in_flight.clear();
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_call_that_never_returns_is_a_lost_link_within_its_deadline", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_call_that_never_returns_is_a_lost_link_within_its_deadline", "--exact"]
 expect_text = '''the request in the hanging call was lost'''
 guard       = "in_flight_held_again"
 
@@ -589,7 +600,7 @@ replacement = '''            Some(_) => None,
         };
     }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_targets_config_is_configured_and_may_override_the_feedback", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_targets_config_is_configured_and_may_override_the_feedback", "--exact"]
 expect_text = '''the config's feedback did not apply'''
 guard       = "config_feedback_override"
 
@@ -629,7 +640,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        done = tokio::time::timeout_at(deadline.into(), crate::link::under_deadline(deadline, operation)) => match done {'''
 replacement = '''        done = async { Ok::<_, ()>(crate::link::under_deadline(deadline, operation).await) } => match done {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_call_that_never_returns_is_a_lost_link_within_its_deadline", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_call_that_never_returns_is_a_lost_link_within_its_deadline", "--exact"]
 expect_text = '''past its 500 ms deadline'''
 guard       = "op_deadline"
 
@@ -641,7 +652,7 @@ anchor      = '''                lost = handle.lost() => return lost,
 '''
 replacement = ''''''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
 expect_text = '''the outage was never seen'''
 guard       = "link_lost"
 
@@ -655,7 +666,7 @@ anchor      = '''            if let Some(at) = self.last_attempt {
 '''
 replacement = ''''''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_episode", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_episode", "--exact"]
 expect_text = '''reconnects are not paced at the retry interval'''
 guard       = "paced_reconnects"
 
@@ -676,7 +687,7 @@ replacement = '''        self.outage.recovered(0, 0, 0);
         let read = match self.prove(handle).await {
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_episode", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_episode", "--exact"]
 expect_text = '''the outage began more than once'''
 guard       = "device_proof_of_life"
 
@@ -690,7 +701,7 @@ replacement = '''        self.reports.status(LinkStatus::Connected);
         let read = match self.prove(handle).await {
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "status_says_connected_only_once_the_device_proved_alive", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "status_says_connected_only_once_the_device_proved_alive", "--exact"]
 expect_text = '''Status said connected for a device that never proved itself alive'''
 guard       = "status_after_proof"
 
@@ -701,7 +712,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        if !episode.warned && episode.since.elapsed() >= self.warn_after {'''
 replacement = '''        if episode.since.elapsed() >= self.warn_after {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_episode", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_lost_link_is_reconnected_at_the_paced_rate_and_its_outage_is_one_episode", "--exact"]
 expect_text = '''the outage past its threshold was not one WARN'''
 guard       = "device_outage_episode"
 
@@ -713,7 +724,7 @@ anchor      = '''        self.reports.status(LinkStatus::Unreachable);
 '''
 replacement = ''''''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
 expect_text = '''the outage was never seen'''
 guard       = "status_unreachable"
 
@@ -726,7 +737,7 @@ anchor      = '''    match value.conflict {
 replacement = '''    match value.conflict {
         Conflict::DeviceWins => Resolution::Apply,'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
 expect_text = '''no Error said the request was superseded'''
 guard       = "conflict_device_wins"
 
@@ -743,7 +754,7 @@ replacement = '''        Conflict::DeviceWins => Resolution::Superseded,
     }
 }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_request_wins", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_request_wins", "--exact"]
 expect_text = '''the request did not win'''
 guard       = "conflict_request_wins"
 
@@ -758,7 +769,7 @@ replacement = '''    if false && same_value(before, current) {
         return Resolution::Apply;
     }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
 expect_text = '''the unchanged property's request was not applied'''
 guard       = "conflict_unchanged"
 
@@ -771,7 +782,7 @@ anchor      = '''            self.before = Some((Instant::now(), self.reports.sn
 replacement = '''            let _ = self.reports.snapshot();
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
 expect_text = '''no Error said the request was superseded'''
 guard       = "conflict_before_in_memory"
 
@@ -789,7 +800,7 @@ replacement = '''            Err(OpError::Rejected(m)) => Err(LinkError::new(m))
                 self.abandon(values.iter());
                 let properties'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_is_reported_and_the_link_stays_up", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_is_reported_and_the_link_stays_up", "--exact"]
 expect_text = '''the rejection got no Error'''
 guard       = "rejected"
 
@@ -807,7 +818,7 @@ replacement = '''            Err(OpError::Unusable(m)) => Err(LinkError::new(m))
                 self.abandon(values.iter());
                 let properties'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unusable_answer_is_reported_once_and_passed_over", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unusable_answer_is_reported_once_and_passed_over", "--exact"]
 expect_text = '''the unusable answer got no Error'''
 guard       = "unusable"
 
@@ -818,7 +829,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''warn!(kind = "command_rejected", target, ?properties, error = message, "The device rejected a request")'''
 replacement = '''info!(kind = "command_rejected", target, ?properties, error = message, "The device rejected a request")'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_is_reported_and_the_link_stays_up", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_is_reported_and_the_link_stays_up", "--exact"]
 expect_text = '''not one WARN `command_rejected`'''
 guard       = "rejected_warn"
 
@@ -832,7 +843,7 @@ anchor      = '''            Some(_) if !self.mailbox.waiting() => Instant::now(
 replacement = '''            Some(_) => last_heard + self.info.timing.probe_interval,
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "unacknowledged_writes_are_held_again_when_the_link_dies_before_a_probe", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "unacknowledged_writes_are_held_again_when_the_link_dies_before_a_probe", "--exact"]
 expect_text = '''the write was never probed'''
 guard       = "probe_unproven"
 
@@ -844,7 +855,7 @@ anchor      = '''                    self.assume(target, map);
 '''
 replacement = ''''''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "assumed_feedback_publishes_applied_values_as_assumed_state", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "assumed_feedback_publishes_applied_values_as_assumed_state", "--exact"]
 expect_text = '''the applied value was not published as assumed state'''
 guard       = "assumed_feedback"
 
@@ -855,7 +866,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''            Work::Configure { target, config } => self.configure(handle, &target, config).await,'''
 replacement = '''            Work::Configure { .. } => Ok(()),'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_targets_config_is_configured_and_may_override_the_feedback", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_targets_config_is_configured_and_may_override_the_feedback", "--exact"]
 expect_text = '''the config never reached the driver'''
 guard       = "configure"
 
@@ -879,7 +890,7 @@ replacement = '''        if changed {
 
     /// A target's observed (or assumed) values, merged into its state. Never waits.'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
 expect_text = '''with the broker stalled the device worker did not apply the held request'''
 guard       = "reports_never_wait"
 
@@ -923,7 +934,7 @@ anchor      = '''        self.reports.event(Outbound { topic: None, payload: eve
 '''
 replacement = ''''''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_drivers_event_reaches_the_event_lane", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_drivers_event_reaches_the_event_lane", "--exact"]
 expect_text = '''the event never reached the Event lane'''
 guard       = "event_lane"
 
@@ -994,7 +1005,7 @@ replacement = '''    let starting = tokio::task::spawn_blocking(move || crate::l
     let logging = starting.await;
     let signals = StopSignals::register();'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
 expect_text = '''did not stop cleanly within its bound on SIGTERM while its logging start was held'''
 guard       = "signals_first"
 
@@ -1011,7 +1022,7 @@ anchor      = '''            tokio::select! {
             }'''
 replacement = '''            starting.await'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
 expect_text = '''did not stop cleanly within its bound on SIGTERM while its logging start was held'''
 guard       = "logging_start_raced"
 
@@ -1024,7 +1035,7 @@ anchor      = '''    runtime.shutdown_timeout(RUNTIME_GRACE);
 replacement = '''    drop(runtime);
 '''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_during_a_held_logging_start_stops_the_bridge_within_its_bound", "--exact"]
 expect_text = '''did not stop cleanly within its bound on SIGTERM while its logging start was held'''
 guard       = "runtime_shutdown_timeout"
 
@@ -1040,7 +1051,7 @@ replacement = '''    if let Some(guard) = &_logging {
     }
     println!("{}", "x".repeat(1 << 20));'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_stdout_and_stderr_nobody_reads_hold_neither_the_start_nor_the_stop", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_stdout_and_stderr_nobody_reads_hold_neither_the_start_nor_the_stop", "--exact"]
 expect_text = '''the bridge never announced itself: its start waited on a stdout or stderr nobody reads'''
 guard       = "no_blocking_prints"
 
@@ -1064,7 +1075,7 @@ file        = "mqtt-bridge-kit/src/devices.rs"
 anchor      = '''                    let _ = spawner.deaths.send(died(match ended {'''
 replacement = '''                    let _ = (&spawner.deaths, died(match ended {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_panic_ends_the_device_worker", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_panic_ends_the_device_worker", "--exact"]
 expect_text = '''the driver's panic went unseen'''
 guard       = "worker_died"
 
@@ -1146,7 +1157,7 @@ replacement = '''                Ok(Err(e)) => {
                     continue;
                 }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_reconnect_publishes_nothing_before_its_subscriptions", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_reconnect_publishes_nothing_before_its_subscriptions", "--exact"]
 expect_text = '''    "connect",'''
 guard       = "fresh_client_per_connection"
 
@@ -1157,7 +1168,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''    AsyncClient::new(options, 100)'''
 replacement = '''    AsyncClient::new(options, 1_000_000)'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "the_device_side_works_while_the_broker_is_stalled", "--exact"]
 expect_text = '''the session was not parked on a full request channel'''
 guard       = "stalled_test_barrier"
 
@@ -1168,7 +1179,7 @@ file        = "mqtt-bridge-kit/src/process.rs"
 anchor      = '''            if over > BLOCKED_GRACE {'''
 replacement = '''            if over > Duration::from_secs(3600) {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline", "--exact"]
 expect_text = '''a driver blocking its thread went unseen'''
 guard       = "blocked_worker_watchdog"
 
@@ -1184,7 +1195,7 @@ replacement = '''    {
         let _ = std::io::stderr().write_all(format!("thread '{thread}' panicked at {location}:\n{payload}\n").as_bytes());
     }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_driver_panic_with_a_stderr_nobody_reads_ends_the_bridge_with_a_failure", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="10000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_driver_panic_with_a_stderr_nobody_reads_ends_the_bridge_with_a_failure", "--exact"]
 expect_text = '''a driver panic with a stderr nobody reads did not end the bridge with a failure'''
 guard       = "panic_hook_off_thread"
 
@@ -1196,7 +1207,7 @@ anchor      = '''    install_panic_hook();
     // No runtime, no bridge'''
 replacement = '''    // No runtime, no bridge'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_connection", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="10000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_connection", "--exact"]
 expect_text = '''a session panic with a stderr nobody reads did not end the bridge with a failure'''
 guard       = "panic_hook_installed"
 
@@ -1212,7 +1223,7 @@ anchor      = '''            Ok(Poll::Ready(())) => {
             }'''
 replacement = '''            Ok(Poll::Ready(())) => Poll::Ready(()),'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_helper_that_ends_is_a_lost_link", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_helper_that_ends_is_a_lost_link", "--exact"]
 expect_text = '''ReturnAfter(200ms): the helper's end went unseen'''
 guard       = "helpers_watched"
 
@@ -1291,7 +1302,7 @@ anchor      = '''                    last_read = Instant::now();
                     }'''
 replacement = '''                    polled'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_poll_slower_than_its_interval_does_not_starve_writes", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_poll_slower_than_its_interval_does_not_starve_writes", "--exact"]
 expect_text = '''with polls slower than their interval, a write never ran'''
 guard       = "poll_starvation"
 
@@ -1339,7 +1350,7 @@ replacement = '''                Step::Poll => {
                     // otherwise be due at once, every time, and starve every write (review C4).
                     last_read = started;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "polls_are_spaced_an_interval_after_the_last_one_ended", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "polls_are_spaced_an_interval_after_the_last_one_ended", "--exact"]
 expect_text = '''the next poll was not due an interval after the last ended'''
 guard       = "poll_from_completion"
 
@@ -1368,7 +1379,7 @@ anchor      = '''    let _ = std::thread::Builder::new().name("logging-failed".i
 replacement = '''    use std::io::Write;
     let _ = writeln!(std::io::stderr(), "{line}");'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_failed_logging_start_with_a_stderr_nobody_reads_holds_neither_the_start_nor_the_stop", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "a_failed_logging_start_with_a_stderr_nobody_reads_holds_neither_the_start_nor_the_stop", "--exact"]
 expect_text = '''its failed logging start waited on a stderr nobody reads'''
 guard       = "logging_failure_off_thread"
 
@@ -1381,7 +1392,7 @@ anchor      = '''            match tokio::time::timeout(SHUTDOWN_GRACE, starting
 replacement = '''            match Ok::<_, ()>(starting.await) {
                 Ok(started) => started,'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "without_its_stop_signals_the_bridge_ends_within_a_bound_whatever_its_logging_start_does", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "without_its_stop_signals_the_bridge_ends_within_a_bound_whatever_its_logging_start_does", "--exact"]
 expect_text = '''without its stop signals the bridge did not end with a failure within its bound'''
 guard       = "no_signals_bounded"
 
@@ -1460,7 +1471,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''.set_last_will(will).set_max_packet_size(Some(MAX_PACKET_SIZE));'''
 replacement = '''.set_last_will(will);'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_large_retained_config_is_taken_and_one_past_the_limit_is_left_at_the_broker", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_large_retained_config_is_taken_and_one_past_the_limit_is_left_at_the_broker", "--exact"]
 expect_text = '''the 20 KiB config never reached configure'''
 guard       = "max_packet_advertised"
 
@@ -1483,7 +1494,7 @@ file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''        let requests = [(topics.desired_target_filter(), true), (topics.desired_property_filter(), false), (topics.command(), true)];'''
 replacement = '''        let requests = [(topics.desired_target_filter(), false), (topics.desired_property_filter(), false), (topics.command(), false)];'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken", "--exact"]
 expect_text = '''a live retained command or target-level write was not refused'''
 guard       = "retain_as_published"
 
@@ -1495,7 +1506,7 @@ file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''(topics.desired_target_filter(), true), (topics.desired_property_filter(), false)'''
 replacement = '''(topics.desired_target_filter(), true), (topics.desired_property_filter(), true)'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken", "--exact"]
 expect_text = '''a live property write was checked as a replay'''
 guard       = "property_writes_live"
 
@@ -1506,7 +1517,7 @@ file        = "mqtt-bridge-kit/src/replies.rs"
 anchor      = '''        if topics.is_reserved_for_replies(&topic) {'''
 replacement = '''        if topics.is_reserved_for_replies(&topic) && false {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_response_topic_on_the_bridges_own_request_lanes_is_refused", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_response_topic_on_the_bridges_own_request_lanes_is_refused", "--exact"]
 expect_text = '''a response topic on the bridge's own lanes was not refused'''
 guard       = "reply_not_on_request_lanes"
 
@@ -1517,7 +1528,7 @@ file        = "mqtt-bridge-kit/src/reports.rs"
 anchor      = '''        state.broker_lost = Some((Instant::now(), values));'''
 replacement = '''        let _: BTreeMap<String, PropertyMap> = values;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_made_during_a_broker_outage_is_decided_against_what_the_bridge_last_knew", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_made_during_a_broker_outage_is_decided_against_what_the_bridge_last_knew", "--exact"]
 expect_text = '''a request made during a broker outage was superseded though nobody touched the device'''
 guard       = "broker_loss_snapshot"
 
@@ -1531,7 +1542,7 @@ replacement = '''        if {
             true
         } {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_link_lost_during_the_catch_up_does_not_forget_a_change_at_the_device", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_link_lost_during_the_catch_up_does_not_forget_a_change_at_the_device", "--exact"]
 expect_text = '''the change at the wall during the outage was reverted after a link lost during the catch-up'''
 guard       = "snapshot_after_recovery"
 
@@ -1563,7 +1574,7 @@ file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''                    value.check = Check { replayed: replay, held };'''
 replacement = '''                    value.check = Check { replayed: false, held };'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_read_back_decides_replays_for_a_device_already_up", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_read_back_decides_replays_for_a_device_already_up", "--exact"]
 expect_text = '''the replayed request was not decided against the read-back'''
 guard       = "replay_checked"
 
@@ -1582,7 +1593,7 @@ replacement = '''self.driver.read_state(Scope::Target(target.to_owned()))).await
                     self.fold(&states);
                     let mut current: Option<PropertyMap> = None;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_catch_up_reads_a_target_the_proving_read_did_not_give", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_catch_up_reads_a_target_the_proving_read_did_not_give", "--exact"]
 expect_text = '''the request for the target nobody touched was not applied'''
 guard       = "catch_up_reads_target"
 
@@ -1593,7 +1604,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''            Conflict::DeviceWins => Resolution::Unknown,'''
 replacement = '''            Conflict::DeviceWins => Resolution::Apply,'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "device_wins_does_not_apply_a_held_request_whose_current_value_is_unknown", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "device_wins_does_not_apply_a_held_request_whose_current_value_is_unknown", "--exact"]
 expect_text = '''the DeviceWins request on an unknown value was not reported superseded'''
 guard       = "unknown_current_device_wins"
 
@@ -1604,7 +1615,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        let (current, values) = if self.mailbox.feedback(target, self.info.feedback) == Feedback::Assumed {'''
 replacement = '''        let (current, values) = if self.mailbox.feedback(target, self.info.feedback) == Feedback::Assumed && false {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_replayed_request_an_assumed_target_already_has_is_not_applied_again", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_replayed_request_an_assumed_target_already_has_is_not_applied_again", "--exact"]
 expect_text = '''a replayed request the assumed target already had was sent again'''
 guard       = "assumed_current"
 
@@ -1615,7 +1626,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''            (current, self.mailbox.revalidate(values))'''
 replacement = '''            (current, values)'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_retracted_during_its_conflict_read_is_not_applied", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_retracted_during_its_conflict_read_is_not_applied", "--exact"]
 expect_text = '''a request retracted during its conflict read was applied'''
 guard       = "revalidate_after_read"
 
@@ -1641,7 +1652,7 @@ replacement = '''    if current.is_some_and(|current| same_value(current, &value
         return Resolution::Apply;
     }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_device_wins", "--exact"]
 expect_text = '''a held value the device already had was written again'''
 guard       = "satisfied"
 
@@ -1652,7 +1663,7 @@ file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''pub const COPY_WINDOW: Duration = Duration::from_secs(60);'''
 replacement = '''pub const COPY_WINDOW: Duration = Duration::from_secs(0);'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_writes_copies_arriving_after_its_apply_are_skipped", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_target_writes_copies_arriving_after_its_apply_are_skipped", "--exact"]
 expect_text = '''a property copy arriving after the target write was applied again'''
 guard       = "copy_window"
 
@@ -1669,7 +1680,7 @@ replacement = '''            if read_back {
                 self.request_fixed_lanes(Some(ctx), &name).await?;
             } else {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "requests_are_subscribed_only_once_the_read_back_is_acknowledged", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "requests_are_subscribed_only_once_the_read_back_is_acknowledged", "--exact"]
 expect_text = '''requests were subscribed before the read-back was acknowledged'''
 guard       = "read_back_suback_first"
 
@@ -1718,7 +1729,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        if self.configured.get(target) == Some(&config) {'''
 replacement = '''        if self.configured.get(target) == Some(&config) && false {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_unchanged_config_is_not_configured_again_while_the_link_stays_up", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_unchanged_config_is_not_configured_again_while_the_link_stays_up", "--exact"]
 expect_text = '''an unchanged config replayed on a reconnect was configured again'''
 guard       = "config_dedupe"
 
@@ -1729,7 +1740,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        self.configured.clear();'''
 replacement = ''''''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_unchanged_config_is_not_configured_again_while_the_link_stays_up", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_unchanged_config_is_not_configured_again_while_the_link_stays_up", "--exact"]
 expect_text = '''a config replayed after the link was lost was not configured'''
 guard       = "config_dedupe_per_link"
 
@@ -1740,7 +1751,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        if self.info.writes == Writes::Unacknowledged && !std::mem::replace(&mut self.unsupported_probe_said, true) {'''
 replacement = '''        if false {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violation", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violation", "--exact"]
 expect_text = '''an unsupported probe of an unacknowledged driver was not one ERROR'''
 guard       = "unsupported_probe"
 
@@ -1758,7 +1769,7 @@ replacement = '''                if let Err(OpError::Unsupported(message)) = oth
                 }
                 self.proven();'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violation", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unsupported_probe_of_an_unacknowledged_driver_is_one_contract_violation", "--exact"]
 expect_text = '''a probe loop'''
 guard       = "unsupported_probe_proof"
 
@@ -1780,7 +1791,7 @@ replacement = '''        let requests = [(topics.desired_target_filter(), true),
         }
         self.request_subscription(ctx, setup, vec![Self::filter(topics.config_filter(), false)]).await?;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "config_is_subscribed_before_desired", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "config_is_subscribed_before_desired", "--exact"]
 expect_text = '''Desired was subscribed before Config'''
 guard       = "config_subscribed_first"
 
@@ -1794,7 +1805,7 @@ anchor      = '''        if let Some(device) = self.fixed_name().and_then(|name|
 replacement = '''        if let Some(device) = self.fixed_name().and_then(|name| self.rt_of(&name).map(|(rt, _)| rt.device.clone())) {
             session::route(&device, topic, publish, Instant::now());'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_reads_it", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_reads_it", "--exact"]
 expect_text = '''a command executed past its expiry, counted from when the session read it'''
 guard       = "expiry_from_arrival"
 
@@ -1807,7 +1818,7 @@ anchor      = '''                if let Ok(Some(reply)) = &reply {
 replacement = '''                if let (false, Ok(Some(reply))) = (true, &reply) {
                     let (target, command) = wire::command_names(payload);'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_refused_on_arrival_answers_on_its_response_topic", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_refused_on_arrival_answers_on_its_response_topic", "--exact"]
 expect_text = '''a command refused on arrival was not answered'''
 guard       = "reply_on_refusal"
 
@@ -1822,7 +1833,7 @@ anchor      = '''                report_refused(
                 );'''
 replacement = '''                let _ = (target, call, reply, message);'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_that_expires_while_queued_is_reported_and_answered", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_that_expires_while_queued_is_reported_and_answered", "--exact"]
 expect_text = '''a command that expired while queued was not answered'''
 guard       = "expired_command_answered"
 
@@ -1834,7 +1845,7 @@ anchor      = '''                self.answer_once(target.as_deref(), "refresh", 
 replacement = '''                self.mailbox.command_done();
                 self.answered(target.as_deref(), "refresh", result, replies, false)'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_failed_refresh_goes_to_error_too", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_failed_refresh_goes_to_error_too", "--exact"]
 expect_text = '''a failed refresh was not on Error'''
 guard       = "refresh_failure_on_error"
 
@@ -1845,7 +1856,7 @@ file        = "mqtt-bridge-kit/src/reports.rs"
 anchor      = '''        states.extend(state.removed.iter().map(|t| (t.clone(), Vec::new())));'''
 replacement = '''        states.extend(state.removed.iter().map(|t| (t.clone(), b"{}".to_vec())));'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_driver_retracts_a_target_or_a_property", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_driver_retracts_a_target_or_a_property", "--exact"]
 expect_text = '''the removed target came back with the model'''
 guard       = "retraction_republished"
 
@@ -1858,7 +1869,7 @@ anchor      = '''            Work::Execute { target, call, reply } => {
 replacement = '''            Work::Execute { target, call, reply } => {
                 let result = op(handle, timing.operation, "execute", self.driver.execute(Some(target.as_deref().unwrap_or("")), &call)).await;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_with_no_target_reaches_execute_with_none", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_with_no_target_reaches_execute_with_none", "--exact"]
 expect_text = '''a command with no target reached execute with one'''
 guard       = "execute_target_option"
 
@@ -1897,7 +1908,7 @@ replacement = '''                    for value in &values {
                         self.reports.request_error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&value.property));
                     }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_partial_apply_reports_only_the_properties_that_failed", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_partial_apply_reports_only_the_properties_that_failed", "--exact"]
 expect_text = '''the Error named more than the refused property'''
 guard       = "partial_apply"
 
@@ -1908,7 +1919,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''                self.mailbox.retain_in_flight(|v| !failed(v));'''
 replacement = '''                self.mailbox.retain_in_flight(|v| !failed(v) && false);'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_partial_applys_written_values_are_held_again_when_the_link_dies_before_proof", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_partial_applys_written_values_are_held_again_when_the_link_dies_before_proof", "--exact"]
 expect_text = '''the value a partial apply wrote was not held again when the link died before proof'''
 guard       = "partial_apply_unproven"
 
@@ -1939,7 +1950,7 @@ anchor      = '''                    // What the device acknowledged is what the
                     self.reports.written(target, &map, reported_before);'''
 replacement = '''                    // What the device acknowledged is what the bridge knows (the lead's F2).'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_made_during_a_broker_outage_is_decided_against_what_the_bridge_last_knew", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_made_during_a_broker_outage_is_decided_against_what_the_bridge_last_knew", "--exact"]
 expect_text = '''a request made during a broker outage was superseded though nobody touched the device'''
 guard       = "written_known"
 
@@ -1954,7 +1965,7 @@ replacement = '''    pub fn snapshot(&self) -> BTreeMap<String, PropertyMap> {
         self.locked().targets.iter().map(|(t, m)| (t.clone(), m.values.clone())).collect()
     }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "an_acknowledged_write_is_a_device_outages_before_value", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "an_acknowledged_write_is_a_device_outages_before_value", "--exact"]
 expect_text = '''a held request was decided against the value before the bridge's own write'''
 guard       = "written_known"
 
@@ -1965,7 +1976,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''                    self.reports.written(target, &applied, reported_before);'''
 replacement = '''                    self.reports.written(target, &map, reported_before);'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "only_the_values_a_partial_apply_wrote_become_what_the_bridge_knows", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "only_the_values_a_partial_apply_wrote_become_what_the_bridge_knows", "--exact"]
 expect_text = '''a replay was decided against a value the partial apply did not leave'''
 guard       = "written_known"
 
@@ -2006,7 +2017,7 @@ replacement = '''    let describing = {
         async move { Ok::<_, tokio::task::JoinError>(described) }
     };'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_while_the_drivers_info_has_not_returned_stops_the_bridge_within_its_bound", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_while_the_drivers_info_has_not_returned_stops_the_bridge_within_its_bound", "--exact"]
 expect_text = '''did not stop cleanly within its bound on SIGTERM while its driver's info() was held'''
 guard       = "driver_info_raced"
 
@@ -2041,7 +2052,7 @@ replacement = '''                    match (polled, self.mailbox.try_take()) {
                         (polled, _) => polled,
                     }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_queued_during_a_poll_that_loses_the_link_is_answered", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_queued_during_a_poll_that_loses_the_link_is_answered", "--exact"]
 expect_text = '''the failed poll took the command off the mailbox'''
 guard       = "poll_keeps_the_mailbox"
 
@@ -2109,7 +2120,7 @@ file        = "mqtt-bridge-kit/src/process.rs"
 anchor      = '''        } else if let Some(quiet) = clock.since_beat().filter(|quiet| *quiet > IDLE_BOUND) {'''
 replacement = '''        } else if let Some(quiet) = clock.since_beat().filter(|_| false) {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_helper_that_blocks_the_worker_thread_while_idle_is_a_dead_worker", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_helper_that_blocks_the_worker_thread_while_idle_is_a_dead_worker", "--exact"]
 expect_text = '''a helper blocking the idle worker's thread went unseen'''
 guard       = "worker_heartbeat"
 
@@ -2123,7 +2134,7 @@ replacement = '''            Some(died) = async {
                 self.deaths.recv().await
             } => died,'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_that_blocks_its_thread_is_a_dead_worker_past_its_deadline", "--exact"]
 expect_text = '''went unseen for 7 s, read in slices'''
 guard       = "watchdog_independent"
 
@@ -2134,7 +2145,7 @@ file        = "mqtt-bridge-kit/src/process.rs"
 anchor      = '''        if let Some((full, whose)) = abandoned.full_for().filter(|(full, _)| *full > cap_bound) {'''
 replacement = '''        if let Some((full, whose)) = abandoned.full_for().filter(|_| false) {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_blocking_cap_that_stays_full_is_a_dead_worker", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_blocking_cap_that_stays_full_is_a_dead_worker", "--exact"]
 expect_text = '''a blocking cap full for good went unseen'''
 guard       = "blocking_cap_escalated"
 
@@ -2146,7 +2157,7 @@ anchor      = '''        let deadline = Instant::now() + self.info.timing.operat
         self.clock.set(Some(deadline));'''
 replacement = '''        let deadline = Instant::now() + self.info.timing.operation;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_disconnect_that_blocks_the_worker_thread_is_a_dead_worker_past_its_bound", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_disconnect_that_blocks_the_worker_thread_is_a_dead_worker_past_its_bound", "--exact"]
 expect_text = '''the blocked disconnect was not seen past its bound'''
 guard       = "disconnect_watched"
 
@@ -2157,7 +2168,7 @@ file        = "mqtt-bridge-kit/src/process.rs"
 anchor      = '''    if let Some(reports) = PANIC_REPORTS.get_or_init(|| PanicReports::start(|| Box::new(std::io::stderr()))) {'''
 replacement = '''    if let Some(reports) = &PanicReports::start(|| Box::new(std::io::stderr())) {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "repeated_panics_with_a_stderr_nobody_reads_leak_no_threads", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "repeated_panics_with_a_stderr_nobody_reads_leak_no_threads", "--exact"]
 expect_text = '''while its helpers panicked: a thread per panic'''
 guard       = "one_panic_reporter"
 
@@ -2170,7 +2181,7 @@ anchor      = '''    if deadline.is_some_and(|d| Instant::now() >= d) {
 replacement = '''    if false && deadline.is_some_and(|d| Instant::now() >= d) {
         debug!(command = %call.command, "A command past its expiry when read; refused");'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "an_assume_past_its_expiry_is_refused_not_taken", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "an_assume_past_its_expiry_is_refused_not_taken", "--exact"]
 expect_text = '''an assume past its expiry was not refused'''
 guard       = "command_expiry_at_arrival"
 
@@ -2181,7 +2192,7 @@ file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''                            callers.into_iter().partition(|c| c.deadline.is_some_and(|d| now >= d));'''
 replacement = '''                            callers.into_iter().partition(|c| c.deadline.is_some_and(|d| now >= d) && false);'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_read_command_that_expires_while_queued_is_refused_not_executed", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_read_command_that_expires_while_queued_is_refused_not_executed", "--exact"]
 expect_text = '''a read-class command past its expiry was executed'''
 guard       = "read_expiry"
 
@@ -2192,7 +2203,7 @@ file        = "mqtt-bridge-kit/src/replies.rs"
 anchor      = '''        if topics.is_reserved_for_replies(&topic) {'''
 replacement = '''        if topics.is_request_lane(&topic) {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_response_topic_on_the_bridges_own_request_lanes_is_refused", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_response_topic_on_the_bridges_own_request_lanes_is_refused", "--exact"]
 expect_text = '''a response topic on the bridge's own lanes was not refused'''
 guard       = "reply_lanes_reserved"
 
@@ -2216,7 +2227,7 @@ file        = "mqtt-bridge-kit/src/reports.rs"
 anchor      = '''        self.locked().targets.get(target).map(TargetModel::proven_values)'''
 replacement = '''        self.locked().targets.get(target).map(|m| m.values.clone())'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unproven_write_to_a_one_way_target_is_applied_again_after_the_link_dies", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unproven_write_to_a_one_way_target_is_applied_again_after_the_link_dies", "--exact"]
 expect_text = '''the unproven write the device never took was not applied again'''
 guard       = "unproven_assumptions"
 
@@ -2227,7 +2238,7 @@ file        = "mqtt-bridge-kit/src/reports.rs"
 anchor      = '''    let mut known: BTreeMap<String, PropertyMap> = state.targets.iter().map(|(t, m)| (t.clone(), m.proven_values())).collect();'''
 replacement = '''    let mut known: BTreeMap<String, PropertyMap> = state.targets.iter().map(|(t, m)| (t.clone(), m.values.clone())).collect();'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unproven_write_to_an_assumed_target_under_device_wins_is_applied_again", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unproven_write_to_an_assumed_target_under_device_wins_is_applied_again", "--exact"]
 expect_text = '''the bridge's own unproven write was not applied again'''
 guard       = "unproven_snapshots"
 
@@ -2251,7 +2262,7 @@ file        = "mqtt-bridge-kit/src/worker.rs"
 anchor      = '''        let broker = value.basis.as_ref().map(|b| (b.at, b.before.as_ref())).unwrap_or_else(|| (self.broker.0, self.broker.1.get(&key)));'''
 replacement = '''        let broker = (self.broker.0, self.broker.1.get(&key));'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_broker_disconnect_during_a_conflict_read_keeps_the_requests_basis", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_broker_disconnect_during_a_conflict_read_keeps_the_requests_basis", "--exact"]
 expect_text = '''a disconnect during the conflict read replaced the request's basis'''
 guard       = "replay_basis_at_arrival"
 
@@ -2262,7 +2273,7 @@ file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''                            Some((first, basis)) if *first == value.value => value.basis = Some(basis.clone()),'''
 replacement = '''                            Some((first, basis)) if *first == value.value && false => value.basis = Some(basis.clone()),'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_superseded_in_one_session_is_not_applied_on_the_next_replay", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "a_request_superseded_in_one_session_is_not_applied_on_the_next_replay", "--exact"]
 expect_text = '''the change at the device was reverted by a replay already superseded'''
 guard       = "replay_basis_pinned"
 
@@ -2276,7 +2287,7 @@ anchor      = '''            Purpose::Read { instance, rt } => {
 replacement = '''            Purpose::Read { instance, rt } if false => {
                 if !self.fixed_read_back_awaited(&instance, rt) {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_read_back_the_broker_refuses_is_said_incomplete", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_read_back_the_broker_refuses_is_said_incomplete", "--exact"]
 expect_text = '''a refused read-back was not said incomplete'''
 guard       = "read_back_suback_granted"
 
@@ -2337,7 +2348,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''            crate::worker::report_refused(&slot.device.reports, slot.device.mailbox.disconnected(), STOPPED_BEFORE);'''
 replacement = '''            let _ = STOPPED_BEFORE;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_answers_the_commands_waiting_for_the_device", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "process", "--", "sigterm_answers_the_commands_waiting_for_the_device", "--exact"]
 expect_text = '''the command waiting at SIGTERM was not answered'''
 guard       = "stop_refuses_waiting"
 
@@ -2362,7 +2373,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''            Some(_) if call.params.keys().any(|p| !crate::topics::valid_segment(p)) => {'''
 replacement = '''            Some(_) if false => {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_assume_with_a_bad_property_name_is_malformed", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "an_assume_with_a_bad_property_name_is_malformed", "--exact"]
 expect_text = '''a bad assume was not refused as malformed'''
 guard       = "assume_validated"
 
@@ -2410,7 +2421,7 @@ anchor      = '''            if let Some(command) = inner.in_flight_command.take
             }'''
 replacement = '''            let _ = inner.in_flight_command.take();'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_executing_at_the_stop_is_answered", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_executing_at_the_stop_is_answered", "--exact"]
 expect_text = '''a command in flight at the stop got no reply'''
 guard       = "command_in_flight_answered"
 
@@ -2541,7 +2552,7 @@ anchor      = '''        if inner.in_flight_command.take().is_none() {
         }'''
 replacement = '''        let _ = inner.in_flight_command.take();'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_cut_off_by_the_watchdog_is_answered_once", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_cut_off_by_the_watchdog_is_answered_once", "--exact"]
 expect_text = '''one command answered more than once'''
 guard       = "one_answer_per_command"
 
@@ -2553,7 +2564,7 @@ anchor      = '''            None => abandoned.refused(kind),'''
 replacement = '''            None if kind == Kind::Helper => {}
             None => abandoned.refused(kind),'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_helpers_budget_full_across_link_losses_is_a_dead_worker", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_helpers_budget_full_across_link_losses_is_a_dead_worker", "--exact"]
 expect_text = '''a full helpers' budget left every link lost for good, and no dead worker'''
 guard       = "helpers_budget_dead_worker"
 
@@ -2577,7 +2588,7 @@ anchor      = '''                        if blocked {
                         }'''
 replacement = '''                        let _ = blocked;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_stop_after_an_unread_verdict_does_not_wait_for_the_blocked_worker", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_stop_after_an_unread_verdict_does_not_wait_for_the_blocked_worker", "--exact"]
 expect_text = '''the stop did not end in time'''
 guard       = "stop_reads_a_finished_verdict"
 
@@ -2637,7 +2648,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''        let step = if reads_owed > 0 {'''
 replacement = '''        let step = if false && reads_owed > 0 {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_is_answered_under_a_steady_stream_of_reports", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_is_answered_under_a_steady_stream_of_reports", "--exact"]
 expect_text = '''a command under a steady stream of reports was never read'''
 guard       = "reads_between_report_batches"
 
@@ -2655,7 +2666,7 @@ anchor      = '''        let unsub = Purpose::Unsub { instance: instance.to_owne
         self.request_unsubscription(Some(ctx), unsub, device.topics.state_filter()).await?;'''
 replacement = '''        let _ = Purpose::Unsub { instance: instance.to_owned(), rt };'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the read-back's subscription was kept once it was done'''
 guard       = "read_back_unsubscribed"
 
@@ -2671,7 +2682,7 @@ replacement = '''    for error in errors {
         reports.event(reply);
     }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_watchdog_verdict_with_a_full_mailbox_answers_every_command", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_watchdog_verdict_with_a_full_mailbox_answers_every_command", "--exact"]
 expect_text = '''a watchdog verdict with a full mailbox dropped refusal Errors'''
 guard       = "verdict_refusals_uncapped"
 
@@ -2706,7 +2717,7 @@ file        = "mqtt-bridge-kit/src/mailbox.rs"
 anchor      = '''        self.abandoned.extend(abandoned);'''
 replacement = '''        let _ = abandoned;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unproven_write_that_expires_unapplied_withdraws_its_assumption", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "an_unproven_write_that_expires_unapplied_withdraws_its_assumption", "--exact"]
 expect_text = '''an unproven write that expired unapplied is still assumed'''
 guard       = "abandoned_reheld_withdrawn"
 
@@ -2760,7 +2771,7 @@ anchor      = '''        self.locked().answers.0.push(report);
 replacement = '''        self.error(report);
     }'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_of_many_properties_reports_every_one", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_rejected_request_of_many_properties_reports_every_one", "--exact"]
 expect_text = '''a rejected request's Errors were displaced'''
 guard       = "request_errors_uncapped"
 
@@ -2820,7 +2831,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''    if !incoming.connected() {'''
 replacement = '''    if !incoming.connected() || shared.outage.down() {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_stop_right_after_a_reconnect_answers_what_it_refuses", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_stop_right_after_a_reconnect_answers_what_it_refuses", "--exact"]
 expect_text = '''a stop inside the reconnect's stability window answered nothing'''
 guard       = "flush_on_accepted_connection"
 
@@ -2842,7 +2853,7 @@ file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''pub(crate) const IN_TURN: [Part; 3] = [Part::Model, Part::Answers, Part::Unsolicited];'''
 replacement = '''pub(crate) const IN_TURN: [Part; 3] = [Part::Answers, Part::Model, Part::Unsolicited];'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_reply_follows_the_state_its_command_produced", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_reply_follows_the_state_its_command_produced", "--exact"]
 expect_text = '''a reply went out before the State its refresh produced'''
 guard       = "reply_after_state"
 
@@ -3003,7 +3014,7 @@ anchor      = '''    fn budget(&self, ctx: &Ctx<'_>) -> Option<usize> {
 replacement = '''    fn budget(&self, ctx: &Ctx<'_>) -> Option<usize> {
         if !self.conn.connected || self.fixed.is_some() {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "packet_ids", "--", "no_packet_id_is_reused_while_a_suback_is_outstanding", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "packet_ids", "--", "no_packet_id_is_reused_while_a_suback_is_outstanding", "--exact"]
 expect_text = '''a packet id was reused while its SUBACK was outstanding'''
 guard       = "fixed_budgeted"
 
@@ -3015,7 +3026,7 @@ file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''        let read_back = self.fixed.as_ref().and_then(|f| f.read_back_until);'''
 replacement = '''        let read_back: Option<Instant> = None;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_late_read_back_is_said_incomplete_and_the_requests_go_without_it", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_late_read_back_is_said_incomplete_and_the_requests_go_without_it", "--exact"]
 expect_text = '''the requests were never subscribed without the read-back'''
 guard       = "fixed_read_back_wait"
 
@@ -3027,7 +3038,7 @@ file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''        if let Some(device) = self.fixed_name().and_then(|name| self.rt_of(&name).map(|(rt, _)| rt.device.clone())) {'''
 replacement = '''        if let Some(device) = self.fixed_name().filter(|_| false).and_then(|name| self.rt_of(&name).map(|(rt, _)| rt.device.clone())) {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
 expect_text = '''no Error said the request was superseded'''
 guard       = "fixed_routing"
 
@@ -3040,7 +3051,7 @@ anchor      = '''            return self.drive(ctx, outputs).await;'''
 replacement = '''            outputs.announce(FIXED_ID);
             return self.drive(ctx, outputs).await;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the bridge published before it had subscribed'''
 guard       = "fixed_announced_at_active"
 
@@ -3055,7 +3066,7 @@ replacement = '''        if let Some(fixed) = &self.fixed {
             let configs = Self::filter(format!("{}/Config/+", self.settings.root), false);
             self.request_subscription(Some(ctx), Purpose::Configs, vec![configs]).await?;'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_fixed_bridge_subscribes_only_its_own_lanes", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_fixed_bridge_subscribes_only_its_own_lanes", "--exact"]
 expect_text = '''a fixed bridge subscribed beyond its own instance'''
 guard       = "fixed_no_config_ownership"
 
@@ -3073,7 +3084,7 @@ replacement = '''                if self.is_fixed(&instance) {
                 }
                 if self.current(&instance, rt).is_none() {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "the_read_back_completes_at_the_first_request_suback_whichever_it_acknowledges", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "the_read_back_completes_at_the_first_request_suback_whichever_it_acknowledges", "--exact"]
 expect_text = '''the read-back waited for the Config SUBACK, held'''
 guard       = "fixed_read_back_any_request_suback"
 
@@ -3087,7 +3098,7 @@ anchor      = '''            Purpose::Unsub { .. } => Ok(()),
 replacement = '''            Purpose::Unsub { .. } => Ok(()),
             _ => Ok(()),'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "the_read_back_completes_at_a_refused_request_suback", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "the_read_back_completes_at_a_refused_request_suback", "--exact"]
 expect_text = '''the read-back waited for the Config SUBACK, held'''
 guard       = "fixed_refused_request_as_grant"
 
@@ -3104,7 +3115,7 @@ anchor      = '''            return Ok(Flow::End);
 replacement = '''        }
         if let Some(overdue) = self.conn.outstanding().find(|p| p.deadline <= now) {'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_late_read_back_is_said_incomplete_and_the_requests_go_without_it", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_late_read_back_is_said_incomplete_and_the_requests_go_without_it", "--exact"]
 expect_text = '''the requests were never subscribed without the read-back'''
 guard       = "fixed_late_read_back_ends_session"
 
@@ -3119,6 +3130,6 @@ anchor      = '''            if !slot.announced {
 replacement = '''            if false {
                 let unpublished = slot.batch.drain(Part::Model).len();'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_stop_during_the_read_back_wait_publishes_no_model", "--exact"]
+argv        = ["cargo", "test", "-q", "--config", 'env.MQTT_CONFORMANCE_BOUND_MS="5000"', "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_stop_during_the_read_back_wait_publishes_no_model", "--exact"]
 expect_text = '''the flush published the model of a slot never announced'''
 guard       = "flush_skips_unannounced_model"

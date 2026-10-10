@@ -9,6 +9,15 @@
 //!
 //! The multi-device host (multi-device spec §7) has a harness of its own ([`host`]): a fake
 //! factory, and a host in-process against a broker for several clients.
+//!
+//! # Environment
+//!
+//! `MQTT_CONFORMANCE_BOUND_MS` sets [`bound`], the patience of every wait in a scenario, in
+//! milliseconds (default 20000). Only the negative controls use it (a mutated guard usually makes
+//! a scenario wait out the bound, so a shorter one returns a row sooner); the tables in
+//! `docs/controls/` run at 5000 and name the rows that need more in their own commands. The kit's
+//! deadlines are not scaled by it. It is not a wait of the runtime, so `docs/wait-registry.md` of
+//! the kit does not list it.
 
 pub mod capture;
 pub mod device;
@@ -26,8 +35,34 @@ use serde_json::Value;
 pub use capture::{Capture, Record};
 pub use device::{fake_device, Answer, Call, Device, FakeDevice, Helper, Op};
 
+/// The default of [`bound`].
+pub const DEFAULT_BOUND: Duration = Duration::from_secs(20);
+
+/// The environment variable that overrides [`bound`], in milliseconds.
+pub const BOUND_ENV: &str = "MQTT_CONFORMANCE_BOUND_MS";
+
 /// The bound on any one wait of a scenario: a regression fails the test, never hangs the suite.
-pub const BOUND: Duration = Duration::from_secs(20);
+/// 20 s, unless `MQTT_CONFORMANCE_BOUND_MS` says otherwise (read once per process).
+///
+/// The override is for the negative controls: a mutated guard usually makes a scenario wait out
+/// this bound before it fails, so a shorter bound makes a control row return sooner. A test that
+/// passes at 20 s can fail at a shorter bound only by waiting for something slower than it, so
+/// every control row's unmutated test is run at the shortened bound before its RED counts (a row
+/// whose test needs longer sets a larger value in its own command). The kit's own deadlines are
+/// not scaled: the bound is only the tests' patience. An unusable value (not a whole number of
+/// milliseconds, or zero) panics rather than falling back, so a mistyped override cannot pass as
+/// the default.
+pub fn bound() -> Duration {
+    static BOUND: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| match std::env::var(BOUND_ENV) {
+        Err(std::env::VarError::NotPresent) => DEFAULT_BOUND,
+        Ok(text) => match text.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => panic!("{BOUND_ENV} must be a positive whole number of milliseconds, not {text:?}"),
+        },
+        Err(e) => panic!("{BOUND_ENV} is unusable: {e}"),
+    })
+}
 
 /// The root every scenario's bridge uses.
 pub const ROOT: &str = "Conf";
@@ -106,7 +141,7 @@ impl Harness {
     ) -> Harness {
         let harness = Harness::start_unwaited(name, info, timing, prepare).await;
         let command = harness.topics.command();
-        assert!(harness.broker.wait_for_subscription(&command, BOUND).await, "the bridge never subscribed to {command}");
+        assert!(harness.broker.wait_for_subscription(&command, bound()).await, "the bridge never subscribed to {command}");
         harness
     }
 
@@ -294,7 +329,7 @@ impl Harness {
     /// stopped in time.
     pub async fn stop_bridge(&mut self) -> bool {
         let running = self.running.take().expect("the bridge is running");
-        tokio::time::timeout(BOUND, running.stop()).await.unwrap_or(false)
+        tokio::time::timeout(bound(), running.stop()).await.unwrap_or(false)
     }
 
     /// Stop the bridge (bounded) and check its lanes. Returns whether it stopped in time.
