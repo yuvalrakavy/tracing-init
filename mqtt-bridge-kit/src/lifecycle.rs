@@ -849,10 +849,11 @@ impl Lifecycle {
                 self.rejected.insert(name.to_owned(), payload.to_vec());
                 let error = format!("kind mismatch: the Config names `{named}`, this process is `{kind}`");
                 self.config_rejected(outputs, name, Reason::Malformed, &error);
-                // Not served: released, if this process served it — its tagged topics cleared, as
-                // nothing of this kind serves it now.
+                // Not served: released, if this process served it — without the delete's cleanup:
+                // §4.5 clears an owner's tagged topics on a delete or a reconciled absence only (R2
+                // gate, Codex minor).
                 if owned {
-                    self.set_want(name, Want::Leave { cleanup: true });
+                    self.set_want(name, Want::Leave { cleanup: false });
                     self.reconcile(ctx, outputs, name).await?;
                 }
             }

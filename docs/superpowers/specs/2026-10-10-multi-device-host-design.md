@@ -63,7 +63,8 @@ Rules:
   Everything else on the root is ignored (DEBUG).
 - **Config errors** (only the process that `via` names reports them):
   - `via` names it, `bridge` is another kind → `Error/{instance}` `{reason:"malformed", error:"kind
-    mismatch"}`; not served.
+    mismatch"}`; not served (an instance it served is released **without** the delete's cleanup:
+    §4.5 clears on a delete or a reconciled absence only).
   - unparseable JSON, invalid driver fields, or a factory failure → `Error/{instance}`
     (`malformed`/`unusable`); its **last accepted Config stays in force** (none → `Status=unreachable`).
   - an unparseable Config whose `via` cannot be read: no owner identifiable; the process that owned the

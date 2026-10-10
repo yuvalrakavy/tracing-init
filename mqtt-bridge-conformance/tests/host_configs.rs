@@ -232,6 +232,31 @@ async fn a_config_of_another_kind_is_rejected_and_not_served() {
     .await
 }
 
+/// A served instance whose Config turns to another kind is released without the delete's cleanup:
+/// §4.5 clears an owner's tagged topics on a delete or a reconciled absence only, and a kind never
+/// changes in place (R2 gate, Codex minor; builder gap 4 overturned).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kind_mismatch_releases_without_cleanup() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| d.set("t1", "power", json!(true)));
+        let h = HostHarness::start("kind-release", fleet).await;
+        let t = h.topics(&lamp);
+        assert!(h.configure(&lamp, json!({})));
+        assert!(h.eventually(BOUND, |h| h.broker.retained_on(&t.state("t1")).is_some()).await, "the device's State never came");
+        let device = h.fleet.device(&lamp).expect("built");
+        assert!(h.configure_raw(&lamp, json!({"bridge": "otherkind", "via": h.bridge}).to_string().as_bytes()));
+        assert!(h.eventually(BOUND, |_| !device.calls_of(Op::Disconnect).is_empty()).await, "the mismatched instance was not released");
+        assert!(h.eventually(BOUND, |h| !h.subscribed(&t.status())).await, "the released instance's read-back stayed subscribed");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(h.broker.retained_on(&t.state("t1")).is_some(), "a kind mismatch retracted the instance's State");
+        assert!(h.broker.retained_on(&t.status()).is_some(), "a kind mismatch retracted the instance's Status");
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// A disabled instance refuses what still arrives on its requests' lanes — a command with its reply,
 /// a target-level write — and ignores a property Desired (it is retained, and replays once the
 /// instance is enabled).
