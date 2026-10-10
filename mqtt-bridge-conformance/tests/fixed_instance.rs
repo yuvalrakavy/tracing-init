@@ -59,6 +59,54 @@ async fn a_late_read_back_is_said_incomplete_and_the_requests_go_without_it() {
     tokio::time::timeout(DEADLINE, scenario).await.expect("the scenario did not end within its deadline");
 }
 
+/// The read-back is complete at the first SUBACK of a request behind its replay, whichever request
+/// it acknowledges, a refusal included (R1; Bridge Runtime spec §5): with the `Config/{i}/#` SUBACK
+/// held, another request's SUBACK completes it, and it is unsubscribed before `Config/{i}/#` is
+/// acknowledged (the R2 confirming reviews 2, Codex 1).
+async fn the_read_back_completes_at_the_first_request_suback(name: &str, refused: bool) {
+    let h = Harness::start_unwaited(name, acknowledged(), quick_timing(), |broker, topics, device| {
+        broker.hold_subacks_matching(&topics.config_filter());
+        if refused {
+            broker.deny_subscriptions(&topics.desired_target_filter());
+            broker.deny_subscriptions(&topics.command());
+        }
+        device.set("t1", "temp", json!(20));
+    })
+    .await;
+    let t = h.topics.clone();
+    // The first request, its SUBACK held (a refused subscription is not recorded as made).
+    assert!(h.broker.wait_for_subscription(&t.config_filter(), BOUND).await, "the requests were never subscribed");
+    let unsubscribed = |h: &Harness| h.broker.events().iter().any(|e| matches!(e, BrokerEvent::Unsubscribed(f) if *f == t.state_filter()));
+    assert!(
+        h.eventually(Duration::from_secs(3), unsubscribed).await,
+        "the read-back waited for the Config SUBACK, held, though another request's SUBACK came (refused: {refused}): {:?}",
+        h.broker.events()
+    );
+    assert!(h.log.of_kind("read_back_incomplete").is_empty(), "the read-back was said incomplete: {:#?}", h.log.records());
+    h.broker.release_subacks();
+    assert!(
+        h.eventually(BOUND, |h| h.status().as_deref() == Some("connected") && h.state("t1").is_some()).await,
+        "the bridge never published its model: status {:?}",
+        h.status()
+    );
+    assert!(h.broker.pkid_reuses().is_empty(), "a packet id was reused: {:#?}", h.broker.pkid_reuses());
+    assert!(h.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_back_completes_at_the_first_request_suback_whichever_it_acknowledges() {
+    tokio::time::timeout(DEADLINE, the_read_back_completes_at_the_first_request_suback("first-suback", false))
+        .await
+        .expect("the scenario did not end within its deadline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_back_completes_at_a_refused_request_suback() {
+    tokio::time::timeout(DEADLINE, the_read_back_completes_at_the_first_request_suback("refused-suback", true))
+        .await
+        .expect("the scenario did not end within its deadline");
+}
+
 /// A fixed bridge owns nothing by Config: it subscribes only its own instance's lanes — no
 /// `Config/+`, no `Status/+` — whatever the root holds.
 #[tokio::test(flavor = "multi_thread")]

@@ -2635,13 +2635,14 @@ guard       = "reads_between_report_batches"
 # Retargeted (second confirming review, minor 5): with up to 64 reads per batch, the echoed States
 # no longer starve the steady-stream scenario's command, so it went GREEN; the connack scenario
 # now sees the UNSUBSCRIBE itself.
-# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's;
+# and in the R2 confirming reviews 2's fix round (Codex 1), into `fixed_read_back_complete`.
 [[control]]
 name        = "the_read_back_stays_subscribed"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                        let unsub = Purpose::Unsub { instance: instance.clone(), rt };
-                        self.request_unsubscription(Some(ctx), unsub, device.topics.state_filter()).await?;'''
-replacement = '''                        let _ = Purpose::Unsub { instance: instance.clone(), rt };'''
+anchor      = '''        let unsub = Purpose::Unsub { instance: instance.to_owned(), rt };
+        self.request_unsubscription(Some(ctx), unsub, device.topics.state_filter()).await?;'''
+replacement = '''        let _ = Purpose::Unsub { instance: instance.to_owned(), rt };'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the read-back's subscription was kept once it was done'''
@@ -3046,3 +3047,35 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_fixed_bridge_subscribes_only_its_own_lanes", "--exact"]
 expect_text = '''a fixed bridge subscribed beyond its own instance'''
 guard       = "fixed_no_config_ownership"
+
+# The R2 confirming reviews 2, Codex 1: the fixed read-back is complete at the first request SUBACK
+# behind its replay, whichever request it acknowledges (R1), not only at the `Config/{i}/#` one.
+[[control]]
+name        = "the_fixed_read_back_waits_for_the_config_suback"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                if self.is_fixed(&instance) {
+                    return self.fixed_read_back_complete(ctx, &instance, rt).await;
+                }
+                if self.current(&instance, rt).is_none() {'''
+replacement = '''                if self.is_fixed(&instance) {
+                    return Ok(());
+                }
+                if self.current(&instance, rt).is_none() {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "the_read_back_completes_at_the_first_request_suback_whichever_it_acknowledges", "--exact"]
+expect_text = '''the read-back waited for the Config SUBACK, held'''
+guard       = "fixed_read_back_any_request_suback"
+
+# The same, a refusal: a refused request SUBACK of the fixed instance counts as a grant (R1 never
+# read their reason codes), so it completes the read-back too.
+[[control]]
+name        = "a_refused_request_suback_completes_nothing"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''            Purpose::Unsub { .. } => Ok(()),
+            purpose => self.granted(ctx, outputs, purpose).await,'''
+replacement = '''            Purpose::Unsub { .. } => Ok(()),
+            _ => Ok(()),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "the_read_back_completes_at_a_refused_request_suback", "--exact"]
+expect_text = '''the read-back waited for the Config SUBACK, held'''
+guard       = "fixed_refused_request_as_grant"

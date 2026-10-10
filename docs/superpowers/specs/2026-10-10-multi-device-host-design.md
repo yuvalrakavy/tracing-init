@@ -299,7 +299,8 @@ line is R1's: `--instance`, no `--name`, no `--factory-timeout`), and the host s
 - **Its CONNACK duties are R1's, in R1's order** (Bridge Runtime spec §5, §9), carried by the host's
   lifecycle: once per process the read-back `State/{instance}/#`, alone; its SUBACK awaited within
   `READ_BACK_WAIT` (5 s) — refused or late: WARN `read_back_incomplete` and on without it — and the
-  next SUBACK (behind its replay) completes it, after which it is unsubscribed; a session that ends
+  next SUBACK (behind its replay), whichever request it acknowledges, granted or refused, completes
+  it, after which it is unsubscribed; a session that ends
   before its SUBACK leaves it to the next, one that ends mid-replay leaves it incomplete. Then the
   four request SUBSCRIBEs, `Config/{instance}/#`, `Desired/{instance}/+` (retain-as-published),
   `Desired/{instance}/+/+`, `Command/{instance}` (retain-as-published); once they are handed over

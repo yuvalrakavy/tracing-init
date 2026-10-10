@@ -29,7 +29,8 @@
 //! `Status/+`. Its CONNACK duties are R1's (Bridge Runtime spec §5, §9), in R1's order: once per
 //! process the read-back, `State/{i}/#`, alone, its SUBACK awaited within
 //! [`READ_BACK_WAIT`](crate::session::READ_BACK_WAIT) (refused or late: WARN `read_back_incomplete`
-//! and on without it; the next SUBACK completes it, and it is unsubscribed); then its four request
+//! and on without it; granted, the next SUBACK — whichever request it acknowledges, granted or
+//! refused — completes it, and it is unsubscribed); then its four request
 //! subscriptions, `Config/{i}/#`, `Desired/{i}/+`, `Desired/{i}/+/+`, `Command/{i}`; once they are
 //! handed over, `Active=true`, the `Version`, and its whole retained model. Every SUBSCRIBE,
 //! UNSUBSCRIBE and publish of it goes through the same packet-id budget as a configured instance's
@@ -945,7 +946,7 @@ impl Lifecycle {
     /// A refusal of one of the fixed instance's subscriptions, taken as R1 took it — the session
     /// goes on. The read-back's is no read-back: said, WARN `read_back_incomplete`, and the
     /// requests subscribed without it. A request's reason code is not read (R1 never read them):
-    /// as a grant, so the next SUBACK still completes the read-back.
+    /// taken as a grant, it completes the read-back as a grant would.
     async fn fixed_refused(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs, purpose: Purpose) -> Result<(), Failed> {
         match purpose {
             Purpose::Read { instance, rt } => {
@@ -1006,6 +1007,22 @@ impl Lifecycle {
             "The broker did not acknowledge the read-back's subscription in time; subscribing to requests without it — a replay may meet no \"before\" values"
         );
         self.request_fixed_lanes(Some(ctx), &name).await
+    }
+
+    /// A SUBACK of one of the fixed instance's requests — the first to come, whichever request it
+    /// acknowledges, granted or refused (R1) — behind the read-back's replay: the read-back is
+    /// complete; then its subscription goes — kept, it would only bring the bridge's own State
+    /// back, a publish for each one it makes, ahead of every request (Codex final gate 1; the R2
+    /// confirming reviews 2, Codex 1: only the `Config/{i}/#` SUBACK completed it).
+    async fn fixed_read_back_complete(&mut self, ctx: &Ctx<'_>, instance: &str, rt: u64) -> Result<(), Failed> {
+        let Some(device) = self.current(instance, rt).filter(|rt| rt.read == Sub::Granted).map(|rt| rt.device.clone()) else {
+            return Ok(());
+        };
+        device.reports.read_back_complete();
+        self.set_sub(instance, |rt| rt.read = Sub::None);
+        let unsub = Purpose::Unsub { instance: instance.to_owned(), rt };
+        self.request_unsubscription(Some(ctx), unsub, device.topics.state_filter()).await?;
+        Ok(())
     }
 
     async fn granted(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs, purpose: Purpose) -> Result<(), Failed> {
@@ -1069,17 +1086,7 @@ impl Lifecycle {
                 };
                 self.set_sub(&instance, |rt| rt.setup = Sub::Granted);
                 if self.is_fixed(&instance) {
-                    // The fixed instance's requests' first SUBACK, behind the read-back's replay,
-                    // completes it; then its subscription goes — kept, it would only bring the
-                    // bridge's own State back, a publish for each one it makes, ahead of every
-                    // request (Codex final gate 1).
-                    if self.current(&instance, rt).is_some_and(|rt| rt.read == Sub::Granted) {
-                        device.reports.read_back_complete();
-                        self.set_sub(&instance, |rt| rt.read = Sub::None);
-                        let unsub = Purpose::Unsub { instance: instance.clone(), rt };
-                        self.request_unsubscription(Some(ctx), unsub, device.topics.state_filter()).await?;
-                    }
-                    return Ok(());
+                    return self.fixed_read_back_complete(ctx, &instance, rt).await;
                 }
                 // S2's SUBACK closes S1's replay: the conflict snapshot freezes.
                 device.reports.read_back_complete();
@@ -1088,8 +1095,12 @@ impl Lifecycle {
                 }
             }
             Purpose::Requests { instance, rt } => {
-                // The fixed instance serves from the start: nothing waits for its requests' grants.
-                if self.current(&instance, rt).is_none() || self.is_fixed(&instance) {
+                // The fixed instance serves from the start: nothing waits for its requests' grants
+                // — but whichever comes first completes its read-back.
+                if self.is_fixed(&instance) {
+                    return self.fixed_read_back_complete(ctx, &instance, rt).await;
+                }
+                if self.current(&instance, rt).is_none() {
                     return Ok(());
                 }
                 // S3's SUBACK closes S2's replay: a target Config no longer retained is retracted
