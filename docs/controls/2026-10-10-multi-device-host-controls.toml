@@ -6,6 +6,17 @@
 #         --root . docs/controls/2026-10-10-multi-device-host-controls.toml
 # Every row must come back RED. R1's own rows stay in 2026-10-04-bridge-runtime-controls.toml (the
 # rows whose code R2 moved are re-anchored there).
+#
+# Runs (2026-10-10). The rows were run in batches as they were written (`--row`), and after each
+# fix round with `--touched <the round's base>`. The whole table at c8d08e4: 59 rows, 54 RED,
+# 3 GREEN, 2 WRONG-REASON. GREEN: `the_pump_drops_the_unsuback` (the cleanup came all the same
+# after the grant bound ended the session; the scenario now asserts no `subscription_refused`),
+# `an_overdue_grant_goes_on` (the pump's stall bound, twice the 5 s keep-alive, ended the session at
+# the same 10 s; the scenario now runs a 30 s keep-alive), `a_retired_runtimes_answers_go_with_it`
+# (no scenario enters a retirement with reports still in the slot; a unit test now does).
+# WRONG-REASON: `a_devices_reports_wake_nobody` and `a_configured_instances_state_is_untagged`, red
+# on an earlier assertion that sees the same guard; their expected texts follow. The five at
+# 5e1f0a7: all RED. The whole table at ccda753: 59 rows, all RED (14 min).
 
 # ---- The pump ------------------------------------------------------------------------------------
 

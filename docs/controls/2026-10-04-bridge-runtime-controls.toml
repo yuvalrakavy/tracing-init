@@ -102,6 +102,18 @@
 # compile. `--touched f106c94` plus the 8 new rows at 8259fc5: 121 rows, all RED (17 min).
 #
 # The landing check (2026-10-10): the whole table at afbc133, no --touched: 206 rows, all RED (33 min).
+#
+# The multi-device host, R2 (branch `feat/r2-host`, 2026-10-10): R2 moved the session, the process
+# and the device worker's keeping (session.rs split into a session part and a device part,
+# devices.rs, lifecycle.rs), so 32 rows were re-anchored, and nothing retired or added here (R2's
+# own rows are in 2026-10-10-multi-device-host-controls.toml). `--touched master` at c8d08e4: 138
+# rows, 137 RED, 1 ANCHOR-MISS (`held_subacks_reach_a_new_connection`: the line moved into the
+# single-client branch, one level deeper); re-anchored, it was GREEN — each held packet now carries
+# its connection's sender (the multi-client mode), which made the clear redundant — so the clear
+# went and the row was retargeted at the release (5e1f0a7, ccda753): RED. The whole table at
+# ccda753: 206 rows, 205 RED, 1 WRONG-REASON (`a_driver_call_is_not_bounded`: red on the
+# scenario's timing assertion, see the row's note): its expected text follows, and with it the row
+# and the retargeted one are RED (45 min).
 
 # The forward queue's high-water WARN (`mqtt_backlog_high`).
 [[control]]
@@ -564,6 +576,10 @@ expect_text = '''the mailbox logged while holding its lock'''
 guard       = "no_logging_under_mailbox_lock"
 
 # Every driver call carries a deadline the runtime enforces: an overrun is a lost link, never a hang.
+# (2026-10-10, R2: without the bound, the watchdog's verdict at the deadline plus BLOCKED_GRACE
+# ends the device's keeper, which drops the worker's stop sender; the worker — pending, not
+# blocked — then stops and disconnects, 2.5 s after the call. The scenario's timing assertion is
+# what notices; on master nothing disconnected within the bound.)
 [[control]]
 name        = "a_driver_call_is_not_bounded"
 file        = "mqtt-bridge-kit/src/worker.rs"
@@ -571,7 +587,7 @@ anchor      = '''        done = tokio::time::timeout_at(deadline.into(), crate::
 replacement = '''        done = async { Ok::<_, ()>(crate::link::under_deadline(deadline, operation).await) } => match done {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "driver_errors", "--", "a_driver_call_that_never_returns_is_a_lost_link_within_its_deadline", "--exact"]
-expect_text = '''the hanging call never lost the link'''
+expect_text = '''past its 500 ms deadline'''
 guard       = "op_deadline"
 
 # A helper's link_lost drops the link.
