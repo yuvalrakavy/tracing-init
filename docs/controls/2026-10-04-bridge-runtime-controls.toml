@@ -17,6 +17,7 @@
 # waiting for a process that ends through its shutdown grace), carry 10000 in their own command. A
 # new row's test must pass 3 times unmutated at the bound its command names. The kit's own deadlines
 # are not scaled by it; a row whose RED text is a bound's own assertion keeps its `expect_text`.
+# The whole table at 740c547 with the 5 s bound, from a clone: 215 rows, all RED, 26 min 33 s (it was 1 h 18 min at 20 s).
 #
 # Runs, on 2026-10-04: the first, 62 RED, 2 GREEN, 5 WRONG-REASON — the GREEN rows
 # (`momentary_commands_wait_for_a_down_device`, `reads_are_queued_while_down`) could not tell a

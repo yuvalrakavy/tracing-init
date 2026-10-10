@@ -17,6 +17,7 @@
 # waiting for a process that ends through its shutdown grace), carry 10000 in their own command. A
 # new row's test must pass 3 times unmutated at the bound its command names. The kit's own deadlines
 # are not scaled by it; a row whose RED text is a bound's own assertion keeps its `expect_text`.
+# The whole table at 740c547 with the 5 s bound, from a clone: 83 rows, all RED, 9 min 27 s (it was about 17 min at 20 s).
 #
 # Runs (2026-10-10). The rows were run in batches as they were written (`--row`), and after each
 # fix round with `--touched <the round's base>`. The whole table at c8d08e4: 59 rows, 54 RED,
