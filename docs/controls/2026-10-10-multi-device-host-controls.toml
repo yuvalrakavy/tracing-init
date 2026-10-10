@@ -154,7 +154,7 @@ guard       = "rotation_sealed"
 [[control]]
 name        = "the_cursor_stays"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''            self.cursor = (i + 1) % n;'''
+anchor      = '''            self.cursor = (i + 1) % (n + 1);'''
 replacement = '''            let _ = (i, n);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_rotation_turns_quanta_round_robin_over_sealed_batches", "--exact"]
@@ -165,7 +165,7 @@ guard       = "rotation_cursor"
 [[control]]
 name        = "the_cursor_stays_end_to_end"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''            self.cursor = (i + 1) % n;'''
+anchor      = '''            self.cursor = (i + 1) % (n + 1);'''
 replacement = '''            let _ = (i, n);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_devices", "--", "a_device_reporting_without_pause_delays_no_reply", "--exact"]
@@ -190,8 +190,10 @@ guard       = "rotation_sealed_e2e"
 name        = "a_retiring_device_is_not_announced"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''            outputs.announce(id);
+            // The frozen output alone (`worker_stopped`).
             let pending'''
-replacement = '''            let pending'''
+replacement = '''            // The frozen output alone (`worker_stopped`).
+            let pending'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_stop_that_spans_a_reconnect_still_retires_its_output", "--exact"]
 expect_text = '''the stopped device's output never retired on the new connection'''
@@ -237,8 +239,8 @@ guard       = "fixed_untagged"
 [[control]]
 name        = "an_omitted_via_names_no_one"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''        None => kind.to_owned(),'''
-replacement = '''        None => String::new(),'''
+anchor      = '''        (None, Some(Value::String(named))) => named.clone(),'''
+replacement = '''        (None, Some(Value::String(_))) => String::new(),'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "lifecycle::tests::the_effective_owner_is_via_or_the_kind", "--exact"]
 expect_text = '''an omitted `via` was not the kind's default id'''
@@ -288,19 +290,6 @@ guard       = "foreign_releases"
 
 # ---- Subscriptions and the bootstrap (§4.3) ------------------------------------------------------
 
-# A packet id may come round again while an earlier request with it waits: a queue each.
-[[control]]
-name        = "a_reused_packet_id_overwrites"
-file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                    Some(pending) => self.conn.awaiting.entry(pkid).or_default().push_back(pending),'''
-replacement = '''                    Some(pending) => {
-                        self.conn.awaiting.insert(pkid, VecDeque::from([pending]));
-                    }'''
-target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "many_instances_bootstrap_at_once", "--exact"]
-expect_text = '''not every instance was served'''
-guard       = "pkid_queue"
-
 # A refused SUBACK ends the session.
 [[control]]
 name        = "a_refused_grant_goes_on"
@@ -345,7 +334,7 @@ guard       = "read_back_frozen_at_s2"
 [[control]]
 name        = "an_untagged_state_is_read_back"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''    if let (Inbound::State { target }, true, Some(_)) = (inbound, publish.retain, &via) {'''
+anchor      = '''    if let (Inbound::State { target }, true, true) = (inbound, publish.retain, via.as_deref() == Some(id)) {'''
 replacement = '''    if let (Inbound::State { target }, true, _) = (inbound, publish.retain, &via) {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_devices", "--", "an_untagged_retained_state_is_no_read_back", "--exact"]
@@ -368,8 +357,8 @@ guard       = "s2_retraction"
 [[control]]
 name        = "active_with_a_grant_pending"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''        if self.conn.active || !self.conn.connected || self.conn.pending_subscriptions() > 0 {'''
-replacement = '''        if self.conn.active || !self.conn.connected {'''
+anchor      = '''self.conn.pending_subscriptions() > 0 || self.budget(ctx).is_some_and(|b| b < 2)'''
+replacement = '''self.budget(ctx).is_some_and(|b| b < 2)'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "active_comes_only_after_every_grant_and_after_the_statuses", "--exact"]
 expect_text = '''Active=true was published with a grant pending'''
@@ -389,8 +378,8 @@ guard       = "active_after_barrier"
 [[control]]
 name        = "the_barrier_is_a_pending_grant"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''filter(|p| !p.unsubscribe && p.purpose != Purpose::Barrier)'''
-replacement = '''filter(|p| !p.unsubscribe)'''
+anchor      = '''let counted = |unsubscribe: bool, purpose: &Purpose| !unsubscribe && *purpose != Purpose::Barrier;'''
+replacement = '''let counted = |unsubscribe: bool, _: &Purpose| !unsubscribe;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "an_incomplete_replay_releases_nothing", "--exact"]
 expect_text = '''Active=true never came on the fallback'''
@@ -427,6 +416,7 @@ name        = "admission_stays_open_while_stopping"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''            Phase::Stopping { .. } => terminal(
                 &device,
+                outputs,
                 topic,
                 publish,
                 "the instance's device is being stopped (its Config changed, or it was disabled, deleted or moved)",
@@ -578,7 +568,7 @@ guard       = "no_driver_refuses"
 [[control]]
 name        = "a_changed_config_waits_for_the_retry"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                if instance.failed_config.as_ref() == Some(&config) && (worker || instance.retry_at.is_some()) {'''
+anchor      = '''                if instance.failed_config.as_ref() == Some(&config) && (worker || instance.ready.is_some() || instance.retry_at.is_some()) {'''
 replacement = '''                if instance.retry_at.is_some() {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_changed_config_of_a_failed_instance_is_built_at_once", "--exact"]
@@ -669,7 +659,11 @@ guard       = "retired_answers_kept"
 [[control]]
 name        = "a_stop_across_a_reconnect_reads_nothing"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                Some(Phase::Live | Phase::Disabled | Phase::Stopping { then: Then::Disable | Then::Release { cleanup: true }, .. })'''
+anchor      = '''                Some(
+                    Phase::Live
+                        | Phase::Disabled
+                        | Phase::Stopping { then: Then::Disable | Then::Release { cleanup: true } | Then::Successor, .. }
+                )'''
 replacement = '''                Some(Phase::Live | Phase::Disabled)'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_disable_that_spans_a_reconnect_keeps_its_read_back", "--exact"]
@@ -680,8 +674,8 @@ guard       = "stopping_reads_on_connack"
 [[control]]
 name        = "an_offline_deletes_cleanup_is_forgotten"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                        self.cleanups.insert(name.to_owned(), own);'''
-replacement = '''                        let _ = own;'''
+anchor      = '''                        self.cleanups.insert(name.to_owned());'''
+replacement = '''                        let _ = &self.cleanups;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_delete_finished_while_disconnected_is_cleared_after_the_reconnect", "--exact"]
 expect_text = '''a delete that ended while disconnected left its tagged topics behind'''
@@ -691,20 +685,233 @@ guard       = "cleanup_pending_kept"
 [[control]]
 name        = "a_pending_cleanup_is_never_handed_over"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                self.hand_over_cleanups(outputs);'''
+anchor      = '''                self.hand_over_cleanups(ctx).await?;'''
 replacement = ''''''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_delete_finished_while_disconnected_is_cleared_after_the_reconnect", "--exact"]
 expect_text = '''a delete that ended while disconnected left its tagged topics behind'''
 guard       = "cleanup_handed_over"
 
-# Minor 2: failed is "nothing serves the instance", not "no Config ever accepted".
+# Failed holds through a retry: a construction under way is no service (R2 gate, Codex 10; the row
+# was `failed_means_nothing_accepted`, whose test now asserts the committed Config kept in force).
 [[control]]
-name        = "failed_means_nothing_accepted"
+name        = "a_retry_reopens_admission"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''&& self.build.is_none() && self.ready.is_none()'''
-replacement = '''&& self.accepted.is_none() && self.build.is_none()'''
+anchor      = '''            && self.ready.is_none()
+            && (self.failed_config.is_some() || self.want == Want::Broken)'''
+replacement = '''            && self.ready.is_none()
+            && self.build.is_none()
+            && (self.failed_config.is_some() || self.want == Want::Broken)'''
 target      = "command"
-argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_change_whose_newest_construction_fails_leaves_the_instance_failed", "--exact"]
-expect_text = '''a target-level write to the instance nothing serves was not refused'''
-guard       = "failed_nothing_serves"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_retry_keeps_the_failed_refusal_policy", "--exact"]
+expect_text = '''a target-level write during a failed instance's retry was not refused'''
+guard       = "failed_holds_through_a_retry"
+
+# ---- The R2 gate's fix round (2026-10-10) ---------------------------------------------------------
+# One row per fixed finding whose guard is one anchor. Codex 2 (the retire-step flood) has none: two
+# layers each prevent the hang — the frozen retirement output, and late answers sent to the outbox —
+# so no single anchor brings it back; its test was RED at 7769cfd. The events' half of Codex 1 has no
+# test short of an inbound overload.
+
+# R2 gate, Codex 1: a due timer goes first at every pass, whatever the publication does.
+[[control]]
+name        = "a_due_timer_waits_behind_the_publication"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        let step = if due {
+            Step::Tick'''
+replacement = '''        let step = if false && due {
+            Step::Tick'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "an_overdue_grant_ends_the_session_under_a_steady_publication", "--exact"]
+expect_text = '''an overdue grant never ended the session while the publication was owed'''
+guard       = "due_timer_first"
+
+# R2 gate, Codex 3: while a request is outstanding the publication is budgeted below the id space.
+[[control]]
+name        = "the_publication_ignores_outstanding_requests"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        self.ids_left(ctx).map(|left| usize::try_from(left).unwrap_or(usize::MAX))'''
+replacement = '''        None'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "no_packet_id_is_reused_while_its_acknowledgement_is_outstanding", "--exact"]
+expect_text = '''a packet id was reused while its acknowledgement was outstanding'''
+guard       = "publication_budget"
+
+# R2 gate, Codex 4 / Claude 4: a committed driver is kept while a newer Config builds.
+[[control]]
+name        = "a_newer_config_drops_the_committed_driver"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                let worker = instance.rt.as_ref().is_some_and(|rt| rt.worker);'''
+replacement = '''                if let Some(ready) = instance.ready.take_if(|r| r.config != config) {
+                    drop_off_thread(ready.driver);
+                }
+                let worker = instance.rt.as_ref().is_some_and(|rt| rt.worker);'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_change_whose_newest_construction_fails_keeps_the_last_accepted_config_in_force", "--exact"]
+expect_text = '''the last accepted Config was not kept in force when a newer one failed'''
+guard       = "committed_config_kept"
+
+# R2 gate, Codex 5 / Claude 2: a live target Config in S2's window counts as present.
+[[control]]
+name        = "a_live_target_config_is_not_present"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                        instance.replayed.insert(target.clone());'''
+replacement = '''                        if publish.retain {
+                            instance.replayed.insert(target.clone());
+                        }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_target_config_created_live_in_the_setup_window_is_not_retracted", "--exact"]
+expect_text = '''a target Config still retained was retracted from the device'''
+guard       = "live_target_config_present"
+
+# R2 gate, Codex 6: the read-back takes only the effective owner's tag.
+[[control]]
+name        = "a_foreign_state_is_read_back"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''    if let (Inbound::State { target }, true, true) = (inbound, publish.retain, via.as_deref() == Some(id)) {'''
+replacement = '''    if let (Inbound::State { target }, true, true) = (inbound, publish.retain, via.is_some()) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_devices", "--", "a_foreign_tagged_retained_state_is_no_read_back", "--exact"]
+expect_text = '''a State another process tagged was read back'''
+guard       = "read_back_owner_tag"
+
+# ...and so does a re-enable's seeding from the slot.
+[[control]]
+name        = "a_re_enable_seeds_a_foreign_state"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''seen.via.as_deref() == Some(own.as_str())'''
+replacement = '''seen.via.is_some()'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_devices", "--", "a_re_enabled_instance_reads_back_only_its_own_tag", "--exact"]
+expect_text = '''a State another process tagged was seeded into the re-enabled read-back'''
+guard       = "re_enable_owner_tag"
+
+# R2 gate, Codex 7: a deferred cleanup clears only what still carries the own tag.
+[[control]]
+name        = "a_sweep_clears_without_reading_the_tags"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''.filter(|(_, via)| via.as_deref() == Some(id.as_str()))'''
+replacement = '''.filter(|_| true)'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_deferred_cleanup_clears_only_what_still_carries_its_own_tag", "--exact"]
+expect_text = '''a deferred cleanup cleared a State another process tagged'''
+guard       = "sweep_rechecks_tags"
+
+# R2 gate, Codex 8: dropping Running closes the registry.
+[[control]]
+name        = "a_dropped_running_leaves_its_workers"
+file        = "mqtt-bridge-kit/src/process.rs"
+anchor      = '''        let _ = self.registry.close();'''
+replacement = '''        let _ = &self.registry;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_owners", "--", "dropping_the_running_handle_stops_every_device", "--exact"]
+expect_text = '''a dropped host's device kept its link'''
+guard       = "drop_closes_registry"
+
+# R2 gate, Codex 9: an omitted `via` is the default id of the kind the Config names.
+[[control]]
+name        = "an_omitted_via_is_the_readers_kind"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        (None, Some(Value::String(named))) => named.clone(),'''
+replacement = '''        (None, Some(Value::String(_))) => kind.to_owned(),'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "lifecycle::tests::an_omitted_via_is_the_default_id_of_the_configs_own_kind", "--exact"]
+expect_text = '''another kind's instance was read as this process's'''
+guard       = "omitted_via_config_kind"
+
+# R2 gate, Claude 1: a re-enable leaves Disabled before building.
+[[control]]
+name        = "a_re_enable_builds_while_disabled"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                    Some((Phase::Disabled, _)) => self.re_enable(ctx, outputs, name).await?,'''
+replacement = '''                    Some((Phase::Disabled, _)) => {}'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_failed_re_enable_is_failed_and_retried", "--exact"]
+expect_text = '''the enabled instance whose first build failed was never retried'''
+guard       = "re_enable_before_build"
+
+# R2 gate, Claude 3: the first root replay reads Status/+ for the process's own litter.
+[[control]]
+name        = "the_first_replay_reads_no_statuses"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        if matches!(self.scan, Scan::Pending) {'''
+replacement = '''        if false {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "an_instance_deleted_while_its_process_was_down_is_cleaned_at_the_restart", "--exact"]
+expect_text = '''a deleted instance's own tagged topics survived the restart'''
+guard       = "first_replay_scan"
+
+# R2 gate, Codex minor: a disable whose driver fields changed is validated first.
+[[control]]
+name        = "a_disable_is_accepted_unchecked"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''            Want::Disable(config) if Self::needs_validation(instance, &config) => {'''
+replacement = '''            Want::Disable(config) if false && Self::needs_validation(instance, &config) => {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_disable_with_invalid_driver_fields_keeps_the_last_accepted_config", "--exact"]
+expect_text = '''a disable with invalid driver fields was not refused'''
+guard       = "disable_validated"
+
+# R2 gate, Codex minor: a kind mismatch releases without the delete's cleanup.
+[[control]]
+name        = "a_kind_mismatch_cleans_up"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                // gate, Codex minor).
+                if owned {
+                    self.set_want(name, Want::Leave { cleanup: false });'''
+replacement = '''                // gate, Codex minor).
+                if owned {
+                    self.set_want(name, Want::Leave { cleanup: true });'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_kind_mismatch_releases_without_cleanup", "--exact"]
+expect_text = '''a kind mismatch retracted the instance's State'''
+guard       = "kind_mismatch_no_cleanup"
+
+# R2 gate, Claude minor 1: Config equality is on the canonical (owner, disabled, fields).
+[[control]]
+name        = "config_equality_is_raw"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''    Verdict::Ours { config: Value::Object(canonical), disabled, fields }'''
+replacement = '''    let _ = canonical;
+    Verdict::Ours { config, disabled, fields }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_config_differing_only_in_a_default_host_field_is_a_no_op", "--exact"]
+expect_text = '''a Config differing only in `disabled: false` was built again'''
+guard       = "canonical_config_equality"
+
+# R2 gate, Claude minor 2: a cleanup is pending until the broker has acknowledged it.
+[[control]]
+name        = "a_cleanup_is_done_once_handed_over"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''handed.map_or(true, |handed| handed > acked)'''
+replacement = '''handed.is_none()'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "a_cleanup_lost_with_its_connection_is_done_on_the_next", "--exact"]
+expect_text = '''a cleanup lost with its connection was never done'''
+guard       = "cleanup_until_acknowledged"
+
+# ...and an outbox dropped at a new session is said.
+[[control]]
+name        = "an_outbox_is_dropped_silently"
+file        = "mqtt-bridge-kit/src/session.rs"
+anchor      = '''        if !self.outbox.is_empty() {
+            warn!(
+                kind = "output_lost_at_session_end",'''
+replacement = '''        if false {
+            warn!(
+                kind = "output_lost_at_session_end",'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::an_outbox_dropped_at_a_new_session_is_said", "--exact"]
+expect_text = '''an outbox dropped at a new session was not said'''
+guard       = "outbox_loss_said"
+
+# R2 gate, Claude minor 4: a stop for a successor spanning a reconnect says its Status first.
+[[control]]
+name        = "a_stop_for_a_successor_says_nothing_at_the_reconnect"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                        | Phase::Stopping { then: Then::Disable | Then::Release { cleanup: true } | Then::Successor, .. }'''
+replacement = '''                        | Phase::Stopping { then: Then::Disable | Then::Release { cleanup: true }, .. }'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "a_stop_spanning_a_reconnect_has_its_status_republished_before_active", "--exact"]
+expect_text = '''the stopping instance's Status was not republished before Active=true'''
+guard       = "successor_status_at_connack"

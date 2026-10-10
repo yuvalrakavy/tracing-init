@@ -2568,8 +2568,8 @@ guard       = "reheld_unsettled"
 [[control]]
 name        = "reports_starve_the_reads"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        let step = if reads_owed > 0 {'''
-replacement = '''        let step = if false && reads_owed > 0 {'''
+anchor      = '''        } else if reads_owed > 0 {'''
+replacement = '''        } else if false && reads_owed > 0 {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "commands", "--", "a_command_is_answered_under_a_steady_stream_of_reports", "--exact"]
 expect_text = '''a command under a steady stream of reports was never read'''
@@ -2859,7 +2859,7 @@ guard       = "replacement_withdrawal_atomic"
 [[control]]
 name        = "a_stop_drops_the_batch_it_cut_short"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''            slot.batch.publish(shared, client, &IN_TURN, QUANTUM).await;'''
+anchor      = '''            slot.batch.publish(shared, client, &IN_TURN, limit).await;'''
 replacement = '''            let mut taken = std::mem::take(&mut slot.batch);
             taken.publish(shared, client, &IN_TURN, usize::MAX).await;'''
 target      = "command"
