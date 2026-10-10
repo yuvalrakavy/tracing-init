@@ -114,6 +114,10 @@
 # ccda753: 206 rows, 205 RED, 1 WRONG-REASON (`a_driver_call_is_not_bounded`: red on the
 # scenario's timing assertion, see the row's note): its expected text follows, and with it the row
 # and the retargeted one are RED (45 min).
+# The R2 gate's fix round (2026-10-10): `reports_starve_the_reads` and
+# `a_stop_drops_the_batch_it_cut_short` re-anchored (the session's select and its budgeted turn).
+# `--touched 7769cfd` at 9b99e31: 82 rows, all RED (16 min); `--touched 9b99e31` at 175904e: 44
+# rows, all RED (9 min).
 
 # The forward queue's high-water WARN (`mqtt_backlog_high`).
 [[control]]

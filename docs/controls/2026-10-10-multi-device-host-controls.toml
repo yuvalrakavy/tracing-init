@@ -17,6 +17,12 @@
 # WRONG-REASON: `a_devices_reports_wake_nobody` and `a_configured_instances_state_is_untagged`, red
 # on an earlier assertion that sees the same guard; their expected texts follow. The five at
 # 5e1f0a7: all RED. The whole table at ccda753: 59 rows, all RED (14 min).
+# The R2 gate's fix round (2026-10-10): `--touched 7769cfd` at 9b99e31, 69 of 75 rows: 66 RED,
+# `a_due_timer_waits_behind_the_publication` GREEN (an overdue grant is no longer starved by the
+# publication alone: its row now targets a retry), `the_pump_drops_the_unsuback` WRONG-REASON (its
+# earlier assertion sees the same guard: expected text follows), `an_overdue_grant_goes_on` HUNG (a
+# due timer bypassing the select spun without yielding: fixed in 175904e). `--touched 9b99e31` at
+# 175904e, 15 rows, and `the_pump_drops_the_unsuback`: all RED.
 
 # ---- The pump ------------------------------------------------------------------------------------
 
