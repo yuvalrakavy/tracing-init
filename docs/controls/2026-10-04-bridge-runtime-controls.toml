@@ -118,6 +118,9 @@
 # `a_stop_drops_the_batch_it_cut_short` re-anchored (the session's select and its budgeted turn).
 # `--touched 7769cfd` at 9b99e31: 82 rows, all RED (16 min); `--touched 9b99e31` at 175904e: 44
 # rows, all RED (9 min).
+# The R2 confirming reviews' fix round (2026-10-10): `--touched 5e158de` at 8715a05, 44 rows: 43 RED,
+# `the_flush_puts_state_first` ANCHOR-MISS (the flush's loop is indented one level deeper now: the
+# host's budgeted flush); it and `the_flush_drops_what_is_pending` re-anchored: RED.
 
 # The forward queue's high-water WARN (`mqtt_backlog_high`).
 [[control]]
@@ -2812,8 +2815,8 @@ guard       = "read_back_view_complete"
 [[control]]
 name        = "the_flush_puts_state_first"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        for part in [Part::Answers, Part::Model, Part::Unsolicited] {'''
-replacement = '''        for part in [Part::Model, Part::Answers, Part::Unsolicited] {'''
+anchor      = '''            for part in [Part::Answers, Part::Model, Part::Unsolicited] {'''
+replacement = '''            for part in [Part::Model, Part::Answers, Part::Unsolicited] {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_answers_before_state", "--exact"]
 expect_text = '''the refusal was not published within the flush'''
