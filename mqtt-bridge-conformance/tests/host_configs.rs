@@ -329,6 +329,35 @@ async fn a_kind_mismatch_releases_without_cleanup() {
     .await
 }
 
+/// A disable whose driver fields changed is validated first (§3): a served instance whose Config
+/// turns to `disabled: true` with invalid driver fields keeps its last accepted Config — still
+/// served, not disabled — and the invalid one's `Error` is said (R2 gate, Codex minor).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disable_with_invalid_driver_fields_keeps_the_last_accepted_config() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        // Builds: the served device, then the disable's new fields — invalid.
+        fleet.script(&lamp, &[Build::Ok, Build::Malformed]);
+        let h = HostHarness::start("disable-invalid", fleet).await;
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        let device = h.fleet.device(&lamp).expect("built");
+        assert!(h.configure(&lamp, json!({"address": "not an address", "disabled": true})));
+        assert!(
+            h.eventually(BOUND, |h| !h.errors_for(&lamp, "malformed").is_empty()).await,
+            "a disable with invalid driver fields was not refused: statuses {:?}, errors {:?}",
+            h.statuses(&lamp),
+            h.errors(&lamp)
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(device.calls_of(Op::Disconnect).is_empty(), "a disable with invalid driver fields stopped the device");
+        assert_eq!(h.status(&lamp).as_deref(), Some("connected"), "{:?}", h.statuses(&lamp));
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// A disabled instance refuses what still arrives on its requests' lanes — a command with its reply,
 /// a target-level write — and ignores a property Desired (it is retained, and replays once the
 /// instance is enabled).

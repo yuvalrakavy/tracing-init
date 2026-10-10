@@ -245,6 +245,9 @@ struct Instance {
     /// serving — the reconnect pacing's retry.
     failed_config: Option<Value>,
     retry_at: Option<Instant>,
+    /// A disabled Config whose changed driver fields the factory has accepted: the disable may go
+    /// on (§3: validated before it is accepted).
+    validated: Option<Value>,
     /// The read-back's view of the instance's slot: each topic's current retained value as last
     /// seen.
     slot: BTreeMap<String, Seen>,
@@ -954,6 +957,7 @@ impl Lifecycle {
                 ready: None,
                 failed_config: None,
                 retry_at: None,
+                validated: None,
                 slot: BTreeMap::new(),
                 installed: BTreeSet::new(),
                 replayed: BTreeSet::new(),
@@ -1013,6 +1017,14 @@ impl Lifecycle {
                     self.create_rt(ctx, outputs, name, Phase::Live, LinkStatus::Unreachable).await?;
                 }
             }
+            Want::Disable(config) if Self::needs_validation(instance, &config) => {
+                // Its driver fields changed from the last accepted Config's: validated by the
+                // factory before the disable is accepted — invalid, the last accepted Config stays
+                // in force and the instance is not disabled (§3; R2 gate, Codex minor).
+                if instance.failed_config.as_ref() != Some(&config) {
+                    self.ensure_build(name, config);
+                }
+            }
             Want::Disable(config) => match phase {
                 None => {
                     self.create_rt(ctx, outputs, name, Phase::Disabled, LinkStatus::Disabled).await?;
@@ -1057,6 +1069,14 @@ impl Lifecycle {
             }
         }
         Ok(())
+    }
+
+    /// Whether a disabled Config waits for its driver fields' validation: they differ from the last
+    /// accepted Config's, and the factory has not accepted them yet. With no accepted Config there
+    /// is nothing to keep in force: the fields are checked when the instance is enabled.
+    fn needs_validation(instance: &Instance, config: &Value) -> bool {
+        instance.accepted.as_ref().is_some_and(|accepted| driver_fields(accepted) != driver_fields(config))
+            && instance.validated.as_ref() != Some(config)
     }
 
     fn accept(&mut self, name: &str, config: Value) {
@@ -1132,6 +1152,14 @@ impl Lifecycle {
                 self.mark_failed(name);
             }
             Ok((driver, info)) => {
+                // A disable's validation: the fields are valid; the driver is not needed.
+                if self.instances.get(name).is_some_and(|i| i.want == Want::Disable(config.clone())) {
+                    drop_off_thread(driver);
+                    if let Some(instance) = self.instances.get_mut(name) {
+                        instance.validated = Some(config);
+                    }
+                    return self.reconcile(ctx, outputs, name).await;
+                }
                 let wanted = self.instances.get(name).is_some_and(|i| i.want == Want::Serve(config.clone()));
                 if !wanted {
                     drop_off_thread(driver);
