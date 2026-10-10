@@ -144,6 +144,12 @@
 # (`the_fixed_read_back_waits_for_the_config_suback`, `a_refused_request_suback_completes_nothing`,
 # `a_late_read_back_goes_on`, `the_flush_publishes_an_unannounced_model`), 1 re-anchored
 # (`the_read_back_stays_subscribed`, into `fixed_read_back_complete`). Runs: see the runner's record.
+# Its `--touched` run found `the_flush_puts_state_first` GREEN: the flush now drains the model of a
+# device not announced (07e56ff), and the bound test never announced its device, so no State was
+# published for Model-first to put ahead of the answers (RED at fc6c3b8, GREEN from 07e56ff). The test
+# now announces it and asserts a State was published; the row is unchanged. That row plus
+# `--touched 4ee0663` at 611e6ef: 19 rows, all RED (2 min); the R2 table's `--touched 4ee0663`: 4
+# rows, all RED.
 
 # The forward queue's high-water WARN (`mqtt_backlog_high`).
 [[control]]
