@@ -665,8 +665,13 @@ decided (each one for the owner to confirm or overturn):
   `SUBSCRIBE` and `SUBACK`; `NoSubscriptionExisted` counts as a success.
 - **Packet ids.** rumqttc 0.25 draws subscribe, unsubscribe and publish packet ids from one counter
   that wraps at the broker's receive maximum, and can hand out the id of a SUBSCRIBE still awaiting
-  its SUBACK; the lifecycle therefore keeps a FIFO of pending requests per packet id and matches
-  each acknowledgement to the oldest.
+  its SUBACK. MQTT §2.2.1 forbids that, so (R2 gate, Codex 3; the FIFO-per-id workaround removed) a
+  host hands rumqttc a SUBSCRIBE or UNSUBSCRIBE only with no publish unacknowledged, and while any
+  is outstanding hands out fewer ids after the oldest than the receive maximum (the pump reads it
+  from the CONNACK; the publication is budgeted to match). Ids in use are unique, and each
+  acknowledgement is matched by its id. A `Bridge`'s fixed CONNACK duties are unchanged (R1): its
+  back-to-back subscribes and first publishes could in principle wrap the same way on a broker
+  with a small receive maximum — not addressed here.
 - **The `Active` gate's "all grants"** excludes the root barrier's own subscription (it is the
   barrier, not a grant the barrier waits for).
 - **The bootstrap is sequential:** S2 is requested on S1's grant, S3 on S2's; on a bootstrap after

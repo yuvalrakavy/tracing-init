@@ -128,6 +128,14 @@ One rule, used for routing, read-back, filtering and cleanup:
      target Configs are applied first, then the device becomes eligible to execute, then S3's replay
      (retained Desired) goes through the conflict rule.
   A refused or overdue (10 s) SUBACK ends the session (§4.6).
+- **Packet ids** (MQTT §2.2.1: an id is not reused until its acknowledgement; R2 gate, Codex 3).
+  rumqttc 0.25 hands out SUBSCRIBE, UNSUBSCRIBE and publish ids from one counter cycling through the
+  broker's receive maximum, and checks only publishes against the ids in use. The host therefore
+  hands rumqttc a SUBSCRIBE or UNSUBSCRIBE only when no publish is unacknowledged (publishing nothing
+  while one waits for that), and while any is outstanding hands out fewer ids after the oldest than
+  the receive maximum — requests and publishes alike, the publication budgeted to match. A slow
+  SUBACK thus holds publication to a few messages until it comes or its 10 s bound ends the session.
+  Each acknowledgement matches its one request by its unique packet id.
 - **Construction off to the side:** the factory runs on its own thread under the host's
   `--factory-timeout` (default 10 s; the driver's operation timing is unknown until `info()`), then
   `info()` under the same bound. A blocked factory or `info()` ends the process (D4 = a). For a Config

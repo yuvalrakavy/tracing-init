@@ -270,6 +270,11 @@ struct Shared {
     conns: Mutex<Vec<Conn>>,
     /// Filters starting with one of these are refused, `NotAuthorized` (an ACL).
     denied: Mutex<Vec<String>>,
+    /// The client's packet ids whose acknowledgement is held — a SUBACK or an UNSUBACK — by
+    /// connection number: in use until released (MQTT §2.2.1).
+    pkids_held: Mutex<Vec<(usize, u16)>>,
+    /// Every packet the client sent with a packet id still in use (`pkid_reuses`).
+    pkid_reuses: Mutex<Vec<String>>,
     /// Arrivals at the `held` lock (see `lock_held`).
     #[cfg(test)]
     held_lock_reached: AtomicUsize,
@@ -337,6 +342,8 @@ impl FakeBroker {
             multi,
             conns: Mutex::new(Vec::new()),
             denied: Mutex::new(Vec::new()),
+            pkids_held: Mutex::new(Vec::new()),
+            pkid_reuses: Mutex::new(Vec::new()),
             #[cfg(test)]
             held_lock_reached: AtomicUsize::new(0),
         });
@@ -529,9 +536,18 @@ impl FakeBroker {
         let mut held = self.shared.held_subacks.lock().unwrap();
         self.shared.holding_subacks.store(false, Ordering::SeqCst);
         self.shared.held_prefixes.lock().unwrap().clear();
+        self.shared.pkids_held.lock().unwrap().clear();
         for (tx, packet) in std::mem::take(&mut *held) {
             let _ = tx.send(packet);
         }
+    }
+
+    /// Every packet the client sent — a QoS 1 or 2 PUBLISH, a SUBSCRIBE, an UNSUBSCRIBE — whose
+    /// packet id was still in use by one of its SUBSCRIBEs or UNSUBSCRIBEs whose acknowledgement
+    /// the broker holds (MQTT §2.2.1: an id is not reused until its acknowledgement), each said as
+    /// text. A real broker may refuse such a packet (`0x91`, packet identifier in use).
+    pub fn pkid_reuses(&self) -> Vec<String> {
+        self.shared.pkid_reuses.lock().unwrap().clone()
     }
 
     /// How many PUBACKs are being held right now.
@@ -1005,6 +1021,14 @@ fn from_v4_qos(q: rumqttc::mqttbytes::QoS) -> QoS {
     }
 }
 
+/// A packet of connection `number` carrying `pkid`: recorded as a reuse if one of the connection's
+/// SUBSCRIBEs or UNSUBSCRIBEs whose acknowledgement is held has that id (MQTT §2.2.1).
+fn check_pkid(shared: &Shared, number: usize, pkid: u16, what: &str) {
+    if shared.pkids_held.lock().unwrap().contains(&(number, pkid)) {
+        shared.pkid_reuses.lock().unwrap().push(format!("{what} with packet id {pkid}, in use by a request whose acknowledgement is held"));
+    }
+}
+
 /// Read and answer one v5 packet; `None` on a malformed stream.
 fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Shared, number: usize) -> Option<Read> {
     // A DISCONNECT with reason 0 and no properties has a remaining length of 0 (MQTT v5 §3.14.2.1),
@@ -1056,6 +1080,7 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             let _ = tx.send(encode_v5(v5::Packet::ConnAck(ack)));
         }
         v5::Packet::Subscribe(s) => {
+            check_pkid(shared, number, s.pkid, "SUBSCRIBE");
             let denied = |path: &str| shared.denied.lock().unwrap().iter().any(|prefix| path.starts_with(prefix.as_str()));
             let codes = s
                 .filters
@@ -1078,6 +1103,7 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             };
             let mut held = shared.held_subacks.lock().unwrap();
             if shared.holding_subacks.load(Ordering::SeqCst) || slow {
+                shared.pkids_held.lock().unwrap().push((number, s.pkid));
                 held.extend(packets.into_iter().map(|p| (tx.clone(), p)));
             } else {
                 for packet in packets {
@@ -1086,6 +1112,7 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             }
         }
         v5::Packet::Unsubscribe(u) => {
+            check_pkid(shared, number, u.pkid, "UNSUBSCRIBE");
             {
                 let mut subscriptions = shared.subscriptions.lock().unwrap();
                 if shared.multi {
@@ -1108,12 +1135,16 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
             // Behind any SUBACK held: a broker answers in order (Claude's final gate minor 2).
             let mut held = shared.held_subacks.lock().unwrap();
             if shared.holding_subacks.load(Ordering::SeqCst) {
+                shared.pkids_held.lock().unwrap().push((number, u.pkid));
                 held.push((tx.clone(), unsuback));
             } else {
                 let _ = tx.send(unsuback);
             }
         }
         v5::Packet::Publish(p) => {
+            if p.qos != QoS::AtMostOnce {
+                check_pkid(shared, number, p.pkid, "PUBLISH");
+            }
             let topic = String::from_utf8_lossy(&p.topic).into_owned();
             let received = Received {
                 topic: topic.clone(),

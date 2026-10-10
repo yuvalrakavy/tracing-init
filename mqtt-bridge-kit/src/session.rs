@@ -192,10 +192,20 @@ pub(crate) enum Flow {
     End,
 }
 
-/// What a handler acts on: the session part and this connection's client.
+/// What a handler acts on: the session part, this connection's client, and its pump's publish
+/// counts.
 pub(crate) struct Ctx<'a> {
     pub shared: &'a Shared,
     pub client: &'a AsyncClient,
+    pub line: crate::pump::Line,
+}
+
+impl Ctx<'_> {
+    /// Every publish this session enqueued is written and acknowledged: a SUBSCRIBE or UNSUBSCRIBE
+    /// sent now takes a packet id nothing else holds (MQTT §2.2.1).
+    pub(crate) fn line_clear(&self) -> bool {
+        self.line.clear(self.shared.enqueued.load(Ordering::SeqCst))
+    }
 }
 
 /// What the session serves.
@@ -226,6 +236,15 @@ impl Mode {
             Mode::Host(host) => host.next_wake(),
         }
     }
+
+    /// A host's SUBSCRIBE or UNSUBSCRIBE waits for the line to clear of publishes: the pump's
+    /// progress is worth a pass.
+    fn line_wait(&self) -> bool {
+        match self {
+            Mode::Fixed(_) => false,
+            Mode::Host(host) => host.line_wait(),
+        }
+    }
 }
 
 /// One device's place in the publication rotation.
@@ -253,11 +272,29 @@ pub(crate) struct Outputs {
     /// A turn may find more without a new report: the last one found something, or the session is
     /// new.
     owed: bool,
+    /// How many more messages may be published now; `None`, no limit. A host's SUBSCRIBE or
+    /// UNSUBSCRIBE outstanding allows only as many as rumqttc can hand out before its packet id
+    /// comes round again; one waiting for the line to clear of publishes, none (MQTT §2.2.1; R2
+    /// gate, Codex 3).
+    budget: Option<usize>,
 }
 
 impl Outputs {
     pub(crate) fn new() -> Outputs {
-        Outputs { slots: Vec::new(), cursor: 0, outbox: Batch::default(), outbox_open: false, owed: true }
+        Outputs { slots: Vec::new(), cursor: 0, outbox: Batch::default(), outbox_open: false, owed: true, budget: None }
+    }
+
+    /// Set the publication's budget (a turn owed when it grows: what waited may go).
+    pub(crate) fn set_budget(&mut self, budget: Option<usize>) {
+        let grows = match (self.budget, budget) {
+            (Some(before), Some(now)) => now > before,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if grows {
+            self.owed = true;
+        }
+        self.budget = budget;
     }
 
     /// A device joins the rotation (and the broker-loss snapshot).
@@ -325,11 +362,12 @@ impl Outputs {
         self.outbox = Batch::default();
         self.outbox_open = false;
         self.owed = true;
+        self.budget = None;
     }
 
     /// Whether anything may be published now.
     fn open(&self) -> bool {
-        self.slots.iter().any(|s| s.announced) || (self.outbox_open && !self.outbox.is_empty())
+        self.budget != Some(0) && (self.slots.iter().any(|s| s.announced) || (self.outbox_open && !self.outbox.is_empty()))
     }
 
     /// One turn of the rotation: the next member after the cursor with output — a device's sealed
@@ -337,6 +375,10 @@ impl Outputs {
     /// the devices — at most [`QUANTUM`] messages. Returns the device served, if any. Cancellation-safe: what is
     /// taken stays in the slot's batch.
     async fn turn(&mut self, shared: &Shared, client: &AsyncClient) -> Option<u64> {
+        let limit = self.budget.map_or(QUANTUM, |budget| budget.min(QUANTUM));
+        if limit == 0 {
+            return None;
+        }
         // The outbox is one member of the rotation, after the devices (position `n`): served in
         // its turn, a quantum at a time, so neither a steady outbox — terminal answers to a flood
         // of late requests — nor a steady device starves the other (R2 gate, Codex 2).
@@ -346,7 +388,7 @@ impl Outputs {
             if i == n {
                 if self.outbox_open && !self.outbox.is_empty() {
                     // WAIT: mqtt-request
-                    self.outbox.publish(shared, client, &IN_TURN, QUANTUM).await;
+                    self.outbox.publish(shared, client, &IN_TURN, limit).await;
                     self.cursor = 0;
                     self.owed = true;
                     return None;
@@ -366,7 +408,7 @@ impl Outputs {
             }
             let id = slot.id;
             // WAIT: mqtt-request
-            slot.batch.publish(shared, client, &IN_TURN, QUANTUM).await;
+            slot.batch.publish(shared, client, &IN_TURN, limit).await;
             self.cursor = (i + 1) % (n + 1);
             self.owed = true;
             return Some(id);
@@ -498,11 +540,17 @@ async fn session(
     let mut accepted: Option<Instant> = None;
     // How many ready incoming events still go before the next turn of the rotation.
     let mut reads_owed: u32 = 0;
-    let ctx = Ctx { shared, client: &client };
+    let ctx = Ctx { shared, client: &client, line: incoming.line() };
     loop {
         let wake = mode.next_wake();
         let open = outputs.open();
         let owed = open && outputs.owed;
+        // A host's SUBSCRIBE or UNSUBSCRIBE waiting for the line to clear of publishes: the pump's
+        // next event may clear it (enabled before the check, so no clearing is missed).
+        let line_wait = mode.line_wait();
+        let mut progress = Box::pin(incoming.progress());
+        progress.as_mut().enable();
+        let line_cleared = line_wait && ctx.line_clear();
         // The stop first: its flush publishes what is pending anyway (re-gate R15). Then, after a
         // turn of the rotation, the incoming events that are ready — up to READS_PER_BATCH — and
         // the lifecycle's, before the next turn: a steady stream of reports to a broker slow to
@@ -522,6 +570,8 @@ async fn session(
         let due = wake.is_some_and(|at| at <= Instant::now());
         let step = if due {
             Step::Tick
+        } else if line_cleared {
+            Step::Line
         } else if reads_owed > 0 {
             // WAIT: session-events
             tokio::select! {
@@ -531,6 +581,7 @@ async fn session(
                 event = incoming.recv() => Step::Event(event),
                 () = std::future::ready(()), if owed => Step::Reported,
                 () = shared.ready.notified(), if open => Step::Reported,
+                () = &mut progress, if line_wait => Step::Line,
                 () = sleep_until(wake) => Step::Tick,
             }
         } else {
@@ -542,9 +593,11 @@ async fn session(
                 () = shared.ready.notified(), if open => Step::Reported,
                 Some(event) = events.recv() => Step::Lifecycle(event),
                 event = incoming.recv() => Step::Event(event),
+                () = &mut progress, if line_wait => Step::Line,
                 () = sleep_until(wake) => Step::Tick,
             }
         };
+        drop(progress);
         reads_owed = match step {
             Step::Reported => READS_PER_BATCH,
             _ => reads_owed.saturating_sub(1),
@@ -630,6 +683,8 @@ async fn session(
                 (Step::Lifecycle(_), Mode::Fixed(_)) => Ok(None),
                 (Step::Tick, Mode::Host(host)) => host.on_timer(&ctx, outputs).await.map(ended),
                 (Step::Tick, Mode::Fixed(_)) => Ok(None),
+                (Step::Line, Mode::Host(host)) => host.on_line(&ctx, outputs).await.map(ended),
+                (Step::Line, Mode::Fixed(_)) => Ok(None),
                 (Step::Reported, Mode::Fixed(_)) => {
                     outputs.turn(shared, &client).await;
                     Ok(None)
@@ -662,7 +717,7 @@ async fn session(
                 return SessionEnd::Ended { connected: accepted };
             }
             Ok(Some(SessionEnd::Shutdown)) => {
-                flush(shared, &client, &mut incoming, outputs).await;
+                flush(shared, &client, &mut incoming, outputs, mode).await;
                 return SessionEnd::Shutdown;
             }
             // The event loop is gone (the pump ended): the next event says so.
@@ -695,6 +750,8 @@ enum Step {
     Lifecycle(Event),
     Reported,
     Tick,
+    /// The line has cleared of publishes for a host's waiting SUBSCRIBE or UNSUBSCRIBE.
+    Line,
     Shutdown,
 }
 
@@ -958,7 +1015,7 @@ impl Batch {
 /// [`FLUSH_BOUND`]. Skipped when the session holds no connection: the last will says it then.
 /// `outputs` holds what the stop cut short of each device's last batch: published with what is
 /// pending.
-async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, outputs: &mut Outputs) {
+async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, outputs: &mut Outputs, mode: &mut Mode) {
     // A connection the broker accepted is one to flush on, whether or not its recovery has lasted
     // long enough to close the outage episode (second confirming review 2: a stop within the
     // stability window skipped every answer). The pump's word, not the session's: a CONNACK the
@@ -971,6 +1028,24 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
     // The ack wait's deadline leaves the DISCONNECT and the close their part of the bound.
     let ack_deadline = Instant::now() + FLUSH_BOUND - DISCONNECT_PART;
     let flushed = async {
+        // A host's SUBSCRIBE or UNSUBSCRIBE outstanding: its acknowledgement first, until the ack
+        // wait's deadline — a publish before it could take its packet id (MQTT §2.2.1; R2 gate,
+        // Codex 3).
+        if let Mode::Host(host) = mode {
+            while host.control_outstanding() {
+                // WAIT: shutdown-flush
+                match tokio::time::timeout_at(ack_deadline.into(), incoming.recv()).await {
+                    Ok(Some(
+                        event @ (PumpEvent::SubAck { .. }
+                        | PumpEvent::UnsubAck { .. }
+                        | PumpEvent::Subscribing(_)
+                        | PumpEvent::Unsubscribing(_)),
+                    )) => host.settle_ack(&event),
+                    Ok(Some(PumpEvent::Ended(_) | PumpEvent::Disconnected) | None) | Err(_) => break,
+                    Ok(Some(_)) => {}
+                }
+            }
+        }
         // What still waits for each device will not run: refused, on Error and on its response
         // topic; then what is pending — Status, Errors, replies — then the last words (re-gate
         // R15). Here, in the session's own flush, so nothing else publishes them first by chance.

@@ -232,7 +232,11 @@ async fn the_flush_publishes_what_is_pending_before_its_last_words() {
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
     device.reports.error(crate::wire::ErrorReport::new(crate::wire::Reason::Rejected, "pending at the stop").target(Some("t1")));
-    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs)).await;
+    let flushed = tokio::time::timeout(
+        Duration::from_secs(5),
+        flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut Mode::Fixed(Fixed::default())),
+    )
+    .await;
     assert!(flushed.is_ok(), "the flush did not end");
     let (error, active) = (shared.topics.error(), shared.topics.active());
     assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&active).is_empty()).await, "the flush never said Active=false");
@@ -264,7 +268,11 @@ async fn the_flush_publishes_answers_before_state() {
     let refusal = crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop").target(Some("t1"));
     let reply = Outbound { topic: Some("Store/replies/flush".into()), payload: b"{}".to_vec(), correlation: None };
     device.reports.refused(vec![refusal], vec![reply]);
-    let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs)).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut Mode::Fixed(Fixed::default())),
+    )
+    .await;
     let error = shared.topics.error();
     assert!(
         broker
@@ -379,7 +387,8 @@ async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
         vec![Outbound { topic: Some("Store/replies/held".into()), payload: b"{}".to_vec(), correlation: None }],
     );
     let disconnected = |b: &FakeBroker| b.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Disconnected));
-    let flushing = flush(&shared, &client, &mut incoming, &mut rig.outputs);
+    let mut fixed = Mode::Fixed(Fixed::default());
+    let flushing = flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut fixed);
     tokio::pin!(flushing);
     // Half a second in, the acks still held: no DISCONNECT yet.
     let early = tokio::time::timeout(Duration::from_millis(500), flushing.as_mut()).await;
@@ -498,8 +507,11 @@ async fn the_ack_wait_ends_with_the_connection() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         broker.drop_connection();
     };
-    let (flushed, ()) =
-        tokio::join!(tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs)), dropping);
+    let mut fixed = Mode::Fixed(Fixed::default());
+    let (flushed, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut fixed)),
+        dropping
+    );
     assert!(flushed.is_ok(), "the flush did not end");
     let took = started.elapsed();
     assert!(took < Duration::from_millis(800), "the ack wait outlived its connection, to its deadline: the flush took {took:?}");
@@ -522,7 +534,11 @@ async fn the_ack_wait_and_the_linger_fit_in_the_flushs_bound() {
     let capture = crate::test_support::Capture::start();
     broker.stop_reading();
     device.reports.refused(vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")], Vec::new());
-    let flushed = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs)).await;
+    let flushed = tokio::time::timeout(
+        Duration::from_secs(5),
+        flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut Mode::Fixed(Fixed::default())),
+    )
+    .await;
     assert!(flushed.is_ok(), "the flush did not end");
     let cut = capture.records().into_iter().filter_map(|r| r.field("message").map(str::to_owned)).find(|m| m.contains("ran out its bound"));
     assert!(cut.is_none(), "the flush ran out its bound: its ack wait and linger do not fit in it ({cut:?})");

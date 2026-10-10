@@ -22,7 +22,7 @@
 //! event loop rather than polling a cancelled one again. A PINGRESP or a publish from the broker is
 //! not progress on what the bridge asked.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -295,6 +295,8 @@ pub struct Incoming {
     inflight: Arc<AtomicUsize>,
     /// The publishes the event loop has written in this session.
     written: Arc<AtomicU64>,
+    /// How many packet ids rumqttc cycles through on this connection (see [`Line::id_space`]).
+    ids: Arc<AtomicU16>,
     /// Told after each event the pump takes, for a wait on its counts.
     progress: Arc<tokio::sync::Notify>,
     /// The session asked for the DISCONNECT the pump will see: it then reads on until the close.
@@ -334,6 +336,12 @@ impl Incoming {
         self.progress.clone().notified_owned()
     }
 
+    /// The pump's publish counts, as a handle of their own (the session's handlers read them while
+    /// the session holds this queue).
+    pub fn line(&self) -> Line {
+        Line { inflight: self.inflight.clone(), written: self.written.clone(), ids: self.ids.clone() }
+    }
+
     /// The DISCONNECT the session is about to ask for is its own: the pump reads on after it until
     /// the broker closes, rather than for one rumqttc sends on a protocol error (the second
     /// confirming review's minor 3).
@@ -349,6 +357,32 @@ impl Incoming {
             self.backlog.popped();
         }
         event
+    }
+}
+
+/// The pump's publish counts: whether every publish a session enqueued has been written and
+/// acknowledged — the line clear of publishes a host's SUBSCRIBE or UNSUBSCRIBE waits for, so its
+/// packet id is in use by nothing else (MQTT §2.2.1; R2 gate, Codex 3).
+#[derive(Clone)]
+pub struct Line {
+    inflight: Arc<AtomicUsize>,
+    written: Arc<AtomicU64>,
+    ids: Arc<AtomicU16>,
+}
+
+impl Line {
+    /// Whether the event loop has written all `enqueued` publishes and the broker has acknowledged
+    /// every one.
+    pub fn clear(&self, enqueued: u64) -> bool {
+        self.written.load(Ordering::SeqCst) >= enqueued && self.inflight.load(Ordering::SeqCst) == 0
+    }
+
+    /// How many packet ids rumqttc 0.25 cycles through on this connection — the broker's receive
+    /// maximum from its CONNACK (none: 65535), as rumqttc takes it with no upper limit set — and so
+    /// how many ids it hands out, publishes and requests alike, before one comes round again. Zero
+    /// before the CONNACK.
+    pub fn id_space(&self) -> u16 {
+        self.ids.load(Ordering::SeqCst)
     }
 }
 
@@ -378,6 +412,7 @@ impl Pump {
         let backlog = Arc::new(Backlog::new());
         let inflight = Arc::new(AtomicUsize::new(0));
         let written = Arc::new(AtomicU64::new(0));
+        let ids = Arc::new(AtomicU16::new(0));
         let progress = Arc::new(tokio::sync::Notify::new());
         let disconnect_asked = Arc::new(AtomicBool::new(false));
         let accepted = Arc::new(AtomicBool::new(false));
@@ -385,13 +420,14 @@ impl Pump {
         let counts = Counts {
             inflight: inflight.clone(),
             written: written.clone(),
+            ids: ids.clone(),
             progress: progress.clone(),
             disconnect_asked: disconnect_asked.clone(),
             accepted: accepted.clone(),
             ended: ended.clone(),
         };
         let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), counts, outage, stall, on_lost).in_current_span());
-        (Pump { task }, Incoming { rx, backlog, inflight, written, progress, disconnect_asked, accepted, ended })
+        (Pump { task }, Incoming { rx, backlog, inflight, written, ids, progress, disconnect_asked, accepted, ended })
     }
 
     async fn run(
@@ -456,7 +492,9 @@ impl Pump {
             }
 
             let forward = match event {
-                Event::Incoming(Packet::ConnAck(_)) => {
+                Event::Incoming(Packet::ConnAck(ack)) => {
+                    let receive_max = ack.properties.as_ref().and_then(|p| p.receive_max).unwrap_or(u16::MAX);
+                    counts.ids.store(receive_max, Ordering::SeqCst);
                     outage.connected();
                     connected = true;
                     counts.accepted.store(true, Ordering::SeqCst);
@@ -503,6 +541,7 @@ impl Pump {
 struct Counts {
     inflight: Arc<AtomicUsize>,
     written: Arc<AtomicU64>,
+    ids: Arc<AtomicU16>,
     progress: Arc<tokio::sync::Notify>,
     disconnect_asked: Arc<AtomicBool>,
     accepted: Arc<AtomicBool>,

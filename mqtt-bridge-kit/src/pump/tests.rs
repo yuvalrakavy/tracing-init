@@ -57,6 +57,7 @@ fn requests_left_unread_when_the_session_ends_are_reported() {
         backlog,
         inflight: Arc::new(AtomicUsize::new(0)),
         written: Arc::new(AtomicU64::new(0)),
+        ids: Arc::new(std::sync::atomic::AtomicU16::new(0)),
         progress: Arc::new(tokio::sync::Notify::new()),
         disconnect_asked: Arc::new(AtomicBool::new(false)),
         accepted: Arc::new(AtomicBool::new(false)),

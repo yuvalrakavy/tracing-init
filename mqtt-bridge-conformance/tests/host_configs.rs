@@ -392,9 +392,53 @@ async fn a_disabled_instance_refuses_what_still_arrives() {
     .await
 }
 
-/// Many instances acquired at once: every subscription's SUBACK matched to its instance by packet id
-/// — rumqttc wraps its packet ids at the broker's receive maximum (10 here), so ids come round
-/// again while earlier requests with them wait — and every device served.
+/// While a subscription's SUBACK is outstanding, no packet id it holds is sent again (MQTT §2.2.1):
+/// rumqttc wraps its ids at the broker's receive maximum (10 here) and checks only its publishes, so
+/// a device's State published meanwhile would reuse it — the host hands a SUBSCRIBE or UNSUBSCRIBE
+/// over only on a line clear of publishes, and while one is outstanding hands out fewer ids than
+/// the space holds (R2 gate, Codex 3).
+#[tokio::test(flavor = "multi_thread")]
+async fn no_packet_id_is_reused_while_its_acknowledgement_is_outstanding() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let (busy, slow) = (instance_name("Abusy"), instance_name("Bslow"));
+        fleet.prepare(&busy, |d| d.set("t0", "n", json!(0)));
+        let h = HostHarness::start("pkids", fleet).await;
+        assert!(h.configure(&busy, json!({})));
+        assert!(h.eventually(BOUND, |h| h.status(&busy).as_deref() == Some("connected")).await, "the busy instance never connected");
+        let device = h.fleet.device(&busy).expect("built");
+        // The slow instance's read-back SUBACK is held: its packet id stays in use.
+        h.broker.hold_subacks_matching(&format!("{ROOT}/State/{slow}"));
+        assert!(h.configure(&slow, json!({})));
+        assert!(
+            h.eventually(BOUND, |h| h.subscribed(&h.topics(&slow).status())).await,
+            "the slow instance's read-back was never asked for"
+        );
+        // Enough State meanwhile for rumqttc's ids to come round more than once.
+        for t in 0..30 {
+            let mut values = mqtt_bridge_kit::PropertyMap::new();
+            values.insert("n".into(), json!(1));
+            device.report(&format!("t{t}"), values);
+        }
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        h.broker.release_subacks();
+        assert!(
+            h.eventually(BOUND, |h| h.status(&slow).as_deref() == Some("connected") && h.state(&busy, "t29").is_some()).await,
+            "the instances were not served once the SUBACK came: {:?}",
+            h.statuses(&slow)
+        );
+        assert!(
+            h.broker.pkid_reuses().is_empty(),
+            "a packet id was reused while its acknowledgement was outstanding: {:#?}",
+            h.broker.pkid_reuses()
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// Many instances acquired at once: every subscription's SUBACK matched to its instance by packet
+/// id, and every device served.
 #[tokio::test(flavor = "multi_thread")]
 async fn many_instances_bootstrap_at_once() {
     within(DEADLINE, async {

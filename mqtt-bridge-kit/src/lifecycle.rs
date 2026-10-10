@@ -22,7 +22,7 @@
 //! foreign write to, or a retraction of, an owned slot is healed; a delete retracts the topics whose
 //! current value carries this process's own tag.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -282,22 +282,58 @@ enum Purpose {
     Unsub { instance: String, rt: u64 },
 }
 
+/// A SUBSCRIBE or UNSUBSCRIBE the lifecycle asks for.
+enum Request {
+    Subscribe(Vec<Filter>),
+    Unsubscribe(String),
+}
+
+/// A request not yet handed to rumqttc (`Lifecycle::drive` hands them over).
+struct Control {
+    purpose: Purpose,
+    request: Request,
+}
+
+impl Control {
+    fn is_unsubscribe(&self) -> bool {
+        matches!(self.request, Request::Unsubscribe(_))
+    }
+}
+
+/// A request handed to rumqttc and awaiting its acknowledgement: its bound, and where it stands in
+/// the order rumqttc hands out packet ids (`Lifecycle::clock`).
 struct Pending {
     purpose: Purpose,
     unsubscribe: bool,
     deadline: Instant,
+    clock: u64,
 }
 
 /// One connection's subscriptions.
+///
+/// **Packet ids** (MQTT §2.2.1: an id is not used again until its acknowledgement; R2 gate, Codex
+/// 3). rumqttc 0.25 draws SUBSCRIBE, UNSUBSCRIBE and publish ids from one counter, in the order
+/// the requests reach it, cycling through [`crate::pump::Line::id_space`] ids (the broker's receive
+/// maximum), and checks only its publishes against the ids in use: a publish, or a later SUBSCRIBE,
+/// could take the id of a SUBSCRIBE still awaiting its SUBACK. So the lifecycle keeps the order
+/// itself: a request is handed over only when no publish is unacknowledged (the line is clear —
+/// nothing is published while one waits for it), and while any request is outstanding, fewer ids
+/// are handed out after the oldest than the id space holds — requests and publishes alike, the
+/// publication budgeted to match. No id in use is handed out again, and each acknowledgement
+/// matches its one request by its packet id.
 #[derive(Default)]
 struct Conn {
     connected: bool,
-    /// Requests handed to rumqttc whose packet id is not seen yet, in order.
-    queued: VecDeque<Pending>,
-    /// Requests awaiting their acknowledgement, by packet id — a queue each: rumqttc shares one
-    /// packet-id space with the publishes and wraps it, so an id may come round again while an
-    /// earlier request with it waits, and a broker answers in order.
-    awaiting: HashMap<u16, VecDeque<Pending>>,
+    /// Requests not yet handed to rumqttc, in order.
+    waiting: VecDeque<Control>,
+    /// Requests handed to rumqttc whose packet id the pump has not seen written yet, in order.
+    unnumbered: VecDeque<Pending>,
+    /// Requests awaiting their acknowledgement, by packet id (unique: see above).
+    numbered: BTreeMap<u16, Pending>,
+    /// The requests handed to rumqttc on this connection.
+    controls: u64,
+    /// The next request waits for the line to clear of publishes.
+    line_wait: bool,
     configs_granted: Option<Instant>,
     barrier_acked: bool,
     /// Instances whose `Config/{i}` came on this connection.
@@ -306,15 +342,25 @@ struct Conn {
 }
 
 impl Conn {
+    /// Every request handed to rumqttc and not yet acknowledged.
+    fn outstanding(&self) -> impl Iterator<Item = &Pending> {
+        self.unnumbered.iter().chain(self.numbered.values())
+    }
+
     /// The subscriptions requested and not yet granted, the barrier's aside: `Active=true` waits
     /// for every other grant, and for the barrier only up to the replay's fallback (multi-device
     /// spec §4.6) — counted here, the fallback could never apply.
     fn pending_subscriptions(&self) -> usize {
-        self.queued.iter().chain(self.awaiting.values().flatten()).filter(|p| !p.unsubscribe && p.purpose != Purpose::Barrier).count()
+        let counted = |unsubscribe: bool, purpose: &Purpose| !unsubscribe && *purpose != Purpose::Barrier;
+        let waiting = self.waiting.iter().filter(|c| counted(c.is_unsubscribe(), &c.purpose)).count();
+        waiting + self.outstanding().filter(|p| counted(p.unsubscribe, &p.purpose)).count()
     }
 
+    /// The outstanding requests' first bound: a waiting one has none yet — it waits for the line,
+    /// which the broker's acknowledgements clear (the pump bounds those), or for an outstanding
+    /// one's acknowledgement (bounded here).
     fn next_deadline(&self) -> Option<Instant> {
-        self.queued.iter().chain(self.awaiting.values().flatten()).map(|p| p.deadline).min()
+        self.outstanding().map(|p| p.deadline).min()
     }
 }
 
@@ -394,24 +440,132 @@ impl Lifecycle {
 
     // ---- Subscriptions ---------------------------------------------------------------------
 
-    /// Subscribe `filters` for `purpose`: queued until rumqttc gives its packet id, then awaited.
+    /// Subscribe `filters` for `purpose`: queued, handed to rumqttc in its turn (`drive`), then
+    /// awaited.
     async fn request_subscription(&mut self, ctx: Option<&Ctx<'_>>, purpose: Purpose, filters: Vec<Filter>) -> Result<(), Failed> {
-        let Some(ctx) = ctx.filter(|_| self.conn.connected) else {
-            return Ok(());
-        };
-        self.conn.queued.push_back(Pending { purpose, unsubscribe: false, deadline: Instant::now() + GRANT_BOUND });
-        // WAIT: mqtt-request
-        ctx.client.subscribe_many(filters).await
+        if ctx.is_some() && self.conn.connected {
+            self.conn.waiting.push_back(Control { purpose, request: Request::Subscribe(filters) });
+        }
+        Ok(())
     }
 
-    /// Unsubscribe `filter` for `purpose`.
+    /// Unsubscribe `filter` for `purpose`; whether it is asked for (a connection holds it).
     async fn request_unsubscription(&mut self, ctx: Option<&Ctx<'_>>, purpose: Purpose, filter: String) -> Result<bool, Failed> {
-        let Some(ctx) = ctx.filter(|_| self.conn.connected) else {
-            return Ok(false);
-        };
-        self.conn.queued.push_back(Pending { purpose, unsubscribe: true, deadline: Instant::now() + GRANT_BOUND });
-        // WAIT: mqtt-request
-        ctx.client.unsubscribe(filter).await.map(|()| true)
+        if ctx.is_some() && self.conn.connected {
+            self.conn.waiting.push_back(Control { purpose, request: Request::Unsubscribe(filter) });
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Where the session stands in the order rumqttc hands out packet ids: every publish it enqueued
+    /// and every request it handed over, on this connection.
+    fn clock(&self, ctx: &Ctx<'_>) -> u64 {
+        ctx.shared.enqueued.load(std::sync::atomic::Ordering::SeqCst) + self.conn.controls
+    }
+
+    /// How many more packet ids may be handed out now without the oldest outstanding request's id
+    /// coming round again; `None`, no request outstanding.
+    fn ids_left(&self, ctx: &Ctx<'_>) -> Option<u64> {
+        let oldest = self.conn.outstanding().map(|p| p.clock).min()?;
+        let since = self.clock(ctx).saturating_sub(oldest);
+        Some(u64::from(ctx.line.id_space()).saturating_sub(1).saturating_sub(since))
+    }
+
+    /// Hand rumqttc the waiting requests that may go — the line clear of publishes, and ids left
+    /// (see [`Conn`]) — then `Active` if it is due, then set the publication's budget. Called after
+    /// every event the lifecycle handles.
+    async fn drive(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<(), Failed> {
+        self.conn.line_wait = false;
+        while self.conn.connected && !self.conn.waiting.is_empty() {
+            if !ctx.line_clear() {
+                self.conn.line_wait = true;
+                break;
+            }
+            if self.ids_left(ctx) == Some(0) {
+                break;
+            }
+            let Some(control) = self.conn.waiting.pop_front() else {
+                break;
+            };
+            self.conn.controls += 1;
+            let pending = Pending {
+                purpose: control.purpose,
+                unsubscribe: matches!(control.request, Request::Unsubscribe(_)),
+                deadline: Instant::now() + GRANT_BOUND,
+                clock: self.clock(ctx),
+            };
+            self.conn.unnumbered.push_back(pending);
+            match control.request {
+                // WAIT: mqtt-request
+                Request::Subscribe(filters) => ctx.client.subscribe_many(filters).await?,
+                // WAIT: mqtt-request
+                Request::Unsubscribe(filter) => ctx.client.unsubscribe(filter).await?,
+            }
+        }
+        self.maybe_active(ctx).await;
+        outputs.set_budget(self.budget(ctx));
+        Ok(())
+    }
+
+    /// How many more messages the session may publish now (`None`: no limit): none while a request
+    /// waits for the line to clear of publishes; with requests outstanding, the ids left.
+    fn budget(&self, ctx: &Ctx<'_>) -> Option<usize> {
+        if !self.conn.connected {
+            return None;
+        }
+        if self.conn.line_wait {
+            return Some(0);
+        }
+        self.ids_left(ctx).map(|left| usize::try_from(left).unwrap_or(usize::MAX))
+    }
+
+    /// The next request waits for the line to clear of publishes: the session wakes on the pump's
+    /// progress.
+    pub(crate) fn line_wait(&self) -> bool {
+        self.conn.line_wait
+    }
+
+    /// The pump has progressed while a request waited for the line.
+    pub(crate) async fn on_line(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<Flow, Failed> {
+        self.drive(ctx, outputs).await.map(|()| Flow::Continue)
+    }
+
+    /// A request is outstanding (the shutdown's flush waits for its acknowledgement first).
+    pub(crate) fn control_outstanding(&self) -> bool {
+        self.conn.connected && self.conn.outstanding().next().is_some()
+    }
+
+    /// A request's packet id seen written, or its acknowledgement: the request it is for, taken
+    /// out once acknowledged (`None` for an id seen, or an acknowledgement of nothing awaited).
+    fn number(&mut self, event: &PumpEvent) -> Option<Pending> {
+        match *event {
+            PumpEvent::Subscribing(pkid) | PumpEvent::Unsubscribing(pkid) => {
+                match self.conn.unnumbered.pop_front() {
+                    Some(pending) => {
+                        if self.conn.numbered.insert(pkid, pending).is_some() {
+                            warn!(pkid, "rumqttc handed out a packet id still awaiting its acknowledgement");
+                        }
+                    }
+                    None => debug!(pkid, "A subscription request the lifecycle did not make"),
+                }
+                None
+            }
+            PumpEvent::SubAck { pkid, .. } | PumpEvent::UnsubAck { pkid, .. } => {
+                let pending = self.conn.numbered.remove(&pkid);
+                if pending.is_none() {
+                    debug!(pkid, "An acknowledgement of nothing awaited");
+                }
+                pending
+            }
+            _ => None,
+        }
+    }
+
+    /// The bookkeeping of a request's packet id or acknowledgement alone, nothing acted on: the
+    /// shutdown's flush, waiting for those outstanding.
+    pub(crate) fn settle_ack(&mut self, event: &PumpEvent) {
+        let _ = self.number(event);
     }
 
     fn filter(path: String, retain_as_published: bool) -> Filter {
@@ -487,7 +641,6 @@ impl Lifecycle {
         let configs = Self::filter(format!("{root}/Config/+"), false);
         let barrier = Self::filter(format!("{root}/_barrier/{}", self.settings.id), false);
         self.request_subscription(Some(ctx), Purpose::Configs, vec![configs]).await?;
-        self.request_subscription(Some(ctx), Purpose::Barrier, vec![barrier]).await?;
         let names: Vec<String> = self.instances.keys().cloned().collect();
         for name in names {
             let phase = self.instances.get(&name).and_then(|i| i.rt.as_ref()).map(|rt| rt.phase);
@@ -501,27 +654,32 @@ impl Lifecycle {
                 self.request_read(Some(ctx), &name).await?;
             }
         }
-        Ok(())
+        // The barrier behind the instances already owned: their read-backs are asked for ahead of
+        // it, so a late barrier SUBACK — holding the ids handed out after it (`Conn`) — delays
+        // their bootstrap the least.
+        self.request_subscription(Some(ctx), Purpose::Barrier, vec![barrier]).await?;
+        self.drive(ctx, outputs).await
     }
 
     /// A SUBSCRIBE or UNSUBSCRIBE written (its packet id), or its acknowledgement.
     pub(crate) async fn on_ack(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs, event: PumpEvent) -> Result<Flow, Failed> {
+        let flow = self.ack(ctx, outputs, event).await?;
+        if flow == Flow::Continue {
+            self.drive(ctx, outputs).await?;
+        }
+        Ok(flow)
+    }
+
+    async fn ack(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs, event: PumpEvent) -> Result<Flow, Failed> {
         match event {
-            PumpEvent::Subscribing(pkid) | PumpEvent::Unsubscribing(pkid) => {
-                match self.conn.queued.pop_front() {
-                    Some(pending) => self.conn.awaiting.entry(pkid).or_default().push_back(pending),
-                    None => debug!(pkid, "A subscription request the lifecycle did not make"),
-                }
+            PumpEvent::Subscribing(_) | PumpEvent::Unsubscribing(_) => {
+                let _ = self.number(&event);
                 Ok(Flow::Continue)
             }
-            PumpEvent::SubAck { pkid, granted } | PumpEvent::UnsubAck { pkid, granted } => {
-                let Some(pending) = self.conn.awaiting.get_mut(&pkid).and_then(VecDeque::pop_front) else {
-                    debug!(pkid, "An acknowledgement of nothing awaited");
+            PumpEvent::SubAck { granted, .. } | PumpEvent::UnsubAck { granted, .. } => {
+                let Some(pending) = self.number(&event) else {
                     return Ok(Flow::Continue);
                 };
-                if self.conn.awaiting.get(&pkid).is_some_and(VecDeque::is_empty) {
-                    self.conn.awaiting.remove(&pkid);
-                }
                 if !granted {
                     warn!(
                         kind = "subscription_refused",
@@ -629,7 +787,10 @@ impl Lifecycle {
     /// the root replay is closed by the barrier — or [`REPLAY_FALLBACK`] has passed since the
     /// `Config/+` grant (multi-device spec §4.6). A pending grant is never bypassed.
     async fn maybe_active(&mut self, ctx: &Ctx<'_>) {
-        if self.conn.active || !self.conn.connected || self.conn.pending_subscriptions() > 0 {
+        // `Active` and `Version` within the publication's budget (`Conn`): a request outstanding
+        // has ids to spare for them — the barrier's, on the fallback — or its acknowledgement
+        // checks again.
+        if self.conn.active || !self.conn.connected || self.conn.pending_subscriptions() > 0 || self.budget(ctx).is_some_and(|b| b < 2) {
             return;
         }
         let Some(granted) = self.conn.configs_granted else {
@@ -685,12 +846,15 @@ impl Lifecycle {
             [_, instance, ..] if self.instances.contains_key(*instance) => self.route_instance(outputs, instance, topic, publish, received),
             _ => debug!(topic, "A publish for no instance this process owns; ignored"),
         }
+        self.drive(ctx, outputs).await?;
         Ok(Flow::Continue)
     }
 
     /// A device's keeper or a construction's watcher, during a session.
     pub(crate) async fn on_event(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs, event: Event) -> Result<Flow, Failed> {
-        self.handle_event(Some(ctx), outputs, event).await.map(|()| Flow::Continue)
+        self.handle_event(Some(ctx), outputs, event).await?;
+        self.drive(ctx, outputs).await?;
+        Ok(Flow::Continue)
     }
 
     /// The same between sessions: nothing can be subscribed — nothing here waits — and the next
@@ -720,7 +884,7 @@ impl Lifecycle {
     /// retry; the sweep of failed instances' held requests.
     pub(crate) async fn on_timer(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<Flow, Failed> {
         let now = Instant::now();
-        if let Some(overdue) = self.conn.queued.iter().chain(self.conn.awaiting.values().flatten()).find(|p| p.deadline <= now) {
+        if let Some(overdue) = self.conn.outstanding().find(|p| p.deadline <= now) {
             warn!(
                 kind = "subscription_refused",
                 purpose = ?overdue.purpose,
@@ -741,6 +905,7 @@ impl Lifecycle {
         if self.next_sweep.is_some_and(|at| at <= now) {
             self.sweep();
         }
+        self.drive(ctx, outputs).await?;
         Ok(Flow::Continue)
     }
 
@@ -775,6 +940,7 @@ impl Lifecycle {
         for name in retiring {
             self.check_retired(Some(ctx), outputs, &name).await?;
         }
+        self.drive(ctx, outputs).await?;
         Ok(Flow::Continue)
     }
 
@@ -784,6 +950,7 @@ impl Lifecycle {
     pub(crate) async fn on_session_lost(&mut self, outputs: &mut Outputs) {
         self.conn = Conn::default();
         outputs.outbox_open = false;
+        outputs.set_budget(None);
         // Cleanups queued in this connection's outbox may not have gone out: pending again.
         let queued = std::mem::take(&mut self.queued_cleanups);
         self.cleanups.extend(queued);
@@ -1262,9 +1429,10 @@ impl Lifecycle {
         }
         let (id, read) = (rt.id, rt.read);
         if connected && read == Sub::Granted {
-            let device = rt.device.clone();
-            if let (true, Some(ctx)) = (outputs.announce(id), ctx) {
-                session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;
+            // Its output may go out: its new `Status` (all its model holds) through the rotation,
+            // which publishes nothing while a request is outstanding (`Conn`).
+            if ctx.is_some() {
+                outputs.announce(id);
             }
             self.request_setup(ctx, name).await?;
         } else if connected {

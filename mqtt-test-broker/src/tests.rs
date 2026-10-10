@@ -617,3 +617,29 @@ async fn a_suback_held_for_one_filter_alone() {
     broker.release_subacks();
     assert_eq!(tokio::time::timeout(BOUND, acks.recv()).await.expect("the held SUBACK never came").map(|a| a.0), Some("suback"));
 }
+
+/// A packet id still in use — a SUBSCRIBE whose SUBACK the broker holds — that the client sends
+/// again (rumqttc's counter wraps at the receive maximum, 10 here, and checks only its publishes)
+/// is recorded as a reuse (MQTT §2.2.1); none is recorded once the SUBACK is released.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_packet_id_reused_while_its_suback_is_held_is_recorded() {
+    let broker = FakeBroker::start().await;
+    broker.hold_subacks_matching("slow/");
+    let (client, events) = client(&broker, 20);
+    let (_task, mut acks) = pump_acks(events);
+    client.subscribe("slow/#", QoS::AtLeastOnce).await.unwrap();
+    for n in 0..10u8 {
+        client.publish("x/1", QoS::AtLeastOnce, false, vec![n]).await.unwrap();
+    }
+    for _ in 0..10 {
+        tokio::time::timeout(BOUND, acks.recv()).await.expect("a PUBACK never came");
+    }
+    let reuses = broker.pkid_reuses();
+    assert_eq!(reuses.len(), 1, "{reuses:?}");
+    assert!(reuses[0].starts_with("PUBLISH with packet id 1"), "{reuses:?}");
+    broker.release_subacks();
+    client.publish("x/1", QoS::AtLeastOnce, false, vec![10]).await.unwrap();
+    tokio::time::timeout(BOUND, acks.recv()).await.expect("the SUBACK never came");
+    tokio::time::timeout(BOUND, acks.recv()).await.expect("a PUBACK never came");
+    assert_eq!(broker.pkid_reuses().len(), 1, "a packet id was recorded after its SUBACK went out");
+}
