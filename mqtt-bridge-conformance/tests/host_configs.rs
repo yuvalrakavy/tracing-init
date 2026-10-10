@@ -437,6 +437,94 @@ async fn no_packet_id_is_reused_while_its_acknowledgement_is_outstanding() {
     .await
 }
 
+/// A reconnect: the busy instance's read-back is granted, and its whole retained model goes out
+/// again — through the publication's budget, as every publish does — while the slow instance's
+/// read-back SUBACK is held: no publish takes the held request's packet id (MQTT §2.2.1; the R2
+/// confirming reviews' packet-id finding — the model went out by direct publishes, outside the
+/// budget).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_grants_republish_stays_within_the_packet_id_budget() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let (busy, slow) = (instance_name("Abusy"), instance_name("Bslow"));
+        fleet.prepare(&busy, |d| d.set("t0", "n", json!(0)));
+        let h = HostHarness::start("pkids-rep", fleet).await;
+        assert!(h.configure(&busy, json!({})));
+        assert!(h.configure(&slow, json!({})));
+        assert!(h.eventually(BOUND, |h| h.status(&busy).as_deref() == Some("connected")).await);
+        assert!(h.eventually(BOUND, |h| h.status(&slow).as_deref() == Some("connected")).await);
+        let device = h.fleet.device(&busy).expect("built");
+        for t in 0..30 {
+            let mut values = mqtt_bridge_kit::PropertyMap::new();
+            values.insert("n".into(), json!(1));
+            device.report(&format!("t{t}"), values);
+        }
+        assert!(h.eventually(BOUND, |h| h.state(&busy, "t29").is_some()).await);
+        h.broker.hold_subacks_matching(&format!("{ROOT}/State/{slow}"));
+        let before = h.broker.accepted();
+        let mark = h.published(&h.topics(&busy).state("t29")).len();
+        h.broker.drop_connection();
+        assert!(h.eventually(BOUND, |h| h.broker.accepted() > before).await, "no reconnect");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let reuses = h.broker.pkid_reuses();
+        h.broker.release_subacks();
+        assert!(reuses.is_empty(), "a packet id was reused while its acknowledgement was outstanding: {reuses:#?}");
+        assert!(
+            h.eventually(BOUND, |h| h.published(&h.topics(&busy).state("t29")).len() > mark
+                && h.status(&slow).as_deref() == Some("connected"))
+                .await,
+            "the model was not republished once the SUBACK came"
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// The shutdown's flush with a request's SUBACK outstanding: it publishes no more than the ids left
+/// before that request's packet id would come round, and once its ack wait has passed it publishes
+/// nothing more — no `Active=false` and no DISCONNECT, so the last will says `Active=false` — rather
+/// than everything at once, on ids still in use (MQTT §2.2.1; the R2 confirming reviews: the flush
+/// published unbudgeted after its ack wait).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_shutdown_flush_stays_within_the_packet_id_budget() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let (busy, slow) = (instance_name("Abusy"), instance_name("Bslow"));
+        fleet.prepare(&busy, |d| d.set("t0", "n", json!(0)));
+        let mut h = HostHarness::start("pkids-flush", fleet).await;
+        assert!(h.configure(&busy, json!({})));
+        assert!(h.eventually(BOUND, |h| h.status(&busy).as_deref() == Some("connected")).await, "the busy instance never connected");
+        let device = h.fleet.device(&busy).expect("built");
+        // The slow instance's read-back SUBACK is held for good: its packet id stays in use.
+        h.broker.hold_subacks_matching(&format!("{ROOT}/State/{slow}"));
+        assert!(h.configure(&slow, json!({})));
+        assert!(
+            h.eventually(BOUND, |h| h.subscribed(&h.topics(&slow).status())).await,
+            "the slow instance's read-back was never asked for"
+        );
+        // More State than the ids left: most of it still waits when the stop comes.
+        for t in 0..30 {
+            let mut values = mqtt_bridge_kit::PropertyMap::new();
+            values.insert("n".into(), json!(1));
+            device.report(&format!("t{t}"), values);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(h.stop_host().await, "the host did not stop in time");
+        assert!(
+            h.broker.pkid_reuses().is_empty(),
+            "the shutdown's flush reused a packet id while its acknowledgement was outstanding: {:#?}",
+            h.broker.pkid_reuses()
+        );
+        assert!(
+            h.eventually(BOUND, |h| h.broker.retained_on(&h.active_topic()).as_deref() == Some(&b"false"[..])).await,
+            "neither the flush nor the last will said Active=false"
+        );
+        h.broker.release_subacks();
+        h.check_lanes();
+    })
+    .await
+}
+
 /// Many instances acquired at once: every subscription's SUBACK matched to its instance by packet
 /// id, and every device served.
 #[tokio::test(flavor = "multi_thread")]

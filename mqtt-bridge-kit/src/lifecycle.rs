@@ -555,7 +555,7 @@ impl Lifecycle {
                 Request::Unsubscribe(filter) => ctx.client.unsubscribe(filter).await?,
             }
         }
-        self.maybe_active(ctx).await;
+        self.maybe_active(ctx, outputs.firsts_waiting()).await;
         outputs.set_budget(self.budget(ctx));
         Ok(())
     }
@@ -583,9 +583,14 @@ impl Lifecycle {
         self.drive(ctx, outputs).await.map(|()| Flow::Continue)
     }
 
-    /// A request is outstanding (the shutdown's flush waits for its acknowledgement first).
-    pub(crate) fn control_outstanding(&self) -> bool {
-        self.conn.connected && self.conn.outstanding().next().is_some()
+    /// How many more messages the shutdown's flush may publish now (`None`: no limit): with a
+    /// request outstanding, the ids left before its packet id would come round (`Conn`). Nothing is
+    /// handed to rumqttc at the flush, so no request waits for the line.
+    pub(crate) fn flush_budget(&self, ctx: &Ctx<'_>) -> Option<usize> {
+        if !self.conn.connected {
+            return None;
+        }
+        self.ids_left(ctx).map(|left| usize::try_from(left).unwrap_or(usize::MAX))
     }
 
     /// A request's packet id seen written, or its acknowledgement: the request it is for, taken
@@ -759,7 +764,7 @@ impl Lifecycle {
                 } else {
                     self.granted(ctx, outputs, pending.purpose).await?;
                 }
-                self.maybe_active(ctx).await;
+                self.maybe_active(ctx, outputs.firsts_waiting()).await;
                 Ok(Flow::Continue)
             }
             _ => Ok(Flow::Continue),
@@ -790,19 +795,24 @@ impl Lifecycle {
                 self.set_sub(&instance, |rt| rt.read = Sub::Granted);
                 // Its slot is read: its output may go out, its current Status and State first —
                 // before `Active=true` (multi-device spec §4.6). Not a stopping runtime's: its slot
-                // is no longer its to write.
+                // is no longer its to write. Through the rotation, within the packet-id budget
+                // (§4.3): a direct publish could take the id of a SUBSCRIBE still awaiting its
+                // SUBACK — another instance's read-back, or the barrier (the R2 confirming
+                // reviews).
                 if self.current(&instance, rt).is_some_and(|rt| matches!(rt.phase, Phase::Live | Phase::Disabled)) {
+                    if let Some(slot) = outputs.slot(rt) {
+                        slot.batch.add_model(&device, device.reports.model());
+                    }
                     outputs.announce(rt);
-                    session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;
                 }
                 // Stopping for a successor across a reconnect: the instance's lifecycle Status is
                 // the successor's to come, `connecting` — said before `Active=true`, so the old
                 // device's retained `connected` does not stand meanwhile (§4.6; R2 gate, Claude
-                // minor 4).
+                // minor 4). Through the outbox, within the budget, as above.
                 if self.current(&instance, rt).is_some_and(|rt| matches!(rt.phase, Phase::Stopping { then: Then::Successor, .. })) {
                     let status = LinkStatus::Connecting.as_str().as_bytes().to_vec();
-                    let tag = session::tagged(Some(&self.settings.id));
-                    session::emit(ctx.shared, ctx.client, device.topics.status(), true, status, tag).await;
+                    let out = Out::new(device.topics.status(), true, status, None, Some(&self.settings.id)).first();
+                    outputs.queue_outbox(Part::Model, out);
                 }
                 if self.current(&instance, rt).is_some_and(|rt| rt.phase == Phase::Live) {
                     self.request_setup(Some(ctx), &instance).await?;
@@ -897,12 +907,19 @@ impl Lifecycle {
 
     /// `Active=true` (and the `Version`) once every subscription requested so far is granted and
     /// the root replay is closed by the barrier — or [`REPLAY_FALLBACK`] has passed since the
-    /// `Config/+` grant (multi-device spec §4.6). A pending grant is never bypassed.
-    async fn maybe_active(&mut self, ctx: &Ctx<'_>) {
+    /// `Config/+` grant — and every owned instance's current Status and State said at its
+    /// read-back's grant has gone out (multi-device spec §4.6). A pending grant is never bypassed.
+    async fn maybe_active(&mut self, ctx: &Ctx<'_>, firsts_waiting: bool) {
         // `Active` and `Version` within the publication's budget (`Conn`): a request outstanding
         // has ids to spare for them — the barrier's, on the fallback — or its acknowledgement
-        // checks again.
-        if self.conn.active || !self.conn.connected || self.conn.pending_subscriptions() > 0 || self.budget(ctx).is_some_and(|b| b < 2) {
+        // checks again. The statuses before it: they go through the rotation, and the turn that
+        // publishes the last of them checks again (`on_turn_done`).
+        if self.conn.active
+            || !self.conn.connected
+            || self.conn.pending_subscriptions() > 0
+            || self.budget(ctx).is_some_and(|b| b < 2)
+            || firsts_waiting
+        {
             return;
         }
         let Some(granted) = self.conn.configs_granted else {
@@ -1022,7 +1039,7 @@ impl Lifecycle {
             );
             return Ok(Flow::End);
         }
-        self.maybe_active(ctx).await;
+        self.maybe_active(ctx, outputs.firsts_waiting()).await;
         let due: Vec<String> = self.instances.values().filter(|i| i.retry_at.is_some_and(|at| at <= now)).map(|i| i.name.clone()).collect();
         for name in due {
             if let Some(instance) = self.instances.get_mut(&name) {
@@ -1595,7 +1612,7 @@ impl Lifecycle {
         let (id, read) = (rt.id, rt.read);
         if connected && read == Sub::Granted {
             // Its output may go out: its new `Status` (all its model holds) through the rotation,
-            // which publishes nothing while a request is outstanding (`Conn`).
+            // within the packet-id budget while a request is outstanding (`Conn`).
             if ctx.is_some() {
                 outputs.announce(id);
             }

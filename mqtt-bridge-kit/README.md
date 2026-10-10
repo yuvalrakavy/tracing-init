@@ -318,7 +318,9 @@ it guarantees to a bridge (details and arguments in the spec's §5.2 and
   (which touches the file system and DNS) runs on a blocking thread raced against the stop; the
   driver's `info()` too. The shutdown answers every command still waiting, publishes `Active=false`,
   waits for the broker's acknowledgements and sends DISCONNECT, within a 2 s flush, inside a 5 s
-  shutdown; the runtime is shut down within 1 s more, never dropped (dropping waits on blocking
+  shutdown (a multi-device host with a subscription unacknowledged publishes only what its packet
+  ids allow; what still waits past the flush's ack wait is not published, and the last will says
+  `Active=false`); the runtime is shut down within 1 s more, never dropped (dropping waits on blocking
   threads without limit). `main` returns an `ExitCode`.
 - **Nothing blocks on stdout or stderr.** The runtime writes nothing there on a lifecycle path; a
   panic report goes through one bounded, lossy queue to one thread, waited for at most 200 ms, so a

@@ -1,6 +1,6 @@
 # Multi-device bridges — design v7 (Bridge Runtime R2 + Bridge Kit S4)
 
-Status: APPROVED by the owner 2026-10-10 (v7) (v6 + its gate's 3 findings; that gate closed the rest and found no new shape issue). Amended after the R2 build's gate (2026-10-10), as the lead decided: §3 (omitted `via`, Config equality, kind mismatch, disable validation, read-back tag), D4 and §4.1 (driver panic), §4.3 (packet ids, failed state, committed Config, S2 window), §4.4 (frozen retirement; the owner's decision on property Desired while disabled), §4.5 (sweeps, first-replay litter), §4.6, §4.7. Three design gates (v1, v3, v4) kept finding races in the
+Status: APPROVED by the owner 2026-10-10 (v7) (v6 + its gate's 3 findings; that gate closed the rest and found no new shape issue). Amended after the R2 build's gate (2026-10-10), as the lead decided: §3 (omitted `via`, Config equality, kind mismatch, disable validation, read-back tag), D4 and §4.1 (driver panic), §4.3 (packet ids, failed state, committed Config, S2 window), §4.4 (frozen retirement; the owner's decision on property Desired while disabled), §4.5 (sweeps, first-replay litter), §4.6, §4.7; and after its confirming reviews (2026-10-10): §3 (a disable during a replacement), §4.3 (every publish budgeted, the shutdown's flush), §4.5 (a cleanup's queued retractions), §4.6, §4.7. Three design gates (v1, v3, v4) kept finding races in the
 per-device isolation machinery (generations, input cache, revocation, cross-process cleanup). The
 owner switched D4 to (a): a stuck device worker restarts the process; every other device failure stays
 per device. With that, v5 drops generations, the input cache, revocation and the leaked-thread ledger,
@@ -137,8 +137,13 @@ One rule, used for routing, read-back, filtering and cleanup:
   broker's receive maximum, and checks only publishes against the ids in use. The host therefore
   hands rumqttc a SUBSCRIBE or UNSUBSCRIBE only when no publish is unacknowledged (publishing nothing
   while one waits for that), and while any is outstanding hands out fewer ids after the oldest than
-  the receive maximum — requests and publishes alike, the publication budgeted to match. A slow
-  SUBACK thus holds publication to a few messages until it comes or its 10 s bound ends the session.
+  the receive maximum — requests and publishes alike, the publication budgeted to match. Every
+  publish goes through that budget: the rotation's, an instance's model republished at its S1 grant
+  (into its slot's batch), a stopping instance's `connecting` (the outbox) and `Active`/`Version`
+  (checked against it). A slow SUBACK thus holds publication to a few messages until it comes or its
+  10 s bound ends the session. The shutdown's flush (§4.7) publishes within the same budget, waits
+  for an acknowledgement for what does not fit until its ack wait's deadline, and past it publishes
+  nothing more — no `Active=false`, no DISCONNECT: the last will says `Active=false`.
   Each acknowledgement matches its one request by its unique packet id.
 - **Construction off to the side:** the factory runs on its own thread under the host's
   `--factory-timeout` (default 10 s; the driver's operation timing is unknown until `info()`), then
@@ -237,7 +242,8 @@ On every CONNACK: subscribe `Config/+`; acquire instances as their Configs repla
 §4.3 bootstrap). The session publishes, **before** `Active/{bridge id}=true`, the current lifecycle
 Status of every owned instance it has reconciled (`connecting`, `connected`, `unreachable`,
 `disabled`, or `unreachable` for a failed one; `connecting` for one whose device is stopping for a
-successor — the stop spanning the reconnect; R2 gate, Claude minor 4). Then `Active=true` is
+successor — the stop spanning the reconnect; R2 gate, Claude minor 4) — through the publication,
+within the packet-id budget (§4.3), `Active=true` waiting until they are out. Then `Active=true` is
 published when
 
 `all subscriptions requested so far are granted && (root barrier acknowledged || 5 s since the Config/+ grant)`.
@@ -251,7 +257,7 @@ a reply follows the State its command produced and is never starved by later Sta
 round-robin with a persistent cursor, at most 32 messages per device per turn, then ready inbound and
 lifecycle work, then the next device. The session's outbox (instance-level `Error`s, terminal
 answers, a retired runtime's answers, cleanups) is one member of that rotation, after the devices. A stopping device's flush (§4.4) takes its turns until done. At
-process stop, answers first (R1). A due timer (a grant's bound, a retry, the sweep) is served before
+process stop, answers first (R1), within the packet-id budget (§4.3). A due timer (a grant's bound, a retry, the sweep) is served before
 anything else at every pass, and the lifecycle's events (a construction done, a worker stopped) go
 ahead of the inbound traffic: neither a steady publication nor a steady inbound stream can starve
 them (R2 gate, Codex 1).

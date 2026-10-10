@@ -40,7 +40,9 @@
 //!
 //! **Shutdown:** what waits refused, every device's answers first, then the rest; `Active=false`,
 //! then DISCONNECT, polling until it is written — within [`FLUSH_BOUND`]; past it the last will says
-//! `Active=false` instead (INFO `bridge_shutdown_cut`).
+//! `Active=false` instead (INFO `bridge_shutdown_cut`). A host's flush publishes within its packet-id
+//! budget while a SUBSCRIBE or UNSUBSCRIBE is outstanding, and past its ack wait publishes nothing
+//! more: no `Active=false`, no DISCONNECT — the last will says it (multi-device spec §4.3).
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -237,6 +239,15 @@ impl Mode {
         }
     }
 
+    /// How many more messages the shutdown's flush may publish now (`None`: no limit): a host's,
+    /// the ids left while a SUBSCRIBE or UNSUBSCRIBE is outstanding (MQTT §2.2.1).
+    fn flush_budget(&self, ctx: &Ctx<'_>) -> Option<usize> {
+        match self {
+            Mode::Fixed(_) => None,
+            Mode::Host(host) => host.flush_budget(ctx),
+        }
+    }
+
     /// A host's SUBSCRIBE or UNSUBSCRIBE waits for the line to clear of publishes: the pump's
     /// progress is worth a pass.
     fn line_wait(&self) -> bool {
@@ -350,6 +361,12 @@ impl Outputs {
             }
             None => false,
         }
+    }
+
+    /// Whether a message to be said before `Active=true` still waits — in a device's batch, or in
+    /// the outbox (multi-device spec §4.6).
+    pub(crate) fn firsts_waiting(&self) -> bool {
+        self.outbox.has_firsts() || self.slots.iter().any(|s| s.batch.has_firsts())
     }
 
     /// A new connection: nothing is announced on it yet, and nothing a previous connection's batch
@@ -887,6 +904,9 @@ pub(crate) struct Out {
     retain: bool,
     payload: Vec<u8>,
     properties: PublishProperties,
+    /// A host's: said before `Active=true` on this connection (multi-device spec §4.6) — the
+    /// session's `Active` waits until no such message waits ([`Outputs::firsts_waiting`]).
+    first: bool,
 }
 
 impl Out {
@@ -894,7 +914,12 @@ impl Out {
     pub(crate) fn new(topic: String, retain: bool, payload: Vec<u8>, correlation: Option<bytes::Bytes>, tag: Option<&str>) -> Out {
         let mut properties = tagged(tag);
         properties.correlation_data = correlation;
-        Out { topic, retain, payload, properties }
+        Out { topic, retain, payload, properties, first: false }
+    }
+
+    /// The same, said before `Active=true` (multi-device spec §4.6).
+    pub(crate) fn first(self) -> Out {
+        Out { first: true, ..self }
     }
 }
 
@@ -934,6 +959,11 @@ pub(crate) struct Batch {
     /// rumqttc's channel took the message cannot be told from outside — and the next publication
     /// finishes it first.
     sending: Option<Sending>,
+    /// How many of the messages waiting, the one under way included, are to be said before
+    /// `Active=true` (`Out::first`).
+    firsts: usize,
+    /// The publish under way is one of them.
+    sending_first: bool,
 }
 
 impl Batch {
@@ -955,7 +985,29 @@ impl Batch {
 
     /// Queue `out` in `part`, behind what waits there.
     pub(crate) fn push(&mut self, part: Part, out: Out) {
+        self.firsts += usize::from(out.first);
         self.queue(part).push_back(out);
+    }
+
+    /// A device's whole retained model — its `Status`, then every target's `State` — behind what
+    /// waits, to be said before `Active=true`: a host's republish once an instance's read-back is
+    /// granted, published through the rotation within its packet-id budget (multi-device spec
+    /// §4.3, §4.6; the R2 confirming reviews: the model went out by direct publishes, outside the
+    /// budget).
+    pub(crate) fn add_model(&mut self, device: &Device, model: Model) {
+        let (topics, tag) = (&device.topics, device.tag.as_deref());
+        debug!(targets = model.states.len(), "Publishing the retained model again after a CONNACK");
+        if let Some(status) = model.status {
+            self.push(Part::Model, Out::new(topics.status(), true, status.as_str().as_bytes().to_vec(), None, tag).first());
+        }
+        for (target, document) in model.states {
+            self.push(Part::Model, Out::new(topics.state(&target), true, document, None, tag).first());
+        }
+    }
+
+    /// Whether a message to be said before `Active=true` waits.
+    pub(crate) fn has_firsts(&self) -> bool {
+        self.firsts > 0
     }
 
     fn queue(&mut self, part: Part) -> &mut VecDeque<Out> {
@@ -968,7 +1020,9 @@ impl Batch {
 
     /// Every message of `part` waiting, taken out.
     pub(crate) fn drain(&mut self, part: Part) -> Vec<Out> {
-        self.queue(part).drain(..).collect()
+        let drained: Vec<Out> = self.queue(part).drain(..).collect();
+        self.firsts -= drained.iter().filter(|out| out.first).count();
+        drained
     }
 
     /// Whether nothing waits: no message, and no publish under way.
@@ -988,11 +1042,18 @@ impl Batch {
     /// many were handed over.
     pub(crate) async fn publish(&mut self, shared: &Shared, client: &AsyncClient, parts: &[Part], limit: usize) -> usize {
         let mut handed = 0;
+        // No packet id to spare: not even the publish under way is finished.
+        if limit == 0 {
+            return handed;
+        }
         loop {
             if let Some(sending) = self.sending.as_mut() {
                 // WAIT: mqtt-request
                 let (topic, sent) = sending.await;
                 self.sending = None;
+                if std::mem::take(&mut self.sending_first) {
+                    self.firsts -= 1;
+                }
                 enqueued(shared, &topic, sent);
                 handed += 1;
             }
@@ -1010,8 +1071,9 @@ impl Batch {
                 return handed;
             };
             let client = client.clone();
+            self.sending_first = out.first;
             self.sending = Some(Box::pin(async move {
-                let Out { topic, retain, payload, properties } = out;
+                let Out { topic, retain, payload, properties, .. } = out;
                 // WAIT: mqtt-request
                 let sent = client.publish_with_properties(topic.clone(), QoS::AtLeastOnce, retain, payload, properties).await;
                 (topic, sent)
@@ -1037,24 +1099,6 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
     // The ack wait's deadline leaves the DISCONNECT and the close their part of the bound.
     let ack_deadline = Instant::now() + FLUSH_BOUND - DISCONNECT_PART;
     let flushed = async {
-        // A host's SUBSCRIBE or UNSUBSCRIBE outstanding: its acknowledgement first, until the ack
-        // wait's deadline — a publish before it could take its packet id (MQTT §2.2.1; R2 gate,
-        // Codex 3).
-        if let Mode::Host(host) = mode {
-            while host.control_outstanding() {
-                // WAIT: shutdown-flush
-                match tokio::time::timeout_at(ack_deadline.into(), incoming.recv()).await {
-                    Ok(Some(
-                        event @ (PumpEvent::SubAck { .. }
-                        | PumpEvent::UnsubAck { .. }
-                        | PumpEvent::Subscribing(_)
-                        | PumpEvent::Unsubscribing(_)),
-                    )) => host.settle_ack(&event),
-                    Ok(Some(PumpEvent::Ended(_) | PumpEvent::Disconnected) | None) | Err(_) => break,
-                    Ok(Some(_)) => {}
-                }
-            }
-        }
         // What still waits for each device will not run: refused, on Error and on its response
         // topic; then what is pending — Status, Errors, replies — then the last words (re-gate
         // R15). Here, in the session's own flush, so nothing else publishes them first by chance.
@@ -1067,12 +1111,42 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
             crate::worker::report_refused(&slot.device.reports, slot.device.mailbox.disconnected(), STOPPED_BEFORE);
             slot.batch.add(&slot.device, slot.device.reports.take());
         }
-        for part in [Part::Answers, Part::Model, Part::Unsolicited] {
-            // WAIT: mqtt-request
-            outputs.outbox.publish(shared, client, &[part], usize::MAX).await;
-            for slot in &mut outputs.slots {
+        // A host's SUBSCRIBE or UNSUBSCRIBE outstanding: no more is published than the ids left
+        // before its packet id would come round (MQTT §2.2.1; R2 gate, Codex 3). What does not fit
+        // waits for an acknowledgement, until the ack wait's deadline; past it nothing more goes —
+        // no `Active=false` and no DISCONNECT, so the last will says `Active=false` — rather than
+        // the rest on ids still in use (the R2 confirming reviews). A fixed bridge has no budget.
+        loop {
+            let ctx = Ctx { shared, client, line: incoming.line() };
+            let mut left = mode.flush_budget(&ctx).unwrap_or(usize::MAX);
+            for part in [Part::Answers, Part::Model, Part::Unsolicited] {
                 // WAIT: mqtt-request
-                slot.batch.publish(shared, client, &[part], usize::MAX).await;
+                left -= outputs.outbox.publish(shared, client, &[part], left).await;
+                for slot in &mut outputs.slots {
+                    // WAIT: mqtt-request
+                    left -= slot.batch.publish(shared, client, &[part], left).await;
+                }
+            }
+            let published = outputs.outbox.is_empty() && outputs.slots.iter().all(|slot| slot.batch.is_empty());
+            if published && left > 0 {
+                break;
+            }
+            let Mode::Host(host) = &mut *mode else {
+                break;
+            };
+            // WAIT: shutdown-flush
+            match tokio::time::timeout_at(ack_deadline.into(), incoming.recv()).await {
+                Ok(Some(
+                    event @ (PumpEvent::SubAck { .. } | PumpEvent::UnsubAck { .. } | PumpEvent::Subscribing(_) | PumpEvent::Unsubscribing(_)),
+                )) => host.settle_ack(&event),
+                Ok(Some(PumpEvent::Ended(_) | PumpEvent::Disconnected) | None) => return Err("the connection ended".to_owned()),
+                Err(_) => {
+                    return Err(
+                        "a subscription's acknowledgement did not come in time: what waits would take a packet id still in use, and is not published"
+                            .to_owned(),
+                    )
+                }
+                Ok(Some(_)) => {}
             }
         }
         emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
@@ -1124,7 +1198,7 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
         Ok(Err(error)) => info!(
             kind = "bridge_shutdown_cut",
             error = %error,
-            "The connection ended before the shutdown's DISCONNECT; the last will says Active=false"
+            "The shutdown's flush ended before its DISCONNECT; the last will says Active=false"
         ),
         Err(_) => info!(
             kind = "bridge_shutdown_cut",
