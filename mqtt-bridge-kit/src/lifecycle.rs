@@ -29,7 +29,8 @@
 //! `Status/+`. Its CONNACK duties are R1's (Bridge Runtime spec §5, §9), in R1's order: once per
 //! process the read-back, `State/{i}/#`, alone, its SUBACK awaited within
 //! [`READ_BACK_WAIT`](crate::session::READ_BACK_WAIT) (refused or late: WARN `read_back_incomplete`
-//! and on without it; granted, the next SUBACK — whichever request it acknowledges, granted or
+//! and on without it — late, from the next connection: the session ends at the wait, as only a new
+//! connection frees the abandoned SUBSCRIBE's packet id; granted, the next SUBACK — whichever request it acknowledges, granted or
 //! refused — completes it, and it is unsubscribed); then its four request
 //! subscriptions, `Config/{i}/#`, `Desired/{i}/+`, `Desired/{i}/+/+`, `Command/{i}`; once they are
 //! handed over, `Active=true`, the `Version`, and its whole retained model. Every SUBSCRIBE,
@@ -927,7 +928,7 @@ impl Lifecycle {
                         kind = "subscription_refused",
                         purpose = ?pending.purpose,
                         unsubscribe = pending.unsubscribe,
-                        "The broker refused a subscription the host needs; ending the session"
+                        "The broker refused a SUBSCRIBE or UNSUBSCRIBE the host made; ending the session"
                     );
                     return Ok(Flow::End);
                 }
@@ -982,31 +983,33 @@ impl Lifecycle {
     }
 
     /// The fixed instance's read-back did not get its SUBACK within
-    /// [`READ_BACK_WAIT`](session::READ_BACK_WAIT): done, as far as the conflict rule goes —
-    /// unsubscribed, its own State coming back would only queue ahead of the requests (Codex
-    /// final gate 1) — and the requests subscribed without it (R1). Its SUBACK, should it still
-    /// come, completes nothing; it is awaited, as every request is, within [`GRANT_BOUND`].
-    async fn fixed_read_back_late(&mut self, ctx: &Ctx<'_>) -> Result<(), Failed> {
+    /// [`READ_BACK_WAIT`](session::READ_BACK_WAIT): done, and incomplete — not asked again — and
+    /// the session ends (returns whether it does). The abandoned SUBSCRIBE's packet id stays in use
+    /// until its SUBACK (MQTT §2.2.1), and only a new connection frees it: going on, the budget
+    /// would hold the publication behind it until [`GRANT_BOUND`] ended the session anyway, 5 s
+    /// later, with the requests taken meanwhile left unanswered (the R2 confirming reviews 2, Claude
+    /// minor 2). The next connection subscribes the requests at once, without it (R1: on without
+    /// it).
+    fn fixed_read_back_late(&mut self) -> bool {
         let Some(name) = self.fixed_name() else {
-            return Ok(());
+            return false;
         };
-        let Some((id, topics)) = self.rt_of(&name).map(|(rt, topics)| (rt.id, topics.clone())) else {
-            return Ok(());
+        let Some(id) = self.rt_of(&name).map(|(rt, _)| rt.id) else {
+            return false;
         };
         if !self.fixed_read_back_awaited(&name, id) {
-            return Ok(());
+            return false;
         }
         if let Some(rt) = self.instances.get_mut(&name).and_then(|i| i.rt.as_mut()) {
             rt.read = Sub::None;
             rt.device.reports.read_back_incomplete();
         }
-        self.request_unsubscription(Some(ctx), Purpose::Unsub { instance: name.clone(), rt: id }, topics.state_filter()).await?;
         warn!(
             kind = "read_back_incomplete",
             waited_ms = session::READ_BACK_WAIT.as_millis() as u64,
-            "The broker did not acknowledge the read-back's subscription in time; subscribing to requests without it — a replay may meet no \"before\" values"
+            "The broker did not acknowledge the read-back's subscription in time; ending the session, which alone frees its packet id — the next subscribes to requests without it, and a replay may meet no \"before\" values"
         );
-        self.request_fixed_lanes(Some(ctx), &name).await
+        true
     }
 
     /// A SUBACK of one of the fixed instance's requests — the first to come, whichever request it
@@ -1323,12 +1326,12 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// A timer: the fixed instance's read-back, late; an overdue grant ends the session; the
+    /// A timer: the fixed instance's read-back, late, ends the session; so does an overdue grant; the
     /// replay's fallback; a failed instance's retry; the sweep of failed instances' held requests.
     pub(crate) async fn on_timer(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<Flow, Failed> {
         let now = Instant::now();
-        if self.fixed.as_ref().and_then(|f| f.read_back_until).is_some_and(|until| until <= now) {
-            self.fixed_read_back_late(ctx).await?;
+        if self.fixed.as_ref().and_then(|f| f.read_back_until).is_some_and(|until| until <= now) && self.fixed_read_back_late() {
+            return Ok(Flow::End);
         }
         if let Some(overdue) = self.conn.outstanding().find(|p| p.deadline <= now) {
             warn!(
@@ -1336,7 +1339,7 @@ impl Lifecycle {
                 purpose = ?overdue.purpose,
                 unsubscribe = overdue.unsubscribe,
                 overdue_ms = GRANT_BOUND.as_millis() as u64,
-                "The broker did not acknowledge a subscription the host needs in time; ending the session"
+                "The broker did not acknowledge a SUBSCRIBE or UNSUBSCRIBE the host made in time; ending the session"
             );
             return Ok(Flow::End);
         }

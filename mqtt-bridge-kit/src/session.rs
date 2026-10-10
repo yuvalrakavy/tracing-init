@@ -79,8 +79,10 @@ const DISCONNECT_PART: Duration = Duration::from_millis(750);
 // The linger and the DISCONNECT's write fit in their part, with 250 ms for the write.
 const _: () = assert!(crate::pump::LINGER_BOUND.as_millis() + 250 <= DISCONNECT_PART.as_millis());
 
-/// How long a fixed bridge's first CONNACK waits for the read-back's SUBACK before it subscribes to
-/// the requests without it (WARN `read_back_incomplete`).
+/// How long a fixed bridge's first CONNACK waits for the read-back's SUBACK: past it, the read-back
+/// is incomplete (WARN `read_back_incomplete`) and the session ends — only a new connection frees
+/// the abandoned SUBSCRIBE's packet id — and the next connection subscribes to the requests without
+/// it.
 pub const READ_BACK_WAIT: Duration = Duration::from_secs(5);
 
 /// The largest packet the bridge takes, advertised in its CONNECT, so a broker discards a larger

@@ -317,29 +317,30 @@ guard       = "foreign_releases"
 
 # ---- Subscriptions and the bootstrap (§4.3) ------------------------------------------------------
 
-# A refused SUBACK ends the session.
+# A refused SUBACK ends the session. (Re-anchored in the R2 confirming reviews 2's fix round: the
+# WARN names SUBSCRIBE or UNSUBSCRIBE.)
 [[control]]
 name        = "a_refused_grant_goes_on"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                        "The broker refused a subscription the host needs; ending the session"
+anchor      = '''                        "The broker refused a SUBSCRIBE or UNSUBSCRIBE the host made; ending the session"
                     );
                     return Ok(Flow::End);'''
-replacement = '''                        "The broker refused a subscription the host needs; ending the session"
+replacement = '''                        "The broker refused a SUBSCRIBE or UNSUBSCRIBE the host made; ending the session"
                     );'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "a_refused_config_subscription_ends_the_session", "--exact"]
 expect_text = '''the session did not end on a refused Config/+'''
 guard       = "refused_ends_session"
 
-# An overdue SUBACK ends the session. (The scenario's 30 s keep-alive keeps the pump's own stall
+# An overdue SUBACK ends the session (re-anchored as the row above). (The scenario's 30 s keep-alive keeps the pump's own stall
 # bound, twice the keep-alive, from ending it first: with 5 s it did, and this row was GREEN.)
 [[control]]
 name        = "an_overdue_grant_goes_on"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                "The broker did not acknowledge a subscription the host needs in time; ending the session"
+anchor      = '''                "The broker did not acknowledge a SUBSCRIBE or UNSUBSCRIBE the host made in time; ending the session"
             );
             return Ok(Flow::End);'''
-replacement = '''                "The broker did not acknowledge a subscription the host needs in time; ending the session"
+replacement = '''                "The broker did not acknowledge a SUBSCRIBE or UNSUBSCRIBE the host made in time; ending the session"
             );'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "an_overdue_subscription_ends_the_session", "--exact"]

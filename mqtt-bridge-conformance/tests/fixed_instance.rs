@@ -11,9 +11,11 @@ use serde_json::json;
 const DEADLINE: Duration = Duration::from_secs(60);
 
 /// A read-back whose SUBACK does not come within its wait (5 s) is said incomplete, WARN
-/// `read_back_incomplete` with the wait, and the requests are subscribed without it; it is
-/// unsubscribed, and the bridge announces itself and publishes its model. Its SUBACK coming late
-/// changes nothing.
+/// `read_back_incomplete` with the wait, and the session ends there: the abandoned SUBSCRIBE's
+/// packet id stays in use until its SUBACK (MQTT §2.2.1), so going on would only freeze the
+/// publication behind it until the 10 s grant bound ended the session anyway (the R2 confirming
+/// reviews 2, Claude minor 2). The next connection subscribes the requests at once, without the
+/// read-back — it is not asked again — and the bridge announces itself and publishes its model.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_late_read_back_is_said_incomplete_and_the_requests_go_without_it() {
     let scenario = async {
@@ -24,6 +26,7 @@ async fn a_late_read_back_is_said_incomplete_and_the_requests_go_without_it() {
         .await;
         let t = h.topics.clone();
         assert!(h.broker.wait_for_subscription(&t.state_filter(), BOUND).await, "the read-back was never subscribed");
+        let asked = std::time::Instant::now();
         h.settle(Duration::from_millis(3000)).await;
         assert!(
             !h.broker.subscriptions().contains(&t.command()),
@@ -35,25 +38,32 @@ async fn a_late_read_back_is_said_incomplete_and_the_requests_go_without_it() {
             "the requests were never subscribed without the read-back: {:?}",
             h.broker.subscriptions()
         );
+        // At the wait, not at the read-back SUBSCRIBE's 10 s grant bound.
+        assert!(
+            h.broker.connections() == 2 && asked.elapsed() < Duration::from_secs(8),
+            "the session did not end at the read-back's wait: connections {}, {:?} after the read-back was asked",
+            h.broker.connections(),
+            asked.elapsed()
+        );
         let warned = h.log.of_kind("read_back_incomplete");
         assert!(
             warned.len() == 1 && warned[0].level == tracing::Level::WARN && warned[0].field("waited_ms").is_some(),
             "a late read-back was not said incomplete, once, with its wait: {:#?}",
             h.log.records()
         );
-        let unsubscribed =
-            |h: &Harness| h.broker.events().iter().any(|e| matches!(e, BrokerEvent::Unsubscribed(f) if *f == t.state_filter()));
         assert!(
-            h.eventually(BOUND, |h| unsubscribed(h) && h.status().as_deref() == Some("connected") && h.state("t1").is_some()).await,
-            "the bridge did not go on without the read-back: unsubscribed {}, status {:?}",
-            unsubscribed(&h),
+            h.eventually(BOUND, |h| h.status().as_deref() == Some("connected") && h.state("t1").is_some()).await,
+            "the bridge did not go on without the read-back: status {:?}",
             h.status()
         );
         assert_eq!(h.broker.retained_on(&t.active()).as_deref(), Some(&b"true"[..]), "the bridge never said Active=true");
+        let asked_again = h.broker.events().iter().filter(|e| matches!(e, BrokerEvent::Subscribed(f) if *f == t.state_filter())).count();
+        assert_eq!(asked_again, 1, "the read-back was asked again on the next connection");
+        assert!(h.broker.pkid_reuses().is_empty(), "a packet id was reused: {:#?}", h.broker.pkid_reuses());
         h.broker.release_subacks();
         h.settle(Duration::from_millis(500)).await;
-        assert_eq!(h.log.of_kind("read_back_incomplete").len(), 1, "the late SUBACK was taken for a read-back again");
-        assert_eq!(h.broker.connections(), 1, "the session did not hold through the late read-back");
+        assert_eq!(h.log.of_kind("read_back_incomplete").len(), 1, "the read-back was said incomplete again");
+        assert_eq!(h.broker.connections(), 2, "the session did not hold once the read-back was given up");
         assert!(h.stop().await);
     };
     tokio::time::timeout(DEADLINE, scenario).await.expect("the scenario did not end within its deadline");

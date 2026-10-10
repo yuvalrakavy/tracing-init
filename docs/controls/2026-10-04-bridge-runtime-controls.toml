@@ -3079,3 +3079,20 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "the_read_back_completes_at_a_refused_request_suback", "--exact"]
 expect_text = '''the read-back waited for the Config SUBACK, held'''
 guard       = "fixed_refused_request_as_grant"
+
+# The R2 confirming reviews 2, Claude minor 2: a late read-back ends the session at its wait — only a
+# new connection frees the abandoned SUBSCRIBE's packet id. Going on, with the requests no longer
+# asked on that connection, the session waits for the 10 s grant bound, and the next connection's
+# requests come past the scenario's window.
+[[control]]
+name        = "a_late_read_back_goes_on"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''            return Ok(Flow::End);
+        }
+        if let Some(overdue) = self.conn.outstanding().find(|p| p.deadline <= now) {'''
+replacement = '''        }
+        if let Some(overdue) = self.conn.outstanding().find(|p| p.deadline <= now) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_late_read_back_is_said_incomplete_and_the_requests_go_without_it", "--exact"]
+expect_text = '''the requests were never subscribed without the read-back'''
+guard       = "fixed_late_read_back_ends_session"
