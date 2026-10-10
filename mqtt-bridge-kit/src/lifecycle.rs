@@ -1316,10 +1316,20 @@ impl Lifecycle {
 
     /// What the instance's latest Config asks. A stop under way not yet unsubscribing ends as the
     /// new want needs: released, or disabled.
+    ///
+    /// A disable whose driver fields still wait for their validation (§3), with a committed driver
+    /// waiting to start — a replacement under way, its old device stopping for it, or its
+    /// bootstrap not done — changes nothing yet: not the stop's destination, and not that driver.
+    /// If the validation fails, the committed Config stays in force (§4.3); once validated, the
+    /// disable is set again (`built`) and takes over (the R2 confirming reviews, Codex 2).
     fn set_want(&mut self, name: &str, want: Want) {
         let Some(instance) = self.instances.get_mut(name) else {
             return;
         };
+        if instance.ready.is_some() && matches!(&want, Want::Disable(config) if Self::needs_validation(instance, config)) {
+            instance.want = want;
+            return;
+        }
         if let Some(rt) = instance.rt.as_mut() {
             if let Phase::Stopping { step, then } = rt.phase {
                 if step != Step::Unsubscribe {
@@ -1351,6 +1361,13 @@ impl Lifecycle {
             return Ok(());
         };
         if instance.rt.as_ref().is_some_and(|rt| matches!(rt.phase, Phase::Stopping { .. })) {
+            // A disable during a stop is validated now, the stop going on as it was (`set_want`).
+            if let Want::Disable(config) = &instance.want {
+                if Self::needs_validation(instance, config) && instance.failed_config.as_ref() != Some(config) {
+                    let config = config.clone();
+                    self.ensure_build(name, config);
+                }
+            }
             return Ok(());
         }
         let phase = instance.rt.as_ref().map(|rt| (rt.phase, rt.worker));
@@ -1505,8 +1522,11 @@ impl Lifecycle {
                 if self.instances.get(name).is_some_and(|i| i.want == Want::Disable(config.clone())) {
                     drop_off_thread(driver);
                     if let Some(instance) = self.instances.get_mut(name) {
-                        instance.validated = Some(config);
+                        instance.validated = Some(config.clone());
                     }
+                    // Validated, the disable takes over: a stop under way ends disabled, and a
+                    // committed driver waiting to start is dropped (`set_want`).
+                    self.set_want(name, Want::Disable(config));
                     return self.reconcile(ctx, outputs, name).await;
                 }
                 let wanted = self.instances.get(name).is_some_and(|i| i.want == Want::Serve(config.clone()));
@@ -1695,8 +1715,12 @@ impl Lifecycle {
         ) {
             Ok(()) => {
                 rt.worker = true;
+                // A newer Config that failed meanwhile — a disable's invalid fields, while this
+                // committed one waited to start — stays failed: not built, nor said, again.
+                if instance.failed_config.as_ref() == Some(&ready.config) {
+                    instance.failed_config = None;
+                }
                 instance.accepted = Some(ready.config);
-                instance.failed_config = None;
                 instance.retry_at = None;
                 info!(instance = name, "The device is started");
             }

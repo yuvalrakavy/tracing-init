@@ -525,6 +525,76 @@ async fn the_shutdown_flush_stays_within_the_packet_id_budget() {
     .await
 }
 
+/// A Config change committed — the old device stopping for its successor — then a disable whose
+/// driver fields are invalid: the disable is validated before it touches the stop or the committed
+/// driver (§3), so the committed Config stays in force — its device starts and serves — and only the
+/// disable's `Error` is said; the instance is never disabled (the R2 confirming reviews, Codex 2).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_disable_during_a_replacement_keeps_the_committed_config() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        // Builds: the first device, the committed change, the disable's fields — invalid.
+        fleet.script(&lamp, &[Build::Ok, Build::Ok, Build::Malformed]);
+        fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(1000))));
+        let h = HostHarness::start("disable-in-change", fleet).await;
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        let old = h.fleet.device(&lamp).expect("built");
+        assert!(h.configure(&lamp, json!({"address": "b"})));
+        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
+        assert!(h.configure(&lamp, json!({"address": "not an address", "disabled": true})));
+        assert!(
+            h.eventually(BOUND, |h| !h.errors_for(&lamp, "malformed").is_empty()).await,
+            "the invalid disable's Error was not said: statuses {:?}, errors {:?}",
+            h.statuses(&lamp),
+            h.errors(&lamp)
+        );
+        let committed = h.fleet.devices(&lamp).get(1).cloned().expect("the committed Config's device was built");
+        assert!(
+            h.eventually(BOUND, |h| committed.connected() && h.status(&lamp).as_deref() == Some("connected")).await,
+            "the committed Config was not kept in force when an invalid disable came during the replacement: statuses {:?}, errors {:?}",
+            h.statuses(&lamp),
+            h.errors(&lamp)
+        );
+        assert!(!h.statuses(&lamp).iter().any(|s| s == "disabled"), "an invalid disable disabled the instance: {:?}", h.statuses(&lamp));
+        assert_eq!(h.fleet.configs(&lamp)[1].get("address"), Some(&json!("b")));
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// The same with valid driver fields: once validated, the disable takes over the stop — the
+/// committed driver is dropped unstarted and the instance is disabled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_valid_disable_during_a_replacement_disables_the_instance() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(1000))));
+        let h = HostHarness::start("valid-disable-in-change", fleet).await;
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        let old = h.fleet.device(&lamp).expect("built");
+        assert!(h.configure(&lamp, json!({"address": "b"})));
+        assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
+        assert!(h.configure(&lamp, json!({"address": "c", "disabled": true})));
+        assert!(
+            h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("disabled")).await,
+            "the valid disable did not disable the instance: statuses {:?}, errors {:?}",
+            h.statuses(&lamp),
+            h.errors(&lamp)
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let committed = h.fleet.devices(&lamp).get(1).cloned().expect("the committed Config's device was built");
+        assert!(committed.calls_of(Op::Connect).is_empty(), "the committed driver started though a disable replaced it");
+        assert_eq!(h.status(&lamp).as_deref(), Some("disabled"), "{:?}", h.statuses(&lamp));
+        assert!(h.errors(&lamp).is_empty(), "{:?}", h.errors(&lamp));
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// Many instances acquired at once: every subscription's SUBACK matched to its instance by packet
 /// id, and every device served.
 #[tokio::test(flavor = "multi_thread")]

@@ -68,8 +68,11 @@ Rules:
   - unparseable JSON, invalid driver fields, or a factory failure → `Error/{instance}`
     (`malformed`/`unusable`); its **last accepted Config stays in force** (none → `Status=unreachable`).
     A `disabled` Config whose driver fields differ from the last accepted one's is validated by the
-    factory first (its driver dropped unused): invalid, the instance is not disabled. With no
-    accepted Config there is nothing to keep, and the fields are checked when it is enabled.
+    factory first (its driver dropped unused): invalid, the instance is not disabled. Until it is
+    validated it touches nothing — a replacement under way (a committed Config's driver waiting to
+    start, the old device stopping for it) goes on, so an invalid disable leaves the committed Config
+    serving, with the disable's `Error` (§4.3). With no accepted Config there is nothing to keep, and
+    the fields are checked when it is enabled.
   - an unparseable Config whose `via` cannot be read: no owner identifiable; the process that owned the
     instance before keeps its last accepted Config and logs one WARN `device_config_invalid`; other
     processes ignore it.
