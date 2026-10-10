@@ -97,14 +97,15 @@ async fn a_changed_config_of_a_failed_instance_is_built_at_once() {
 }
 
 /// A Config change committed — the old device stopping for its successor — then changed again, the
-/// newest one's construction failing: nothing serves the instance, so it is failed — `unreachable`,
-/// a target-level write refused — not a runtime holding requests for a worker that never comes.
+/// newest one's construction failing: the committed Config is the last accepted one, and stays in
+/// force (§3) — its device starts and serves, and only the newest one's `Error` is said; the
+/// instance is not failed (R2 gate, Codex 4 / Claude 4; builder gap 12 overturned).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_change_whose_newest_construction_fails_leaves_the_instance_failed() {
+async fn a_change_whose_newest_construction_fails_keeps_the_last_accepted_config_in_force() {
     within(DEADLINE, async {
         let fleet = Fleet::new(acknowledged());
         let lamp = instance_name("Lamp");
-        // Builds: the first device, the committed change (dropped for the newest), the newest — failing.
+        // Builds: the first device, the committed change, the newest — failing.
         fleet.script(&lamp, &[Build::Ok, Build::Ok, Build::Unusable]);
         fleet.prepare(&lamp, |d| d.answer(Op::Disconnect, None, Answer::Block(Duration::from_millis(1000))));
         let h = tuned("change-then-fail", fleet, |host| {
@@ -117,20 +118,91 @@ async fn a_change_whose_newest_construction_fails_leaves_the_instance_failed() {
         assert!(h.configure(&lamp, json!({"address": "b"})));
         assert!(h.eventually(BOUND, |_| !old.calls_of(Op::Disconnect).is_empty()).await, "the change was never committed");
         assert!(h.configure(&lamp, json!({"address": "c"})));
+        assert!(h.eventually(BOUND, |h| !h.errors_for(&lamp, "unusable").is_empty()).await, "the newest Config's failure was not said");
+        let committed = h.fleet.devices(&lamp).get(1).cloned().expect("the committed Config's device was built");
         assert!(
-            h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("unreachable") && !h.errors_for(&lamp, "unusable").is_empty()).await,
-            "a failed newest construction did not leave the instance failed: {:?} {:?}",
+            h.eventually(BOUND, |h| committed.connected() && h.status(&lamp).as_deref() == Some("connected")).await,
+            "the last accepted Config was not kept in force when a newer one failed: statuses {:?}, errors {:?}",
             h.statuses(&lamp),
             h.errors(&lamp)
         );
+        assert_eq!(h.fleet.configs(&lamp)[1].get("address"), Some(&json!("b")));
+        let reply = "Store/replies/change-then-fail";
+        assert!(h.command(&lamp, json!({"command": "learn"}), Some((reply, b"1"))));
+        assert!(
+            h.eventually(BOUND, |h| h.replies(reply).iter().any(|r| r.get("value").is_some())).await,
+            "the last accepted Config's device did not serve: {:?}",
+            h.replies(reply)
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// A disabled instance enabled again whose construction fails is failed (§4.3) — `unreachable`,
+/// retried at the pacing until it serves — not left saying `disabled` and never retried (R2 gate,
+/// Claude 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_re_enable_is_failed_and_retried() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        fleet.script(&lamp, &[Build::Unusable]);
+        let h = tuned("re-enable-fails", fleet, |host| {
+            host.timing(mqtt_bridge_kit::TimingOverrides { retry: Some(Duration::from_secs(1)), ..quick_timing() })
+        })
+        .await;
+        assert!(h.configure(&lamp, json!({"address": "a", "disabled": true})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("disabled")).await);
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        assert!(h.eventually(BOUND, |h| !h.errors_for(&lamp, "unusable").is_empty()).await, "no Error for the failed build");
+        assert!(
+            h.eventually(Duration::from_secs(8), |h| h.fleet.builds(&lamp) >= 2 && h.status(&lamp).as_deref() == Some("connected")).await,
+            "the enabled instance whose first build failed was never retried; builds {}, statuses {:?}",
+            h.fleet.builds(&lamp),
+            h.statuses(&lamp)
+        );
+        assert!(
+            h.statuses(&lamp).iter().any(|s| s == "unreachable"),
+            "the failed re-enable never said unreachable: {:?}",
+            h.statuses(&lamp)
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// A failed instance's retry is no service: while the retry's construction runs, a target-level
+/// write is still refused, not held for a device that may never come (R2 gate, Codex 10).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_keeps_the_failed_refusal_policy() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        // The first build fails; the retry blocks its factory 1.5 s (under the 2 s factory bound).
+        fleet.script(&lamp, &[Build::Unusable, Build::Block(Duration::from_millis(1500))]);
+        let h = tuned("retry-policy", fleet, |host| {
+            host.timing(mqtt_bridge_kit::TimingOverrides { retry: Some(Duration::from_secs(1)), ..quick_timing() })
+        })
+        .await;
         let t = h.topics(&lamp);
+        assert!(h.configure(&lamp, json!({"address": "a"})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("unreachable")).await, "{:?}", h.statuses(&lamp));
         assert!(h.eventually(BOUND, |h| h.subscribed(&t.desired_target_filter())).await);
+        assert!(h.eventually(BOUND, |h| h.fleet.builds(&lamp) == 2).await, "the failed instance was never retried");
         assert!(h.broker.publish(&t.desired_target("t1"), json!({"power": true}).to_string(), &SendOptions::default()));
         assert!(
-            h.eventually(BOUND, |h| h.errors_for(&lamp, "refused").iter().any(|e| e["target"] == "t1" && e.get("command").is_none())).await,
-            "a target-level write to the instance nothing serves was not refused: {:?}",
+            h.eventually(Duration::from_millis(1000), |h| h
+                .errors_for(&lamp, "refused")
+                .iter()
+                .any(|e| e["target"] == "t1" && e.get("command").is_none()))
+                .await,
+            "a target-level write during a failed instance's retry was not refused: {:?}",
             h.errors(&lamp)
         );
+        let device = h.built(&lamp).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(device.applies().is_empty(), "a write refused during the retry was applied: {:?}", device.applies());
         assert!(h.stop().await);
     })
     .await

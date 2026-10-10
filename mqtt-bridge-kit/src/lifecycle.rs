@@ -256,11 +256,15 @@ struct Instance {
 }
 
 impl Instance {
-    /// Failed: a live runtime with no worker, no construction under way and no driver waiting to
-    /// start — nothing serves the instance (a first construction failure; or the commit of a new
-    /// Config whose construction then failed).
+    /// Failed: a live runtime with no worker and no driver waiting to start — nothing serves the
+    /// instance — whose construction has failed (or whose Config naming this process is malformed,
+    /// with none accepted before). A retry's construction under way is no service: the failed
+    /// policy holds until a device serves (R2 gate, Codex 10). A first construction not yet done
+    /// has not failed.
     fn failed(&self) -> bool {
-        self.rt.as_ref().is_some_and(|rt| rt.phase == Phase::Live && !rt.worker) && self.build.is_none() && self.ready.is_none()
+        self.rt.as_ref().is_some_and(|rt| rt.phase == Phase::Live && !rt.worker)
+            && self.ready.is_none()
+            && (self.failed_config.is_some() || self.want == Want::Broken)
     }
 }
 
@@ -1021,17 +1025,17 @@ impl Lifecycle {
                 Some(_) => self.accept(name, config),
             },
             Want::Serve(config) => {
-                if phase.is_none() {
-                    self.create_rt(ctx, outputs, name, Phase::Live, LinkStatus::Connecting).await?;
+                match phase {
+                    None => self.create_rt(ctx, outputs, name, Phase::Live, LinkStatus::Connecting).await?,
+                    // Enabled again: it leaves Disabled before anything is built — a live runtime
+                    // with no driver yet, bootstrapping S2 and S3, `connecting` — so a failed
+                    // construction takes the ordinary failed path (R2 gate, Claude 1).
+                    Some((Phase::Disabled, _)) => self.re_enable(ctx, outputs, name).await?,
+                    Some(_) => {}
                 }
                 let Some(instance) = self.instances.get_mut(name) else {
                     return Ok(());
                 };
-                if instance.ready.as_ref().is_some_and(|r| r.config != config) {
-                    if let Some(ready) = instance.ready.take() {
-                        drop_off_thread(ready.driver);
-                    }
-                }
                 let worker = instance.rt.as_ref().is_some_and(|rt| rt.worker);
                 if worker && instance.accepted.as_ref() == Some(&config) {
                     // Serving it already: a construction under way for another Config is stale.
@@ -1041,9 +1045,12 @@ impl Lifecycle {
                 if instance.ready.as_ref().is_some_and(|r| r.config == config) {
                     return self.commit(ctx, outputs, name).await;
                 }
+                // A driver ready for another Config — the one committed last, waiting for its
+                // bootstrap — is kept until the wanted Config's construction succeeds: if it fails,
+                // the last accepted Config stays in force (§3; R2 gate, Codex 4 / Claude 4).
                 // A Config whose construction failed is built again only when nothing serves, at
                 // the reconnect pacing.
-                if instance.failed_config.as_ref() == Some(&config) && (worker || instance.retry_at.is_some()) {
+                if instance.failed_config.as_ref() == Some(&config) && (worker || instance.ready.is_some() || instance.retry_at.is_some()) {
                     return Ok(());
                 }
                 self.ensure_build(name, config);
@@ -1131,7 +1138,10 @@ impl Lifecycle {
                     return Ok(());
                 }
                 if let Some(instance) = self.instances.get_mut(name) {
-                    instance.ready = Some(Ready { config, driver, info });
+                    // It replaces a driver kept ready for the Config committed before it.
+                    if let Some(kept) = instance.ready.replace(Ready { config, driver, info }) {
+                        drop_off_thread(kept.driver);
+                    }
                 }
                 self.reconcile(ctx, outputs, name).await?;
             }
@@ -1147,7 +1157,11 @@ impl Lifecycle {
         let Some(instance) = self.instances.get_mut(name) else {
             return;
         };
-        let Some(rt) = instance.rt.as_ref().filter(|rt| rt.phase == Phase::Live && !rt.worker) else {
+        // Something serves it, or is ready to: the last accepted Config stays in force.
+        if !instance.failed() {
+            return;
+        }
+        let Some(rt) = instance.rt.as_ref() else {
             return;
         };
         rt.device.reports.status(LinkStatus::Unreachable);
@@ -1183,7 +1197,11 @@ impl Lifecycle {
                 self.start_if_ready(ctx, outputs, name).await?;
             }
             (Phase::Live, true) => self.begin_stop(ctx, outputs, name, Then::Successor).await?,
-            (Phase::Disabled, _) => self.re_enable(ctx, outputs, name).await?,
+            // (A reconcile has left Disabled before building; kept for any other way here.)
+            (Phase::Disabled, _) => {
+                self.re_enable(ctx, outputs, name).await?;
+                self.start_if_ready(ctx, outputs, name).await?;
+            }
             (Phase::Stopping { .. }, _) => {}
         }
         Ok(())

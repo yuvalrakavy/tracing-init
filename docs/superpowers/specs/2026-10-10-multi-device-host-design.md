@@ -135,7 +135,14 @@ One rule, used for routing, read-back, filtering and cleanup:
   `Error/{instance}`; requests get R1's offline policy with refusal (held property Desired expire on
   their deadline, settled by the session; Commands and target-level Desired refused with replies;
   reads refused with replies when they carry a response topic). It is retried at the reconnect pacing
-  and on any Config change (a changed Config is never a no-op for a failed instance).
+  and on any Config change (a changed Config is never a no-op for a failed instance). A retry's
+  construction under way is no service: the failed policy holds until a device serves. A disabled
+  instance enabled again leaves Disabled before its construction (a live runtime, S2 and S3
+  bootstrapped, `connecting`), so a failed construction there is this ordinary failed state.
+- **A committed Config stays in force:** a Config change committed (its driver built, the current
+  device stopping for it) and then changed again keeps the committed driver until the newest
+  Config's construction succeeds; if that fails, the committed one starts and serves, and only the
+  newest one's `Error` is said (§3, "last accepted Config stays in force").
 - **Reconnect reconciliation:** after each completed `Config/+` replay (closed by the barrier), every previously owned
   instance absent from it is released as deleted (§4.4, then the bridge's cleanup, §4.5); every owned
   device's S2 replay is compared with its installed target Configs and a target Config no longer
