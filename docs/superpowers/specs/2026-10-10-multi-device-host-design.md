@@ -50,6 +50,8 @@ Grammar unchanged: `{Root}/{Lane}/{instance}[/{target}[/{property}]]`.
 **Single-device bridges** (mqtt_ac): unchanged on the wire — no Config, no `via` tag (a fixed
 instance cannot move between processes). **Configured instances:** every `Status`/`State` carries
 exactly one `via` user property; none or several → ignored (DEBUG) by the Store and by read-back.
+The read-back (S1, and a re-enable's seeding from the slot) takes as a "before" value only a `State`
+whose one `via` is the instance's effective owner (§4.2); another process's tag is no "before" value.
 
 Rules:
 - **Bridge id** (`--name`, default = the kind) is unique on the root. `via` omitted in a Config = the

@@ -263,3 +263,69 @@ async fn an_untagged_retained_state_is_no_read_back() {
     })
     .await
 }
+
+/// The read-back takes only a `State` tagged with the instance's effective owner (§4.2): one tagged
+/// by another process is no "before" value — the request is applied as a first install, where
+/// reading it would have superseded it (R2 gate, Codex 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_tagged_retained_state_is_no_read_back() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let porch = instance_name("Porch");
+        fleet.prepare(&porch, |d| d.set("t1", "power", json!(true)));
+        let h = HostHarness::start("foreign-read-back", fleet).await;
+        let t = h.topics(&porch);
+        let foreign = SendOptions::default().retained().user_property("via", "another-process");
+        h.broker.retain(&t.state("t1"), json!({"power": false}).to_string(), &foreign);
+        h.broker.retain(
+            &t.desired("t1", "power"),
+            json!(false).to_string(),
+            &SendOptions::default().retained().user_property("conflict", "DeviceWins"),
+        );
+        assert!(h.configure(&porch, json!({})));
+        let device = h.built(&porch).await;
+        assert!(
+            h.eventually(BOUND, |_| device.get("t1", "power") == Some(json!(false))).await,
+            "a State another process tagged was read back as a \"before\" value: errors {:?}",
+            h.errors(&porch)
+        );
+        assert!(h.errors_for(&porch, "superseded").is_empty(), "{:?}", h.errors(&porch));
+        assert!(h.stop().await);
+    })
+    .await
+}
+
+/// Re-enabled, an instance seeds its read-back from what its slot shows — only a `State` tagged
+/// with its effective owner (§4.2): one another process tagged while it was disabled is no
+/// "before" value (R2 gate, Codex 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_re_enabled_instance_reads_back_only_its_own_tag() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let porch = instance_name("Porch");
+        fleet.prepare(&porch, |d| d.set("t1", "power", json!(true)));
+        let h = HostHarness::start("foreign-re-enable", fleet).await;
+        let t = h.topics(&porch);
+        assert!(h.configure(&porch, json!({"disabled": true})));
+        assert!(h.eventually(BOUND, |h| h.status(&porch).as_deref() == Some("disabled")).await, "{:?}", h.statuses(&porch));
+        let foreign = SendOptions::default().retained().user_property("via", "another-process");
+        assert!(h.broker.publish(&t.state("t1"), json!({"power": false}).to_string(), &foreign));
+        h.broker.retain(
+            &t.desired("t1", "power"),
+            json!(false).to_string(),
+            &SendOptions::default().retained().user_property("conflict", "DeviceWins"),
+        );
+        // The disabled instance's read-back has seen the foreign write.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(h.configure(&porch, json!({})));
+        let device = h.built(&porch).await;
+        assert!(
+            h.eventually(BOUND, |_| device.get("t1", "power") == Some(json!(false))).await,
+            "a State another process tagged was seeded into the re-enabled read-back: errors {:?}",
+            h.errors(&porch)
+        );
+        assert!(h.errors_for(&porch, "superseded").is_empty(), "{:?}", h.errors(&porch));
+        assert!(h.stop().await);
+    })
+    .await
+}

@@ -1196,6 +1196,7 @@ impl Lifecycle {
         retire_slot(&self.shared, outputs, old.id, name, self.conn.connected && ctx.is_some());
         self.create_rt(None, outputs, name, Phase::Live, LinkStatus::Connecting).await?;
         let connected = self.conn.connected;
+        let own = self.settings.id.clone();
         let Some(instance) = self.instances.get_mut(name) else {
             return Ok(());
         };
@@ -1203,8 +1204,9 @@ impl Lifecycle {
             return Ok(());
         };
         rt.read = old.read;
+        // Only what carries this process's own tag — the effective owner's (§4.2).
         for (topic, seen) in &instance.slot {
-            if let (Inbound::State { target }, Some(_)) = (instance.topics.parse(topic), &seen.via) {
+            if let (Inbound::State { target }, true) = (instance.topics.parse(topic), seen.via.as_deref() == Some(own.as_str())) {
                 if let Ok(values) = wire::decode_state(&seen.payload) {
                     rt.device.reports.read_back(&target, values);
                 }
@@ -1569,7 +1571,9 @@ fn observe_slot(instance: &mut Instance, id: &str, topic: &str, inbound: &Inboun
         return;
     }
     let reports = &rt.device.reports;
-    if let (Inbound::State { target }, true, Some(_)) = (inbound, publish.retain, &via) {
+    // Only the effective owner's own tag is a "before" value (§4.2): a State another process
+    // tagged is not this owner's knowledge of the device (R2 gate, Codex 6).
+    if let (Inbound::State { target }, true, true) = (inbound, publish.retain, via.as_deref() == Some(id)) {
         match wire::decode_state(payload) {
             Ok(values) => reports.read_back(target, values),
             Err(e) => {
