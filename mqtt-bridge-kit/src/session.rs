@@ -899,9 +899,19 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
         // batch — its publish under way finished first, then its answers, then these (third
         // confirming reviews, Codex 1). Every device's answers before any device's model, the
         // outbox's with them.
+        // The model of a device not announced on this connection is not published (the rotation's
+        // rule): its read-back — the fixed instance's before `Active=true`, a configured one's
+        // before its grant — is still reading the retained State it would overwrite (the R2
+        // confirming reviews 2, Claude minor 3). Its answers and unsolicited reports still go.
         for slot in &mut outputs.slots {
             crate::worker::report_refused(&slot.device.reports, slot.device.mailbox.disconnected(), STOPPED_BEFORE);
             slot.batch.add(&slot.device, slot.device.reports.take());
+            if !slot.announced {
+                let unpublished = slot.batch.drain(Part::Model).len();
+                if unpublished > 0 {
+                    debug!(unpublished, "A device's model not announced on this connection is not published at the stop");
+                }
+            }
         }
         // A SUBSCRIBE or UNSUBSCRIBE outstanding: no more is published than the ids left before its
         // packet id would come round (MQTT §2.2.1; R2 gate, Codex 3) — a fixed bridge's as a host's.

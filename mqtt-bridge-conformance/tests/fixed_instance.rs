@@ -117,6 +117,46 @@ async fn the_read_back_completes_at_a_refused_request_suback() {
         .expect("the scenario did not end within its deadline");
 }
 
+/// A stop during the first read-back's wait: the fixed slot was never announced on the connection
+/// — the read-back is still reading the retained State its model would overwrite — so the flush
+/// publishes none of its model; `Active=false` and the DISCONNECT still go (the R2 confirming
+/// reviews 2, Claude minor 3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_during_the_read_back_wait_publishes_no_model() {
+    let scenario = async {
+        let mut h = Harness::start_unwaited("stop-read-back-wait", acknowledged(), quick_timing(), |broker, topics, device| {
+            broker.hold_subacks_matching(&topics.state_filter());
+            device.set("t1", "temp", json!(20));
+            device.set("t2", "temp", json!(21));
+        })
+        .await;
+        let t = h.topics.clone();
+        assert!(h.broker.wait_for_subscription(&t.state_filter(), BOUND).await, "the read-back was never subscribed");
+        assert!(h.eventually(BOUND, |h| h.device.connected()).await, "the device never connected");
+        h.settle(Duration::from_millis(500)).await;
+        assert!(h.stop_bridge().await, "the bridge did not stop in time");
+        let state_prefix = t.state_filter().trim_end_matches('#').to_owned();
+        let model: Vec<String> = h
+            .broker
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                BrokerEvent::Published(r) if r.topic == t.status() || r.topic.starts_with(&state_prefix) => Some(r.topic.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(model.is_empty(), "the flush published the model of a slot never announced: {model:?}");
+        assert!(
+            h.published(&t.active()).iter().any(|r| &r.payload[..] == b"false"),
+            "the flush did not say Active=false: {:#?}",
+            h.log.of_kind("bridge_shutdown_cut")
+        );
+        assert!(h.broker.pkid_reuses().is_empty(), "a packet id was reused: {:#?}", h.broker.pkid_reuses());
+        h.broker.release_subacks();
+    };
+    tokio::time::timeout(DEADLINE, scenario).await.expect("the scenario did not end within its deadline");
+}
+
 /// A fixed bridge owns nothing by Config: it subscribes only its own instance's lanes — no
 /// `Config/+`, no `Status/+` — whatever the root holds.
 #[tokio::test(flavor = "multi_thread")]
