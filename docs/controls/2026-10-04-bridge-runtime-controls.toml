@@ -1102,6 +1102,11 @@ expect_text = '''the pump's poll did not return for 20 s with the broker not rea
 guard       = "mqtt_poll_bound"
 
 # MINOR 14: each connection a fresh client, so nothing queued in one goes out ahead of the next CONNACK's subscriptions.
+# Since the one-runtime merge the reused client shows in one of two ways, both this scenario's
+# reconnect assertions: what it queued goes out first, or — its packet-id accounting stale, the
+# line never clear for the next CONNACK's SUBSCRIBEs — the bridge never announces itself again (2
+# of 3 runs). The expected text is what both print, the second connection's events, which the
+# scenario's set-up assertion does not.
 [[control]]
 name        = "the_pump_reconnects_inside_its_event_loop"
 file        = "mqtt-bridge-kit/src/pump.rs"
@@ -1113,7 +1118,7 @@ replacement = '''                Ok(Err(e)) => {
                 }'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_reconnect_publishes_nothing_before_its_subscriptions", "--exact"]
-expect_text = '''something went out before the subscriptions on the reconnect'''
+expect_text = '''    "connect",'''
 guard       = "fresh_client_per_connection"
 
 # C14: the stalled-broker scenario proves its session was parked on a full request channel.
