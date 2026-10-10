@@ -218,7 +218,10 @@ Per device, R1's cancellation-safe batch, **sealed** when taken (later State goe
 a reply follows the State its command produced and is never starved by later State. Devices are served
 round-robin with a persistent cursor, at most 32 messages per device per turn, then ready inbound and
 lifecycle work, then the next device. A stopping device's flush (§4.4) takes its turns until done. At
-process stop, answers first (R1).
+process stop, answers first (R1). A due timer (a grant's bound, a retry, the sweep) is served before
+anything else at every pass, and the lifecycle's events (a construction done, a worker stopped) go
+ahead of the inbound traffic: neither a steady publication nor a steady inbound stream can starve
+them (R2 gate, Codex 1).
 
 ### 4.8 Logging
 Every record under a device carries `instance` and the bridge id. New kinds: `device_config_invalid`

@@ -504,13 +504,23 @@ async fn session(
         // dropped — at a read a second, and a command behind it waited past its expiry (the second
         // confirming review's minor 5). With no read owed, what is pending goes first: answers are
         // uncapped, so no backlog drained first can displace them (re-gate 3 S2).
-        let step = if reads_owed > 0 {
+        // A timer due — an overdue grant, a failed instance's retry, the sweep — and the lifecycle's
+        // events — a construction done, a worker stopped — get their service whatever the inbound
+        // traffic and the publication do (R2 gate, Codex 1: a steady stream of reports kept the
+        // rotation owed at every pass, and an overdue SUBACK never ended the session; a steady
+        // inbound stream could strand a construction's end). A due timer goes first, and each
+        // handler clears what it served; the events are finite, made only by the lifecycle's own
+        // work, so ahead of the inbound they cannot starve it.
+        let due = wake.is_some_and(|at| at <= Instant::now());
+        let step = if due {
+            Step::Tick
+        } else if reads_owed > 0 {
             // WAIT: session-events
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
-                event = incoming.recv() => Step::Event(event),
                 Some(event) = events.recv() => Step::Lifecycle(event),
+                event = incoming.recv() => Step::Event(event),
                 () = std::future::ready(()), if owed => Step::Reported,
                 () = shared.ready.notified(), if open => Step::Reported,
                 () = sleep_until(wake) => Step::Tick,
@@ -522,8 +532,8 @@ async fn session(
                 _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
                 () = std::future::ready(()), if owed => Step::Reported,
                 () = shared.ready.notified(), if open => Step::Reported,
-                event = incoming.recv() => Step::Event(event),
                 Some(event) = events.recv() => Step::Lifecycle(event),
+                event = incoming.recv() => Step::Event(event),
                 () = sleep_until(wake) => Step::Tick,
             }
         };

@@ -132,6 +132,59 @@ async fn an_overdue_subscription_ends_the_session() {
     .await
 }
 
+/// A due timer gets its service whatever the publication does: with a device reporting without
+/// pause — the rotation always owed — another instance's overdue SUBACK still ends the session at
+/// its 10 s bound (R2 gate, Codex 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overdue_grant_ends_the_session_under_a_steady_publication() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let (chatty, quiet) = (instance_name("Achatty"), instance_name("Bquiet"));
+        fleet.prepare(&chatty, |d| d.set("t0", "n", json!(0)));
+        // A keep-alive long enough that the pump's own stall bound cannot end the session first.
+        let slow_pings = mqtt_bridge_kit::MqttTiming { keep_alive: Duration::from_secs(30), ..quick_mqtt() };
+        let h = HostHarness::join(broker().await, &instance_name("starved"), fleet, |host| host.mqtt_timing(slow_pings)).await;
+        assert!(h.configure(&chatty, json!({})));
+        assert!(h.eventually(BOUND, |h| h.status(&chatty).as_deref() == Some("connected")).await, "the chatty device never connected");
+        h.broker.delay_acks(Duration::from_millis(10));
+        let device = h.fleet.device(&chatty).expect("built");
+        let flood = tokio::spawn(async move {
+            let mut n = 0u64;
+            loop {
+                for t in 0..1200 {
+                    let mut values = mqtt_bridge_kit::PropertyMap::new();
+                    values.insert("n".into(), json!(n));
+                    device.report(&format!("t{t}"), values);
+                }
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The quiet instance's requests' SUBACK never comes on this connection.
+        h.broker.hold_subacks_matching(&format!("{ROOT}/Desired/{quiet}"));
+        let connections = h.broker.connections();
+        assert!(h.configure(&quiet, json!({})));
+        assert!(h.eventually(BOUND, |h| h.subscribed(&h.topics(&quiet).command())).await, "S3 was never asked for");
+        assert!(
+            h.eventually(Duration::from_secs(16), |h| h
+                .log
+                .of_kind("subscription_refused")
+                .iter()
+                .any(|r| r.field("overdue_ms").is_some()))
+                .await,
+            "an overdue grant never ended the session while the publication was owed"
+        );
+        assert!(h.eventually(BOUND, |h| h.broker.connections() > connections).await, "the session never came again");
+        flood.abort();
+        h.broker.delay_acks(Duration::ZERO);
+        h.broker.release_subacks();
+        assert!(h.eventually(BOUND, |h| h.status(&quiet).as_deref() == Some("connected")).await, "the quiet instance never connected");
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// After a reconnect, every owned instance's current `Status` is published again before
 /// `Active=true`.
 #[tokio::test(flavor = "multi_thread")]
