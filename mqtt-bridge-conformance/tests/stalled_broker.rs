@@ -122,6 +122,11 @@ async fn a_broker_that_stops_reading_is_left_for_a_fresh_session() {
 async fn a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_reads_it() {
     let h = Harness::start_with("expiry-arrival", acknowledged(), quick_timing(), |_, _, device| device.set("t1", "temp", json!(20))).await;
     assert!(h.eventually(BOUND, |h| h.status().as_deref() == Some("connected")).await);
+    // The CONNACK's republication of the model is done before the broker stops acknowledging: a
+    // State still unacknowledged when the acks are held keeps the session waiting on it, reading
+    // no command, until the pump's stall bound (10 s) ends the session, and 400 commands then find
+    // a fresh one (the test took 14.7 s, one run in two).
+    assert!(h.eventually(BOUND, |h| h.state("t1").is_some()).await);
     park_the_session(&h).await;
     // One second to live, arriving while the session is parked.
     let command = json!({"target": "t1", "command": "pulse"}).to_string();

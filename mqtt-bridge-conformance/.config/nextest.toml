@@ -1,0 +1,33 @@
+# The suite's wall time is bounded by its slowest tests starting late, not by any one test: the
+# longest ones (10-13 s, each waiting out a real kit deadline or a real flood) sum to a minute on
+# 20 threads, and started last they run alone at the end. Nextest starts higher `priority` first,
+# so the slowest start at once and the quick tests fill the rest. (Measured in the design,
+# docs/fake-time-design.md of the 2026-10-10 test-speed pass; the figures are in the commit.)
+# Nextest reads this file from the package root, and this crate is a package of its own.
+
+# The tests of 10 s and more.
+[[profile.default.overrides]]
+filter = '''
+test(=a_device_reporting_without_pause_delays_no_reply)
+| test(=an_overdue_grant_ends_the_session_under_a_steady_publication)
+| test(=repeated_panics_with_a_stderr_nobody_reads_leak_no_threads)
+| test(=a_broker_that_stops_reading_is_left_for_a_fresh_session)
+| test(=a_paused_process_is_no_dead_worker_when_it_wakes)
+| test(=a_broker_that_acknowledges_nothing_is_left_for_a_fresh_session)
+| test(=an_overdue_subscription_ends_the_session)
+'''
+priority = 100
+
+# The tests of 6 to 9 s.
+[[profile.default.overrides]]
+filter = '''
+test(=a_request_flood_cannot_hold_a_stop_open)
+| test(=a_driver_panic_with_a_stderr_nobody_reads_ends_the_bridge_with_a_failure)
+| test(=a_session_panic_with_a_stderr_nobody_reads_ends_the_bridge_and_its_connection)
+| test(=a_stdout_and_stderr_nobody_reads_hold_neither_the_start_nor_the_stop)
+| test(=a_stop_spanning_a_reconnect_has_its_status_republished_before_active)
+| test(=a_first_construction_failure_leaves_the_instance_failed_and_retried)
+| test(=a_command_is_answered_under_a_steady_stream_of_reports)
+| test(=without_its_stop_signals_the_bridge_ends_within_a_bound_whatever_its_logging_start_does)
+'''
+priority = 50
