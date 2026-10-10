@@ -250,7 +250,8 @@ struct Instance {
     slot: BTreeMap<String, Seen>,
     /// The target Configs given to the current device (non-empty last).
     installed: BTreeSet<String>,
-    /// The target Configs the current connection's S2 replayed.
+    /// The target Configs present on the current connection since S2 was asked for: replayed by
+    /// S2, or written live meanwhile (a live retraction removes one).
     replayed: BTreeSet<String>,
 }
 
@@ -1526,12 +1527,14 @@ impl Lifecycle {
             Phase::Disabled => terminal(&device, topic, publish, "the instance is disabled"),
             Phase::Live => {
                 if let Inbound::Config { target } = &inbound {
+                    // Present on this connection: replayed, or written live since S2 was asked for
+                    // — a target Config the Store creates in S2's window is retained though no
+                    // replay brought it (R2 gate, Codex 5 / Claude 2); a live retraction is gone.
                     if publish.payload.is_empty() {
                         instance.installed.remove(target);
+                        instance.replayed.remove(target);
                     } else {
                         instance.installed.insert(target.clone());
-                    }
-                    if publish.retain {
                         instance.replayed.insert(target.clone());
                     }
                 }

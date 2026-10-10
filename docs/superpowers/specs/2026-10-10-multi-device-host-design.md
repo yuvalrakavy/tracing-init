@@ -138,7 +138,9 @@ One rule, used for routing, read-back, filtering and cleanup:
 - **Reconnect reconciliation:** after each completed `Config/+` replay (closed by the barrier), every previously owned
   instance absent from it is released as deleted (§4.4, then the bridge's cleanup, §4.5); every owned
   device's S2 replay is compared with its installed target Configs and a target Config no longer
-  retained is retracted (`configure(target, None)`). An incomplete replay (§4.6 fallback) releases
+  retained is retracted (`configure(target, None)`). "Present" is what the S2 replay brought **plus**
+  the live deliveries since S2 was asked for (a target Config the Store creates in S2's window is
+  retained, though no replay brought it; a live retraction removes one). An incomplete replay (§4.6 fallback) releases
   nothing and retracts nothing.
 
 ### 4.4 Stopping a device (Config change, disable, delete, release)

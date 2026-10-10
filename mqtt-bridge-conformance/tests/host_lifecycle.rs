@@ -556,3 +556,38 @@ async fn an_incomplete_replay_releases_nothing() {
     })
     .await
 }
+
+/// A target Config the Store creates live while a reconnect's S2 replay is open (between S2's
+/// SUBACK and S3's) is present on this connection, though not replayed: the reconciliation at S3's
+/// SUBACK leaves it applied (R2 gate, Codex 5 / Claude 2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_config_created_live_in_the_setup_window_is_not_retracted() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let lamp = instance_name("Lamp");
+        let h = HostHarness::start("setup-window", fleet).await;
+        let t = h.topics(&lamp);
+        assert!(h.configure(&lamp, json!({})));
+        assert!(h.eventually(BOUND, |h| h.status(&lamp).as_deref() == Some("connected")).await);
+        let device = h.fleet.device(&lamp).expect("built");
+        // Reconnect, S3's SUBACK held on the new connection.
+        reconnected(&h, |h| h.broker.hold_subacks_matching(&format!("{ROOT}/Desired/{lamp}"))).await;
+        assert!(
+            h.eventually(BOUND, |h| since_last_connect(h).iter().any(|l| *l == format!("sub {}", t.command()))).await,
+            "S3 was never asked for on the new connection"
+        );
+        // The Store creates a target Config now: retained, delivered live (its retain flag cleared).
+        assert!(h.broker.publish(&t.config("t9"), json!({"zone": 9}).to_string(), &SendOptions::default().retained()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.broker.release_subacks();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let calls: Vec<_> = device.calls_of(Op::Configure).into_iter().filter(|c| c.target.as_deref() == Some("t9")).collect();
+        assert!(h.broker.retained_on(&t.config("t9")).is_some());
+        assert!(
+            calls.last().is_some_and(|c| c.values.is_some()),
+            "a target Config still retained was retracted from the device: {calls:#?}"
+        );
+        assert!(h.stop().await);
+    })
+    .await
+}
