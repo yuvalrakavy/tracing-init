@@ -465,7 +465,10 @@ pub(crate) fn tagged(tag: Option<&str>) -> PublishProperties {
     properties
 }
 
-pub(crate) type Failed = rumqttc::v5::ClientError;
+/// A request rumqttc refused (it carries the refused request): the session ends on it. Boxed, as
+/// it passes up every handler's `Result`, and the bare `ClientError` is over 200 bytes
+/// (`clippy::result_large_err`).
+pub(crate) type Failed = Box<rumqttc::v5::ClientError>;
 
 /// Publish one message. A refusal — a topic rumqttc does not publish to, or the event loop gone —
 /// is that one message dropped, said at DEBUG; the caller goes on with the rest (review B2: the
@@ -487,7 +490,7 @@ pub(crate) async fn emit(
 /// What came of a publish: counted when rumqttc took it — the shutdown waits until the pump has
 /// written, and the broker acknowledged, every publish enqueued (the second confirming review's
 /// minor) — else that one message dropped, said at DEBUG.
-fn enqueued(shared: &Shared, topic: &str, sent: Result<(), Failed>) {
+fn enqueued(shared: &Shared, topic: &str, sent: Result<(), rumqttc::v5::ClientError>) {
     match sent {
         Ok(()) => {
             shared.enqueued.fetch_add(1, Ordering::SeqCst);
@@ -702,7 +705,7 @@ impl Out {
 }
 
 /// A publish under way: its topic, for the refusal's line, and rumqttc's request.
-type Sending = std::pin::Pin<Box<dyn std::future::Future<Output = (String, Result<(), Failed>)> + Send>>;
+type Sending = std::pin::Pin<Box<dyn std::future::Future<Output = (String, Result<(), rumqttc::v5::ClientError>)> + Send>>;
 
 /// A part of a batch, in the order a publication takes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
