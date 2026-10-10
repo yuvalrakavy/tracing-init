@@ -1,7 +1,9 @@
 //! The bridge process (lifted from mqtt_ac's `main.rs` and `service.rs`; the fleet's F1, F3 and
 //! no-hang 3b round 3).
 //!
-//! [`Bridge::run`] is `main`'s whole body:
+//! A [`Bridge`] is a facade over [`Host`] in its N = 1 mode (one fixed instance; see
+//! [`crate::host`]), and this process is the same around either. [`Bridge::run`] is `main`'s whole
+//! body:
 //! - **Stop signals first:** SIGINT and SIGTERM are taken before anything else, so from then on
 //!   either is a stop request — the bounded shutdown — whatever the start is doing. A failure to
 //!   take them is WARN `signal_handler_unavailable`, and the bridge does not start; the logging

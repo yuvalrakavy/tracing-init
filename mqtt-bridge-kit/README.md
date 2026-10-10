@@ -70,8 +70,9 @@ the runtime enforces, and an error class that says what the runtime does next.
 ## Topology: `Bridge` or `Host` (owner decision D1)
 
 An `{instance}` in the topic grammar is *one device link*: a controller the bridge fronts, or one
-device it talks to directly. The runtime builds both shapes, over the same device machinery (R1's
-worker, mailbox, reports, outage episodes, conflict rule):
+device it talks to directly. The runtime builds both shapes, and they are one runtime: a `Bridge` is
+a `Host` with one fixed instance (below), over the same device machinery (R1's worker, mailbox,
+reports, outage episodes, conflict rule):
 
 - **A controller-fronted bridge: one process per controller, `Bridge`.** The device you talk to is a
   controller or gateway (a CoolMaster, an HWI, an AV receiver); the devices behind it are its
@@ -126,6 +127,19 @@ worker, mailbox, reports, outage episodes, conflict rule):
 Which to choose: a controller with its devices behind it is a `Bridge` (its targets are the devices);
 devices that are each a network endpoint, configured by the Store, are a `Host`. Never put many
 endpoints behind one `Bridge` driver: one stuck endpoint would then be the whole bridge's outage.
+
+### One runtime: a `Bridge` is the host's N = 1 mode
+
+There is one runtime, not two. A `Bridge` is a thin facade over `Host` with one **fixed instance**:
+named from `--instance`, served by the driver `main` hands to `run`, and owned by the process itself
+(multi-device spec §4.1, §4.2). So the fixed instance has no `Config/{instance}` and no `Config/+`
+subscription, no root barrier, no `via` tag, no healing or cleanup, and its `Active` is
+`Active/{instance}`; its CONNACK duties are R1's, in R1's order (the read-back `State/{instance}/#`
+once per process and alone, then its requests, then `Active=true`, the `Version` and the model).
+Everything else — the session, the per-instance lifecycle that carries those duties, the publication
+rotation, the packet-id budget (MQTT §2.2.1: no SUBSCRIBE, UNSUBSCRIBE or publish takes an id still
+awaiting its acknowledgement) and the bounded shutdown flush — is the host's own code, the same for
+one fixed device as for many configured ones. A `Bridge`'s API, command line and wire are unchanged.
 
 ## The topic grammar and lanes
 
@@ -268,7 +282,8 @@ executable contract: a black-box suite that plays the Store's side over `FakeBro
 *scriptable fake device* (itself a `DeviceDriver`: up and down, values changed at the device, scripted
 answers per operation — a lost link, a refusal, an unusable reply, a call that never returns, a panic,
 a thread-blocking call). Its scenarios: reconnects (a CONNACK's subscriptions before `Active`, a broker
-restart without persistence); requests (held while the device is down and applied within their expiry,
+restart without persistence); the fixed instance as the host's N = 1 mode (no packet id reused while
+a SUBACK is held, a late read-back, no root subscriptions); requests (held while the device is down and applied within their expiry,
 never after; the outage conflict both ways; a target-level write reaching `apply` once; retractions);
 commands and replies; driver errors (paced reconnects, one outage episode, unacknowledged writes held
 again); malformed payloads; a stalled broker; and the process (`fake-bridge` as a real binary:
@@ -318,7 +333,7 @@ it guarantees to a bridge (details and arguments in the spec's §5.2 and
   (which touches the file system and DNS) runs on a blocking thread raced against the stop; the
   driver's `info()` too. The shutdown answers every command still waiting, publishes `Active=false`,
   waits for the broker's acknowledgements and sends DISCONNECT, within a 2 s flush, inside a 5 s
-  shutdown (a multi-device host with a subscription unacknowledged publishes only what its packet
+  shutdown (with a subscription unacknowledged, a bridge or a host publishes only what its packet
   ids allow; what still waits past the flush's ack wait is not published, and the last will says
   `Active=false`); the runtime is shut down within 1 s more, never dropped (dropping waits on blocking
   threads without limit). `main` returns an `ExitCode`.

@@ -15,6 +15,9 @@
 //!
 //! and, at any time, tells of a button pressed at a lamp: `EVT lamp <id> <on|off> <level>`.
 //!
+//! The `Bridge` this file builds is the runtime's multi-device `Host` in its N = 1 mode — one fixed
+//! instance, `--instance` — so tutorial section 12's host is the same runtime with many devices.
+//!
 //! Run it against a controller with
 //! `cargo run --example tutorial_bridge -- --instance home --broker <host> --controller <host>`.
 

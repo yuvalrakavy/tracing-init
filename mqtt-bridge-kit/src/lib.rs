@@ -26,7 +26,11 @@
 //! A device-direct bridge is a [`Host`]: one process, one MQTT session, many devices, each an
 //! instance the Store configures with a retained `Config/{instance}` and the bridge's factory builds
 //! (multi-device spec, `docs/superpowers/specs/2026-10-10-multi-device-host-design.md`; see
-//! [`host`]). To learn the API by building a bridge, read `docs/tutorial-writing-a-bridge.md` (its
+//! [`host`]). The two shapes are one runtime: a `Bridge` is a thin facade over `Host` in its N = 1
+//! mode — one fixed instance, named from `--instance`, owned by the process itself (no Config, no
+//! `via` tag, `Active/{instance}`), with R1's CONNACK duties and wire — so the session, the
+//! lifecycle, the publication, the packet-id budget and the shutdown flush are written once.
+//! To learn the API by building a bridge, read `docs/tutorial-writing-a-bridge.md` (its
 //! code is `examples/tutorial_bridge.rs`, and its §12, a `Host`, `examples/tutorial_multidevice.rs`);
 //! for the command line, the topic grammar, the testing kit and the no-hang guarantees, this crate's
 //! `README.md`.
@@ -37,7 +41,7 @@
 //! |---|---|
 //! | the topic grammar from `--root` and `--instance`; the subscriptions | [`topics`], [`session`] |
 //! | the pump: polls only, one connection per client; an unbounded forward with a backlog episode; MQTT progress bounded | [`pump`] |
-//! | every CONNACK: subscribe (the read-back first, its SUBACK awaited), `Active=true`, `Version`, the retained model again | [`session`] |
+//! | every CONNACK: subscribe (the read-back first, its SUBACK awaited), `Active=true`, `Version`, the retained model again, every request and publish within the packet-id budget | [`session`], the host's lifecycle ([`host`]) |
 //! | the start-up read-back of the bridge's own retained `State` | [`session`], [`reports`] |
 //! | requests: both `Desired` forms, the deadline from the message expiry, `conflict`, retractions, malformed payloads answered on `Error` | [`session`], [`wire`] |
 //! | the mailbox: latest per (target, property), momentary FIFO (64) refused while down, reads coalesced, held values dropped at their deadline, unproven writes held again | [`mailbox`] |

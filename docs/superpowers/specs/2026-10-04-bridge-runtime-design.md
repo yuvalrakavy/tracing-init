@@ -715,3 +715,19 @@ decided (each one for the owner to confirm or overturn):
 - **Known minors, not fixed:** there is no periodic healing backstop beyond the per-message one;
   the broker-lost snapshot ignores the read-back (inherited from R1). (The retire-step flood is
   fixed: R2 gate, Codex 2.)
+
+### Notes from the one-runtime merge (2026-10-10)
+
+- **One runtime** (owner decision, the multi-device spec's D9 and §4.9): a `Bridge` is a thin facade
+  over `Host` with one fixed instance, named from `--instance`. R1's own session path — its CONNACK
+  duties, its blocking read-back wait, its direct republish, its unbudgeted flush — is deleted; the
+  host's lifecycle carries the fixed instance's CONNACK duties in R1's order (the read-back alone and
+  once per process, its SUBACK awaited within `READ_BACK_WAIT`, then the four request subscriptions,
+  then `Active=true`, the `Version` and the model), and R1's conformance suite passes unchanged.
+- **Packet ids:** every SUBSCRIBE, UNSUBSCRIBE and publish of a fixed bridge now goes through the
+  host's packet-id budget (MQTT §2.2.1), which closes a risk R1 had: `Active`, `Version` and the
+  model went out right behind the subscriptions, and with a small receive maximum took the id of a
+  SUBSCRIBE still awaiting its SUBACK. As every request, a SUBSCRIBE of a fixed bridge is bounded by
+  the host's 10 s grant bound; R1 never waited for its requests' SUBACKs at all.
+- **The read-back's UNSUBSCRIBE** waits, as every request does, for the line to clear of publishes
+  (nothing published meanwhile), so it may go out ahead of the model rather than behind it.

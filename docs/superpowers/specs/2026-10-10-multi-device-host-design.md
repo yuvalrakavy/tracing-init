@@ -7,6 +7,10 @@ per device. With that, v5 drops generations, the input cache, revocation and the
 and bootstraps each device from its own per-instance subscriptions (a genuine broker replay).
 Tier T2 (it mints wire contract).
 
+Amended after the one-runtime merge (2026-10-10, owner decision D9: "There should not be multiple
+versions"): D1, D9, §4.1, §4.3, §4.6, the new §4.9 (the fixed instance is the host's N = 1 mode),
+§7 and §8. R1's separate session path is deleted; a `Bridge` is the host with one fixed instance.
+
 ## 1. Problem and scope
 
 R1 runs one device link per process. That fits **controller-fronted** bridges, one process per
@@ -22,7 +26,7 @@ per bridge. Out of scope: restore (deferred), the IR drivers, the YNCA conversio
 
 | # | Decision |
 |---|---|
-| D1 | Controller-fronted: one process per controller. Device-direct: one process, many devices. |
+| D1 | Controller-fronted: one process per controller. Device-direct: one process, many devices. Both shapes are one runtime (D9): a controller-fronted process is the host with one fixed instance. |
 | D2 | Prefer self-configuration (bridge enumerates) wherever the protocol allows; manual Admin UI definition is the fallback; chosen per level (instance, target), driver default. |
 | D3 | A configured instance's Config carries the implementation kind (`bridge`, verified) and the serving process (`via`, selected). Several processes of one kind may share a root. |
 | D4 | (revised 2026-10-10, option a) A device worker blocked past its deadline, or with a budget that stays exhausted, ends the process (R1's dead-worker path). So does a driver that panics, or a worker that ends unasked — R1's dead-worker path too (accepted at the R2 gate). Every other device failure — no reply, timeouts, a closed link — is that device's lost link, handled per device. |
@@ -30,6 +34,7 @@ per bridge. Out of scope: restore (deferred), the IR drivers, the YNCA conversio
 | D6 | Shape A: one MQTT session routing to per-device runtimes. |
 | D7 | The Store is hardware-agnostic: one IR device class; `IrCommand`; GC translates to raw IR in the bridge from the port's code-set Config. |
 | D8 | Status and State carry their publisher (`via` user property); each device bootstraps from its own per-instance subscriptions; configured instances are tagged; a bridge clears only its own tagged topics, on delete; the Store clears only what it publishes. |
+| D9 | (2026-10-10, after the R2 build) **One runtime.** The single-device `Bridge` is a thin facade over the multi-device host with N = 1: one fixed instance, named from `--instance` (§4.9). R1's separate session and process path is deleted; no duplicate connect, republish, flush or packet-id budget code remains. R1's startup and wire behaviour do not change. |
 
 ## 3. Wire contract
 
@@ -105,7 +110,9 @@ MQTT broker ◄──►│ pump ─► session: router · per-instance subscrip
   that does not answer, closes, times out, misbehaves — is that device's lost link, handled per device
   by R1's outage machinery; the other devices are unaffected.
 - **`Bridge` (single-device) keeps its API unchanged** (`Bridge::run(driver)`); internally it is the host
-  with one fixed device. One in-process difference from R1 (accepted at the R2 gate): after a
+  with one fixed device — the host's N = 1 mode, a facade over `Host` (D9, §4.9): one session, one
+  lifecycle, one publication rotation, one packet-id budget and one shutdown flush serve both
+  shapes. One in-process difference from R1 (accepted at the R2 gate): after a
   watchdog's *blocked* verdict the keeper drops the worker's stop sender, so a worker that was only
   pending stops and disconnects before `Running::stop` — observable only after a death, which ends
   the process anyway. Dropping a `Running` unstopped stops every worker, as R1's did. The multi-device API is `Host::new(kind).device(factory).run()`, where the
@@ -137,7 +144,8 @@ One rule, used for routing, read-back, filtering and cleanup:
   A refused or overdue (10 s) SUBACK ends the session (§4.6).
 - **Packet ids** (MQTT §2.2.1: an id is not reused until its acknowledgement; R2 gate, Codex 3).
   rumqttc 0.25 hands out SUBSCRIBE, UNSUBSCRIBE and publish ids from one counter cycling through the
-  broker's receive maximum, and checks only publishes against the ids in use. The host therefore
+  broker's receive maximum, and checks only publishes against the ids in use — R1's own risk too,
+  closed for a fixed bridge by the same budget (§4.9). The host therefore
   hands rumqttc a SUBSCRIBE or UNSUBSCRIBE only when no publish is unacknowledged (publishing nothing
   while one waits for that), and while any is outstanding hands out fewer ids after the oldest than
   the receive maximum — requests and publishes alike, the publication budgeted to match. Every
@@ -256,6 +264,10 @@ published when
 A pending grant is never bypassed. With the 5 s fallback, instances whose Config arrives later get
 their Status as they are acquired (accepted transient, §8).
 
+A fixed host (a `Bridge`, §4.9) owns nothing by Config: its CONNACK subscribes no `Config/+`, waits
+for no barrier, and keeps R1's startup instead — its `Active=true` once its requests are subscribed,
+then its `Version` and model.
+
 ### 4.7 Publication and fairness
 Per device, R1's cancellation-safe batch, **sealed** when taken (later State goes to the next batch), so
 a reply follows the State its command produced and is never starved by later State. Devices are served
@@ -271,6 +283,36 @@ them (R2 gate, Codex 1).
 Every record under a device carries `instance` and the bridge id. New kinds: `device_config_invalid`
 (WARN), `device_config_rejected` (WARN), `subscription_refused` (WARN), `slot_reasserted` (INFO, a
 foreign write seen on an owned slot).
+
+### 4.9 The fixed instance: the host's N = 1 mode (D9)
+There is one runtime. A `Bridge` is a thin facade over `Host` (its builder delegates; its command
+line is R1's: `--instance`, no `--name`, no `--factory-timeout`), and the host serves exactly one
+**fixed instance**, named from `--instance`:
+- **Ownership:** the process itself (§4.2). No `Config/{instance}` is read for it and no `Config/+`
+  is subscribed, so there is no root barrier, no reconnect reconciliation, no `Status/+` litter scan;
+  its bridge id is its instance (`Active/{instance}`, `Version/{instance}`, the client id
+  `{Root}-{instance}`, the last will).
+- **No `via`:** its `Status` and `State` are untagged (§3, §4.5); it never heals or cleans its slot.
+- **Its driver** is the one `main` hands to `run` — no factory, no `--factory-timeout` — and its
+  worker starts at once, as R1's did: the device side runs whatever the broker does, its reports
+  waiting for `Active`.
+- **Its CONNACK duties are R1's, in R1's order** (Bridge Runtime spec §5, §9), carried by the host's
+  lifecycle: once per process the read-back `State/{instance}/#`, alone; its SUBACK awaited within
+  `READ_BACK_WAIT` (5 s) — refused or late: WARN `read_back_incomplete` and on without it — and the
+  next SUBACK (behind its replay) completes it, after which it is unsubscribed; a session that ends
+  before its SUBACK leaves it to the next, one that ends mid-replay leaves it incomplete. Then the
+  four request SUBSCRIBEs, `Config/{instance}/#`, `Desired/{instance}/+` (retain-as-published),
+  `Desired/{instance}/+/+`, `Command/{instance}` (retain-as-published); once they are handed over
+  (granted or not: R1 never waited for them), `Active=true`, the `Version`, and the whole retained
+  model, then its reports. Every publish is routed as R1's (its grammar answers what is none of its
+  lanes on `Error`).
+- **The same machinery:** every SUBSCRIBE, UNSUBSCRIBE and publish of it goes through §4.3's
+  packet-id budget, which closes R1's own MQTT §2.2.1 risk (`Active`, `Version` and the model used to
+  go out right behind the subscriptions, on ids a SUBSCRIBE still held); its output goes through
+  §4.7's rotation; the shutdown's flush is §4.7's, budgeted. As every request does, an outstanding
+  SUBSCRIBE of it is bounded by §4.3's 10 s (an overdue one ends the session — otherwise the budget
+  would freeze publication once the id space wraps); a refusal of one of its request subscriptions
+  is not read, as R1 did not.
 
 ## 5. Store kit (S4)
 
@@ -347,6 +389,9 @@ foreign write seen on an owned slot).
    a late Status from the old owner is reasserted over by the new owner and ignored by the Store.
 7. Fairness: a device producing State continuously never delays its own reply nor another's.
 8. Last will: process death → that bridge id's instances unavailable; other processes unaffected.
+9. The fixed instance (§4.9): R1's conformance suite unchanged and passing on the host; no packet id
+   reused while one of its SUBACKs is held (failing first against R1's own session); a late
+   read-back said incomplete and gone without; no root subscription.
 Kit DSL tests: Config via RetainedIntent; uniqueness; delete retracts only Store-owned topics;
 Status/State accepted only from the effective owner, exactly one tag;
 LinkStatus reset on `Via` change; availability truth table; IR shapes.
@@ -361,6 +406,10 @@ LinkStatus reset on `Via` change; availability truth table; IR shapes.
 - The 5 s Config-replay fallback (§4.6) can show a stale Status for an instance whose Config has not
   yet arrived.
 - YNCA: one connection per receiver; live testing needs the old system's session released.
+- A fixed bridge (§4.9) whose broker never acknowledges one of its SUBSCRIBEs now ends the session
+  after 10 s and reconnects (R1 went on regardless); with a broker that answers its SUBACKs, nothing
+  differs. A publication held while an UNSUBSCRIBE waits for the line to clear of publishes (the
+  read-back's, just after `Active`) resumes once the broker acknowledges what is in flight.
 
 ## 9. Documentation (every level, both sides)
 Reference and tutorial for the Rust side (rustdoc, runtime spec, crate README with D1, "Writing a

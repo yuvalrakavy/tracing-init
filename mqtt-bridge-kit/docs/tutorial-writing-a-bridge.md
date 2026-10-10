@@ -812,6 +812,13 @@ host, `Host` (multi-device spec, `docs/superpowers/specs/2026-10-10-multi-device
 | `Status`, `State` | untagged | tagged with the user property `via` = the bridge id |
 | a blocked driver | ends the process | ends the process (all its devices restart with it) |
 
+These are not two runtimes. The `Bridge` you built is this host's **N = 1 mode**: a `Host` with one
+fixed instance, named from `--instance`, served by the driver you pass to `run` instead of one a
+factory builds, and owned by the process itself — so it subscribes no `Config/+`, waits for no
+barrier, tags nothing with `via`, and says `Active/{instance}`. Its session, its CONNACK duties (R1's,
+in R1's order), its publication, its packet-id budget and its shutdown flush are the host's own code.
+Moving from one shape to the other changes where drivers come from, not the machinery around them.
+
 This section's code is a second example file, [`examples/tutorial_multidevice.rs`](../examples/tutorial_multidevice.rs):
 a bridge for imaginary smart plugs that speak a one-line protocol over TCP (`GET` → `on`/`off`,
 `SET on|off` → `OK`), one plug per instance, one target (`socket`) with one property (`on`). The

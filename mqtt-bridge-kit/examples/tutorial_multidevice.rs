@@ -1,7 +1,8 @@
 //! The tutorial's multi-device bridge (`docs/tutorial-writing-a-bridge.md`, section 12): one
 //! process for many smart plugs, each its own network device and its own instance — a
 //! *device-direct* bridge on the multi-device host (`Host`), where the LampNet bridge was
-//! *controller-fronted* (`Bridge`, one process per controller).
+//! *controller-fronted* (`Bridge`, one process per controller). One runtime serves both: a
+//! `Bridge` is this host with one fixed instance (N = 1), its driver handed to `run`.
 //!
 //! A plug speaks one line at a time over TCP: it greets with `PLUG 1`, answers `GET` with `on` or
 //! `off`, and `SET on` / `SET off` with `OK` (or `ERR <message>`). Its one target is `socket`, with
