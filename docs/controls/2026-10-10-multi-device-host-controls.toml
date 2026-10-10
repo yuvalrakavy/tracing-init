@@ -391,8 +391,8 @@ guard       = "active_after_grants"
 [[control]]
 name        = "active_before_the_barrier"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''        if !self.conn.barrier_acked && Instant::now() < granted + REPLAY_FALLBACK {'''
-replacement = '''        if false {'''
+anchor      = '''                if !self.conn.barrier_acked && Instant::now() < granted + REPLAY_FALLBACK {'''
+replacement = '''                if false {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_lifecycle", "--", "an_incomplete_replay_releases_nothing", "--exact"]
 expect_text = '''Active=true came before the barrier's SUBACK or the replay's fallback'''

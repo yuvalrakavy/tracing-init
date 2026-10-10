@@ -2308,11 +2308,14 @@ expect_text = '''the command waiting at SIGTERM was not answered'''
 guard       = "stop_refuses_waiting"
 
 # Re-gate R15: the flush publishes what is pending before Active=false.
+# Retargeted at the one-runtime merge: a batch left unpublished now waits for an acknowledgement
+# (the flush is budgeted for a fixed bridge too) and the flush then says no Active=false at all —
+# a failure on another assertion; the mutation drops what is pending instead.
 [[control]]
 name        = "the_flush_drops_what_is_pending"
 file        = "mqtt-bridge-kit/src/session.rs"
 anchor      = '''                    left -= slot.batch.publish(shared, client, &[part], left).await;'''
-replacement = '''                    let _ = (&slot.batch, part);'''
+replacement = '''                    let _ = slot.batch.drain(part);'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_flush_publishes_what_is_pending_before_its_last_words", "--exact"]
 expect_text = '''the flush dropped what was pending'''
