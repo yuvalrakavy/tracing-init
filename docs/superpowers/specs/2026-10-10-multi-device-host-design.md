@@ -1,6 +1,6 @@
 # Multi-device bridges — design v7 (Bridge Runtime R2 + Bridge Kit S4)
 
-Status: APPROVED by the owner 2026-10-10 (v7) (v6 + its gate's 3 findings; that gate closed the rest and found no new shape issue). Three design gates (v1, v3, v4) kept finding races in the
+Status: APPROVED by the owner 2026-10-10 (v7) (v6 + its gate's 3 findings; that gate closed the rest and found no new shape issue). Amended after the R2 build's gate (2026-10-10), as the lead decided: §3 (omitted `via`, Config equality, kind mismatch, disable validation, read-back tag), D4 and §4.1 (driver panic), §4.3 (packet ids, failed state, committed Config, S2 window), §4.4 (frozen retirement; the owner's decision on property Desired while disabled), §4.5 (sweeps, first-replay litter), §4.6, §4.7. Three design gates (v1, v3, v4) kept finding races in the
 per-device isolation machinery (generations, input cache, revocation, cross-process cleanup). The
 owner switched D4 to (a): a stuck device worker restarts the process; every other device failure stays
 per device. With that, v5 drops generations, the input cache, revocation and the leaked-thread ledger,
@@ -25,7 +25,7 @@ per bridge. Out of scope: restore (deferred), the IR drivers, the YNCA conversio
 | D1 | Controller-fronted: one process per controller. Device-direct: one process, many devices. |
 | D2 | Prefer self-configuration (bridge enumerates) wherever the protocol allows; manual Admin UI definition is the fallback; chosen per level (instance, target), driver default. |
 | D3 | A configured instance's Config carries the implementation kind (`bridge`, verified) and the serving process (`via`, selected). Several processes of one kind may share a root. |
-| D4 | (revised 2026-10-10, option a) A device worker blocked past its deadline, or with a budget that stays exhausted, ends the process (R1's dead-worker path). Every other device failure — no reply, timeouts, a closed link — is that device's lost link, handled per device. |
+| D4 | (revised 2026-10-10, option a) A device worker blocked past its deadline, or with a budget that stays exhausted, ends the process (R1's dead-worker path). So does a driver that panics, or a worker that ends unasked — R1's dead-worker path too (accepted at the R2 gate). Every other device failure — no reply, timeouts, a closed link — is that device's lost link, handled per device. |
 | D5 | Available ⇔ the serving process's `Active` is true AND the instance's own `Status` is `connected`. |
 | D6 | Shape A: one MQTT session routing to per-device runtimes. |
 | D7 | The Store is hardware-agnostic: one IR device class; `IrCommand`; GC translates to raw IR in the bridge from the port's code-set Config. |
@@ -97,11 +97,15 @@ MQTT broker ◄──►│ pump ─► session: router · per-instance subscrip
   a session part and a per-device part; the algorithms are unchanged.
 - **Failure domain (D4 = a):** a device whose worker thread is **blocked** past its deadline (R1's
   watchdog verdict), or whose blocking/helper budget stays exhausted, ends the **process** by R1's
-  dead-worker path (bounded shutdown, failure exit, supervisor restart). Every other failure — a device
+  dead-worker path (bounded shutdown, failure exit, supervisor restart); so does a driver panic, or
+  a worker that ends unasked (R1's dead-worker path as well). Every other failure — a device
   that does not answer, closes, times out, misbehaves — is that device's lost link, handled per device
   by R1's outage machinery; the other devices are unaffected.
 - **`Bridge` (single-device) keeps its API unchanged** (`Bridge::run(driver)`); internally it is the host
-  with one fixed device. The multi-device API is `Host::new(kind).device(factory).run()`, where the
+  with one fixed device. One in-process difference from R1 (accepted at the R2 gate): after a
+  watchdog's *blocked* verdict the keeper drops the worker's stop sender, so a worker that was only
+  pending stops and disconnects before `Running::stop` — observable only after a death, which ends
+  the process anyway. Dropping a `Running` unstopped stops every worker, as R1's did. The multi-device API is `Host::new(kind).device(factory).run()`, where the
   factory builds a driver from an instance Config.
 
 ### 4.2 Effective owner

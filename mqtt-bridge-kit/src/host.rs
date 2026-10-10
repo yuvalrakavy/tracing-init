@@ -38,8 +38,9 @@
 //! `Status` — once both are done (§4.3).
 //!
 //! **Failure domain (D4 = a).** A device whose worker thread is blocked, whose blocking budget
-//! stays exhausted, or whose factory or `info()` does not return in time ends the process (R1's
-//! dead-worker path: the bounded shutdown, a failure exit, the supervisor's restart). Every other
+//! stays exhausted, whose driver panics (or whose worker ends unasked), or whose factory or `info()`
+//! does not return in time ends the process (R1's dead-worker path: the bounded shutdown, a failure
+//! exit, the supervisor's restart). Every other
 //! device failure is that device's lost link, handled per device.
 //!
 //! **Retained topics.** Every `Status` and `State` of a configured instance carries exactly one

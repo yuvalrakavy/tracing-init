@@ -677,12 +677,22 @@ decided (each one for the owner to confirm or overturn):
 - **The bootstrap is sequential:** S2 is requested on S1's grant, S3 on S2's; on a bootstrap after
   the first (a reconnect), S2's retraction of stale target Configs happens at S3's grant.
 - **An unowned instance with malformed host fields** (its `via` readable, naming this process)
-  is failed (`Status=unreachable`); a **kind mismatch** releases an owned instance with the
-  delete's cleanup.
-- **A failed instance** (no driver serves it: its factory refused, panicked or its Config was
-  malformed) is retried at the device's `--retry` (at least 1 s); a retry of the same failing
-  Config logs at DEBUG; one `Error/{instance}` per failing Config. A factory panic is `Unusable`.
-  A driver panic, or a worker that ends unasked, ends the process.
+  is failed (`Status=unreachable`); a **kind mismatch** releases an owned instance *without* the
+  delete's cleanup (R2 gate, Codex minor: builder gap 4 overturned).
+- **A failed instance** (no driver serves it nor is ready to — a construction under way, a retry's
+  included, is no service — and its construction failed or its Config is malformed with none
+  accepted) is retried at the device's `--retry` (at least 1 s); a retry of the same failing Config
+  logs at DEBUG; one `Error/{instance}` per failing Config. A factory panic is `Unusable`. A Config
+  committed and then changed again keeps its built driver until the newer one's construction
+  succeeds; if that fails, the committed one serves (R2 gate, Codex 4 / Claude 4: builder gap 12
+  overturned). A driver panic, or a worker that ends unasked, ends the process — R1's dead-worker
+  path; the multi-device spec's D4 says so (the owner accepted it, R2 gate).
+- **A `Bridge`'s stop sender after a blocked verdict** (builder gap 15, accepted): the keeper drops
+  the worker's stop sender on the watchdog's verdict, so a worker that was only pending, not truly
+  blocked, stops and disconnects before `Running::stop`, where R1 kept it running until the stop.
+  Observable only after a death, which ends the process anyway; R1's control row
+  `a_driver_call_is_not_bounded` now notices its guard through a timing assertion. Dropping a
+  `Running` unstopped closes admission and stops every worker, as R1's did (R2 gate, Codex 8).
 - **Re-enabling** a disabled instance seeds its read-back from the instance's retained slots the
   session saw.
 - **Untagged non-empty writes** on an owned slot are foreign and reasserted (`slot_reasserted`).

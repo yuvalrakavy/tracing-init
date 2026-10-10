@@ -86,7 +86,8 @@ worker, mailbox, reports, outage episodes, conflict rule):
 
 - **A device-direct bridge: one process, many devices, `Host`.** Each device is its own network
   endpoint (an IR emitter per room, mqtt_ynca's receivers), and one process serves many of them over
-  one MQTT session. The process has a **bridge id** (`--name`, default the kind), unique on the root;
+  one MQTT session. The process has a **bridge id** (`--name`, default the kind), unique on the root
+  (a Config that omits `via` names the default id of the kind it names in `bridge`);
   it learns its instances from the Store's retained `{Root}/Config/{instance}` =
   `{"bridge": "<kind>", "via": "<bridge id>", …driver fields…, "disabled"?: bool}` and serves every
   instance whose Config names it, building each device with the bridge's **factory** from that Config.
@@ -106,7 +107,10 @@ worker, mailbox, reports, outage episodes, conflict rule):
   process wrote; a Config whose `via` names another process hands the instance over. A factory that
   refuses a Config (`FactoryError::Malformed` / `Unusable`) publishes `Error/{instance}` and keeps the
   last accepted Config in force (none: the instance is *failed*, `Status=unreachable`, retried at the
-  `--retry` pace).
+  `--retry` pace); a `disabled` Config with changed driver fields is checked by the factory first. A
+  cleanup that cannot be done at once — the delete ended while the broker was away, or the process
+  was down — is done after a later root replay, re-reading the instance's slot so only values still
+  tagged with this process are cleared.
 
   The failure domain is the process for a *blocked* device only (owner decision D4 = a): a device
   worker blocked past its deadline, a blocking budget that stays exhausted, or a factory or `info()`
@@ -153,7 +157,7 @@ publishes no `via`.
 | `Desired/{instance}/{target}` | Store to bridge | never | JSON `{property: value, ...}` | several properties, atomically (one `apply`) |
 | `Command/{instance}` | Store to bridge | never; 30 s expiry | JSON `{target?, command, ...}` | momentary actions; the standard `refresh` and `assume`; the driver's own |
 | `Config/{instance}/{target}` | Store to bridge | yes (empty retracts) | JSON | per-target setup (to `configure`); may override the feedback mode |
-| `Config/{instance}` | Store to a `Host` | yes (empty deletes the instance) | JSON `{bridge, via?, …driver fields…, disabled?}` | the instance: which kind, which process (`via`, default the kind), the factory's fields |
+| `Config/{instance}` | Store to a `Host` | yes (empty deletes the instance) | JSON `{bridge, via?, …driver fields…, disabled?}` | the instance: which kind, which process (`via`, default: the kind named in `bridge`), the factory's fields |
 
 Details the runtime fixes (spec §5.1), which the lanes' payloads rely on:
 
