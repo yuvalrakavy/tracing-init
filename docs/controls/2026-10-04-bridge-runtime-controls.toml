@@ -168,36 +168,41 @@ expect_text = '''the outage began more than once'''
 guard       = "broker_outage_proof_of_life"
 
 # rumqttc reconnects inside one event loop and the broker keeps no session: every CONNACK subscribes again.
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "the_connack_duties_are_done_once_per_session"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                (Step::Event(Some(PumpEvent::Connected)), Mode::Fixed(fixed)) => {
-                    let device = outputs.slots[0].device.clone();'''
-replacement = '''                (Step::Event(Some(PumpEvent::Connected)), Mode::Fixed(fixed)) if fixed.read_back_requested => Ok(None),
-                (Step::Event(Some(PumpEvent::Connected)), Mode::Fixed(fixed)) => {
-                    let device = outputs.slots[0].device.clone();'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''            } else {
+                self.request_fixed_lanes(Some(ctx), &name).await?;
+            }
+            return self.drive(ctx, outputs).await;'''
+replacement = '''            } else {
+                return Ok(());
+            }
+            return self.drive(ctx, outputs).await;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the state was not published again after the reconnect'''
 guard       = "connack_every_time"
 
 # Active=true before the subscriptions.
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "active_is_announced_before_the_subscriptions"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    for (filter, retain_as_published) in requests {'''
-replacement = '''    emit(shared, client, topics.active(), true, b"true".to_vec(), properties()).await;
-    for (filter, retain_as_published) in requests {'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                if *requests == Sub::None || self.conn.waiting.iter().any(|c| !c.is_unsubscribe()) {'''
+replacement = '''                if *requests == Sub::None && false {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the bridge published before it had subscribed'''
 guard       = "connack_order"
 
 # Every CONNACK publishes the version.
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "the_version_is_not_published"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    emit(shared, client, shared.topics.version(), true, shared.version.clone().into_bytes(), properties()).await;
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        session::emit(shared, ctx.client, shared.topics.version(), true, shared.version.clone().into_bytes(), session::properties()).await;
 '''
 replacement = '''
 '''
@@ -207,13 +212,14 @@ expect_text = '''was not published again'''
 guard       = "connack_version"
 
 # The fleet's F4: every CONNACK republishes the retained model from the bridge's own state.
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "the_model_is_not_republished_at_connack"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    republish(shared, client, device, device.reports.model()).await;
-'''
-replacement = '''
-'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''            if let Some(slot) = outputs.slot(id) {
+                slot.batch.add_model(&device, device.reports.model(), false);
+            }'''
+replacement = '''            let _ = &device;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_broker_restarted_without_persistence_gets_the_retained_model_again", "--exact"]
 expect_text = '''the retained model was not restored'''
@@ -233,11 +239,12 @@ expect_text = '''no Error said the request was superseded'''
 guard       = "nothing_before_connack"
 
 # The start-up read-back of the bridge's own retained State: the conflict rule's before values after a restart.
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "the_read_back_is_never_subscribed"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        client.subscribe(topics.state_filter(), QoS::AtLeastOnce).await?;'''
-replacement = '''        let _ = topics.state_filter();'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                vec![Self::filter(topics.state_filter(), false)]'''
+replacement = '''                vec![Self::filter(topics.state("never"), false)]'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
 expect_text = '''no Error said the request was superseded'''
@@ -1356,9 +1363,10 @@ expect_text = '''`--retry 0` was accepted'''
 guard       = "cli_ranges"
 
 # Item 32: a driver's required option, missing, is a usage error.
+# Re-anchored at the one-runtime merge: the Bridge's builder is the host's.
 [[control]]
 name        = "a_required_option_is_not_checked"
-file        = "mqtt-bridge-kit/src/process.rs"
+file        = "mqtt-bridge-kit/src/host.rs"
 anchor      = '''        if let Some(missing) = self.required.iter().find(|name| !self.settings.options.contains_key(*name)) {'''
 replacement = '''        if let Some(missing) = self.required.iter().find(|_| false) {'''
 target      = "command"
@@ -1395,18 +1403,17 @@ expect_text = '''a target that is no topic segment reached the model'''
 guard       = "reported_names_validated"
 
 # B2: a refused publish is one message dropped, not the CONNACK duties.
+# Re-anchored at the one-runtime merge: the model goes out as a batch, a refusal there drops the rest.
 [[control]]
 name        = "a_refused_publish_ends_the_connack_duties"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''    for (target, document) in model.states {
-        emit(shared, client, device.topics.state(&target), true, document, tagged(tag)).await;
-    }'''
-replacement = '''    for (target, document) in model.states {
-        if target.contains('#') {
-            return;
-        }
-        emit(shared, client, device.topics.state(&target), true, document, tagged(tag)).await;
-    }'''
+anchor      = '''                enqueued(shared, &topic, sent);
+                handed += 1;'''
+replacement = '''                if sent.is_err() {
+                    self.model.clear();
+                }
+                enqueued(shared, &topic, sent);
+                handed += 1;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::a_refused_publish_is_one_message_dropped", "--exact"]
 expect_text = '''the state after a refused one was never published'''
@@ -1435,26 +1442,24 @@ expect_text = '''a publish within the bound'''
 guard       = "fake_broker_max_packet"
 
 # C10: commands and target-level writes are subscribed retain-as-published.
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "commands_are_subscribed_without_retain_as_published"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        (topics.desired_target_filter(), true),
-        (topics.desired_property_filter(), false),
-        (topics.command(), true),'''
-replacement = '''        (topics.desired_target_filter(), false),
-        (topics.desired_property_filter(), false),
-        (topics.command(), false),'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        let requests = [(topics.desired_target_filter(), true), (topics.desired_property_filter(), false), (topics.command(), true)];'''
+replacement = '''        let requests = [(topics.desired_target_filter(), false), (topics.desired_property_filter(), false), (topics.command(), false)];'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken", "--exact"]
 expect_text = '''a live retained command or target-level write was not refused'''
 guard       = "retain_as_published"
 
 # C10: property writes are not subscribed retain-as-published (a live retained one is live).
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "property_writes_are_subscribed_retain_as_published"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''(topics.desired_property_filter(), false)'''
-replacement = '''(topics.desired_property_filter(), true)'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''(topics.desired_target_filter(), true), (topics.desired_property_filter(), false)'''
+replacement = '''(topics.desired_target_filter(), true), (topics.desired_property_filter(), true)'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "payloads", "--", "a_live_retained_command_or_target_write_is_refused_and_a_live_retained_property_write_is_taken", "--exact"]
 expect_text = '''a live property write was checked as a replay'''
@@ -1618,11 +1623,17 @@ expect_text = '''a property copy arriving after the target write was applied aga
 guard       = "copy_window"
 
 # C9: the requests are subscribed only once the read-back's SUBACK has come.
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "requests_are_subscribed_before_the_read_back_is_acknowledged"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        match read_back_acknowledged(device, incoming).await {'''
-replacement = '''        match ReadBack::Granted {'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''            if read_back {
+                self.request_read(Some(ctx), &name).await?;
+            } else {'''
+replacement = '''            if read_back {
+                self.request_read(Some(ctx), &name).await?;
+                self.request_fixed_lanes(Some(ctx), &name).await?;
+            } else {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "requests_are_subscribed_only_once_the_read_back_is_acknowledged", "--exact"]
 expect_text = '''requests were subscribed before the read-back was acknowledged'''
@@ -1718,28 +1729,36 @@ expect_text = '''a probe loop'''
 guard       = "unsupported_probe_proof"
 
 # M4: Config is subscribed before Desired (a device already up when the replays arrive).
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "desired_is_subscribed_before_config"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''        (topics.config_filter(), false),
-        (topics.desired_target_filter(), true),
-        (topics.desired_property_filter(), false),
-        (topics.command(), true),'''
-replacement = '''        (topics.desired_target_filter(), true),
-        (topics.desired_property_filter(), false),
-        (topics.command(), true),
-        (topics.config_filter(), false),'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        self.request_subscription(ctx, setup, vec![Self::filter(topics.config_filter(), false)]).await?;
+        let requests = [(topics.desired_target_filter(), true), (topics.desired_property_filter(), false), (topics.command(), true)];
+        for (filter, retain_as_published) in requests {
+            let purpose = Purpose::Requests { instance: instance.clone(), rt: id };
+            self.request_subscription(ctx, purpose, vec![Self::filter(filter, retain_as_published)]).await?;
+        }'''
+replacement = '''        let requests = [(topics.desired_target_filter(), true), (topics.desired_property_filter(), false), (topics.command(), true)];
+        for (filter, retain_as_published) in requests {
+            let purpose = Purpose::Requests { instance: instance.clone(), rt: id };
+            self.request_subscription(ctx, purpose, vec![Self::filter(filter, retain_as_published)]).await?;
+        }
+        self.request_subscription(ctx, setup, vec![Self::filter(topics.config_filter(), false)]).await?;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "config_is_subscribed_before_desired", "--exact"]
 expect_text = '''Desired was subscribed before Config'''
 guard       = "config_subscribed_first"
 
 # C7: a request's expiry counts from its arrival at the pump.
+# Re-anchored at the one-runtime merge: the fixed instance's publishes are routed by the lifecycle.
 [[control]]
 name        = "the_expiry_counts_from_the_session"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                    span.in_scope(|| route(device, &topic, &publish, received));'''
-replacement = '''                    span.in_scope(|| route(device, &topic, &publish, Instant::now()));'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        if let Some(device) = self.fixed_name().and_then(|name| self.rt_of(&name).map(|(rt, _)| rt.device.clone())) {
+            session::route(&device, topic, publish, received);'''
+replacement = '''        if let Some(device) = self.fixed_name().and_then(|name| self.rt_of(&name).map(|(rt, _)| rt.device.clone())) {
+            session::route(&device, topic, publish, Instant::now());'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "stalled_broker", "--", "a_requests_expiry_counts_from_its_arrival_not_from_when_the_session_reads_it", "--exact"]
 expect_text = '''a command executed past its expiry, counted from when the session read it'''
@@ -2214,11 +2233,14 @@ expect_text = '''the change at the device was reverted by a replay already super
 guard       = "replay_basis_pinned"
 
 # Re-gate minor: only a SUBACK that grants the read-back counts; one that refuses it is incomplete.
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "a_refused_read_back_counts_as_granted"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                return if granted { ReadBack::Granted } else { ReadBack::Refused };'''
-replacement = '''                return if granted || true { ReadBack::Granted } else { ReadBack::Refused };'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''            Purpose::Read { instance, rt } => {
+                if !self.fixed_read_back_awaited(&instance, rt) {'''
+replacement = '''            Purpose::Read { instance, rt } if false => {
+                if !self.fixed_read_back_awaited(&instance, rt) {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_read_back_the_broker_refuses_is_said_incomplete", "--exact"]
 expect_text = '''a refused read-back was not said incomplete'''
@@ -2587,11 +2609,13 @@ guard       = "reads_between_report_batches"
 # Retargeted (second confirming review, minor 5): with up to 64 reads per batch, the echoed States
 # no longer starve the steady-stream scenario's command, so it went GREEN; the connack scenario
 # now sees the UNSUBSCRIBE itself.
+# Re-anchored at the one-runtime merge: the fixed instance's CONNACK duties are the lifecycle's.
 [[control]]
 name        = "the_read_back_stays_subscribed"
-file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''                (Step::Event(Some(PumpEvent::SubAck { .. })), Mode::Fixed(_)) if read_back_done => {'''
-replacement = '''                (Step::Event(Some(PumpEvent::SubAck { .. })), Mode::Fixed(_)) if false && read_back_done => {'''
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''                        let unsub = Purpose::Unsub { instance: instance.clone(), rt };
+                        self.request_unsubscription(Some(ctx), unsub, device.topics.state_filter()).await?;'''
+replacement = '''                        let _ = Purpose::Unsub { instance: instance.clone(), rt };'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
 expect_text = '''the read-back's subscription was kept once it was done'''
@@ -2930,3 +2954,69 @@ target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "--", "session::tests::the_ack_wait_and_the_linger_fit_in_the_flushs_bound", "--exact"]
 expect_text = '''the flush ran out its bound: its ack wait and linger do not fit in it'''
 guard       = "flush_parts_fit"
+
+# The one-runtime merge: the host's packet-id budget covers the fixed instance (MQTT §2.2.1, R1's own
+# risk): without it, Active, Version and the model take the id of a SUBSCRIBE awaiting its SUBACK.
+[[control]]
+name        = "the_fixed_bridge_publishes_outside_the_budget"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''    fn budget(&self, ctx: &Ctx<'_>) -> Option<usize> {
+        if !self.conn.connected {'''
+replacement = '''    fn budget(&self, ctx: &Ctx<'_>) -> Option<usize> {
+        if !self.conn.connected || self.fixed.is_some() {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "packet_ids", "--", "no_packet_id_is_reused_while_a_suback_is_outstanding", "--exact"]
+expect_text = '''a packet id was reused while its SUBACK was outstanding'''
+guard       = "fixed_budgeted"
+
+# The one-runtime merge: the read-back's wait (READ_BACK_WAIT) is a lifecycle timer; with no wake for
+# it, the requests wait for the SUBACK's own bound.
+[[control]]
+name        = "the_late_read_back_never_ends"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        let read_back = self.fixed.as_ref().and_then(|f| f.read_back_until);'''
+replacement = '''        let read_back: Option<Instant> = None;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_late_read_back_is_said_incomplete_and_the_requests_go_without_it", "--exact"]
+expect_text = '''the requests were never subscribed without the read-back'''
+guard       = "fixed_read_back_wait"
+
+# The one-runtime merge: the fixed instance takes every publish through R1's routing; routed as a
+# configured instance, its untagged retained State is no "before" value.
+[[control]]
+name        = "the_fixed_instance_is_routed_as_a_configured_one"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        if let Some(device) = self.fixed_name().and_then(|name| self.rt_of(&name).map(|(rt, _)| rt.device.clone())) {'''
+replacement = '''        if let Some(device) = self.fixed_name().filter(|_| false).and_then(|name| self.rt_of(&name).map(|(rt, _)| rt.device.clone())) {'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "requests", "--", "the_outage_conflict_after_a_bridge_restart_uses_the_read_back", "--exact"]
+expect_text = '''no Error said the request was superseded'''
+guard       = "fixed_routing"
+
+# The one-runtime merge: the fixed instance's output may go out only once Active=true is said (R1),
+# not at the CONNACK.
+[[control]]
+name        = "the_fixed_reports_go_before_active"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''            return self.drive(ctx, outputs).await;'''
+replacement = '''            outputs.announce(FIXED_ID);
+            return self.drive(ctx, outputs).await;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "reconnects", "--", "a_connack_subscribes_before_active_then_republishes_the_model", "--exact"]
+expect_text = '''the bridge published before it had subscribed'''
+guard       = "fixed_announced_at_active"
+
+# The one-runtime merge: a fixed host owns nothing by Config (multi-device spec §4.2): no Config/+.
+[[control]]
+name        = "a_fixed_bridge_subscribes_the_root_configs"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor      = '''        if let Some(fixed) = &self.fixed {
+            let (name, read_back) = (fixed.name.clone(), !fixed.read_back_done);'''
+replacement = '''        if let Some(fixed) = &self.fixed {
+            let (name, read_back) = (fixed.name.clone(), !fixed.read_back_done);
+            let configs = Self::filter(format!("{}/Config/+", self.settings.root), false);
+            self.request_subscription(Some(ctx), Purpose::Configs, vec![configs]).await?;'''
+target      = "command"
+argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "fixed_instance", "--", "a_fixed_bridge_subscribes_only_its_own_lanes", "--exact"]
+expect_text = '''a fixed bridge subscribed beyond its own instance'''
+guard       = "fixed_no_config_ownership"

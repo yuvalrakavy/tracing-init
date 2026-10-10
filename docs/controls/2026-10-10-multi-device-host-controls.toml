@@ -231,22 +231,24 @@ argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformanc
 expect_text = '''the Status was not tagged'''
 guard       = "batch_tagged"
 
+# Re-anchored at the one-runtime merge.
 [[control]]
 name        = "a_republished_status_is_untagged"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''            self.push(Part::Model, Out::new(topics.status(), true, status.as_str().as_bytes().to_vec(), None, tag).first());'''
-replacement = '''            self.push(Part::Model, Out::new(topics.status(), true, status.as_str().as_bytes().to_vec(), None, None).first());'''
+anchor      = '''            self.push(Part::Model, said(Out::new(topics.status(), true, status.as_str().as_bytes().to_vec(), None, tag)));'''
+replacement = '''            self.push(Part::Model, said(Out::new(topics.status(), true, status.as_str().as_bytes().to_vec(), None, None)));'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "the_statuses_are_republished_before_active_after_a_reconnect", "--exact"]
 expect_text = '''`via` user properties, not one'''
 guard       = "republish_tagged"
 
 # A fixed bridge stays untagged.
+# Re-anchored at the one-runtime merge: the fixed device is built by the lifecycle (`start_fixed`).
 [[control]]
 name        = "a_fixed_bridge_is_tagged"
-file        = "mqtt-bridge-kit/src/process.rs"
+file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''            tag: None,'''
-replacement = '''            tag: Some(instance.clone()),'''
+replacement = '''            tag: Some(name.to_owned()),'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_fixed_bridge_is_never_tagged", "--exact"]
 expect_text = '''a fixed bridge's'''
@@ -338,11 +340,14 @@ expect_text = '''an overdue SUBACK did not end the session'''
 guard       = "overdue_ends_session"
 
 # S2's SUBACK freezes the read-back.
+# Re-anchored at the one-runtime merge.
 [[control]]
 name        = "the_read_back_is_not_frozen_at_s2"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''                device.reports.read_back_complete();'''
-replacement = '''                let _ = &device;'''
+anchor      = '''                // S2's SUBACK closes S1's replay: the conflict snapshot freezes.
+                device.reports.read_back_complete();'''
+replacement = '''                // S2's SUBACK closes S1's replay: the conflict snapshot freezes.
+                let _ = &device;'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_devices", "--", "the_read_back_freezes_at_the_setup_subscriptions_suback", "--exact"]
 expect_text = '''the replayed Desired was decided against a State that came after S2's SUBACK'''
@@ -372,12 +377,12 @@ guard       = "s2_retraction"
 
 # ---- The startup (§4.6) --------------------------------------------------------------------------
 
+# Re-anchored at the one-runtime merge.
 [[control]]
 name        = "active_with_a_grant_pending"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''            || self.conn.pending_subscriptions() > 0
-'''
-replacement = ''''''
+anchor      = '''                if self.conn.pending_subscriptions() > 0 || outputs.firsts_waiting() {'''
+replacement = '''                if outputs.firsts_waiting() {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "active_comes_only_after_every_grant_and_after_the_statuses", "--exact"]
 expect_text = '''Active=true was published with a grant pending'''
@@ -416,14 +421,16 @@ expect_text = '''a passed fallback woke the session again and again'''
 guard       = "fallback_no_spin"
 
 # The statuses go out at S1's grant, before Active=true.
+# Re-anchored at the one-runtime merge.
 [[control]]
 name        = "no_status_at_the_read_backs_grant"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''                    if let Some(slot) = outputs.slot(rt) {
-                        slot.batch.add_model(&device, device.reports.model());
+                        slot.batch.add_model(&device, device.reports.model(), true);
                     }
 '''
-replacement = ''''''
+replacement = '''
+'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "the_statuses_are_republished_before_active_after_a_reconnect", "--exact"]
 expect_text = '''Status was not republished'''
@@ -997,14 +1004,22 @@ guard       = "successor_status_at_connack"
 
 # Packet ids (both reviews): an instance's model republished at its S1 grant goes through the
 # rotation's budget, not by direct publishes (the direct call restored).
+# Retargeted at the one-runtime merge: `session::republish` is gone; the mutation publishes the model directly.
 [[control]]
 name        = "the_read_grant_republishes_directly"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
 anchor      = '''                    if let Some(slot) = outputs.slot(rt) {
-                        slot.batch.add_model(&device, device.reports.model());
+                        slot.batch.add_model(&device, device.reports.model(), true);
                     }
 '''
-replacement = '''                    session::republish(ctx.shared, ctx.client, &device, device.reports.model()).await;
+replacement = '''                    let model = device.reports.model();
+                    if let Some(status) = model.status {
+                        let payload = status.as_str().as_bytes().to_vec();
+                        session::emit(ctx.shared, ctx.client, device.topics.status(), true, payload, session::tagged(device.tag.as_deref())).await;
+                    }
+                    for (target, document) in model.states {
+                        session::emit(ctx.shared, ctx.client, device.topics.state(&target), true, document, session::tagged(device.tag.as_deref())).await;
+                    }
 '''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_configs", "--", "a_read_grants_republish_stays_within_the_packet_id_budget", "--exact"]
@@ -1015,22 +1030,23 @@ guard       = "read_grant_republish_budgeted"
 # Active waits until none waits. (The first two targets were GREEN, 2026-10-10: a live instance's S2
 # request holds Active back anyway, and a session's first turn comes before its next read; the
 # scenario now has the barrier acknowledged before the last read-back's grant.)
+# Re-anchored at the one-runtime merge.
 [[control]]
 name        = "active_before_the_statuses_are_out"
 file        = "mqtt-bridge-kit/src/lifecycle.rs"
-anchor      = '''            || firsts_waiting
-'''
-replacement = ''''''
+anchor      = '''                if self.conn.pending_subscriptions() > 0 || outputs.firsts_waiting() {'''
+replacement = '''                if self.conn.pending_subscriptions() > 0 {'''
 target      = "command"
 argv        = ["cargo", "test", "-q", "--manifest-path", "mqtt-bridge-conformance/Cargo.toml", "--test", "host_startup", "--", "active_waits_for_the_statuses_said_through_the_rotation", "--exact"]
 expect_text = '''Active=true went before the Status said through the rotation'''
 guard       = "active_after_firsts"
 
 # The shutdown's flush publishes within the ids left while a request is outstanding.
+# Re-anchored at the one-runtime merge.
 [[control]]
 name        = "the_flush_publishes_unbudgeted"
 file        = "mqtt-bridge-kit/src/session.rs"
-anchor      = '''            let mut left = mode.flush_budget(&ctx).unwrap_or(usize::MAX);'''
+anchor      = '''            let mut left = host.flush_budget(&ctx).unwrap_or(usize::MAX);'''
 replacement = '''            let mut left = usize::MAX;
             let _ = &ctx;'''
 target      = "command"
