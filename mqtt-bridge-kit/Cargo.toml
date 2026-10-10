@@ -34,3 +34,8 @@ tracing-core = "0.1"
 [[example]]
 name = "tutorial_bridge"
 test = true
+
+# The tutorial's multi-device bridge (section 12), with its tests.
+[[example]]
+name = "tutorial_multidevice"
+test = true

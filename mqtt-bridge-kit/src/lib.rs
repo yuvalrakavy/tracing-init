@@ -20,11 +20,16 @@
 //! ```
 //!
 //! A driver is one object the runtime calls one operation at a time, under deadlines it enforces;
-//! each operation's contract and error classes are on [`DeviceDriver`] and [`OpError`]. A bridge is
-//! one process per controller: the controller is the topic `instance`, the devices behind it its
-//! targets (a multi-device host is planned, not built). To learn the API by building a bridge, read
-//! `docs/tutorial-writing-a-bridge.md` (its code is `examples/tutorial_bridge.rs`); for the command
-//! line, the topic grammar, the testing kit and the no-hang guarantees, this crate's `README.md`.
+//! each operation's contract and error classes are on [`DeviceDriver`] and [`OpError`]. A bridge
+//! takes one of two shapes (owner decision D1). A controller-fronted bridge is a [`Bridge`]: one
+//! process per controller, the controller the topic `instance`, the devices behind it its targets.
+//! A device-direct bridge is a [`Host`]: one process, one MQTT session, many devices, each an
+//! instance the Store configures with a retained `Config/{instance}` and the bridge's factory builds
+//! (multi-device spec, `docs/superpowers/specs/2026-10-10-multi-device-host-design.md`; see
+//! [`host`]). To learn the API by building a bridge, read `docs/tutorial-writing-a-bridge.md` (its
+//! code is `examples/tutorial_bridge.rs`, and its §12, a `Host`, `examples/tutorial_multidevice.rs`);
+//! for the command line, the topic grammar, the testing kit and the no-hang guarantees, this crate's
+//! `README.md`.
 //!
 //! What the runtime owns (spec §5), and where:
 //!
@@ -41,6 +46,7 @@
 //! | replies on the response topic, with the correlation data | [`replies`] |
 //! | outage episodes with the fleet's kind names | [`pump`], [`worker`] |
 //! | the process: signals first, the logging start raced against the stop, a bounded end, a panic hook, a watchdog on the device worker | [`process`], [`logging`] |
+//! | (a [`Host`]) the instances: `Config/{instance}` and its effective owner, the per-instance bootstrap (S1-S3, SUBACKs by packet id), construction off to the side, stopping and handover, the `via` tags and healing, the sealed batches served round-robin | [`host`], [`session`] |
 
 #![warn(missing_docs)]
 

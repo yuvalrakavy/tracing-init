@@ -1,7 +1,9 @@
 # Bridge Runtime (`mqtt-bridge-kit`) — design
 
 **Status:** approved by the owner, 2026-10-04. R1 built; its gate's findings fixed (§5.2 and the
-notes through §5.1, §12), 2026-10-04.
+notes through §5.1, §12), 2026-10-04. The multi-device host (`Host`, the multi-device spec
+`docs/superpowers/specs/2026-10-10-multi-device-host-design.md`, §3, §4) built on it, 2026-10-10:
+the notes at the end say what it changed here.
 **Companions (kept in sync, owner rule 2026-10-04):**
 - the SDL Bridge Support Kit spec (Store, `docs/superpowers/specs/2026-10-04-sdl-bridge-kit-design.md`),
   which owns the wire contract;
@@ -169,7 +171,8 @@ capped queue whose overflow is counted and logged once per episode.
 | Replies | a command's answer goes to its MQTT v5 response topic, carrying its correlation data |
 | Outages | broker and device episodes: INFO first failure, DEBUG retries, one WARN past 30 s, INFO recovery with `down_for_ms` and `attempts` — declared once a connection (broker) or a recovered link (device, `Timing::stable`, 5 s, `--device-stable`) has lasted |
 | Process | signals first (without them, the logging start is waited for at most 5 s, to say so, and the bridge does not start); logging start raced against the stop; no blocking prints (the logging's own failure is written by a thread of its own); `Active=false` and DISCONNECT; explicit runtime ended with `shutdown_timeout`; `ExitCode` |
-| Logging | tracing-init with lossy destinations; the fleet's kind names (Store `docs/guides/logging-policy.md`) |
+| Logging | tracing-init with lossy destinations; the fleet's kind names (Store `docs/guides/logging-policy.md`); a `Host` adds `device_config_invalid`, `device_config_rejected`, `subscription_refused`, `output_lost_at_session_end` (WARN) and `slot_reasserted` (INFO), and every record under a device carries `instance` and the bridge id |
+| Instances (a `Host` only) | `Config/+` and the effective owner; per instance the bootstrap (S1 read-back, S2 target Configs, S3 requests, each SUBACK matched by packet id), construction off to the side (`--factory-timeout`), the stop (admission closed, the worker stopped, output retired, the lanes unsubscribed), the `via` tags, the slot healing and the delete cleanup; `Active` after a root barrier; sealed batches served round-robin, 32 per device per turn (multi-device spec §4) |
 
 Device-link states: `Connecting` → `Proving` (connected, awaiting the first good read or probe) → `Up`,
 or `Down` on `LinkError`, a missed deadline or `link_lost`. `Down` retries after the pacing interval.
@@ -348,13 +351,17 @@ commands are refused, and reads are dropped.
   bounded synchronous call longer than a lowered `--operation-timeout` plus 2 s — ends the process
   instead of losing the link. That is deliberate: such a call blocks the worker's thread either
   way, and only the restart frees it (Claude's re-gate minor 13).
-- **Several workers per session (mqtt_ynca's receivers): not built.** What would have to become
-  per worker: `Shared`'s mailbox, reports and commands (a router from target to worker); the
-  `Status` lane (one per receiver: there is no per-receiver availability lane yet); `Running`'s
-  worker, clock and watchdog — the watchdog's verdict must become per worker, with an outcome per
-  worker, since today one stuck worker ends the whole bridge, and under one session that would take
-  every receiver down; and `Bridge::start`, which takes one driver. The read-back and the
-  broker snapshot can stay shared; the panic hook is process-global already.
+- **Several workers per session (mqtt_ynca's receivers): built as the multi-device host, 2026-10-10.**
+  `Shared` is split into a session part (the client, the topics' root and bridge id, `Version`,
+  the devices) and a per-device part (topics, mailbox, reports, commands, the `via` tag, the
+  span); the session routes each inbound message by its instance to its device. Each device has
+  its own worker thread, keeper and watchdog, and its own `Status` (the lane is per instance, and
+  a configured instance is its own instance). The watchdog's verdict stays a process outcome
+  (owner decision D4 = a: a blocked worker, an exhausted budget or a factory that does not return
+  ends the process, R1's dead-worker path); every other device failure is that device's lost
+  link. `Bridge::start` keeps its one driver: a `Bridge` is the same session with one fixed
+  device, untagged, with R1's subscriptions and wire unchanged. The panic hook stays
+  process-global.
 - **Test seams:** the environment variables `MQTT_BRIDGE_TEST_*` (a held logging start, refused
   stop signals, a panicking session) are compiled in only with the kit's `test-seams` cargo
   feature, which the conformance suite enables — never in a deployed bridge, debug build or not
@@ -483,6 +490,11 @@ fn main() -> ExitCode {
   for a value the driver cannot use, and `usage_exit()` — `--help` or a usage error said, and its
   exit code, before any driver is built; and `start(driver) -> Running` to run a bridge in-process
   (used by the suite).
+- A multi-device bridge is `Host::new(kind).from_cli().device(factory).run()` (or `.start()` in
+  process), with the same option methods, `--name` and `--factory-timeout` in place of
+  `--instance`; the factory is `Fn(&DeviceConfig) -> Result<D, FactoryError> + Send + Sync`,
+  called on a thread of its own for each accepted `Config/{instance}`
+  (`FactoryError::Malformed` / `Unusable` answer `Error/{instance}`).
 - The stdio binding is itself a `DeviceDriver` (`PluginDriver`) that forwards each call to the plugin
   process.
 
@@ -546,6 +558,8 @@ so both bindings run the same suite.
   - a driver call that never returns, which becomes a lost link within its deadline.
 - **Process:** SIGTERM, including during a stalled `connect`; malformed `Desired` and `Command`
   payloads.
+- **The multi-device host:** the multi-device spec's §7 scenarios (`host_*` test files), with a
+  scriptable fake factory, each under an outer deadline with a progress assertion.
 - **Plugins:** a plugin that crashes, hangs or floods its stdout.
 
 Every guard also gets a negative-control row. The suite runs in this repo's CI.
@@ -555,6 +569,7 @@ Every guard also gets a negative-control row. The suite runs in this repo's CI.
 ```text
 mqtt-bridge-kit/          the runtime and the Rust trait binding (library)
   src/  topics · wire · pump · session · mailbox · worker · reports · replies · process · plugin
+        host (the `Host` builder) · lifecycle (per instance) · devices (worker threads, keepers)
 mqtt-bridge-host/         binary: runs a stdio plugin under the runtime
 mqtt-bridge-conformance/  the suite; the fake device as a driver and as a plugin
 python/mqtt_bridge_kit/   the Python SDK (stdio binding only)
@@ -635,6 +650,46 @@ inputs:
 
 ### Notes from the documentation pass (2026-10-10)
 
-- `LinkStatus::Disabled` (`disabled`) is part of the grammar but no R1 bridge reports it; it arrives with the multi-device host (a configured instance that is disabled).
+- `LinkStatus::Disabled` (`disabled`) is part of the grammar but no R1 bridge reports it; the multi-device host publishes it for a configured instance that is disabled.
 - `MqttTiming::poll_retry` is settable in code only (no CLI flag); `--connect-timeout 0` is not yet refused like the other zero timings (follow-up).
 - §10's `plugin`, `mqtt-bridge-host` and Python SDK are R3 and not built.
+
+### Notes from building the multi-device host (2026-10-10)
+
+What R2 changed in the R1 runtime, and the points the multi-device spec left open that the build
+decided (each one for the owner to confirm or overturn):
+
+- **Unchanged for a `Bridge`:** its API, its wire (no `Config/{instance}`, no `via`), its
+  subscriptions and their order, its logging. R1's conformance suite passes unchanged.
+- **The pump forwards `UNSUBSCRIBE` and `UNSUBACK`** (with their packet ids), as it forwarded
+  `SUBSCRIBE` and `SUBACK`; `NoSubscriptionExisted` counts as a success.
+- **Packet ids.** rumqttc 0.25 draws subscribe, unsubscribe and publish packet ids from one counter
+  that wraps at the broker's receive maximum, and can hand out the id of a SUBSCRIBE still awaiting
+  its SUBACK; the lifecycle therefore keeps a FIFO of pending requests per packet id and matches
+  each acknowledgement to the oldest.
+- **The `Active` gate's "all grants"** excludes the root barrier's own subscription (it is the
+  barrier, not a grant the barrier waits for).
+- **The bootstrap is sequential:** S2 is requested on S1's grant, S3 on S2's; on a bootstrap after
+  the first (a reconnect), S2's retraction of stale target Configs happens at S3's grant.
+- **An unowned instance with malformed host fields** (its `via` readable, naming this process)
+  is failed (`Status=unreachable`); a **kind mismatch** releases an owned instance with the
+  delete's cleanup.
+- **A failed instance** (no driver serves it: its factory refused, panicked or its Config was
+  malformed) is retried at the device's `--retry` (at least 1 s); a retry of the same failing
+  Config logs at DEBUG; one `Error/{instance}` per failing Config. A factory panic is `Unusable`.
+  A driver panic, or a worker that ends unasked, ends the process.
+- **Re-enabling** a disabled instance seeds its read-back from the instance's retained slots the
+  session saw.
+- **Untagged non-empty writes** on an owned slot are foreign and reasserted (`slot_reasserted`).
+- **A disabled or stopping instance ignores property `Desired`** (the multi-device spec §4.4 says
+  "refused"; the build drops them rather than publishing an `Error` per retained request at each
+  bootstrap) — for the owner to decide.
+- **An overdue grant** (no SUBACK within 10 s) logs `subscription_refused` with `overdue_ms`.
+- **A `Host`'s defaults:** the root is the kind, the bridge id is the kind, the `Version` text is
+  `<kind> <version>`, and with no version set `<kind> (mqtt-bridge-kit <its version>)`.
+- **Cleanups survive a session loss:** a delete finished while disconnected keeps its cleanup
+  pending and hands it over at the next session's root barrier. Answers and unsolicited reports of
+  a device that is retired go to a session outbox, published in the next turn.
+- **Known minors, not fixed:** a request flood can keep a stopping device's retire step busy
+  (bounded only by the flood); there is no periodic healing backstop beyond the per-message one;
+  the broker-lost snapshot ignores the read-back (inherited from R1).

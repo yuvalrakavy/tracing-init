@@ -14,13 +14,22 @@ fn main() -> ExitCode {
 }
 ```
 
+A device-direct bridge, many devices in one process, is a `Host` instead (see the topology, below):
+
+```rust,ignore
+Host::new("ynca").root("Ynca").from_cli().device(receiver_from_config).run()
+```
+
 - **Learn it:** [`docs/tutorial-writing-a-bridge.md`](docs/tutorial-writing-a-bridge.md) writes a
   complete bridge step by step, with tests, negative controls and a systemd unit. Its code is
-  [`examples/tutorial_bridge.rs`](examples/tutorial_bridge.rs).
+  [`examples/tutorial_bridge.rs`](examples/tutorial_bridge.rs); its §12, a multi-device host, is
+  [`examples/tutorial_multidevice.rs`](examples/tutorial_multidevice.rs).
 - **Look it up:** `cargo doc --no-deps --open` (every public item is documented), and this page.
 - **The source of truth:**
   [`docs/superpowers/specs/2026-10-04-bridge-runtime-design.md`](../docs/superpowers/specs/2026-10-04-bridge-runtime-design.md)
-  (the runtime), and, for the wire contract, the Store's Bridge Kit spec
+  (the runtime) and
+  [`docs/superpowers/specs/2026-10-10-multi-device-host-design.md`](../docs/superpowers/specs/2026-10-10-multi-device-host-design.md)
+  (the multi-device host), and, for the wire contract, the Store's Bridge Kit spec
   (`docs/superpowers/specs/2026-10-04-sdl-bridge-kit-design.md`) and contract guide
   (`docs/guides/mqtt-bridge-contract.md`) in the Store repository.
 - **A real bridge on it:** [mqtt_ac v2](https://github.com/yuvalrakavy/mqtt_ac/tree/265df22) (the
@@ -44,7 +53,8 @@ Minimum Rust version 1.80.
 | replies on the response topic, with the correlation data | |
 | outage episodes, with the fleet's log `kind` names | |
 | the process: signals, logging start, bounded shutdown, panic hook, a watchdog on the device worker, the exit status | |
-| the command line, `--help`, usage errors | the driver's own options (`Bridge::option`) |
+| the command line, `--help`, usage errors | the driver's own options (`Bridge::option`, `Host::option`) |
+| (a `Host`) the instances: `Config/{instance}`, ownership, per-instance bootstrap, stopping, handover, the `via` tags, the publication rotation | the factory: a driver from an instance's Config, or a `FactoryError` |
 
 The contract between the two is the `DeviceDriver` trait: every operation has a meaning, a deadline
 the runtime enforces, and an error class that says what the runtime does next.
@@ -57,26 +67,61 @@ the runtime enforces, and an error class that says what the runtime does next.
 | `Unsupported` | no such command or property | publishes `Error`; no retry |
 | `Partial` | (`apply` only) these properties failed; every other value was applied | publishes `Error` for each failed property alone; the link stays up |
 
-## Topology: one process per controller
+## Topology: `Bridge` or `Host` (owner decision D1)
 
-An `{instance}` in the topic grammar is *one bridge process, or a gateway it fronts*. The runtime
-supports one shape today and plans another:
+An `{instance}` in the topic grammar is *one device link*: a controller the bridge fronts, or one
+device it talks to directly. The runtime builds both shapes, over the same device machinery (R1's
+worker, mailbox, reports, outage episodes, conflict rule):
 
-- **A controller-fronted bridge: one process per controller. This is what this crate builds.** The
-  device you talk to is a controller or gateway (a CoolMaster, an HWI, an AV receiver); the devices
-  behind it are its **targets** (an indoor unit `L7.400`, a lamp zone). `--instance` names the
-  controller, one process serves one device link, and the runtime's one device worker and one driver
-  are that link. Several controllers are several processes, each with its own instance. mqtt_ac is
-  the worked example: one CoolMaster controller, its indoor units as targets.
-- **A device-direct bridge, many devices per process: the planned multi-device host. Not built.**
-  Here each device is its own network endpoint (an IR blaster per room, or mqtt_ynca's receivers,
-  which the spec names), and one process should host many of them with one MQTT session. Today that
-  means one process per device. The runtime's spec records what would have to become per device (its
-  §5.2, "Several workers per session"): the mailbox, reports and commands behind a router from target to worker; a `Status` lane
-  per device (the grammar has only one per instance); the watchdog's verdict, so that one stuck device
-  does not end the whole bridge; and `Bridge::start`, which takes one driver. The read-back and the
-  broker snapshot can stay shared. Until that host exists, do not build a many-devices driver on this
-  API; run one bridge per device.
+- **A controller-fronted bridge: one process per controller, `Bridge`.** The device you talk to is a
+  controller or gateway (a CoolMaster, an HWI, an AV receiver); the devices behind it are its
+  **targets** (an indoor unit `L7.400`, a lamp zone). `--instance` names the controller, one process
+  serves one device link, and its one driver is that link. Several controllers are several processes,
+  each with its own instance. Nothing on the wire names the process: no `Config/{instance}`, no `via`
+  tag. mqtt_ac is the worked example: one CoolMaster controller, its indoor units as targets.
+
+  ```rust,ignore
+  Bridge::new("Aircondition").from_cli().run(Coolmaster::new())
+  ```
+
+- **A device-direct bridge: one process, many devices, `Host`.** Each device is its own network
+  endpoint (an IR emitter per room, mqtt_ynca's receivers), and one process serves many of them over
+  one MQTT session. The process has a **bridge id** (`--name`, default the kind), unique on the root;
+  it learns its instances from the Store's retained `{Root}/Config/{instance}` =
+  `{"bridge": "<kind>", "via": "<bridge id>", …driver fields…, "disabled"?: bool}` and serves every
+  instance whose Config names it, building each device with the bridge's **factory** from that Config.
+
+  ```rust,ignore
+  Host::new("ynca").root("Ynca").version("2.0.0").from_cli()
+      .device(|config: &DeviceConfig| receiver_from(config.fields()))
+      .run()
+  ```
+
+  Per instance, the host subscribes the instance's own lanes in three steps (its read-back, its target
+  Configs, its requests), builds the driver off to the side within `--factory-timeout`, and starts the
+  device once both are done; the device then has its own `Status/{instance}`, its own outage episodes
+  and its own budgets. A Config change stops the old device (its in-flight requests answered, its
+  output published) before the new one starts; `"disabled": true` stops it and publishes
+  `Status=disabled`; a deleted Config stops it and retracts the instance's retained topics this
+  process wrote; a Config whose `via` names another process hands the instance over. A factory that
+  refuses a Config (`FactoryError::Malformed` / `Unusable`) publishes `Error/{instance}` and keeps the
+  last accepted Config in force (none: the instance is *failed*, `Status=unreachable`, retried at the
+  `--retry` pace).
+
+  The failure domain is the process for a *blocked* device only (owner decision D4 = a): a device
+  worker blocked past its deadline, a blocking budget that stays exhausted, or a factory or `info()`
+  that does not return in time ends the process by R1's dead-worker path (bounded shutdown, failure
+  exit, the supervisor restarts it). Every other device failure is that device's lost link; the other
+  devices do not notice.
+
+  The tutorial's [§12](docs/tutorial-writing-a-bridge.md#12-many-devices-in-one-process) writes one,
+  in [`examples/tutorial_multidevice.rs`](examples/tutorial_multidevice.rs). The design is
+  [`docs/superpowers/specs/2026-10-10-multi-device-host-design.md`](../docs/superpowers/specs/2026-10-10-multi-device-host-design.md)
+  (§3 the wire contract, §4 the host).
+
+Which to choose: a controller with its devices behind it is a `Bridge` (its targets are the devices);
+devices that are each a network endpoint, configured by the Store, are a `Host`. Never put many
+endpoints behind one `Bridge` driver: one stuck endpoint would then be the whole bridge's outage.
 
 ## The topic grammar and lanes
 
@@ -89,22 +134,26 @@ This is the summary; [`topics`](src/topics.rs) builds every topic.
 {Root}/{Lane}/{instance}[/{target}[/{property}]]
 ```
 
-`Root` (the device family; `--root`, default the family given to `Bridge::new`), `instance`
-(`--instance`), a target and a property are each **one topic segment**: never empty, never containing
-`/`, `+` or `#`. QoS 1 everywhere.
+`Root` (the device family; `--root`, default the family given to `Bridge::new`, or a `Host`'s kind),
+`instance` (`--instance`; a `Host`'s from each `Config/{instance}`), a target and a property are each
+**one topic segment**: never empty, never containing `/`, `+` or `#`. QoS 1 everywhere. A `Host`
+publishes `Active` and `Version` under its bridge id (`--name`) instead of an instance, and every
+`Status` and `State` it publishes carries the MQTT v5 user property `via` = its bridge id; a `Bridge`
+publishes no `via`.
 
 | Lane | Direction | Retained | Payload | Meaning |
 |---|---|---|---|---|
-| `Active/{instance}` | bridge to Store | yes; last will `false` | plain text `true` / `false` | the bridge process is alive and connected |
-| `Status/{instance}` | bridge to Store | yes | plain text `connecting` / `connected` / `unreachable` | the device link (the Store grammar also has `disabled`; the runtime does not report it) |
-| `Version/{instance}` | bridge to Store | yes | plain text | the bridge's version (`Bridge::version`) |
-| `State/{instance}/{target}` | bridge to Store | yes (an empty payload retracts) | JSON object | observed state; `"assumed": true` when not read back |
+| `Active/{instance}` (a `Host`: `Active/{bridge id}`) | bridge to Store | yes; last will `false` | plain text `true` / `false` | the bridge process is alive and connected |
+| `Status/{instance}` | bridge to Store | yes; a `Host`'s tagged `via` | plain text `connecting` / `connected` / `unreachable`, and from a `Host` `disabled` | the device link |
+| `Version/{instance}` (a `Host`: `Version/{bridge id}`) | bridge to Store | yes | plain text; a `Host`'s is `<kind> <version>` | the bridge's version (`Bridge::version`, `Host::version`) |
+| `State/{instance}/{target}` | bridge to Store | yes (an empty payload retracts); a `Host`'s tagged `via` | JSON object | observed state; `"assumed": true` when not read back |
 | `Event/{instance}` | bridge to Store | no | JSON `{kind, target?, ...}` | something happened; **replies** arrive here (`"kind":"reply"`) |
 | `Error/{instance}` | bridge to Store | no | JSON `{error, reason, target?, property?, command?}` | a request refused or failed |
 | `Desired/{instance}/{target}/{property}` | Store to bridge | yes (empty retracts) | JSON scalar | a requested value the device has not confirmed |
 | `Desired/{instance}/{target}` | Store to bridge | never | JSON `{property: value, ...}` | several properties, atomically (one `apply`) |
 | `Command/{instance}` | Store to bridge | never; 30 s expiry | JSON `{target?, command, ...}` | momentary actions; the standard `refresh` and `assume`; the driver's own |
 | `Config/{instance}/{target}` | Store to bridge | yes (empty retracts) | JSON | per-target setup (to `configure`); may override the feedback mode |
+| `Config/{instance}` | Store to a `Host` | yes (empty deletes the instance) | JSON `{bridge, via?, …driver fields…, disabled?}` | the instance: which kind, which process (`via`, default the kind), the factory's fields |
 
 Details the runtime fixes (spec §5.1), which the lanes' payloads rely on:
 
@@ -152,6 +201,14 @@ any driver is built.
 Timings that cannot run (a zero pause, a keep-alive outside its range) are usage errors on the command
 line and fail `Bridge::start` when set in code.
 
+`Host::from_cli()` reads the same options, with two in place of `--instance` (a `Host` has no fixed
+instance), and with its device timings applying to every device it builds:
+
+| Option | Meaning | Default |
+|---|---|---|
+| `--name <id>` | this process's bridge id, unique on the root; the `via` its instances' Configs name | the kind |
+| `--factory-timeout <d>` | the bound on one device's construction (the factory and `info()`); past it the process ends (D4) (not zero) | 10 s |
+
 ## The driver API
 
 The reference is the rustdoc. In one screen:
@@ -187,11 +244,14 @@ device, on `127.0.0.1`. **Never use a real broker.**
   `retain`, and reading back everything the bridge published (`received_on`, `events`, `retained_on`,
   `subscriptions`). It also injects the faults a bridge must survive: `drop_connection`,
   `restart_without_persistence`, `refuse_connections`, `hold_acks` / `delay_acks` (a broker that does
-  not acknowledge), `stop_reading` (a wedged connection), `hold_subacks`, `deny_subscriptions`.
+  not acknowledge), `stop_reading` (a wedged connection), `hold_subacks`, `hold_subacks_matching` (one
+  filter's SUBACK alone), `deny_subscriptions`. `FakeBroker::start_multi()` accepts several clients at
+  once (two `Host` processes on one root, each with its own will).
 - **`Bridge::start(driver)`** runs the bridge in-process on the test's tokio runtime (no signals, no
   logging start, no panic hook) and returns a `Running`; `stop()` is the bounded shutdown. Set the
   broker, instance, timing and `device_stable` in code, with short timings so an outage plays out in a
-  second.
+  second. **`Host::start()`** does the same for a multi-device host (`.broker`, `.name`, `.timing`,
+  `.factory_timeout`); the test publishes the retained `Config/{instance}` the factory builds from.
 - **The stand-in device** is yours: a small server for your device's protocol. The tutorial's is
   [`examples/tutorial_bridge.rs`](examples/tutorial_bridge.rs) (`tests` module); mqtt_ac's is
   [`tests/support/coolmaster.rs`](https://github.com/yuvalrakavy/mqtt_ac/blob/265df22/tests/support/coolmaster.rs).
@@ -208,7 +268,11 @@ restart without persistence); requests (held while the device is down and applie
 never after; the outage conflict both ways; a target-level write reaching `apply` once; retractions);
 commands and replies; driver errors (paced reconnects, one outage episode, unacknowledged writes held
 again); malformed payloads; a stalled broker; and the process (`fake-bridge` as a real binary:
-SIGTERM, including during a stalled connect). Every publish is checked against the lanes' JSON
+SIGTERM, including during a stalled connect). The `host_*` scenarios hold the multi-device host to its
+spec's §7 with a scriptable fake factory: routing and independence, Config change, disable, delete
+and handover with their output flushed, the per-instance bootstrap and the `Active` barrier, a stuck
+SUBACK, a factory that is slow or never returns, two processes on one root, healing, and fairness
+under a flood. Every publish is checked against the lanes' JSON
 Schemas, retain flags and QoS when a harness stops. It is what changes to the runtime are held to;
 **a bridge's author does not run it against their driver**, they test the driver as above. (To run it:
 `cargo test --manifest-path mqtt-bridge-conformance/Cargo.toml` from the repository root. It needs
@@ -282,5 +346,4 @@ this repository's own builds; a bridge that unifies it in fails to compile, by d
 ## Not built yet
 
 - The stdio plugin protocol, `mqtt-bridge-host` and the Python SDK (spec §7, §8, R3).
-- The multi-device host (above).
 - Restore for one-way devices (spec §11, "Deferred").

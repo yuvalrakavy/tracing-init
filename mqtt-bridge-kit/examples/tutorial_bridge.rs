@@ -736,10 +736,15 @@ mod tests {
         assert_caught(verdict, "the lamp is Some((false, 0))");
     }
 
-    /// Every Rust block of the tutorial is quoted from this file, verbatim.
+    /// Every Rust block of the tutorial is quoted from this file, verbatim — but section 12's, the
+    /// multi-device bridge, which `examples/tutorial_multidevice.rs` checks against itself.
     #[test]
     fn the_tutorials_code_is_this_files() {
-        let tutorial = include_str!("../docs/tutorial-writing-a-bridge.md");
+        let whole = include_str!("../docs/tutorial-writing-a-bridge.md");
+        let section = whole.find("## 12. Many devices in one process").expect("the tutorial's multi-device section");
+        let after = whole[section..].find("\n## mqtt_ac v2").map_or(whole.len(), |end| section + end);
+        let tutorial = format!("{}{}", &whole[..section], &whole[after..]);
+        let tutorial = tutorial.as_str();
         let source = include_str!("tutorial_bridge.rs");
         let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let source = squash(source);

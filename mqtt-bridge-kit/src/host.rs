@@ -47,8 +47,8 @@
 //! foreign write or a retraction of its slot (healing), and on a delete retracts the topics whose
 //! current value carries its own tag (§4.5).
 //!
-//! The session side of all this is in [`crate::session`]; this module is the public builder, the
-//! factory's types, and the per-instance lifecycle.
+//! The session side of all this is in [`crate::session`], and the per-instance lifecycle in the
+//! crate's private `lifecycle` module; this module is the public builder and the factory's types.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;

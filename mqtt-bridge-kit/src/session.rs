@@ -10,12 +10,12 @@
 //! device, so every CONNACK is read and answered whatever the devices are doing (no-hang 3b, review
 //! B3).
 //!
-//! **The session part and the device part** (multi-device spec §4.1): [`Shared`] is the
+//! **The session part and the device part** (multi-device spec §4.1): `Shared` is the
 //! session's — the broker, the bridge's own `Active` and `Version`, the outage episode, the
-//! publication rotation's readiness signal; [`Device`] is one device's — its lanes, mailbox and
+//! publication rotation's readiness signal; `Device` is one device's — its lanes, mailbox and
 //! reports, and, for a host's configured instance, the `via` tag its `Status` and `State` carry.
-//! A fixed bridge ([`Mode::Fixed`]) has one device, untagged, and R1's CONNACK duties; a host
-//! ([`Mode::Host`]) has the per-instance lifecycle of [`crate::host`].
+//! A fixed bridge (`Mode::Fixed`) has one device, untagged, and R1's CONNACK duties; a host
+//! (`Mode::Host`) has the per-instance lifecycle of [`crate::host`].
 //!
 //! **On every CONNACK** (the broker keeps no session) of a fixed bridge: subscribe, then
 //! `Active=true`, then the version, then the whole retained model again from the bridge's own
@@ -33,7 +33,7 @@
 //! the SUBACK leaves the read-back to the next.
 //!
 //! **Publication and fairness** (multi-device spec §4.7): each device's output is R1's
-//! cancellation-safe [`Batch`], *sealed* when taken — later State goes to the next batch — so a
+//! cancellation-safe `Batch`, *sealed* when taken — later State goes to the next batch — so a
 //! reply follows the State its command produced and is never starved by later State. Devices are
 //! served round-robin with a persistent cursor, at most [`QUANTUM`] messages per device per turn,
 //! then the ready inbound and lifecycle work, then the next device.

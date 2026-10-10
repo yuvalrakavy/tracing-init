@@ -10,6 +10,11 @@ which builds with `cargo build --examples` and whose tests run with `cargo test 
 A test in that file checks that each block of this page is a verbatim excerpt of it, so the text
 cannot drift from code that compiles.
 
+Section 12 then turns to the other shape: a *device-direct* bridge, many devices in one process,
+on the multi-device host (`Host`); its code is a second file,
+[`examples/tutorial_multidevice.rs`](../examples/tutorial_multidevice.rs), checked against that
+section the same way.
+
 The worked real-world example is **mqtt_ac v2**, the CoolMaster air-conditioning bridge, which was the
 runtime's first user. Where it does something the tutorial does not, the text says so and links to its
 files (see [mqtt_ac v2, file by file](#mqtt_ac-v2-file-by-file) at the end).
@@ -789,6 +794,148 @@ Notes, each of which is the runtime's behaviour rather than something the unit h
 - **Two bridges, one MQTT client id.** The client id is derived from the root and instance; do not run
   two processes with the same pair against one broker.
 - **Versioning.** `Bridge::version("lampnet 0.1.0")` is the retained `Version` the Store shows.
+
+## 12. Many devices in one process
+
+LampNet is *controller-fronted*: one controller, its lamps behind it as targets, one process per
+controller. That is the `Bridge` you have built. Some devices are each their own network endpoint —
+an AV receiver per room (mqtt_ynca), an IR emitter per room, a smart plug per socket — and running a
+process per device does not scale. Those bridges are *device-direct*: **one process serves many
+devices**, each an instance of its own, over one MQTT session. That is the runtime's multi-device
+host, `Host` (multi-device spec, `docs/superpowers/specs/2026-10-10-multi-device-host-design.md`).
+
+| | `Bridge` (controller-fronted) | `Host` (device-direct) |
+|---|---|---|
+| devices per process | one, fixed: `--instance` | as many as the Store configures |
+| where a device comes from | the driver you pass to `run` | a factory, from each instance's `Config/{instance}` |
+| the process's name | the instance | the bridge id, `--name` (default: the kind) |
+| `Status`, `State` | untagged | tagged with the user property `via` = the bridge id |
+| a blocked driver | ends the process | ends the process (all its devices restart with it) |
+
+This section's code is a second example file, [`examples/tutorial_multidevice.rs`](../examples/tutorial_multidevice.rs):
+a bridge for imaginary smart plugs that speak a one-line protocol over TCP (`GET` → `on`/`off`,
+`SET on|off` → `OK`), one plug per instance, one target (`socket`) with one property (`on`). The
+driver is written exactly as LampNet's was:
+
+```rust
+/// One smart plug: one instance, one device link.
+pub struct Plug {
+    address: Address,
+    link: Option<(BufReader<OwnedReadHalf>, OwnedWriteHalf)>,
+}
+```
+
+What is new is where a driver comes from. The Store creates each instance and publishes, retained,
+`{Root}/Config/{instance}`:
+
+```text
+Plugs/Config/kitchen   {"bridge": "plug", "via": "plugs-lan1", "address": "10.0.0.31"}
+```
+
+`bridge` is the implementation kind (the host verifies it), `via` the process that serves the
+instance (omitted: the kind's default bridge id, the kind itself), `"disabled": true` keeps the
+instance owned but not served, and every other field is your driver's. An empty payload deletes the
+instance. Your part is a **factory**: from an instance's driver fields to a driver.
+
+```rust
+fn plug(config: &DeviceConfig) -> Result<Plug, FactoryError> {
+    let address = config.fields().get("address").and_then(Value::as_str);
+    let address = address.ok_or_else(|| FactoryError::Malformed("`address`, a string `host[:port]`, is required".into()))?;
+    Address::parse(address).map(Plug::new).map_err(FactoryError::Malformed)
+}
+```
+
+- The factory checks the fields and builds the driver; it must not connect (that is `connect`, which
+  the runtime calls, paced and bounded, once the device starts). It runs on a thread of its own,
+  bounded by `--factory-timeout` (10 s), and the driver's `info()` after it under the same bound.
+- `FactoryError::Malformed` (bad fields) and `FactoryError::Unusable` (valid, but no driver now)
+  become one `Error/{instance}` naming the reason. The instance's last accepted Config stays in
+  force; with none, the instance is *failed*: `Status=unreachable`, its commands refused, retried
+  at the reconnect pacing and at once on any change of its Config.
+
+`main` names the kind and gives the factory:
+
+```rust
+fn main() -> ExitCode {
+    Host::new("plug").root("Plugs").app_name("plugs").version("0.1.0").from_cli().device(plug).run()
+}
+```
+
+The command line is a `Bridge`'s with `--name <id>` (this process's bridge id, unique on the root;
+several processes of one kind may share a root, one per subnet) and `--factory-timeout <d>` in place
+of `--instance`. The retained `Version` says `<kind> <version>` (`plug 0.1.0`), which the Store's
+Admin UI reads to offer this process for an instance's `Via`.
+
+What the runtime does with each instance whose Config names the process (spec §4):
+
+- **Its own subscriptions, in three steps** — its read-back (`State/{i}/+`, `Status/{i}`), its target
+  Configs (`Config/{i}/+`), its requests — each SUBACK matched before the next, so the device starts
+  with its previous `State` frozen as the conflict rule's "before" values, its target Configs
+  applied first, then its retained requests through the conflict rule. The device starts once both
+  the driver and the requests' grant are in.
+- **Each device is R1's worker, mailbox and reports**: its own `Status`, outages, proof, catch-up,
+  conflict rule and budgets. One device that never answers is that device's outage; the others are
+  unaffected. A driver that *blocks its thread*, a blocking budget that stays full, or a factory that
+  does not return ends the process (the supervisor restarts it, every device with it).
+- **A Config change** builds the new driver while the old device keeps serving; only on success is
+  the old one stopped (its waiting requests answered, its subscriptions removed) and the new one
+  bootstrapped. **Disable** stops the device and keeps `Status=disabled`; **delete** stops it and
+  clears the retained topics this process published.
+- **The slot heals.** Every `Status` and `State` carries `via`; another process's late write to an
+  owned instance's slot is overwritten by the owner.
+- `Active/{bridge id}` is `true` once every subscription is granted and every owned instance's
+  `Status` is published; its last will says `false`, so a process's death makes all its instances
+  unavailable at once.
+
+Tests look like LampNet's — a stand-in device, `FakeBroker`, the real runtime in-process — with
+`Host::start` and the Store's Config published retained:
+
+```rust
+    fn host(broker: &FakeBroker) -> Running {
+        let timing = TimingOverrides { retry: Some(Duration::from_millis(300)), poll: Some(None), ..TimingOverrides::default() };
+        let mqtt = MqttTiming { poll_retry: Duration::from_millis(100), ..MqttTiming::default() };
+        Host::new("plug")
+            .root("Plugs")
+            .name("plugs-test")
+            .broker(&broker.address())
+            .timing(timing)
+            .mqtt_timing(mqtt)
+            .device(plug)
+            .start()
+            .expect("the host starts")
+    }
+```
+
+```rust
+    fn configure(broker: &FakeBroker, instance: &str, fields: Value) {
+        let mut config = json!({"bridge": "plug", "via": "plugs-test"});
+        config.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        broker.publish(&format!("Plugs/Config/{instance}"), config.to_string(), &SendOptions::default().retained());
+    }
+```
+
+```rust
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_plugs_in_one_process() {
+        let broker = FakeBroker::start().await;
+        let kitchen = StandIn::start().await;
+        let running = host(&broker);
+        assert!(broker.wait_for_subscription("Plugs/Config/+", BOUND).await, "the host never subscribed to the Configs");
+        configure(&broker, "kitchen", json!({"address": kitchen.address()}));
+        configure(&broker, "porch", json!({"address": "127.0.0.1:1"}));
+        assert!(broker.wait_until(BOUND, |b| status(b, "kitchen") == by_us("connected")).await, "{:?}", status(&broker, "kitchen"));
+        assert!(broker.wait_until(BOUND, |b| status(b, "porch") == by_us("unreachable")).await, "{:?}", status(&broker, "porch"));
+        let desired = Topics::new("Plugs", "kitchen").unwrap().desired("socket", "on");
+        broker.publish(&desired, "true", &SendOptions::default().retained());
+        assert!(broker.wait_until(BOUND, |_| kitchen.on()).await, "the write never reached the kitchen plug");
+        assert!(running.stop().await);
+    }
+```
+
+Two plugs, one process: the porch plug (nothing listens at its address) is `unreachable` and
+retried, while the kitchen plug serves; each `Status` is tagged `via = plugs-test`. Run them with
+`cargo test --example tutorial_multidevice`. (Two processes on one root need a broker for several
+clients at once: `FakeBroker::start_multi`.)
 
 ## mqtt_ac v2, file by file
 
