@@ -1496,6 +1496,17 @@ impl Lifecycle {
                     self.reconcile(ctx, outputs, name).await?;
                 }
             }
+            // A name the Store would never show: not served, whoever wrote the Config (multi-device
+            // spec §11 G1; the Store refuses to make such an instance, so only a hand-written
+            // Config reaches here). Said once per Config, as a kind mismatch is.
+            Verdict::Malformed { .. } | Verdict::Ours { .. } if crate::topics::wire_id_problem(name).is_some() => {
+                if self.rejected.get(name).is_some_and(|p| p == payload) {
+                    return Ok(());
+                }
+                self.rejected.insert(name.to_owned(), payload.to_vec());
+                let error = crate::topics::check_wire_id("instance", name).err().unwrap_or_default();
+                self.config_rejected(outputs, name, Reason::Malformed, &error);
+            }
             Verdict::Malformed { config, error } => {
                 if self.instances.get(name).is_some_and(|i| i.last_seen.as_ref() == Some(&config)) {
                     return Ok(());

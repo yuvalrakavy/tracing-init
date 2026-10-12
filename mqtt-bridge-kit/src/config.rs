@@ -342,6 +342,8 @@ fn parse_as(
     let id = if host { settings.name.as_deref() } else { settings.instance.as_deref() };
     if !host || id.is_some() {
         crate::topics::Topics::new(&settings.root, id.unwrap_or_default()).map_err(Problem::Usage)?;
+        // A name the Store would never show runs and publishes unseen (multi-device spec §11 G1).
+        crate::topics::check_wire_id(if host { "bridge id" } else { "instance" }, id.unwrap_or_default()).map_err(Problem::Usage)?;
     } else if !crate::topics::valid_segment(&settings.root) {
         crate::topics::Topics::new(&settings.root, "x").map_err(Problem::Usage)?;
     }
@@ -478,6 +480,35 @@ mod tests {
         let text = usage_host("gc", "globalcache", "IRemitter", &[]);
         assert!(text.contains("--name <id>") && text.contains("--factory-timeout <d>"), "{text}");
         assert!(!text.contains("--instance"), "a host's usage offers `--instance`: {text}");
+    }
+
+    /// A fixed bridge's `--instance` and a host's `--name` are held to the Store's wire-id rules at
+    /// parse time (multi-device spec §11 G1): a name the Store would never show is a usage error
+    /// saying which rule it breaks. Names the Store shows still pass.
+    #[test]
+    fn a_name_the_store_would_never_show_is_a_usage_error() {
+        let usage = |line: String| match parse(args(&line), &mut Settings::new("A"), &[]) {
+            Err(Problem::Usage(m)) => Some(m),
+            _ => None,
+        };
+        let host_usage = |line: String| match parse_host(args(&line), &mut Settings::new("gc"), &[]) {
+            Err(Problem::Usage(m)) => Some(m),
+            _ => None,
+        };
+        for (bad, rule) in [("_z_Bridges", "sort prefix"), ("gc-1_", "digit"), ("@gc", "path syntax"), ("gc@", "'@'"), ("..", "path step")]
+        {
+            let m = usage(format!("--instance {bad} --broker x")).unwrap_or_else(|| panic!("--instance {bad} was accepted"));
+            assert!(m.contains("instance") && m.contains(bad) && m.contains(rule), "{m}");
+            let m = host_usage(format!("--name {bad} --broker x")).unwrap_or_else(|| panic!("--name {bad} was accepted"));
+            assert!(m.contains("bridge id") && m.contains(bad) && m.contains(rule), "{m}");
+        }
+        // Whitespace-only, which `split_whitespace` cannot carry: through the inline form.
+        let spaces = vec!["--instance= ".to_owned(), "--broker".to_owned(), "x".to_owned()];
+        assert!(matches!(parse(spaces, &mut Settings::new("A"), &[]), Err(Problem::Usage(m)) if m.contains("whitespace")));
+        for good in ["ctrl", "gc-1", "gc_1", "a.b", "_a"] {
+            assert!(usage(format!("--instance {good} --broker x")).is_none(), "--instance {good} was refused");
+            assert!(host_usage(format!("--name {good} --broker x")).is_none(), "--name {good} was refused");
+        }
     }
 
     #[test]

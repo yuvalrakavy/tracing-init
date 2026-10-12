@@ -415,6 +415,8 @@ impl Host {
             false => self.settings.name.clone().unwrap_or_else(|| self.kind.clone()),
         };
         let topics = Topics::new(&self.settings.root, &id)?;
+        // Also for a name set in code, and for the kind standing as an unnamed host's id.
+        crate::topics::check_wire_id(if self.fixed { "instance" } else { "bridge id" }, &id)?;
         let (broker_host, broker_port) = config::broker_host_port(self.settings.broker.as_deref().ok_or("no broker")?)?;
         let (span, version, factory, fixed) = match (self.fixed, fixed) {
             (true, Some((driver, info))) => {
@@ -480,5 +482,26 @@ impl Host {
         session::spawn(shared, lifecycle, outputs, events, shutdown_rx, &mut tasks);
         drop(_entered);
         Ok(Running::new(tasks, shutdown, span, registry, deaths))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bridge id set in code (not only on the command line) is held to the Store's wire-id rules
+    /// when the host starts (multi-device spec §11 G1): a refused name is the start's failure.
+    #[test]
+    fn a_bridge_id_the_store_would_never_show_is_the_starts_failure() {
+        for bad in ["_z_Bridges", "gc-1_", "@gc", "gc@", ".."] {
+            let error = Host::new("gc").name(bad).broker("x").start().err().expect(bad);
+            assert!(error.contains("bridge id") && error.contains(bad) && error.contains("Store"), "{bad}: {error}");
+        }
+        // Unnamed, the kind stands where the id does, and is held to the same rules.
+        let error = Host::new("gc1_").broker("x").start().err().expect("kind gc1_");
+        assert!(error.contains("bridge id") && error.contains("gc1_"), "{error}");
+        // A plain name passes the check; this host stops later, having no factory.
+        let error = Host::new("gc").name("gc-lan1").broker("x").start().err().expect("no factory");
+        assert!(!error.contains("Store"), "{error}");
     }
 }

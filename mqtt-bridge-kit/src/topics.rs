@@ -8,6 +8,54 @@ pub fn valid_segment(segment: &str) -> bool {
     !segment.is_empty() && !segment.contains(['/', '+', '#']) && !segment.contains('\0')
 }
 
+/// Why `id`, a bridge id or an instance name, cannot name a Store object as itself, or `None`.
+///
+/// Mirrors the Store's `wire_id_problem` (`data/globals/schemas/Std/mqtt_bridge.sdl`, Store main
+/// c6360a333), rule for rule and in its order: not one topic segment (empty, or a `/`, `+`, `#`);
+/// whitespace-only; `.` or `..` (path steps); a leading `@` or `*`, or a `{…}` id (path syntax); a
+/// trailing `@` (the Store expands it into a generated name); a trailing digit and `_` (the shape of
+/// generated names); a sort prefix `_x_…` (a `_`, one other character, then another `_` somewhere
+/// after). A bridge or instance so named runs and publishes, but the Store never shows it (multi-device
+/// spec §11 G1), so the runtime refuses it at start-up ([`check_wire_id`]).
+pub fn wire_id_problem(id: &str) -> Option<&'static str> {
+    if id.is_empty() {
+        return Some("is empty");
+    }
+    if !valid_segment(id) {
+        return Some("is not one MQTT topic segment (it holds a '/', '+' or '#')");
+    }
+    if id.trim().is_empty() {
+        return Some("is only whitespace");
+    }
+    if id == "." || id == ".." {
+        return Some("is a path step");
+    }
+    if id.starts_with(['@', '*']) || (id.starts_with('{') && id.ends_with('}')) {
+        return Some("is store path syntax, not a name");
+    }
+    if id.ends_with('@') {
+        return Some("ends in '@', which the store expands into a generated name");
+    }
+    let chars: Vec<char> = id.chars().collect();
+    let n = chars.len();
+    if n >= 2 && chars[n - 1] == '_' && chars[n - 2].is_ascii_digit() {
+        return Some("ends in a digit and '_', the shape the store reserves for generated names");
+    }
+    if n >= 3 && chars[0] == '_' && chars[1] != '_' && chars[2..].contains(&'_') {
+        return Some("starts with a sort prefix (_x_), which the store strips from the name it shows and looks up");
+    }
+    None
+}
+
+/// `Ok` if `id` (named `what` in the message: "bridge id", "instance") is a name the Store will show,
+/// else the usage error saying which rule it breaks ([`wire_id_problem`]).
+pub fn check_wire_id(what: &str, id: &str) -> Result<(), String> {
+    match wire_id_problem(id) {
+        None => Ok(()),
+        Some(why) => Err(format!("the {what} `{id}` {why}; the Store would never show it")),
+    }
+}
+
 /// One bridge's topics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Topics {
@@ -294,5 +342,54 @@ mod tests {
         assert!(Topics::new("A", "x+").is_err());
         assert!(Topics::new("", "x").is_err());
         assert!(Topics::new("A", "").is_err());
+    }
+
+    #[test]
+    fn a_name_the_store_refuses_is_named_by_its_rule() {
+        let refused = [
+            ("", "empty"),
+            ("a/b", "segment"),
+            ("a+", "segment"),
+            ("a#", "segment"),
+            ("a\0b", "segment"),
+            ("   ", "whitespace"),
+            ("\t", "whitespace"),
+            (".", "path step"),
+            ("..", "path step"),
+            ("@gc", "path syntax"),
+            ("*gc", "path syntax"),
+            ("{id}", "path syntax"),
+            ("{}", "path syntax"),
+            ("gc@", "'@'"),
+            ("gc-1_", "digit"),
+            ("7_", "digit"),
+            ("_z_Bridges", "sort prefix"),
+            ("_y_Discovered", "sort prefix"),
+            ("_s_store", "sort prefix"),
+            ("_a_", "sort prefix"),
+            ("_x_y_z", "sort prefix"),
+            ("_ü_x", "sort prefix"),
+        ];
+        for (id, rule) in refused {
+            let why = wire_id_problem(id).unwrap_or_else(|| panic!("{id:?} was accepted"));
+            assert!(why.contains(rule), "{id:?}: `{why}` does not name `{rule}`");
+        }
+    }
+
+    #[test]
+    fn a_name_the_store_shows_is_accepted() {
+        for id in [
+            "ctrl", "Lamp", "gc-1", "gc_1", "gc1", "a.b", "a..", "ab_", "_a", "__a_", "_", "__", "_ab", "a@b", "a*", "x{y}", "{", "{a}b{",
+            "מזגן",
+        ] {
+            assert_eq!(wire_id_problem(id), None, "{id:?} was refused");
+        }
+    }
+
+    #[test]
+    fn check_wire_id_says_what_and_why() {
+        assert_eq!(check_wire_id("instance", "ctrl"), Ok(()));
+        let e = check_wire_id("bridge id", "_z_Bridges").unwrap_err();
+        assert!(e.contains("bridge id") && e.contains("`_z_Bridges`") && e.contains("sort prefix"), "{e}");
     }
 }

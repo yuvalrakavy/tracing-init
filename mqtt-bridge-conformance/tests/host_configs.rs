@@ -305,6 +305,38 @@ async fn a_config_of_another_kind_is_rejected_and_not_served() {
     .await
 }
 
+/// A Config/{i} whose name the Store would never show (a sort prefix here) is not served, whoever
+/// wrote it: `Error/{instance}` `{reason: malformed}` naming the rule, said once, nothing built
+/// (multi-device spec §11 G1). A plain name beside it is served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_named_as_the_store_would_never_show_is_rejected_and_not_served() {
+    within(DEADLINE, async {
+        let fleet = Fleet::new(acknowledged());
+        let bad = format!("_z_{}", instance_name("Lamp"));
+        let good = instance_name("Lamp");
+        let h = HostHarness::start("wire-id", fleet).await;
+        assert!(h.configure(&bad, json!({})));
+        assert!(
+            h.eventually(bound(), |h| h
+                .errors_for(&bad, "malformed")
+                .iter()
+                .any(|e| e["error"].as_str().is_some_and(|s| s.contains("sort prefix"))))
+                .await,
+            "the refused name was not said: {:?}",
+            h.errors(&bad)
+        );
+        assert!(h.configure(&good, json!({})));
+        assert!(h.eventually(bound(), |h| h.fleet.builds(&good) == 1).await, "a plain name was not served");
+        assert!(h.configure(&bad, json!({})));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(h.errors(&bad).len(), 1, "the same refusal was said twice");
+        assert_eq!(h.fleet.builds(&bad), 0, "a name the Store would never show was built");
+        assert!(!h.subscribed(&h.topics(&bad).status()), "a name the Store would never show was served");
+        assert!(h.stop().await);
+    })
+    .await
+}
+
 /// A served instance whose Config turns to another kind is released without the delete's cleanup:
 /// §4.5 clears an owner's tagged topics on a delete or a reconciled absence only, and a kind never
 /// changes in place (R2 gate, Codex minor; builder gap 4 overturned).

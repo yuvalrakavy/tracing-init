@@ -490,13 +490,15 @@ disabled (`lifecycle.rs` `terminal()`); a late fixed read-back ending the sessio
 Store's markers never match; the kind as the first word of `Version`; per-instance Config errors without
 `target`; a bridge never publishing an empty `Active`.
 
-- **G1. No wire-id validation beyond "one segment".** The Store makes an object only for a bridge id or instance
-  name that passes its `wire_id_problem` (`Std/mqtt_bridge.sdl`): not whitespace-only, `.` or `..`, a leading
-  `@`, `*` or `{…}`, a trailing `@` or digit+`_`, or a sort prefix `_x_…`. The runtime accepts any
-  `valid_segment` (`topics.rs`, `config.rs`) for `--name` and `--instance`, so a bridge started as `_z_Bridges`
-  or `gc-1_` runs, publishes, and is never shown by the Store. Obligation: refuse such a name at start-up (a
-  usage error), with the Store's list. A configured instance's name is the Store's to refuse; only the bridge id
-  and a fixed instance's name are the runtime's.
+- **G1. FIXED (2026-10-12): wire-id validation beyond "one segment".** The Store makes an object only for a
+  bridge id or instance name that passes its `wire_id_problem` (`Std/mqtt_bridge.sdl`): not whitespace-only,
+  `.` or `..`, a leading `@`, `*` or `{…}`, a trailing `@` or digit+`_`, or a sort prefix `_x_…`. The runtime
+  now mirrors those rules in `topics::wire_id_problem` / `topics::check_wire_id` (`mqtt-bridge-kit/src/topics.rs`):
+  a `--instance` or `--name` that fails them is a usage error at parse time (`config.rs`), and the bridge id
+  set in code, or the kind standing as an unnamed host's id, is refused when the host starts (`host.rs`
+  `launch`). A hand-written `Config/{i}` whose name fails them is not served: one `Error/{i}` `malformed`
+  naming the rule, said once, WARN `device_config_rejected` (`lifecycle.rs` `config`). The Store still refuses to
+  make such an instance itself, so that last path is only a backstop.
 - **G2. A fixed bridge does not heal its slot.** Hosts republish a topic that is emptied or tagged by another
   process (§4.5), but a fixed bridge subscribes no `Status` and publishes it only on a change (`reports.rs`,
   `lifecycle.rs`): a Store purge of a running fixed bridge would leave its `LinkStatus` unset until the link next
