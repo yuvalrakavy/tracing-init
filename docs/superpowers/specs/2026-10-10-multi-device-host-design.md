@@ -11,6 +11,13 @@ Amended after the one-runtime merge (2026-10-10, owner decision D9: "There shoul
 versions"): D1, D9, §4.1, §4.3, §4.6, the new §4.9 (the fixed instance is the host's N = 1 mode),
 §7 and §8. R1's separate session path is deleted; a `Bridge` is the host with one fixed instance.
 
+Amended after the Store's S4a landed (Store main c6360a333, 2026-10-12; `docs/superpowers/specs/2026-10-11-bridge-kit-s4a-design.md`
+in the Store repo, whose §19 deviations D1-D45 and limits R12-R14 override its body): §3 (the Config payload as
+published, `_device`, `Version`, `Error`, the replay markers, names), §4.4 (the Store's view of a disabled
+instance), §4.5 (purge and Forget built), §5 (rewritten to the Store kit as built), §8, §10 and the new §11
+(where the runtime does not yet meet an S4 obligation). S4a added no bridge-side requirement beyond what v7
+already said; the wire contract is unchanged.
+
 ## 1. Problem and scope
 
 R1 runs one device link per process. That fits **controller-fronted** bridges, one process per
@@ -42,13 +49,13 @@ Grammar unchanged: `{Root}/{Lane}/{instance}[/{target}[/{property}]]`.
 
 | Topic | Dir | Retained | Payload / meaning |
 |---|---|---|---|
-| `Config/{instance}` | Store → bridge | yes | **NEW.** `{"bridge":"<kind>","via":"<bridge id>", …driver fields…, "disabled"?:bool}`. Empty = deleted. |
+| `Config/{instance}` | Store → bridge | yes | **NEW.** `{"bridge":"<kind>","via"?:"<bridge id>", …driver fields…, "disabled"?:true}`. Empty = deleted. Published by the Store's Config keeper with an `origin` user property: `via` is present iff the instance names a process, `disabled` only as `true`, keys sorted. Never published for a fixed instance. |
 | `Config/{instance}/{target}` | Store → bridge | yes | Unchanged (per-target setup; a GC port's code set, §5.3). |
-| `Active/{bridge id}` | bridge → Store | yes, last will | Plain text `true`/`false`; empty = unknown. Multi-device: one per process. |
-| `Version/{bridge id}` | bridge → Store | yes | Plain text `<kind> <version>`, e.g. `globalcache 1.2.0`. |
+| `Active/{bridge id}` | bridge → Store | yes, last will | Plain text `true`/`false`. Multi-device: one per process. A bridge never publishes an empty one; the Store reads an empty one (a purge or Forget cleared it) as unknown. |
+| `Version/{bridge id}` | bridge → Store | yes | Plain text, one line, `<kind> <version>`, e.g. `globalcache 1.2.0`. The first word is the process's `Kind` in the Store, which refuses a `Via` whose known kind differs from the instance's. |
 | `Status/{instance}` | bridge → Store | yes | Plain text `connecting`/`connected`/`unreachable`/`disabled`, **with the MQTT v5 user property `via` = the publishing bridge id.** |
-| `State/{instance}/{target}` | bridge → Store | yes | JSON, **with the user property `via`**. Device-wide values use the reserved target `_device`. |
-| `Error/{instance}` | bridge → Store | no | `{reason, error, target?}`; an instance-level error has no `target`. |
+| `State/{instance}/{target}` | bridge → Store | yes | JSON, **with the user property `via`**. Device-wide values use the reserved target `_device`: the Store lands them on an instance whose class is a `BridgeDeviceTarget` and ignores them (DEBUG) otherwise; it makes no child of that name. |
+| `Error/{instance}` | bridge → Store | no | `{reason, error, target?}`; an instance-level error has no `target`; the Store records a `malformed`/`unusable` one in the instance's persisted `ConfigError` until it publishes a different Config. Carries no `via`: accepted from any process. |
 | `Event/{instance}` | bridge → Store | no | Unchanged. |
 | `Desired/…`, `Command/{instance}` | Store → bridge | as R1 | Unchanged. |
 
@@ -56,16 +63,19 @@ Grammar unchanged: `{Root}/{Lane}/{instance}[/{target}[/{property}]]`.
 instance cannot move between processes). **Configured instances:** every `Status`/`State` carries
 exactly one `via` user property; none or several → ignored (DEBUG) by the Store and by read-back.
 The read-back (S1, and a re-enable's seeding from the slot) takes as a "before" value only a `State`
-whose one `via` is the instance's effective owner (§4.2); another process's tag is no "before" value.
+whose one `via` is the instance's effective owner (§4.2); another process's tag is no "before" value. The Store never publishes `Config/{instance}` for a fixed instance (S4a F1: a fixed bridge's `Config/{instance}/#` also matches the parent level, and it would answer `malformed` at every replay).
 
 Rules:
 - **Bridge id** (`--name`, default = the kind) is unique on the root. `via` omitted in a Config = the
   default id of the kind the Config names (`bridge`), so a process of another kind ignores it and says
   nothing (R2 gate, Codex 9); a Config naming neither `via` nor `bridge` names no owner (unreadable).
-- **Instance names are unique on the root** (all kinds, all managers; the Store enforces it on create
-  and rename). An instance's **kind never changes in place** (a different kind = a new object).
+- **Instance names are unique on the root** (all kinds, all managers of one Store MQTT client; the Store enforces it on create,
+  rename, `Root` and client change, and refuses a name that fails its `wire_id_problem`: §11 G1). An instance's **kind never changes in place** (a different kind = a new object).
 - **Ownership:** a process owns an instance iff its last *accepted* Config has `via` = its bridge id.
   Everything else on the root is ignored (DEBUG).
+- **The Store's replay markers** sit at `Config/_s_store/_s_sync/…` (and `Desired/_s_store/_s_sync/…`), two
+  levels below the lane: the root-wide `Config/+` never matches them, and `_s_store` is a sort prefix the Store
+  refuses as an instance name. A topic that reaches a bridge there is no instance's.
 - **Config errors** (only the process that `via` names reports them):
   - `via` names it, `bridge` is another kind → `Error/{instance}` `{reason:"malformed", error:"kind
     mismatch"}`; not served (an instance it served is released **without** the delete's cleanup:
@@ -210,7 +220,7 @@ In order:
    a response topic refused with a reply, target-level Desired refused; **property Desired ignored**
    (owner decision, 2026-10-10) — it stays retained, replays on re-enable (or to a successor) and
    expires on its own deadline. A refusal would repeat at every replay and never settle, and
-   `Status=disabled` already tells the Store why nothing is applied. Re-enable runs §4.3's bootstrap
+   `Status=disabled` already tells the Store why nothing is applied. The Store sees a disabled instance unavailable (`Status` is not `connected`), so its pending requests keep only their `RequestExpiry` and no `ConfirmTimeout` runs (S4a §6). Re-enable runs §4.3's bootstrap
    from S2.
    Delete / release-as-deleted unsubscribes all three, then cleanup (§4.5). A `via` move unsubscribes
    all three and keeps no claim.
@@ -249,9 +259,17 @@ In order:
     down leaves no owner-tagged `Status`/`State` that a later re-creation under the same bridge id
     would read as current. (An instance released by a kind mismatch is swept the same way at the
     next restart.)
-- **The Store clears only what it publishes** (§5.1). Litter left by a bridge that is permanently gone
-  (decommissioned) is removed by an explicit Admin UI action ("purge retained for instance"), a
-  follow-up — not an automatic janitor.
+- **The Store clears only what it publishes** (§5.1): its Config, its Desired and its markers. Bridge-owned
+  topics (`Active`, `Version`, `Status`, `State`) it clears only on a person's explicit action, built in S4a
+  (§10.2, §10.3 there), on the connection it has just read and never queued:
+  - **Purge** (`PurgeRetained`, on the manager by instance name or on the instance) empties the instance's
+    retained `Status` and `State` whoever's tag they carry, and a foreign `Config` of that name no object
+    wants. A configured instance's host heals its slot (§4.5 above), so purging a served one costs a moment. A
+    **fixed** bridge subscribes no `Status` and republishes it only on a change (§11 G2), so the Store
+    refuses to purge a running one.
+  - **Forget** (on a bridge process) deletes the process object and empties its `Active` and `Version`; it is
+    refused while `Active` is `true`, or until the current connection has shown the process down. A bridge
+    that is in fact running republishes `Active=true` at its next CONNACK (§4.6).
 
 ### 4.6 Startup and liveness
 On every CONNACK: subscribe `Config/+`; acquire instances as their Configs replay (each with its
@@ -328,37 +346,58 @@ line is R1's: `--instance`, no `--name`, no `--factory-timeout`), and the host s
 
 ## 5. Store kit (S4)
 
-**Prerequisites:** S2 (`RetainedIntent`) and S3 (`#Std/Availability`) of the kit spec land first.
+**Built as S4a** (Store main c6360a333; `docs/superpowers/specs/2026-10-11-bridge-kit-s4a-design.md`, whose §19
+deviations override its body), on S2 (`RetainedIntent`) and S3 (`#Std/Availability`). S4b, the pair
+migrations (mqtt_ynca with `ynca.sdl` first), is still to come: mqtt_ynca today ignores `bridge`/`via` and serves
+every `Config/#` under its root, so no kit manager may sit on the `Ynca` root until then (S4a F15).
 
 ### 5.1 Instances: discovered or configured (D2)
-- **Discovered** (CoolMaster): unchanged.
-- **Configured** (YNCA, RTI, GC): the user creates the instance (address, `Via`, Disabled…). It
-  publishes `Config/{instance}` through `RetainedIntent` (reasserted on the Store client's reconnect;
-  pending retractions kept until delivered).
-- **Uniqueness** on the root; the kind is fixed by the class.
-- **Delete / rename:** the Store retracts only its own topics (`Config/{i}`, `Config/{i}/#`, its
-  retained `Desired/{i}/…`) through `RetainedIntent`. Bridge-owned `Status`/`State` are cleaned by
-  their owner (§4.5). Reuse of a deleted name waits until the Store's own retractions for it are delivered
-  (store-wide fence across managers and clients); bridge-owned topics need no fence — the new owner's
-  healing repairs any late clear from the old one.
-- **Changing the device behind an instance** (its address): the Store retracts the instance's retained
-  Desired before publishing the new Config, so nothing meant for the old device replays to the new one.
-- **Targets:** discovered by default; a driver may declare them configured (HDL).
+- **Discovered** (CoolMaster): unchanged, except that `Active` and a lone `Status` no longer create an instance
+  (each `Active`/`Version` makes a process object, below): an untagged `State` does, unless the process is
+  known down. A family is all discovered or all configured.
+- **Configured** (YNCA, RTI, GC): the user creates the instance (address, `Via`, Disabled…). The **Config
+  keeper** `#Mqtt/BridgeConfigs` (one per MQTT client, made by the first kit manager on it) publishes
+  `Config/{instance}` and `Config/{instance}/{target}`, retained, with the user property `origin`. It is not a
+  blind re-assert: it reads each root back on every connection (a marker at `Config/_s_store/_s_sync/…`) and
+  decides every publish and retraction from that read-back, bound to the connection that read it. An identical
+  Config of its origin is adopted (no re-send, no bridge churn after a Store restart); one the broker lost is
+  sent again; one of its origin that no object wants is retracted (a deleted instance or manager, a rename, a
+  `Root` or client change, an earlier run's); another origin's is left alone, and creating an object of that
+  name takes it over. A 60 s sweep catches what no event announces.
+- **Uniqueness** of names per root and client, across managers, refused at create, rename, `Root` and client
+  change; the kind is fixed by the class. A fixed instance never gets a `Config/{instance}`.
+- **Delete / rename:** the Store retracts only its own topics (`Config/{i}`, `Config/{i}/{t}`, its retained
+  `Desired/{i}/…`, and the orphaned `Desired` of a deleted manager or an old root). A rename gives up every
+  pending request of the instance. Bridge-owned `Status`/`State` are cleaned by their owner (§4.5). **Reuse of
+  a deleted name** is not refused: the instance is created at once and its Config is *held* until the
+  retractions of the earlier owner's `Desired` under that name are delivered, so no old request replays to the
+  new device (S4a §5.5).
+- **Changing the device behind an instance** (a `device_identity_fields()` field, e.g. its address): the Store
+  retracts the instance's and its targets' pending `Desired` before the new Config goes out (held until they
+  are delivered).
+- **Targets:** discovered by default; a driver may declare them configured (HDL): `Config/{i}/{t}`.
+- **Unload** (S4a R12): a real store keeps its Configs on the broker through unload, reset and restore; its
+  delete, or its MqttClient's, clears them; a test store (name starting `_`) clears everything. Deployment
+  assumption: one store per broker and root (R13, R14 are the limits when that fails).
 
 ### 5.2 Availability (D5)
-- Per bridge id, the manager keeps liveness from `Active/{bridge id}`: true / false / unknown. A Root
-  change resets it.
-- A **configured** instance accepts `Status/{i}` and `State/{i}/…` only when the message carries
-  exactly one `via` equal to its effective owner (§4.2). A **fixed** instance accepts untagged
-  messages (tags, if any, are ignored). Messages from any other process
-  are ignored (DEBUG) — so a late write from a previous owner can never stand.
-- On a change of `Via` the instance's `LinkStatus` resets to unknown until the new owner's Status
-  arrives.
+- Per bridge id: each `Active/{bridge id}` or `Version/{bridge id}` makes a `#Mqtt/Bridge` process object in the
+  manager's `_z_Bridges` folder (`Active` true / false / unset, `Kind` = the first word of `Version`), fixed
+  bridges included. A `Root` change resets them.
+- A **configured** instance accepts `Status/{i}` and `State/{i}/…` only when the message carries exactly one
+  `via` equal to its effective owner (§4.2). A **fixed** instance accepts untagged messages (tags, if any, are
+  ignored). Messages from any other process are ignored (DEBUG `bridge_via_ignored`), so a late write from a
+  previous owner can never stand.
+- `Via` is a reference to a process object, picked in the Admin UI's reference picker (a whole-store tree
+  narrowed by class; no hook can offer only matching processes). A write is refused for a process under another
+  manager or of another known kind. The id on the wire is the hidden `ViaId`, kept when the process object is
+  deleted (which clears `Via`), so nothing changes on the wire. With exactly one process of the kind, `Via` is
+  set to it at creation; unset, the owner is the kind's default id.
+- On a change of `Via` the instance's `LinkStatus` resets to unknown until the new owner's Status arrives.
 - `Available = active(effective owner) == true && LinkStatus == "connected"`; unknown counts as not available.
-  Recomputed on a change of `Via`, the effective Root, the liveness map or `LinkStatus`, and fanned out
-  through the kit's existing `push_link` to targets and bound equipment; a newly discovered target
-  starts from its instance's current availability.
-- The Admin UI offers for `Via` the bridge ids seen whose `Version` names the instance's kind.
+  Recomputed on a change of `Via`, the effective Root, a process's `Active` or `LinkStatus`, and fanned out
+  through the kit's existing `push_link` to targets and bound equipment; a newly discovered target starts from
+  its instance's current availability.
 
 ### 5.3 IR devices (D7)
 - One device class (`IrDevice`) sets `IrCommand` → momentary `Command/{controller}`
@@ -369,6 +408,17 @@ line is R1's: `--instance`, no `--name`, no `--factory-timeout`), and the host s
 - Port Config: `Config/{controller}/{port}` `{"codeset":{"name":s,"version":n,"codes":{"<IrCommand>":
   "<raw>"}}}` (GC needs `codes`; RTI needs `name`). Outcomes: no code set → `refused`; unknown code →
   `rejected` naming it; invalid code set → `Error` naming the port, previous code set stays.
+
+### 5.4 What the Store does with an instance it does not configure (S4a)
+- **Adoption.** In a configured family, an instance the broker shows that no object has is a candidate
+  (`#Mqtt/DiscoveredInstance` in the manager's `_y_Discovered` folder) when, on the Store's current
+  connection, a `Config/{i}` of another origin or none is read back (a predecessor store, a pre-kit driver), or a
+  `via`-tagged `Status`/`State` arrives for the name. Its kind is the Config's `bridge`, else the serving
+  process's `Kind`; with neither, `Adopt` is refused. `Adopt` makes the instance (`ViaId` = the seen process,
+  fields from the Config) and the keeper publishes the Store's Config over the old one; `AdoptAll` does every
+  candidate not ignored. A fixed family has none. A candidate goes when its source is cleared, an instance of its
+  name appears, or a new connection's replay does not bring it back.
+- **Purge and Forget:** §4.5.
 
 ## 6. Mapping
 
@@ -414,7 +464,7 @@ LinkStatus reset on `Via` change; availability truth table; IR shapes.
 - A Config change drops that device's link briefly (stop, rebuild, re-subscribe).
 - A `via` move takes the instance briefly offline; a late old-owner write or clear is repaired by the new
   owner's healing (bounded).
-- Litter from a permanently removed bridge stays until the Admin UI purge action (follow-up).
+- Litter from a permanently removed bridge stays until a person runs the Store's purge or Forget (built in S4a, §4.5): never an automatic janitor.
 - The 5 s Config-replay fallback (§4.6) can show a stale Status for an instance whose Config has not
   yet arrived.
 - YNCA: one connection per receiver; live testing needs the old system's session released.
@@ -431,5 +481,34 @@ guide, mixin doc comments, "Writing an SDL driver on the kit": discovered vs con
 availability, IR); the tutorial artifact and the `developing-mqtt-bridges` skill in sync.
 
 ## 10. Sequencing
-1. Land R1. 2. Approve this spec. 3. Kit S2 (RetainedIntent) and S3 (Availability). 4. R2 runtime host.
-5. S4 kit. 6. mqtt_ynca + ynca.sdl. 7. IR bridges (own designs).
+1. Land R1. 2. Approve this spec. 3. Kit S2 (RetainedIntent) and S3 (Availability). 4. R2 runtime host. 5. S4 kit: **S4a landed** (Store main c6360a333: the keeper, processes, `via`, adoption, purge); S4b (the pair migrations) follows. 6. mqtt_ynca + ynca.sdl (S4b). 7. IR bridges (own designs). 8. The runtime gaps of §11.
+
+## 11. Open gaps: where the runtime as built does not yet meet an S4 obligation
+Checked against `mqtt-bridge-kit` at tracing-init master a016fe1 and Store main c6360a333 (2026-10-12). Met, so
+not gaps: the `via` tag on every configured `Status`/`State`; property `Desired` ignored while stopping or
+disabled (`lifecycle.rs` `terminal()`); a late fixed read-back ending the session; `Config/+` one level, so the
+Store's markers never match; the kind as the first word of `Version`; per-instance Config errors without
+`target`; a bridge never publishing an empty `Active`.
+
+- **G1. No wire-id validation beyond "one segment".** The Store makes an object only for a bridge id or instance
+  name that passes its `wire_id_problem` (`Std/mqtt_bridge.sdl`): not whitespace-only, `.` or `..`, a leading
+  `@`, `*` or `{…}`, a trailing `@` or digit+`_`, or a sort prefix `_x_…`. The runtime accepts any
+  `valid_segment` (`topics.rs`, `config.rs`) for `--name` and `--instance`, so a bridge started as `_z_Bridges`
+  or `gc-1_` runs, publishes, and is never shown by the Store. Obligation: refuse such a name at start-up (a
+  usage error), with the Store's list. A configured instance's name is the Store's to refuse; only the bridge id
+  and a fixed instance's name are the runtime's.
+- **G2. A fixed bridge does not heal its slot.** Hosts republish a topic that is emptied or tagged by another
+  process (§4.5), but a fixed bridge subscribes no `Status` and publishes it only on a change (`reports.rs`,
+  `lifecycle.rs`): a Store purge of a running fixed bridge would leave its `LinkStatus` unset until the link next
+  changes. The Store works around it (it refuses that purge, S4a D39), so nothing is wrong on the wire today; the
+  consequence is that a retained `Status` lost on the broker (a broker restart without persistence is covered by
+  the CONNACK republish, a person's manual clear is not) is not repaired until the next change.
+- **G3. A fixed bridge answers a stray `Config/{instance}`.** Its `Config/{instance}/#` subscription also matches
+  the parent level, which parses as `Unknown` and is answered with `Error` `malformed` at every replay (S4a F1,
+  inferred from `topics.rs`/`session.rs`, no test). The Store never publishes it, so it is silent in practice;
+  another publisher's would make the bridge say `malformed` on every connection. Hardening: ignore (DEBUG) the
+  parent level for a fixed instance.
+- **G4. `Error` carries no `via`.** The Store cannot attribute an instance-level `Error` to a process (S4a F2,
+  R6): after a `Via` move an old owner's late refusals abandon pending requests, and a grammar `Error` of a
+  process that does not own the instance could be recorded as its `ConfigError`. Accepted by S4a as bounded; it
+  would close if `Error` carried the tag too, a wire change for a later decision.
