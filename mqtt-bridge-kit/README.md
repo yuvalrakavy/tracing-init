@@ -38,6 +38,36 @@ Host::new("ynca").root("Ynca").from_cli().device(receiver_from_config).run()
 The crate is not published (`publish = false`); bridges depend on it by git revision and pin one.
 Minimum Rust version 1.80.
 
+## Process services that must survive link outages
+
+A controller may also serve a local configuration UI or own a shared bus. Those
+resources belong to the process: a failed MQTT connection or a device reconnect
+must not stop them. Implement `ProcessService` and use
+`Bridge::run_managed(service)` (`start_managed` for embedding/tests).
+
+Construct the service without opening resources. Its async `run` owns listeners,
+bus handles and helper tasks on an isolated current-thread Tokio runtime. Once
+ready, call `context.ready(driver)?` to transfer a resource-free driver proxy.
+The runtime validates its pure `info()` once before starting device/MQTT work.
+Then serve until `context.cancelled().await`, close admission and release the
+service resources. Driver `disconnect` affects the device link only. Service
+shutdown must not wait for MQTT disconnection.
+
+`ServiceTiming` defaults to 10 s startup and 2 s cooperative stop. A failed,
+panicked or synchronously blocked service is a component death; its independent
+watcher closes MQTT admission even if an embedder does not poll `Running::ended`.
+Service, device and MQTT teardown share one absolute 5 s ceiling. Forced
+cancellation is successful only after the service future, local tasks and
+runtime (including blocking helpers) are destroyed. A blocked thread/destructor
+is abandoned at the parent deadline; `stop` returns false and managed process
+shutdown exits unsuccessfully. Dropping a startup future or `Running` forces
+cancellation, but only awaiting bounded stop confirms cleanup.
+
+Service helpers must propagate fatal errors to `run`; an unobserved task panic
+does not automatically fail the service. Keep resources inside `run` or its
+runtime-owned tasks: detached OS threads need an explicit lifetime/bound policy.
+The full contract is [managed process services](../docs/superpowers/specs/2026-10-21-managed-process-services.md).
+
 ## What the runtime owns, and what a driver writes
 
 | The runtime owns | A driver writes |

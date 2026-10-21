@@ -69,6 +69,7 @@ mod lifecycle;
 pub mod link;
 pub mod logging;
 pub mod mailbox;
+pub mod managed;
 pub mod process;
 pub mod pump;
 pub mod replies;
@@ -88,6 +89,7 @@ pub use driver::{
 };
 pub use host::{DeviceConfig, FactoryError, Host};
 pub use link::{LinkContext, LinkHandle, ReadBack, Reporter};
+pub use managed::{ProcessService, ServiceContext, ServiceTiming};
 pub use process::{install_panic_hook, Bridge, Died, Running};
 pub use session::MqttTiming;
 pub use wire::Conflict;

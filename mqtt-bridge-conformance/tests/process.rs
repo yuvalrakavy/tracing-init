@@ -502,3 +502,82 @@ async fn a_usage_error_is_said_and_ends_with_status_2() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--instance"), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+async fn service_started(dir: &Path) -> String {
+    let marker = dir.join("service-live");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(address) = std::fs::read_to_string(&marker) {
+            if address.parse::<std::net::SocketAddr>().is_ok() {
+                return address;
+            }
+        }
+        assert!(Instant::now() < deadline, "managed service never opened its listener");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_sigterm_during_startup_closes_the_service_listener_before_a_successful_exit() {
+    let broker = FakeBroker::start().await;
+    let dir = workdir("managed_start_stop");
+    let mut child = bridge(&dir, &broker, &["--service", "no-ready"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let address = service_started(&dir).await;
+    assert!(tokio::net::TcpStream::connect(&address).await.is_ok());
+    signal(&child, "-TERM");
+    let status = exit_within(&mut child, Duration::from_secs(4)).await;
+    assert!(status.is_some_and(|s| s.success()), "startup cancellation did not complete: {status:?}");
+    assert!(!dir.join("service-live").exists(), "startup cancellation skipped resource destruction");
+    assert!(tokio::net::TcpStream::connect(&address).await.is_err());
+    assert_eq!(broker.connections(), 0, "service reached MQTT without readiness");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_sigterm_reports_failure_when_the_service_destructor_blocks() {
+    let broker = FakeBroker::start().await;
+    let dir = workdir("managed_drop_stop");
+    let mut child = bridge(&dir, &broker, &["--service", "blocked-drop"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    service_started(&dir).await;
+    signal(&child, "-TERM");
+    let status = exit_within(&mut child, Duration::from_secs(8)).await;
+    assert!(dir.join("drop-entered").exists(), "service destructor never blocked");
+    assert!(status.is_some_and(|s| !s.success()), "abandoned resource destruction claimed clean shutdown: {status:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_broker_outage_and_full_stdio_do_not_hold_service_start_or_stop() {
+    let broker = FakeBroker::start().await;
+    broker.refuse_connections(true);
+    let dir = workdir("managed_outage");
+    let (full, unread) = full_stream();
+    let stdout = OwnedFd::from(full.try_clone().unwrap());
+    let mut child =
+        bridge(&dir, &broker, &["--service", "up"]).stdout(Stdio::from(stdout)).stderr(Stdio::from(OwnedFd::from(full))).spawn().unwrap();
+    let address = service_started(&dir).await;
+    assert!(tokio::net::TcpStream::connect(&address).await.is_ok());
+    signal(&child, "-TERM");
+    let status = exit_within(&mut child, Duration::from_secs(4)).await;
+    drop(unread);
+    assert!(status.is_some_and(|s| s.success()), "managed outage/full-output shutdown failed: {status:?}");
+    assert!(!dir.join("service-live").exists());
+    assert!(tokio::net::TcpStream::connect(&address).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_failure_or_panic_with_full_stdio_ends_the_process_unsuccessfully() {
+    for mode in ["fail", "panic", "blocked"] {
+        let broker = FakeBroker::start().await;
+        let dir = workdir(&format!("managed_{mode}"));
+        let (full, unread) = full_stream();
+        let stdout = OwnedFd::from(full.try_clone().unwrap());
+        let mut child = bridge(&dir, &broker, &["--service", mode])
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(OwnedFd::from(full)))
+            .spawn()
+            .unwrap();
+        service_started(&dir).await;
+        let status = exit_within(&mut child, Duration::from_secs(13)).await;
+        drop(unread);
+        assert!(status.is_some_and(|s| !s.success()), "managed {mode} did not exit with failure: {status:?}");
+    }
+}

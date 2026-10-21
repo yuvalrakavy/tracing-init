@@ -79,3 +79,23 @@ fn a_pause_starts_a_grace_before_the_watchdog_judges() {
     }
     assert!(pause.judging(tick + WATCH_TICK), "the grace never ended");
 }
+#[tokio::test]
+async fn shutdown_rejects_ready_work_after_its_absolute_deadline() {
+    let polled = std::sync::atomic::AtomicBool::new(false);
+    let deadline = tokio::time::Instant::now() - std::time::Duration::from_millis(1);
+    assert!(
+        !super::stop_before(deadline, std::time::Duration::from_secs(5), async {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+    );
+    assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+    assert!(
+        !super::stop_before(deadline, std::time::Duration::from_secs(5), async {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        })
+        .await,
+        "ready completion after a delayed executor poll extended shutdown"
+    );
+}

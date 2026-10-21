@@ -7,11 +7,52 @@
 
 use std::process::ExitCode;
 
-use mqtt_bridge_conformance::{acknowledged, fake_device, Answer, Op};
+use mqtt_bridge_conformance::{acknowledged, fake_device, Answer, FakeDevice, Op};
+use mqtt_bridge_kit::{ProcessService, ServiceContext};
+
+struct Managed {
+    driver: FakeDevice,
+    mode: String,
+}
+struct Resource {
+    blocked_drop: bool,
+}
+impl Drop for Resource {
+    fn drop(&mut self) {
+        if self.blocked_drop {
+            std::fs::write("drop-entered", "yes").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+        let _ = std::fs::remove_file("service-live");
+    }
+}
+impl ProcessService for Managed {
+    type Driver = FakeDevice;
+    async fn run(self, mut ctx: ServiceContext<FakeDevice>) -> Result<(), String> {
+        let _resource = Resource { blocked_drop: self.mode == "blocked-drop" };
+        let _listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
+        std::fs::write("service-live", _listener.local_addr().unwrap().to_string()).unwrap();
+        if self.mode != "no-ready" {
+            ctx.ready(self.driver)?;
+        }
+        match self.mode.as_str() {
+            "blocked" => std::thread::sleep(std::time::Duration::from_secs(30)),
+            "fail" | "panic" => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert_ne!(self.mode, "panic", "managed process panic");
+                return Err("managed process failure".into());
+            }
+            _ => {}
+        }
+        ctx.cancelled().await;
+        Ok(())
+    }
+}
 
 fn main() -> ExitCode {
     let bridge = mqtt_bridge_kit::Bridge::new("Fake")
         .option("device", "up | down | stall-connect | panic-apply | hang-apply | panic-helper | hang-info")
+        .option("service", "up | no-ready | blocked | blocked-drop | fail | panic (managed process tests)")
         .from_cli();
     let (driver, device) = fake_device(acknowledged());
     device.set("t1", "power", serde_json::json!(true));
@@ -24,5 +65,9 @@ fn main() -> ExitCode {
         "hang-info" => device.hold_info("info-entered".into(), std::time::Duration::from_secs(30)),
         _ => {}
     }
-    bridge.run(driver)
+    if let Some(mode) = bridge.value("service").map(str::to_owned) {
+        bridge.run_managed(Managed { driver, mode })
+    } else {
+        bridge.run(driver)
+    }
 }

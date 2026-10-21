@@ -5,3 +5,4 @@ App.*.log
 /mqtt-test-broker/target
 /mqtt-bridge-kit/target
 /mqtt-bridge-conformance/target
+*.ledger.json.lock

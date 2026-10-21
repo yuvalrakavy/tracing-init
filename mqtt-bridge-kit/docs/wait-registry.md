@@ -77,14 +77,29 @@ selects on, and a death goes to a channel `Running::ended` reads.
 | `devices-registry` | acyclic | the running devices' keepers (`lock-order` mutex, class `devices-registry`) | Held only to insert, look up, remove or close: never across an await, no other lock taken under it, nothing logged under it. A stop request under it is a watch channel's send, which never waits. |
 | `device-keeper` | bounded | a device's worker end, its watchdog's verdict, a stop request, the stop's deadline (the keeper's `select!`); and the process's stop waiting for each keeper's end (`all_ended`) | With no stop asked, an idle wait for a death: the worker's end and the watchdog's verdict never wait on the keeper. Once a stop is asked, `DEVICE_STOP_BOUND` (10 s): the worker's cooperative stop (its disconnect within 2 s), or the watchdog's verdict that its thread is blocked (within its heartbeat's 5 s), comes first; on expiry the device is dead — a death on the channel, and the process ends (D4 = a). The process's stop waits for the keepers within `WORKER_STOP_BOUND` and `SHUTDOWN_GRACE` (`shutdown`). |
 | `device-factory` | bounded | a construction's progress, on its watcher's channel: the factory's return, then the driver's `info()` | Each within `--factory-timeout` (10 s by default); the factory and `info()` run on a thread of their own, which cannot be cancelled. On expiry a death on the channel — D4 = a: the process ends, for the supervisor's restart frees the thread. The thread sends and goes on; nothing waits on the watcher. |
+| `managed-lifecycle` | acyclic | the process service's phase (`lock-order` mutex) | Serializes readiness, stopping, fatal/completion facts, worker admission and the earliest shutdown deadline. Never awaits, logs, calls driver methods or drops service resources under it. Admission constructs the host's internal state and starts threads/tasks with already validated info; this orders before the internal registry lock, which never takes the managed lock. Watch sends publish immutable facts; receivers release watch borrows before taking this lock. |
+| `managed-start` | bounded | validated readiness from the service worker | `ServiceTiming.startup` (10 s default). `ready` computes pure driver info on the isolated worker, checks expiry/cancellation, seeds heartbeat and transfers once. On expiry or worker exit, cancels the service and waits for teardown only within the shared 5 s stop ceiling. A dropped startup future forces cancellation through its guard. |
+| `managed-thread` | acyclic | the service's isolated current-thread runtime | Nothing joins this OS thread. Startup, heartbeat and completion are observed independently by the parent. After cancellation the parent waits only within `managed-stop`; a synchronously blocked worker or destructor is abandoned. Completion is sent after service, LocalSet and runtime teardown. |
+| `managed-run` | acyclic | the service future or forced cancellation | The parent writes cancellation without waiting. Cooperative shutdown is `managed-cancel`; after its configured grace the force branch drops the service future and LocalSet. Synchronous blocks are detected by `managed-watch`; the parent remains bounded independently. |
+| `managed-cancel` | acyclic | cooperative stop watch | Only the service waits; the parent sets it without waiting. It is also set on startup cancellation, fatal death and owner drop. Service authors must not await MQTT disconnection during teardown. |
+| `managed-watch` | bounded | worker completion or heartbeat timer | Reuses the device watchdog's operation/idle bounds and process-pause grace. Heartbeat is seeded before polling service code and again at readiness. On expiry or failure the watcher latches a persistent fatal cause, closes registry admission and cancels the session without requiring `Running::ended` to be polled. |
+| `managed-fatal` | acyclic | persistent service fatal watch | Only `Running::ended` waits, raced against signals by the process runner. The independent watcher sets the fatal fact without waiting on its consumer. Repeated reads retain the same cause. |
+| `managed-fatal-stop` | bounded | device keepers and session shutdown after service death | Uses the same absolute 5 s component shutdown deadline as explicit stop, even with an unpolled `Running`. Admission closes synchronously first; the session stop is requested after at most the existing 2.5 s worker grace. On expiry the cleanup wait is abandoned; explicit stop reports failure at the original ceiling. |
+| `managed-stop` | bounded | actual service teardown completion | Cooperative grace `ServiceTiming.stop` (2 s default), then forced cancellation, all within the earliest absolute 5 s component shutdown deadline. Later cleanup calls cannot extend it. Completion timestamp must precede that ceiling; a cancellation flag alone is not completion. On expiry a blocked worker/destructor returns false; managed process shutdown exits unsuccessfully. |
+| `managed-runtime` | acyclic | actual service runtime destruction | After dropping the service future and LocalSet, runtime drop confirms its blocking helpers have ended. This may block only the isolated service thread: nobody joins it. The parent's `managed-stop` deadline independently reports failure/abandonment, and no completion fact is published while a runtime helper or destructor is still running. |
+| `process-launch` | acyclic | bridge launch raced against OS stop | Ordinary launch is immediate; managed launch waits on `managed-start`. A signal drops the startup future, retaining `StartupSlot` to confirm service teardown within the original component ceiling. No-ready workers cannot leave live resources behind a successful process exit. |
 
 ## Settings
 
 ```wait-lint
 # rumqttc's client calls, which wait on its request channel, and its event loop's poll.
-wait-methods = publish, publish_with_properties, subscribe, subscribe_many, unsubscribe, disconnect, poll
+wait-methods = publish, publish_with_properties, subscribe, subscribe_many, unsubscribe, disconnect, poll, stop_until
 # Dependency calls whose .await waits on nothing in this process.
 not-waits = sleep, sleep_until, yield_now
+# Service runtime destruction may wait for blocking helpers, on its isolated thread only.
+wait-fns = destroy_service_runtime
+# Managed service deaths are internal.
+local-methods = died
 # The driver trait's methods, awaited on a driver: this code's own (every call is bounded by its
 # caller, `op`).
 local-methods = read_state, configure, probe, blocking
@@ -123,6 +138,28 @@ link-lost src/link.rs LinkHandle::lost
 logging-start src/process.rs serve_with
 mailbox-lock src/mailbox.rs Mailbox::locked
 mailbox-posted src/mailbox.rs Mailbox::take
+managed-cancel src/managed.rs ServiceContext::cancelled
+managed-fatal src/managed.rs Managed::died
+managed-fatal-stop src/managed.rs Control::fatal
+managed-lifecycle src/managed.rs Control::complete
+managed-lifecycle src/managed.rs Control::deadline
+managed-lifecycle src/managed.rs Control::fatal
+managed-lifecycle src/managed.rs Control::stopping
+managed-lifecycle src/managed.rs Managed::admit
+managed-lifecycle src/managed.rs Managed::already_failed
+managed-lifecycle src/managed.rs ServiceContext::ready
+managed-run src/managed.rs spawn
+managed-runtime src/managed.rs spawn
+managed-start src/managed.rs Bridge::start_managed_in
+managed-stop src/managed.rs Bridge::start_managed_in
+managed-stop src/managed.rs Control::stop_until
+managed-stop src/managed.rs Managed::stop_until
+managed-stop src/managed.rs StartupSlot::stop
+managed-stop src/process.rs Running::stop
+managed-stop src/process.rs serve_with
+managed-thread src/managed.rs spawn
+managed-watch src/managed.rs spawn
+managed-watch src/managed.rs watch
 mqtt-poll src/pump.rs Pump::run
 mqtt-poll src/pump.rs linger
 mqtt-pump-queue src/pump.rs Incoming::recv
@@ -134,6 +171,7 @@ mqtt-request src/session.rs emit
 mqtt-request src/session.rs flush
 panic-report src/process.rs PanicReports::report
 panic-report src/process.rs PanicReports::start
+process-launch src/process.rs serve_with
 reports-lock src/reports.rs Reports::locked
 reports-ready src/reports.rs Reports::reported
 runtime src/process.rs run_with
@@ -146,7 +184,8 @@ session-retry src/session.rs run
 session-work src/session.rs session
 shutdown src/process.rs Running::stop
 shutdown src/process.rs serve
-shutdown src/process.rs stop_within
+shutdown src/process.rs stop_before
+shutdown src/process.rs stop_devices_then_session
 shutdown-flush src/session.rs flush
 stop-signal src/process.rs StopSignals::next
 worker-stop src/worker.rs spawn

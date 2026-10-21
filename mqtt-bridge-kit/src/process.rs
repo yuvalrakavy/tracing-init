@@ -66,7 +66,7 @@ pub const RUNTIME_GRACE: Duration = Duration::from_secs(1);
 /// call its own timers cannot interrupt, and the watchdog declares it dead.
 pub const BLOCKED_GRACE: Duration = Duration::from_secs(2);
 /// How often the watchdog reads the operation's deadline and the heartbeat.
-const WATCH_TICK: Duration = Duration::from_millis(100);
+pub(crate) const WATCH_TICK: Duration = Duration::from_millis(100);
 /// A watchdog tick later than asked by more than this is a pause of the whole process.
 const PAUSE_SLACK: Duration = Duration::from_secs(1);
 /// After a pause, how long the watchdog gives the worker to resume before it judges again.
@@ -189,6 +189,29 @@ impl PanicReports {
 pub struct Bridge(Host);
 
 impl Bridge {
+    pub(crate) fn validate_managed_start(&self) -> Result<(), String> {
+        self.0.validate_managed_start()
+    }
+    pub(crate) fn launch_managed<D: DeviceDriver>(
+        self,
+        driver: D,
+        info: crate::DriverInfo,
+        managed: crate::managed::Managed,
+    ) -> Result<Running, String> {
+        let mut pending: Option<Box<dyn crate::devices::Startable>> = Some(Box::new(Built(driver)));
+        let launched = managed.admit(|| {
+            let running = self.0.launch(Some((pending.take().unwrap(), Some(info))))?;
+            let registry = running.registry.clone();
+            let shutdown = running.shutdown.clone();
+            Ok((running, registry, shutdown))
+        });
+        if let Some(driver) = pending {
+            crate::devices::drop_off_thread(driver);
+        }
+        let mut running = launched?;
+        running.managed = Some(managed);
+        Ok(running)
+    }
     /// A bridge of `family`, which is also the default MQTT root (`Aircondition`, `Lutron`, `IR`;
     /// `--root` overrides it). The program's name (its executable's file name) is the logging's
     /// application name and the usage text's, unless [`app_name`](Self::app_name) says otherwise.
@@ -317,7 +340,36 @@ impl Bridge {
             let info = driver.info();
             (driver, info)
         };
-        run_with(app, log_config, describe, move |(driver, info)| self.0.launch(Some((Box::new(Built(driver)), Some(info)))))
+        run_with(
+            app,
+            log_config,
+            describe,
+            move |(driver, info)| async move { self.0.launch(Some((Box::new(Built(driver)), Some(info)))) },
+            None,
+        )
+    }
+
+    /// Run a fixed bridge with a process service under the ordinary signals,
+    /// tracing-init and bounded shutdown policy. Construct the service without I/O.
+    pub fn run_managed<S: crate::managed::ProcessService>(self, service: S) -> ExitCode {
+        self.run_managed_with(service, crate::managed::ServiceTiming::default())
+    }
+    /// Like `run_managed`, with explicit service timing bounds.
+    pub fn run_managed_with<S: crate::managed::ProcessService>(self, service: S, timing: crate::managed::ServiceTiming) -> ExitCode {
+        if let Some(code) = self.usage_exit() {
+            return code;
+        }
+        let app = self.0.app();
+        let log_config = self.0.settings().log_config.clone();
+        let slot = Arc::new(crate::managed::StartupSlot::default());
+        let launch_slot = slot.clone();
+        run_with(
+            app,
+            log_config,
+            move || service,
+            move |service| async move { self.start_managed_in(service, timing, launch_slot).await },
+            Some(slot),
+        )
     }
 
     /// Start the bridge on the current tokio runtime, in-process: the MQTT side as tasks, the
@@ -343,17 +395,18 @@ pub(crate) fn run_process(
     log_config: Option<std::path::PathBuf>,
     launch: impl FnOnce() -> Result<Running, String>,
 ) -> ExitCode {
-    run_with(app, log_config, || (), move |()| launch())
+    run_with(app, log_config, || (), move |()| std::future::ready(launch()), None)
 }
 
 /// The process around a bridge or a host: the panic hook, an explicit runtime, `serve`, and the
 /// runtime's bounded end. `describe` runs on a blocking thread raced against the stop signals,
 /// then `launch` starts the parts.
-fn run_with<P: Send + 'static>(
+fn run_with<P: Send + 'static, F: Future<Output = Result<Running, String>>>(
     app: String,
     log_config: Option<std::path::PathBuf>,
     describe: impl FnOnce() -> P + Send + 'static,
-    launch: impl FnOnce(P) -> Result<Running, String>,
+    launch: impl FnOnce(P) -> F,
+    startup: Option<Arc<crate::managed::StartupSlot>>,
 ) -> ExitCode {
     install_panic_hook();
     // No runtime, no bridge: said by the status alone (there is no log yet).
@@ -361,7 +414,7 @@ fn run_with<P: Send + 'static>(
         return ExitCode::FAILURE;
     };
     // WAIT: runtime
-    let exit = runtime.block_on(serve_with(app, log_config, describe, launch));
+    let exit = runtime.block_on(serve_with(app, log_config, describe, launch, startup));
     // Shut down within a bound, never dropped: dropping waits for every thread still in a
     // synchronous call — a DNS lookup of the broker's name (tokio and rumqttc resolve names on
     // blocking threads), a stalled logging start — without limit.
@@ -371,11 +424,12 @@ fn run_with<P: Send + 'static>(
 
 /// From the stop signals to the bounded shutdown. tracing-init's guard lives here and is
 /// dropped when this returns, inside the runtime.
-async fn serve_with<P: Send + 'static>(
+async fn serve_with<P: Send + 'static, F: Future<Output = Result<Running, String>>>(
     app: String,
     log_config: Option<std::path::PathBuf>,
     describe: impl FnOnce() -> P + Send + 'static,
-    launch: impl FnOnce(P) -> Result<Running, String>,
+    launch: impl FnOnce(P) -> F,
+    startup: Option<Arc<crate::managed::StartupSlot>>,
 ) -> ExitCode {
     let mut signals = StopSignals::register();
     let starting = tokio::task::spawn_blocking(move || crate::logging::start(&app, log_config.as_deref()));
@@ -430,9 +484,25 @@ async fn serve_with<P: Send + 'static>(
             return ExitCode::SUCCESS;
         }
     };
-    let running = match launch(described) {
+    let mut launching = Box::pin(launch(described));
+    // WAIT: process-launch
+    let launched = tokio::select! {
+        biased;
+        _=signals.next()=>{
+            drop(launching);
+            // WAIT: managed-stop
+            return if let Some(startup)=startup{if startup.stop().await{ExitCode::SUCCESS}else{ExitCode::FAILURE}}else{ExitCode::SUCCESS};
+        },
+        result=&mut launching=>result,
+    };
+    drop(launching);
+    let running = match launched {
         Ok(running) => running,
         Err(e) => {
+            if let Some(startup) = startup {
+                // WAIT: managed-stop
+                let _ = startup.stop().await;
+            }
             warn!(kind = "startup_failed", error = %e, "The bridge could not start");
             return ExitCode::FAILURE;
         }
@@ -446,6 +516,7 @@ async fn serve_with<P: Send + 'static>(
 
 /// A running bridge or host (see [`Bridge::start`], [`Host::start`](crate::Host::start)).
 pub struct Running {
+    pub(crate) managed: Option<crate::managed::Managed>,
     tasks: JoinSet<()>,
     shutdown: watch::Sender<bool>,
     span: Span,
@@ -465,7 +536,7 @@ impl Running {
         registry: Arc<Registry>,
         deaths: mpsc::UnboundedReceiver<Died>,
     ) -> Running {
-        Running { tasks, shutdown, span, registry, deaths }
+        Running { tasks, shutdown, span, registry, deaths, managed: None }
     }
 }
 
@@ -501,13 +572,8 @@ pub(crate) async fn supervise(
         if !pause.judging(std::time::Instant::now()) {
             continue;
         }
-        if let Some(deadline) = clock.deadline() {
-            let over = std::time::Instant::now().saturating_duration_since(deadline);
-            if over > BLOCKED_GRACE {
-                break (format!("the device worker blocked its thread {} ms past its operation's deadline", over.as_millis()), true);
-            }
-        } else if let Some(quiet) = clock.since_beat().filter(|quiet| *quiet > IDLE_BOUND) {
-            break (format!("the device worker's thread was blocked for {} ms with no operation running", quiet.as_millis()), true);
+        if let Some(cause) = blocked_reason(&clock, "device worker") {
+            break (cause, true);
         }
         if let Some((full, whose)) = abandoned.full_for().filter(|(full, _)| *full > cap_bound) {
             break (
@@ -527,21 +593,44 @@ pub(crate) async fn supervise(
     (Died { part: "device", cause }, blocked)
 }
 
+/// Shared watchdog predicate; each component keeps its own failure effects.
+pub(crate) fn blocked_reason(clock: &OpClock, label: &str) -> Option<String> {
+    if let Some(deadline) = clock.deadline() {
+        let over = std::time::Instant::now().saturating_duration_since(deadline);
+        if over > BLOCKED_GRACE {
+            return Some(format!("the {label} blocked its thread {} ms past its operation's deadline", over.as_millis()));
+        }
+    } else if let Some(quiet) = clock.since_beat().filter(|q| *q > IDLE_BOUND) {
+        return Some(format!("the {label}'s thread was blocked for {} ms with no operation running", quiet.as_millis()));
+    }
+    None
+}
+
+/// Shared order: close device admission, allow bounded disconnect, then flush MQTT.
+pub(crate) async fn stop_devices_then_session(mut dones: Vec<watch::Receiver<bool>>, shutdown: watch::Sender<bool>) {
+    // WAIT: shutdown
+    let workers_ended = tokio::time::timeout(WORKER_STOP_BOUND, all_ended(&mut dones)).await.is_ok();
+    let _ = shutdown.send(true);
+    if !workers_ended {
+        all_ended(&mut dones).await;
+    }
+}
+
 /// Whether a watchdog tick may judge. A tick that came far later than asked — the process was
 /// paused (SIGSTOP, a VM's pause) — starts a grace: the worker was paused too, and its heartbeat
 /// and timers resume with it, so what the clocks say across the pause is no verdict (re-gate 3 S6).
-struct PauseGrace {
+pub(crate) struct PauseGrace {
     last_tick: std::time::Instant,
     grace_until: Option<std::time::Instant>,
 }
 
 impl PauseGrace {
-    fn new(now: std::time::Instant) -> Self {
+    pub(crate) fn new(now: std::time::Instant) -> Self {
         PauseGrace { last_tick: now, grace_until: None }
     }
 
     /// The tick at `now`: may it judge the worker?
-    fn judging(&mut self, now: std::time::Instant) -> bool {
+    pub(crate) fn judging(&mut self, now: std::time::Instant) -> bool {
         let gap = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
         if gap > WATCH_TICK + PAUSE_SLACK {
@@ -555,7 +644,7 @@ impl PauseGrace {
 /// A part of the bridge that ended on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Died {
-    /// Which part ended: `"mqtt"` (the session) or `"device"` (the worker, or the watchdog's verdict on it).
+    /// Which part ended: `"mqtt"`, `"device"`, or a managed process `"service"`.
     pub part: &'static str,
     /// Why it ended.
     pub cause: String,
@@ -571,6 +660,16 @@ impl Running {
     pub async fn ended(&mut self) -> Died {
         // WAIT: bridge-parts
         tokio::select! {
+            biased;
+            died = async {
+                match self.managed.as_mut() {
+                    Some(service) => service.died().await,
+                    None => {
+                        // WAIT: bridge-parts
+                        std::future::pending().await
+                    }
+                }
+            } => died,
             Some(died) = self.deaths.recv() => died,
             Some(joined) = self.tasks.join_next() => Died { part: "mqtt", cause: match joined {
                 Ok(()) => "returned".to_owned(),
@@ -594,20 +693,34 @@ impl Running {
             // verdict that a worker's thread is blocked, reached before the stop or during its wait,
             // ends that keeper's wait at once (re-gate 4 minor 4; re-gate 5) — a blocked worker
             // will not stop, and is not waited for. No device starts once the stop has begun.
-            let mut dones = self.registry.close();
+            let deadline =
+                self.managed.as_ref().map_or_else(|| tokio::time::Instant::now() + SHUTDOWN_GRACE, |service| service.shutdown_deadline());
+            let dones = self.registry.close();
+            let managed = self.managed.take();
             let shutdown = &self.shutdown;
             let tasks = &mut self.tasks;
             let all = async move {
-                // WAIT: shutdown
-                let workers_ended = tokio::time::timeout(WORKER_STOP_BOUND, all_ended(&mut dones)).await.is_ok();
-                let _ = shutdown.send(true);
+                stop_devices_then_session(dones, shutdown.clone()).await;
                 // WAIT: shutdown
                 while tasks.join_next().await.is_some() {}
-                if !workers_ended {
-                    all_ended(&mut dones).await;
+            };
+            let service_stop = async {
+                match managed.as_ref() {
+                    Some(service) => {
+                        // WAIT: managed-stop
+                        service.stop_until(deadline).await
+                    }
+                    None => true,
                 }
             };
-            let ended = stop_within(SHUTDOWN_GRACE, all).await;
+            let mut service_ended = false;
+            let ended = stop_before(deadline, SHUTDOWN_GRACE, async {
+                // WAIT: shutdown
+                let (_, service) = tokio::join!(all, service_stop);
+                service_ended = service;
+            })
+            .await
+                && service_ended;
             if !ended {
                 self.tasks.abort_all();
             }
@@ -620,9 +733,16 @@ impl Running {
 }
 
 /// `stop`, for at most `grace`; past it one WARN `shutdown_timeout`. Returns whether it ended.
+#[cfg(test)]
 pub(crate) async fn stop_within<T>(grace: Duration, stop: impl Future<Output = T>) -> bool {
+    stop_before(tokio::time::Instant::now() + grace, grace, stop).await
+}
+async fn stop_before<T>(deadline: tokio::time::Instant, grace: Duration, stop: impl Future<Output = T>) -> bool {
+    // Tokio polls the operation first; explicitly reject late ready completion.
     // WAIT: shutdown
-    let ended = tokio::time::timeout(grace, stop).await.is_ok();
+    let ended = tokio::time::Instant::now() < deadline
+        && tokio::time::timeout_at(deadline, stop).await.is_ok()
+        && tokio::time::Instant::now() <= deadline;
     if !ended {
         warn!(
             kind = "shutdown_timeout",
@@ -643,6 +763,7 @@ pub(crate) enum Ending {
 /// The running bridge, until a stop signal or the death of one of its parts, then its bounded
 /// shutdown.
 pub(crate) async fn serve(mut running: Running, stop: impl Future<Output = &'static str>) -> Ending {
+    let managed = running.managed.is_some();
     // WAIT: bridge-end
     let ending = tokio::select! {
         signal = stop => {
@@ -655,8 +776,12 @@ pub(crate) async fn serve(mut running: Running, stop: impl Future<Output = &'sta
         }
     };
     // WAIT: shutdown
-    running.stop().await;
-    ending
+    let stopped = running.stop().await;
+    if managed && !stopped {
+        Ending::WorkerDied
+    } else {
+        ending
+    }
 }
 
 /// The test seam's environment variable (with the `test-seams` feature only): set, the stop signals cannot be

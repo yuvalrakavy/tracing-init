@@ -1,0 +1,53 @@
+[[control]]
+name = "runtime_abandons_live_blocking_helpers"
+file = "mqtt-bridge-kit/src/managed.rs"
+anchor = "destroy_service_runtime(runtime);"
+replacement = "runtime.shutdown_timeout(Duration::from_millis(1));"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_running_blocking_helper_prevents_successful_service_teardown)"]
+expect_text = "runtime timeout was mistaken for teardown of a running blocking helper"
+
+[[control]]
+name = "fatal_is_not_checked_at_worker_admission"
+file = "mqtt-bridge-kit/src/managed.rs"
+anchor = "if let Some(error) = self.failed_locked(&p) {\n            return Err(error);\n        }"
+replacement = "let _ = self.failed_locked(&p);"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(death_between_the_readiness_check_and_launch_prevents_all_worker_admission)"]
+expect_text = "new workers were admitted after service death"
+
+[[control]]
+name = "running_renews_the_component_shutdown_budget"
+file = "mqtt-bridge-kit/src/process.rs"
+anchor = "self.managed.as_ref().map_or_else(|| tokio::time::Instant::now() + SHUTDOWN_GRACE, |service| service.shutdown_deadline())"
+replacement = "tokio::time::Instant::now() + SHUTDOWN_GRACE"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(running_stop_enforces_the_original_deadline_for_mqtt_even_after_service_completion)"]
+expect_text = "late MQTT/device shutdown was accepted after service completion"
+
+[[control]]
+name = "startup_ignores_persistent_worker_death"
+file = "mqtt-bridge-kit/src/managed.rs"
+anchor = "died=managed.died()=>Err(died.cause),"
+replacement = "died=std::future::pending::<Died>()=>Err(died.cause),"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(persistent_worker_death_ends_startup_even_when_a_retained_context_keeps_readiness_open)"]
+expect_text = "a retained context hid the already-completed worker from startup"
+
+[[control]]
+name = "service_has_no_independent_blocked_watchdog"
+file = "mqtt-bridge-kit/src/managed.rs"
+anchor = "if let Some(cause)=crate::process::blocked_reason(&control.clock,\"service worker\"){"
+replacement = "if let Some(cause)=None::<String>{"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(blocking_immediately_after_readiness_is_detected_without_the_services_heartbeat_task_running)"]
+expect_text = "blocked service escaped the independent watchdog"
+
+[[control]]
+name = "expired_absolute_deadline_polls_ready_teardown"
+file = "mqtt-bridge-kit/src/process.rs"
+anchor = "tokio::time::Instant::now() < deadline"
+replacement = "true"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(shutdown_rejects_ready_work_after_its_absolute_deadline)"]
+expect_text = "assertion failed: !polled.load"

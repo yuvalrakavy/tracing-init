@@ -1045,7 +1045,7 @@ pub(crate) const HEARTBEAT_TICK: Duration = Duration::from_millis(250);
 
 /// The worker runtime's heartbeat, until the runtime ends: a ticker on the worker's own thread, so
 /// any block of the thread — a helper's synchronous read, a driver's sleep — stops it.
-async fn heartbeat(clock: Arc<OpClock>) {
+pub(crate) async fn heartbeat(clock: Arc<OpClock>) {
     loop {
         clock.beat();
         tokio::time::sleep(HEARTBEAT_TICK).await;

@@ -397,6 +397,20 @@ impl Host {
         self.launch(None)
     }
 
+    /// Validate fixed settings before a process service can acquire resources.
+    pub(crate) fn validate_managed_start(&self) -> Result<(), String> {
+        if let Some(problem) = &self.problem {
+            return Err(match problem {
+                Problem::Help => "--help".into(),
+                Problem::Usage(m) => m.clone(),
+            });
+        }
+        let instance = self.settings.instance.as_deref().ok_or("no instance")?;
+        Topics::new(&self.settings.root, instance)?;
+        crate::topics::check_wire_id("instance", instance)?;
+        config::broker_host_port(self.settings.broker.as_deref().ok_or("no broker")?)?;
+        config::check_timing(&self.settings.timing.apply(Timing::default()), &self.settings.mqtt)
+    }
     /// Start either mode on the current runtime: a configured host, whose factory builds each
     /// instance's driver; or a [`Bridge`](crate::Bridge)'s fixed instance (N = 1), with `fixed`'s
     /// driver — and its `info()`, if [`Bridge::run`](crate::Bridge::run) took it off the runtime

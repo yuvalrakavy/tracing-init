@@ -971,6 +971,29 @@ Reading order if you are writing your first bridge: `main.rs` (40 lines), then `
 shape of a protocol module that does no I/O, then `driver.rs`' `impl DeviceDriver`, then one scenario in
 `tests/driver.rs` end to end.
 
+## Optional: a configuration server with a process lifetime
+
+LampNet's reader belongs to its device link. A configuration web server or a
+shared bus owner has a longer lifetime: it must keep running during MQTT/device
+outages. Use `ProcessService` for that resource owner, and let its `Driver` be a
+proxy using bounded requests to the service. `Bridge::run_managed(service)` owns
+the signals, tracing-init, watchdog and bounded stop just as `run(driver)` does.
+
+Construct the service without opening resources. Open them in `run`, call
+`context.ready(proxy)?` once after preparation, then serve until
+`context.cancelled().await`. `ready` validates the proxy's pure `info()` on the
+service thread and transfers it without waiting for a broker or a device read.
+Close service admission, cancel helpers and release resources before returning.
+The proxy's `disconnect` must tolerate a closing service and must not stop the
+process resource owner during a device reconnect.
+
+Service futures and their local tasks run on an isolated current-thread runtime.
+Bring helper failures back to `run`; do not silently detach fatal helper errors.
+Keep I/O owned by that future/runtime so cancellation can destroy it. A blocked
+helper or destructor cannot hold the process past its parent deadline, but it
+does make shutdown unsuccessful. See the README's process-services section for
+startup/stop bounds and the embedding counterparts `start_managed[_with]`.
+
 ## A checklist before you ship a driver
 
 - `info()` declares what is true: `writes`, `feedback`, every command and its class. A driver with
