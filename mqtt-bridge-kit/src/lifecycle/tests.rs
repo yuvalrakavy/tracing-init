@@ -60,9 +60,19 @@ fn a_retired_runtimes_answers_go_to_the_outbox() {
         })
     };
     let answered = |device: &Device| {
-        let reply = Outbound { topic: Some("Store/replies/r".into()), payload: b"{}".to_vec(), correlation: None };
+        let reply = Outbound {
+            context: crate::RequestContext::default(),
+            topic: Some("Store/replies/r".into()),
+            payload: b"{}".to_vec(),
+            correlation: None,
+        };
         device.reports.refused(Vec::new(), vec![reply]);
-        device.reports.event(Outbound { topic: None, payload: br#"{"kind":"x"}"#.to_vec(), correlation: None });
+        device.reports.event(Outbound {
+            context: crate::RequestContext::default(),
+            topic: None,
+            payload: br#"{"kind":"x"}"#.to_vec(),
+            correlation: None,
+        });
     };
     let mut outputs = Outputs::new();
     let live = device();
@@ -121,6 +131,69 @@ fn a_passed_fallback_is_no_timer() {
 
 fn read(config: serde_json::Value) -> Verdict {
     classify(config.to_string().as_bytes(), "gc", "gc-lan1")
+}
+
+struct StartFails;
+impl Startable for StartFails {
+    fn describe(&self) -> DriverDescription {
+        DriverDescription { info: crate::DriverInfo::default(), policy: Box::new(crate::RequestPolicy::Unfenced) }
+    }
+    fn start(
+        self: Box<Self>,
+        _: crate::DriverInfo,
+        _: &str,
+        _: Arc<Mailbox>,
+        _: Arc<Reports>,
+        _: tokio::sync::watch::Receiver<bool>,
+        _: Span,
+    ) -> std::io::Result<crate::devices::Started> {
+        Err(std::io::Error::other("injected worker thread creation failure"))
+    }
+}
+struct RetryDriver;
+impl crate::DeviceDriver for RetryDriver {
+    fn info(&self) -> crate::DriverInfo {
+        crate::DriverInfo::default()
+    }
+    async fn connect(&mut self, _: &mut crate::LinkContext) -> Result<(), crate::LinkError> {
+        Ok(())
+    }
+    async fn disconnect(&mut self) {}
+    async fn read_state(&mut self, _: crate::Scope) -> Result<Vec<crate::TargetState>, crate::OpError> {
+        Ok(Vec::new())
+    }
+    async fn apply(&mut self, _: &str, _: &PropertyMap) -> Result<(), crate::OpError> {
+        Ok(())
+    }
+    async fn execute(&mut self, _: Option<&str>, _: &crate::CommandCall) -> Result<Option<Value>, crate::OpError> {
+        Ok(None)
+    }
+    async fn configure(&mut self, _: &str, _: Option<&Value>) -> Result<(), crate::OpError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn failed_worker_start_can_retry_without_reinstalling_mapping_authority() {
+    let mut host = lifecycle();
+    let mut outputs = Outputs::new();
+    let config = json!({"bridge":"kind","via":"host"});
+    host.instances.insert("Lamp".into(), Instance::new("Lamp", Topics::new("T", "Lamp").unwrap(), Want::Serve(config.clone())));
+    host.create_rt(None, &mut outputs, "Lamp", Phase::Live, LinkStatus::Connecting).await.unwrap();
+    let instance = host.instances.get_mut("Lamp").unwrap();
+    let id = instance.rt.as_mut().unwrap().id;
+    instance.rt.as_mut().unwrap().bootstrapped = true;
+    instance.ready = Some(Ready { config: config.clone(), info: StartFails.describe(), driver: Box::new(StartFails) });
+    host.start_if_ready(None, &mut outputs, "Lamp").await.unwrap();
+    assert!(host.instances["Lamp"].failed_config.is_some(), "worker start failure was not recorded");
+    let driver: Box<dyn Startable> = Box::new(crate::devices::Built(RetryDriver));
+    host.instances.get_mut("Lamp").unwrap().ready = Some(Ready { config, info: driver.describe(), driver });
+    host.start_if_ready(None, &mut outputs, "Lamp").await.unwrap();
+    let rt = host.instances["Lamp"].rt.as_ref().unwrap();
+    let started = rt.worker && rt.id == id;
+    let mut done = host.spawner.registry.close();
+    tokio::time::timeout(Duration::from_secs(3), crate::devices::all_ended(&mut done)).await.expect("retried worker did not stop");
+    assert!(started, "failed worker could not restart in its existing runtime");
 }
 
 /// Empty is a delete; what cannot be read names no owner.

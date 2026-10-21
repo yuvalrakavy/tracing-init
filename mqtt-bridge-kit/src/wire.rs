@@ -10,6 +10,7 @@ use rumqttc::v5::mqttbytes::v5::PublishProperties;
 use serde_json::{json, Value};
 
 use crate::driver::{CommandCall, PropertyMap};
+use crate::generations::RequestContext;
 use crate::topics::valid_segment;
 
 /// Which change wins when a request and a change at the device both happened during one outage
@@ -39,7 +40,7 @@ impl Conflict {
 }
 
 /// A request's metadata, from its MQTT v5 properties.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestMeta {
     /// When it expires: its message expiry, counted from its arrival at the bridge — when the pump
     /// received it, not when the session got to it. A held request is dropped then (Store kit spec
@@ -47,6 +48,20 @@ pub struct RequestMeta {
     pub deadline: Option<Instant>,
     /// What to do if the device changed while the request waited.
     pub conflict: Conflict,
+    /// The packet's original generation, preserved through every queued form.
+    pub context: RequestContext,
+}
+
+/// Decode only opaque context, leaving each lane's expiry/conflict semantics alone.
+pub fn request_context(properties: Option<&PublishProperties>) -> Result<RequestContext, String> {
+    let mut generations = properties.into_iter().flat_map(|p| &p.user_properties).filter(|(key, _)| key == "target-generation");
+    let Some((_, generation)) = generations.next() else {
+        return Ok(RequestContext::default());
+    };
+    if generations.next().is_some() {
+        return Err("target-generation must occur exactly once".into());
+    }
+    RequestContext::new(generation.clone())
 }
 
 /// A request's metadata, from the properties of the publish that carried it, arriving `now`.
@@ -58,7 +73,7 @@ pub fn request_meta(properties: Option<&PublishProperties>, now: Instant) -> Res
             Conflict::parse(v).ok_or_else(|| format!("the user property `conflict` is `{v}`, not `DeviceWins` or `RequestWins`"))?
         }
     };
-    Ok(RequestMeta { deadline, conflict })
+    Ok(RequestMeta { deadline, conflict, context: request_context(properties)? })
 }
 
 fn parse(payload: &[u8]) -> Result<Value, String> {
@@ -191,6 +206,8 @@ impl Reason {
 /// An `Error` lane message: `{error, target?, property?, command?, reason}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorReport {
+    /// Original request context, carried as MQTT metadata, outside the JSON grammar.
+    pub context: RequestContext,
     /// The human-readable text.
     pub error: String,
     /// The target the failure concerns, if it concerns one.
@@ -206,7 +223,13 @@ pub struct ErrorReport {
 impl ErrorReport {
     /// A report with a reason and a text, naming no target.
     pub fn new(reason: Reason, error: impl Into<String>) -> ErrorReport {
-        ErrorReport { error: error.into(), target: None, property: None, command: None, reason }
+        ErrorReport { context: RequestContext::default(), error: error.into(), target: None, property: None, command: None, reason }
+    }
+
+    /// Preserve the original request's mapping on its terminal error.
+    pub fn context(mut self, context: &RequestContext) -> Self {
+        self.context = context.clone();
+        self
     }
 
     /// Name the target, if there is one.

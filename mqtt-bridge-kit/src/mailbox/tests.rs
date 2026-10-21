@@ -10,6 +10,7 @@ use crate::test_support::Capture;
 
 fn value(target: &str, property: &str, v: Value) -> StateValue {
     StateValue {
+        context: RequestContext::default(),
         target: target.into(),
         property: property.into(),
         value: v,
@@ -19,6 +20,265 @@ fn value(target: &str, property: &str, v: Value) -> StateValue {
         basis: None,
         reheld: false,
     }
+}
+
+fn contextual(property: &str, generation: &str) -> StateValue {
+    StateValue { context: RequestContext::new(generation).unwrap(), ..value("u1", property, json!(40)) }
+}
+
+#[test]
+fn mixed_context_values_are_never_combined_in_one_apply() {
+    let mailbox = up();
+    mailbox.post_state(contextual("power", "epoch.1"), false);
+    mailbox.post_state(contextual("level", "epoch.2"), false);
+    let work = drain(&mailbox);
+    assert_eq!(work.len(), 2, "different generations were combined in one apply");
+    for work in work {
+        let Work::Apply { values, .. } = work else { panic!("expected apply") };
+        assert_eq!(values.len(), 1);
+    }
+}
+
+#[test]
+fn a_fresh_generation_is_not_suppressed_as_a_property_copy() {
+    let mailbox = up();
+    mailbox.post_target(vec![contextual("level", "epoch.1")]);
+    assert_eq!(
+        mailbox.post_state(contextual("level", "epoch.2"), false),
+        Posted::Queued,
+        "a fresh generation was suppressed as an old property copy"
+    );
+    let Work::Apply { values, .. } = mailbox.try_take().unwrap() else { panic!("expected apply") };
+    assert_eq!(values[0].context.generation(), Some("epoch.2"));
+}
+
+#[test]
+fn a_replayed_generation_keeps_its_own_conflict_basis() {
+    let mailbox = up();
+    for (generation, before) in [("epoch.1", 10), ("epoch.2", 30)] {
+        let mut value = contextual("level", generation);
+        value.basis = Some(Basis { at: Instant::now(), before: Some(json!(before)) });
+        mailbox.post_state(value, true);
+    }
+    let Work::Apply { values, .. } = mailbox.try_take().unwrap() else { panic!("expected apply") };
+    assert_eq!(values[0].basis.as_ref().unwrap().before, Some(json!(30)), "fresh generation inherited an old conflict basis");
+}
+
+#[test]
+fn replay_of_a_new_generation_replaces_a_reheld_old_value() {
+    let mailbox = up();
+    mailbox.post_state(contextual("level", "epoch.1"), false);
+    assert!(mailbox.try_take().is_some());
+    mailbox.applied(true);
+    mailbox.disconnected();
+    mailbox.post_state(contextual("level", "epoch.2"), true);
+    let Some(Held::Values(held)) = mailbox.take_held() else { panic!("expected held value") };
+    assert_eq!(held.values[0].context.generation(), Some("epoch.2"), "new generation replay retained the old unproven request");
+    assert!(!held.values[0].reheld);
+}
+
+#[test]
+fn read_commands_from_different_generations_are_never_coalesced() {
+    let mailbox = up();
+    for generation in ["epoch.1", "epoch.2"] {
+        mailbox.post_read_with_context(
+            ReadKey::Command { target: Some("u1".into()), command: "status".into() },
+            Some(call("status")),
+            None,
+            None,
+            RequestContext::new(generation).unwrap(),
+        );
+    }
+    assert_eq!(drain(&mailbox).len(), 2, "different-generation read commands were coalesced");
+}
+
+fn fenced_up() -> (Arc<Mailbox>, Arc<crate::reports::Reports>) {
+    let reports = crate::reports::Reports::new();
+    let mailbox = up();
+    mailbox.bind_reports(&reports);
+    reports.install_policy(crate::RequestPolicy::Fenced(crate::TargetGenerations {
+        instance: "epoch.2".into(),
+        targets: [("u1".into(), "epoch.2".into())].into_iter().collect(),
+    }));
+    (mailbox, reports)
+}
+
+#[test]
+fn stale_or_missing_state_cannot_replace_fresh_fenced_intent() {
+    for context in [RequestContext::default(), RequestContext::new("epoch.1").unwrap()] {
+        let (mailbox, _reports) = fenced_up();
+        mailbox.post_state(contextual("level", "epoch.2"), false);
+        let old = StateValue { context, value: json!(90), ..contextual("level", "epoch.1") };
+        assert_eq!(mailbox.post_state(old, false), Posted::Refused(Refusal::StaleGeneration), "stale state displaced fresh fenced intent");
+        let Work::Apply { values, .. } = mailbox.try_take().unwrap() else { panic!("expected apply") };
+        assert_eq!(values[0].context.generation(), Some("epoch.2"));
+        assert_eq!(values[0].value, json!(40));
+    }
+}
+
+#[test]
+fn mapping_replacement_cannot_split_validation_from_posting_and_displace_fresh_intent() {
+    let (mailbox, reports) = fenced_up();
+    let initial = crate::TargetGenerations { instance: "epoch.2".into(), targets: [("u1".into(), "epoch.2".into())].into_iter().collect() };
+    let next = crate::TargetGenerations { instance: "epoch.3".into(), targets: [("u1".into(), "epoch.3".into())].into_iter().collect() };
+    let (checked_tx, checked_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let old_mailbox = mailbox.clone();
+    let old = std::thread::spawn(move || {
+        AFTER_GENERATION_CHECK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                checked_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(5)).expect("test did not release paused admission");
+            }))
+        });
+        old_mailbox.post_state(contextual("level", "epoch.2"), false)
+    });
+    checked_rx.recv_timeout(Duration::from_secs(5)).expect("old request never reached admission");
+    let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
+    let (fresh_tx, fresh_rx) = std::sync::mpsc::sync_channel(1);
+    let fresh_mailbox = mailbox.clone();
+    let swap = std::thread::spawn(move || {
+        attempted_tx.send(()).unwrap();
+        reports.replace_generations(&initial, next).unwrap();
+        fresh_tx.send(fresh_mailbox.post_state(contextual("level", "epoch.3"), false)).unwrap();
+    });
+    attempted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // A broken check-before-lock implementation lets the swap and fresh post
+    // finish here. The correct implementation keeps the swap behind the paused
+    // old post, then retires it. In both schedules resume the old poster and
+    // assert the externally observable survivor, rather than inspecting locks.
+    let early = fresh_rx.recv_timeout(Duration::from_millis(200)).ok();
+    resume_tx.send(()).unwrap();
+    assert_eq!(old.join().unwrap(), Posted::Queued);
+    assert_eq!(early.unwrap_or_else(|| fresh_rx.recv_timeout(Duration::from_secs(5)).unwrap()), Posted::Queued);
+    swap.join().unwrap();
+    let Some(Work::Apply { values, .. }) = mailbox.try_take() else { panic!("fresh request disappeared") };
+    assert_eq!(values[0].context.generation(), Some("epoch.3"), "old admission displaced fresh work across table replacement");
+    assert!(mailbox.try_take().is_none());
+}
+
+#[test]
+fn fenced_target_posts_reject_the_whole_carrier_if_any_context_is_stale() {
+    let (mailbox, _reports) = fenced_up();
+    let posted = mailbox.post_target(vec![contextual("power", "epoch.2"), contextual("level", "epoch.1")]);
+    assert_eq!(posted, Posted::Refused(Refusal::StaleGeneration), "a mixed-generation target carrier was partly admitted");
+    assert!(mailbox.try_take().is_none());
+}
+
+#[test]
+fn stale_config_cannot_displace_a_fresh_fenced_setup() {
+    let (mailbox, _reports) = fenced_up();
+    mailbox.post_config_with_context("u1", Some(json!({"mode":"fresh"})), RequestContext::new("epoch.2").unwrap());
+    assert_eq!(
+        mailbox.post_config_with_context("u1", Some(json!({"mode":"old"})), RequestContext::new("epoch.1").unwrap()),
+        Posted::Refused(Refusal::StaleGeneration),
+        "stale config displaced fresh setup"
+    );
+    let Work::Configure { context, config, .. } = mailbox.try_take().unwrap() else { panic!("expected config") };
+    assert_eq!(context.generation(), Some("epoch.2"));
+    assert_eq!(config, Some(json!({"mode":"fresh"})));
+}
+
+#[test]
+fn old_retractions_never_cancel_fresh_state_or_configuration() {
+    let (mailbox, _reports) = fenced_up();
+    let old = RequestContext::new("epoch.1").unwrap();
+    let fresh = RequestContext::new("epoch.2").unwrap();
+    mailbox.post_state(contextual("level", "epoch.2"), false);
+    mailbox.post_config_with_context("u1", Some(json!({"mode":"fresh"})), fresh.clone());
+    assert_eq!(mailbox.retract_with_context("u1", "level", &old), Ok(false));
+    assert_eq!(mailbox.post_config_with_context("u1", None, old), Posted::Skipped);
+    assert!(matches!(mailbox.try_take(), Some(Work::Configure { context, .. }) if context == fresh));
+    assert!(matches!(mailbox.try_take(), Some(Work::Apply { values, .. }) if values[0].context == fresh));
+}
+
+#[test]
+fn missing_retraction_context_cannot_cancel_fenced_work() {
+    let (mailbox, _reports) = fenced_up();
+    mailbox.post_state(contextual("level", "epoch.2"), false);
+    assert_eq!(mailbox.retract_with_context("u1", "level", &RequestContext::default()), Err(Refusal::StaleGeneration));
+    assert_eq!(mailbox.post_config("u1", None), Posted::Refused(Refusal::StaleGeneration));
+    assert!(mailbox.try_take().is_some());
+}
+
+#[test]
+fn complete_table_replacement_retires_in_flight_and_held_work_without_reusing_a_name() {
+    let (mailbox, reports) = fenced_up();
+    let initial = crate::TargetGenerations { instance: "epoch.2".into(), targets: [("u1".into(), "epoch.2".into())].into_iter().collect() };
+    let replacement =
+        crate::TargetGenerations { instance: "epoch.3".into(), targets: [("u1".into(), "epoch.3".into())].into_iter().collect() };
+    mailbox.post_state(contextual("level", "epoch.2"), false);
+    assert!(matches!(mailbox.try_take(), Some(Work::Apply { .. })));
+    mailbox.applied(true);
+    mailbox.disconnected();
+    mailbox.post_config_with_context("u1", Some(json!({"feedback":"assumed"})), RequestContext::new("epoch.2").unwrap());
+    reports.state_with_context("u1", [("level".into(), json!(40))].into_iter().collect(), false, &RequestContext::new("epoch.2").unwrap());
+    reports.read_back_with_context("u1", [("level".into(), json!(10))].into_iter().collect(), &RequestContext::new("epoch.2").unwrap());
+    reports.read_back_complete();
+    reports.broker_lost();
+    reports.replace_generations(&initial, replacement.clone()).unwrap();
+    assert!(mailbox.try_take().is_none(), "retired work survived replacement");
+    assert!(mailbox.unproven_since().is_none());
+    assert!(reports.snapshot().is_empty(), "old occupant survived in the conflict model");
+    assert!(reports.read_back_view().1.is_empty(), "old frozen readback survived replacement");
+    assert!(reports.broker_before().1.is_empty(), "old broker basis survived replacement");
+    let retired = reports.take();
+    assert_eq!(retired.states, vec![("u1".into(), Vec::new(), RequestContext::new("epoch.2").unwrap())]);
+    assert!(reports.replace_generations(&initial, initial.clone()).is_err(), "stale expected table was accepted");
+    // The same name returns with a fresh generation; an old retraction or copy cannot touch it.
+    let newest = crate::TargetGenerations { instance: "epoch.4".into(), targets: [("u1".into(), "epoch.4".into())].into_iter().collect() };
+    reports.replace_generations(&replacement, newest).unwrap();
+    mailbox.post_state(contextual("level", "epoch.4"), false);
+    reports.state_with_context("u1", [("level".into(), json!(70))].into_iter().collect(), false, &RequestContext::new("epoch.4").unwrap());
+    reports.remove_with_context("u1", &RequestContext::new("epoch.2").unwrap());
+    mailbox.retract_with_context("u1", "level", &RequestContext::new("epoch.2").unwrap()).unwrap();
+    assert_eq!(mailbox.post_state(contextual("level", "epoch.2"), true), Posted::Refused(Refusal::StaleGeneration));
+    let Some(Held::Values(held)) = mailbox.take_held() else { panic!("fresh held request was cancelled") };
+    assert_eq!(held.values[0].context.generation(), Some("epoch.4"));
+    assert_eq!(reports.snapshot()["u1"]["level"], json!(70));
+    assert_eq!(reports.model().states[0].2.generation(), Some("epoch.4"));
+}
+
+#[test]
+fn a_mapping_swap_preserves_unchanged_targets_and_refuses_retired_commands_once() {
+    let (mailbox, reports) = fenced_up();
+    let initial = crate::TargetGenerations { instance: "epoch.2".into(), targets: [("u1".into(), "epoch.2".into())].into_iter().collect() };
+    let next = crate::TargetGenerations {
+        instance: "epoch.3".into(),
+        targets: [("u1".into(), "epoch.2".into()), ("u2".into(), "epoch.3".into())].into_iter().collect(),
+    };
+    mailbox.post_state(contextual("level", "epoch.2"), false);
+    mailbox.post_command_with_context(None, call("commission"), None, None, RequestContext::new("epoch.2").unwrap());
+    reports.replace_generations(&initial, next).unwrap();
+    let changes = reports.take();
+    assert_eq!(changes.answer_errors.len(), 1);
+    assert_eq!(changes.answer_errors[0].context.generation(), Some("epoch.2"));
+    assert!(matches!(mailbox.try_take(), Some(Work::Apply { .. })), "unchanged target work was discarded");
+    assert!(mailbox.try_take().is_none(), "retired instance command survived");
+    assert!(reports.take().answer_errors.is_empty(), "retired command was refused twice");
+}
+
+#[test]
+fn fenced_momentary_commands_require_current_target_or_instance_context_but_reads_do_not() {
+    let (mailbox, _reports) = fenced_up();
+    assert_eq!(
+        mailbox.post_command(Some("u1".into()), call("pulse"), None, None),
+        Posted::Refused(Refusal::StaleGeneration),
+        "fenced momentary command admitted without context"
+    );
+    assert_eq!(
+        mailbox.post_command_with_context(None, call("commission"), None, None, RequestContext::new("epoch.1").unwrap()),
+        Posted::Refused(Refusal::StaleGeneration)
+    );
+    assert_eq!(
+        mailbox.post_command_with_context(Some("unknown".into()), call("pulse"), None, None, RequestContext::new("epoch.2").unwrap()),
+        Posted::Refused(Refusal::StaleGeneration)
+    );
+    assert_eq!(mailbox.post_read(ReadKey::Refresh(None), None, None, None), Posted::Queued);
+    assert_eq!(
+        mailbox.post_command_with_context(Some("u1".into()), call("pulse"), None, None, RequestContext::new("epoch.2").unwrap()),
+        Posted::Queued
+    );
 }
 
 fn call(command: &str) -> CommandCall {
@@ -333,15 +593,22 @@ fn configs_are_the_latest_per_target_and_may_set_the_feedback() {
     mailbox.connected();
     let mut configs = Vec::new();
     while let Some(held) = mailbox.take_held() {
-        if let Held::Config { target, config } = &held {
+        if let Held::Config { target, config, .. } = &held {
             mailbox.configured(target, config.as_ref());
         }
         configs.push(held);
     }
-    assert_eq!(configs, vec![Held::Config { target: "tv".into(), config: Some(json!({"code": "b", "feedback": "assumed"})) }]);
+    assert_eq!(
+        configs,
+        vec![Held::Config {
+            context: RequestContext::default(),
+            target: "tv".into(),
+            config: Some(json!({"code": "b", "feedback": "assumed"}))
+        }]
+    );
     assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Assumed);
     mailbox.post_config("tv", None);
-    let Some(Work::Configure { target, config }) = mailbox.try_take() else { panic!("no configure") };
+    let Some(Work::Configure { target, config, .. }) = mailbox.try_take() else { panic!("no configure") };
     mailbox.configured(&target, config.as_ref());
     assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Observed, "a retracted config kept its feedback override");
 }
@@ -406,7 +673,7 @@ fn a_configs_feedback_override_is_committed_when_configure_takes_it() {
     let mailbox = up();
     mailbox.post_config("tv", Some(json!({"feedback": "assumed"})));
     assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Observed, "the override took effect before configure took it");
-    let Some(Work::Configure { target, config }) = mailbox.try_take() else { panic!("no configure") };
+    let Some(Work::Configure { target, config, .. }) = mailbox.try_take() else { panic!("no configure") };
     mailbox.configured(&target, config.as_ref());
     assert_eq!(mailbox.feedback("tv", Feedback::Observed), Feedback::Assumed, "the override did not take effect when configure took it");
     mailbox.post_config("tv", None);
@@ -501,7 +768,7 @@ fn a_targets_config_goes_before_its_held_values_whatever_its_held_flag() {
     mailbox.connected();
     let _ = mailbox.post_config("b", Some(json!({"port": 2})));
     match mailbox.take_held() {
-        Some(Held::Config { target, config }) => assert_eq!((target.as_str(), config), ("b", Some(json!({"port": 2})))),
+        Some(Held::Config { target, config, .. }) => assert_eq!((target.as_str(), config), ("b", Some(json!({"port": 2})))),
         other => panic!("b's held value went before its config: {other:?}"),
     }
 }

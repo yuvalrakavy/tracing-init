@@ -1,0 +1,143 @@
+[[control]]
+name = "fenced_authority_is_bypassed"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "match &self.request_policy {"
+replacement = "match &None::<RequestPolicy> {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(stale_or_missing_state_cannot_replace_fresh_fenced_intent)"]
+expect_text = "stale state displaced fresh fenced intent"
+
+[[control]]
+name = "validation_is_moved_outside_mailbox_ownership"
+file = "mqtt-bridge-kit/src/mailbox.rs"
+anchor = "        let now = Instant::now();\n        let posted = {\n            let mut inner = self.locked();\n            if !self.context_is_current(Some(&value.target), &value.context) {\n                return Posted::Refused(Refusal::StaleGeneration);\n            }\n            let key = (value.target.clone(), value.property.clone());"
+replacement = "        let now = Instant::now();\n        let current = self.context_is_current(Some(&value.target), &value.context);\n        let posted = {\n            let mut inner = self.locked();\n            if !current {\n                return Posted::Refused(Refusal::StaleGeneration);\n            }\n            let key = (value.target.clone(), value.property.clone());"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(mapping_replacement_cannot_split_validation_from_posting_and_displace_fresh_intent)"]
+expect_text = "old admission displaced fresh work across table replacement"
+
+[[control]]
+name = "grouping_ignores_original_context"
+file = "mqtt-bridge-kit/src/mailbox.rs"
+anchor = "value.target == target && value.context == context && *h == held"
+replacement = "value.target == target && *h == held"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(mixed_context_values_are_never_combined_in_one_apply)"]
+expect_text = "different generations were combined in one apply"
+
+[[control]]
+name = "property_copy_ignores_original_context"
+file = "mqtt-bridge-kit/src/mailbox.rs"
+anchor = "copy == value.value && context == value.context && now < until"
+replacement = "copy == value.value && now < until"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_fresh_generation_is_not_suppressed_as_a_property_copy)"]
+expect_text = "a fresh generation was suppressed as an old property copy"
+
+[[control]]
+name = "driver_admission_is_skipped"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = "            self.driver.validate_request(target, context, kind).map_err(|error| match error {\n                OpError::Partial(_) => OpError::Rejected(\"driver validation must reject the complete request\".into()),\n                error => error,\n            })"
+replacement = "            Ok(())"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(driver_validation_runs_before_config_cache_and_already_satisfied_acceptance)"]
+expect_text = "cache or satisfied conflict bypassed driver admission"
+
+[[control]]
+name = "direct_conflict_read_ignores_original_context"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = "s.state.target == target && self.reports.observation_matches(target, &s.context, &context)"
+replacement = "s.state.target == target"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_stale_direct_read_cannot_satisfy_fresh_held_intent)"]
+expect_text = "a stale direct read was accepted as already satisfying fresh intent"
+
+[[control]]
+name = "proving_read_is_retagged_with_the_current_mapping"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = "            if self.reports.context_is_current(Some(&state.state.target), &state.context) {\n                let context = if self.reports.fenced() { state.context } else { RequestContext::default() };\n                proving.entry((state.state.target, context)).or_default().extend(state.state.values);\n            }"
+replacement = "            let context = match self.reports.current_policy() {\n                Some(RequestPolicy::Fenced(table)) => RequestContext::new(table.targets.get(&state.state.target).unwrap()).unwrap(),\n                _ => RequestContext::default(),\n            };\n            proving.entry((state.state.target, context)).or_default().extend(state.state.values);"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_stale_proving_read_cannot_satisfy_fresh_held_intent)"]
+expect_text = "a stale proving read was accepted as already satisfying fresh held intent"
+
+[[control]]
+name = "sealed_outputs_drop_original_generation"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = "self.properties.user_properties.push((\"target-generation\".into(), generation.to_owned()));"
+replacement = "let _ = generation;"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_sealed_batch_keeps_original_context_on_state_replies_errors_and_events)"]
+expect_text = "a sealed output was retagged or lost its original token"
+
+[[control]]
+name = "successful_config_does_not_replace_obsolete_cache"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = "self.configured.insert(target.to_owned(), (context, config));"
+replacement = "self.configured.entry(target.to_owned()).or_insert((context, config));"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(config_context_reaches_the_driver_and_equal_data_from_another_generation_is_distinct)"]
+expect_text = "config from a fresh generation was deduplicated using old context"
+
+[[control]]
+name = "late_state_is_allowed_into_current_model"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "            if !state.context_is_current(Some(target), context) {\n                return;\n            }\n            let newly_refused"
+replacement = "            let newly_refused"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(fenced_reports_and_removals_require_the_original_current_context)"]
+expect_text = "late observations changed a fresh mapping"
+
+[[control]]
+name = "late_removal_can_erase_replacement"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "            if !state.context_is_current(Some(target), context) {\n                return;\n            }\n            state.targets.remove(target);"
+replacement = "            state.targets.remove(target);"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(fenced_reports_and_removals_require_the_original_current_context)"]
+expect_text = "no entry found for key"
+
+[[control]]
+name = "retired_mailbox_work_is_kept"
+file = "mqtt-bridge-kit/src/generations.rs"
+anchor = "        match target {\n            Some(target) => self.targets.get(target) == Some(context),\n            None => self.instance.as_ref() == Some(context),\n        }"
+replacement = "        false"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(complete_table_replacement_retires_in_flight_and_held_work_without_reusing_a_name)"]
+expect_text = "retired work survived replacement"
+
+[[control]]
+name = "complete_expected_table_is_not_compared"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "if state.request_policy.as_ref() != Some(&RequestPolicy::Fenced(expected.clone())) {"
+replacement = "if false {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(complete_table_replacement_retires_in_flight_and_held_work_without_reusing_a_name)"]
+expect_text = "stale expected table was accepted"
+
+[[control]]
+name = "identical_startup_policy_retry_panics"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "        if let Some(current) = &state.request_policy {\n            assert_eq!(current, &policy, \"initial installation cannot replace mapping authority\");\n            return;\n        }"
+replacement = "        assert!(state.request_policy.is_none(), \"initial request policy installed twice\");"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(failed_worker_start_can_retry_without_reinstalling_mapping_authority)"]
+expect_text = "initial request policy installed twice"
+
+[[control]]
+name = "optional_context_erases_legacy_partial_state"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "if replaced && fenced {"
+replacement = "if replaced {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(optional_context_does_not_erase_unfenced_partial_state)"]
+expect_text = "optional context erased unrelated legacy state"
+
+[[control]]
+name = "optional_context_blocks_legacy_conflict_reads"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "&& (!matches!(state.request_policy, Some(RequestPolicy::Fenced(_))) || observed == requested)"
+replacement = "&& observed == requested"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(optional_request_context_preserves_unfenced_proving_and_direct_reads)"]
+expect_text = "optional metadata hid a valid legacy read"

@@ -284,6 +284,47 @@ the deadline), `read_back` (the previous run's retained `State`) and `handle()`,
 `LinkHandle` to keep for later operations. `Bridge` is the builder `main` uses; `Running` is a bridge
 started in-process (`Bridge::start`), for tests and embedders.
 
+## Controllers whose target mappings can change
+
+A fixed `Bridge` can opt into generation fencing with
+`DeviceDriver::request_policy() -> RequestPolicy::Fenced(TargetGenerations)`.
+The complete table contains an instance generation and every current target's
+generation. The runtime captures it once with `info()` before requests can run.
+The default is `Unfenced`; existing drivers need no changes. Dynamic `Host`
+factories returning `Fenced` are explicitly rejected before connection.
+
+Clients attach exactly one MQTT v5 `target-generation` user property to Desired,
+target Config and mutating commands, including empty retractions. A token is
+opaque, case-sensitive, and contains 1–128 visible ASCII bytes (`0x21..0x7e`).
+Targetless mutations use the instance token. Unknown targets and absent or stale
+tokens are refused. Reads may omit the token; `assume` is unavailable in fenced
+mode. JSON payloads and the existing topic grammar remain unchanged.
+
+Implement the contextual driver methods (`apply_with_context`,
+`execute_with_context`, `configure_with_context`, `read_state_with_context`) and
+use the corresponding Reporter methods for state, events and removals. Carry the
+original context through queued work and observations. Legacy observation methods
+have absent context and cannot update a fenced model. State, events, request
+errors and replies retain their original token on MQTT, including sealed batches
+and reconnect replay. Never assign the current token to an old observation.
+
+When changing mappings, freeze service admission and serialize hardware work,
+durably save the new inventory, then call
+`Reporter::replace_generations(&expected_table, next_table)`. It compares the
+complete expected table, installs the next authority and retires exact old
+runtime work/history under the same lock order used by admission. Report the
+complete inventory before making the new service mapping ready. An uncertain
+save or failed replacement must keep service admission frozen. Never reuse a
+retired token for the same target.
+
+Use the pure `validate_request` hook to reject work during service transitions or
+enforce read-only metadata. It runs before cached Config acceptance and outage
+conflict decisions, under the operation watchdog. It cannot perform I/O. The
+service must also validate the original context atomically with physical address
+resolution at dispatch; runtime checks cannot undo an operation already started.
+See the [generation contract](../docs/superpowers/specs/2026-10-21-bridge-target-generations.md)
+and the tutorial's optional mutable-inventory section.
+
 ## The testing kit
 
 A bridge's tests run the real runtime around the real driver, against a fake broker and a stand-in

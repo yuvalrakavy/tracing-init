@@ -994,6 +994,55 @@ helper or destructor cannot hold the process past its parent deadline, but it
 does make shutdown unsuccessful. See the README's process-services section for
 startup/stop bounds and the embedding counterparts `start_managed[_with]`.
 
+## Optional: mutable physical inventories
+
+LampNet's fixed target names need no additional methods. A controller that lets
+the operator rename devices, reuse an address or change group membership needs a
+mapping fence: a retained request from the previous occupant must not control its
+replacement. Use the existing fixed `Bridge`, including `run_managed` when a
+process service owns the controller; dynamic factory fencing is unsupported.
+
+Return `RequestPolicy::Fenced(TargetGenerations { instance, targets })` from
+`request_policy()`. Capture the complete initial table from the durable inventory,
+including metadata targets. Give every changed mapping a fresh token that is
+never reused for that target. The runtime calls this pure method once alongside
+`info()`. Clients obtain their tokens from your complete inventory publication
+and return them in the MQTT v5 user property `target-generation` (one value,
+1–128 bytes in `0x21..0x7e`). Reads can omit it. Missing or retired tokens cannot
+mutate a fenced mapping, and the runtime refuses its standard `assume` command.
+
+Override `apply_with_context`, `execute_with_context` and
+`configure_with_context` to pass the original `RequestContext` to your service.
+Have `read_state_with_context` return `ContextualState` records stamped when the
+physical read was issued. Use `Reporter::state_with_context`,
+`event_with_context`, `remove_with_context` and `remove_property_with_context`
+for unsolicited reports. A late read or callback keeps its original token;
+absent/retired context cannot update the current model. Errors and replies also
+retain the request's token outside their unchanged JSON payload.
+
+Keep routing readiness separate from persistence. For a mapping edit:
+
+1. Freeze service mutation admission and serialize with hardware operations.
+2. Save the proposed inventory durably; remain frozen on uncertainty.
+3. Call `reporter.replace_generations(&old_table, new_table)` and require success.
+4. Report the complete new inventory with its instance token.
+5. Expose the new service mapping as ready.
+
+The table comparison rejects a stale owner. The runtime retires old queued,
+in-flight and unproven work and its conflict history, preserving original tokens
+on any retirement replies. A call already executing cannot be undone. Recheck
+the context at the service's actual address-resolution/dispatch boundary too.
+The pure `validate_request` hook lets the proxy reject transition-phase work
+before cached Config success or an already-satisfied conflict decision; it does
+no I/O and cannot override the runtime's own fence.
+
+Test through a local fake broker: stale Desired/Config/commands and retractions,
+rename away and back, address reuse, group-semantic changes, a delayed read across
+replacement, and output sealed before replacement. Verify actual driver calls
+and MQTT properties. Also retain the ordinary unfenced conformance suite so the
+optional feature cannot alter existing bridges. The full runtime contract is
+[`bridge-target-generations`](../../docs/superpowers/specs/2026-10-21-bridge-target-generations.md).
+
 ## A checklist before you ship a driver
 
 - `info()` declares what is true: `writes`, `feedback`, every command and its class. A driver with

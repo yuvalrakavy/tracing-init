@@ -700,6 +700,14 @@ impl Out {
         Out { first: true, ..self }
     }
 
+    /// Stamp the sealed observation/request context, never the current table.
+    pub(crate) fn context(mut self, context: &crate::RequestContext) -> Self {
+        if let Some(generation) = context.generation() {
+            self.properties.user_properties.push(("target-generation".into(), generation.to_owned()));
+        }
+        self
+    }
+
     /// Whether it is an empty retained message — a retraction — on `topic`, or under `prefix`.
     pub(crate) fn retracts(&self, topic: &str, prefix: &str) -> bool {
         self.retain && self.payload.is_empty() && (self.topic == topic || self.topic.starts_with(prefix))
@@ -755,15 +763,24 @@ impl Batch {
         let topics = &device.topics;
         let tag = device.tag.as_deref();
         let Changes { answer_errors, replies, status, states, errors, events } = changes;
-        self.answers.extend(answer_errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None, None)));
+        self.answers.extend(answer_errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None, None).context(&e.context)));
         self.answers.extend(
-            replies.into_iter().map(|r| Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation, None)),
+            replies
+                .into_iter()
+                .map(|r| Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation, None).context(&r.context)),
         );
         self.model.extend(status.map(|s| Out::new(topics.status(), true, s.as_str().as_bytes().to_vec(), None, tag)));
-        self.model.extend(states.into_iter().map(|(target, document)| Out::new(topics.state(&target), true, document, None, tag)));
-        self.unsolicited.extend(errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None, None)));
-        self.unsolicited
-            .extend(events.into_iter().map(|e| Out::new(e.topic.unwrap_or_else(|| topics.event()), false, e.payload, e.correlation, None)));
+        self.model.extend(
+            states
+                .into_iter()
+                .map(|(target, document, context)| Out::new(topics.state(&target), true, document, None, tag).context(&context)),
+        );
+        self.unsolicited.extend(errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None, None).context(&e.context)));
+        self.unsolicited.extend(
+            events
+                .into_iter()
+                .map(|e| Out::new(e.topic.unwrap_or_else(|| topics.event()), false, e.payload, e.correlation, None).context(&e.context)),
+        );
     }
 
     /// Queue `out` in `part`, behind what waits there.
@@ -784,8 +801,8 @@ impl Batch {
         if let Some(status) = model.status {
             self.push(Part::Model, said(Out::new(topics.status(), true, status.as_str().as_bytes().to_vec(), None, tag)));
         }
-        for (target, document) in model.states {
-            self.push(Part::Model, said(Out::new(topics.state(&target), true, document, None, tag)));
+        for (target, document, context) in model.states {
+            self.push(Part::Model, said(Out::new(topics.state(&target), true, document, None, tag).context(&context)));
         }
     }
 
@@ -1024,18 +1041,31 @@ pub(crate) fn traced(publish: &Publish) -> (String, Span) {
 /// An incoming publish for `device`, received at `now`, handled without waiting: requests go to the
 /// mailbox, what must be answered to the reports. Every deadline counts from `now`.
 pub(crate) fn route(device: &Device, topic: &str, publish: &Publish, now: Instant) {
+    route_with_config_admission(device, topic, publish, now, |_, _, _| {});
+}
+
+/// Configuration bookkeeping observes successful wire/table/mailbox admission,
+/// never an invalid delivery and never a later driver/hardware verdict.
+pub(crate) fn route_with_config_admission(
+    device: &Device,
+    topic: &str,
+    publish: &Publish,
+    now: Instant,
+    mut admitted: impl FnMut(&str, &crate::RequestContext, bool),
+) {
     let properties = publish.properties.as_ref();
+    let original_context = wire::request_context(properties).unwrap_or_default();
     let payload = &publish.payload[..];
     let malformed = |error: String, report: ErrorReport| {
         info!(kind = "validation_rejected", topic, error = %error, "A request was malformed; answered on Error");
         device.reports.error(ErrorReport { error, ..report });
     };
-    let blank = || ErrorReport::new(Reason::Malformed, "");
+    let blank = || ErrorReport::new(Reason::Malformed, "").context(&original_context);
     match device.topics.parse(topic) {
         Inbound::State { target } => {
             if publish.retain {
-                match wire::decode_state(payload) {
-                    Ok(values) => device.reports.read_back(&target, values),
+                match wire::decode_state(payload).and_then(|values| Ok((values, wire::request_context(properties)?))) {
+                    Ok((values, context)) => device.reports.read_back_with_context(&target, values, &context),
                     Err(e) => debug!(target = %target, error = %e, "The retained state read back is not a state; ignored"),
                 }
             }
@@ -1047,16 +1077,24 @@ pub(crate) fn route(device: &Device, topic: &str, publish: &Publish, now: Instan
                 Ok(None) => {
                     // The key's assumption is settled — unless a write of it is still unproven: the
                     // probe proves it, or the link's loss holds it again (re-gate 4 minor 7).
-                    if !device.mailbox.retract(&target, &property) {
-                        device.reports.assumption_settled(&target, &property);
+                    match wire::request_context(properties) {
+                        Err(error) => malformed(error, report),
+                        Ok(context) => match device.mailbox.retract_with_context(&target, &property, &context) {
+                            Err(why) => device.reports.request_error(
+                                ErrorReport::new(Reason::Refused, why.as_str()).context(&context).target(Some(&target)).property(&property),
+                            ),
+                            Ok(false) => device.reports.assumption_settled_with_context(&target, &property, &context),
+                            Ok(true) => {}
+                        },
                     }
                 }
                 Ok(Some(value)) => match wire::request_meta(properties, now) {
                     Err(e) => malformed(e, report),
                     Ok(meta) => {
                         // A replay's "before" basis, as of its arrival (re-gate R2).
-                        let basis = publish.retain.then(|| device.reports.broker_basis(&target, &property));
+                        let basis = publish.retain.then(|| device.reports.broker_basis_with_context(&target, &property, &meta.context));
                         let value = StateValue {
+                            context: meta.context,
                             target,
                             property,
                             value,
@@ -1066,9 +1104,18 @@ pub(crate) fn route(device: &Device, topic: &str, publish: &Publish, now: Instan
                             basis,
                             reheld: false,
                         };
-                        withdrawing(device, |withdraw| {
-                            device.mailbox.post_state_then(value, publish.retain, withdraw);
-                        });
+                        let target = value.target.clone();
+                        let property = value.property.clone();
+                        if let Posted::Refused(why) = withdrawing(device, &original_context, |withdraw| {
+                            device.mailbox.post_state_then(value, publish.retain, withdraw)
+                        }) {
+                            device.reports.request_error(
+                                ErrorReport::new(Reason::Refused, why.as_str())
+                                    .context(&original_context)
+                                    .target(Some(&target))
+                                    .property(&property),
+                            );
+                        }
                     }
                 },
             }
@@ -1084,6 +1131,7 @@ pub(crate) fn route(device: &Device, topic: &str, publish: &Publish, now: Instan
                     let values = values
                         .into_iter()
                         .map(|(property, value)| StateValue {
+                            context: meta.context.clone(),
                             target: target.clone(),
                             property,
                             value,
@@ -1094,9 +1142,13 @@ pub(crate) fn route(device: &Device, topic: &str, publish: &Publish, now: Instan
                             reheld: false,
                         })
                         .collect();
-                    withdrawing(device, |withdraw| {
-                        device.mailbox.post_target_then(values, withdraw);
-                    });
+                    if let Posted::Refused(why) =
+                        withdrawing(device, &original_context, |withdraw| device.mailbox.post_target_then(values, withdraw))
+                    {
+                        device.reports.request_error(
+                            ErrorReport::new(Reason::Refused, why.as_str()).context(&original_context).target(Some(&target)),
+                        );
+                    }
                 }
             }
         }
@@ -1108,6 +1160,7 @@ pub(crate) fn route(device: &Device, topic: &str, publish: &Publish, now: Instan
                 if let Ok(Some(reply)) = &reply {
                     let (target, command) = wire::command_names(payload);
                     device.reports.event(Outbound {
+                        context: original_context.clone(),
                         topic: Some(reply.topic.clone()),
                         payload: reply_payload(
                             target.as_deref(),
@@ -1130,30 +1183,52 @@ pub(crate) fn route(device: &Device, topic: &str, publish: &Publish, now: Instan
                 Err(e) => return refuse(e),
                 Ok(decoded) => decoded,
             };
+            let context = match wire::request_context(properties) {
+                Ok(context) => context,
+                Err(error) => return refuse(error),
+            };
             command(
                 device,
                 target,
                 call,
                 reply,
                 properties.and_then(|p| p.message_expiry_interval).map(|s| now + Duration::from_secs(u64::from(s))),
+                context,
             );
         }
-        Inbound::Config { target } => match wire::decode_config(payload) {
-            Err(e) => malformed(e, blank().target(Some(&target))),
-            Ok(config) => {
-                device.mailbox.post_config(&target, config);
+        Inbound::Config { target } => {
+            match wire::decode_config(payload).and_then(|config| Ok((config, wire::request_context(properties)?))) {
+                Err(e) => malformed(e, blank().target(Some(&target))),
+                Ok((config, context)) => {
+                    let present = config.is_some();
+                    match device.mailbox.post_config_with_context(&target, config, context.clone()) {
+                        Posted::Refused(why) => device.reports.request_error(
+                            ErrorReport::new(Reason::Refused, why.as_str()).context(&original_context).target(Some(&target)),
+                        ),
+                        Posted::Queued | Posted::Held | Posted::Skipped => admitted(&target, &context, present),
+                        Posted::Dropped => {}
+                    }
+                }
             }
-        },
+        }
         // A fixed bridge never subscribes to its `Status`: one arriving is no topic it reads.
         Inbound::Status | Inbound::Unknown => malformed(format!("`{topic}` is no topic of this bridge's grammar"), blank()),
     }
 }
 
 /// A command: the standard `refresh` and `assume`, or one the driver declares.
-fn command(device: &Device, target: Option<String>, call: crate::driver::CommandCall, reply: Option<ReplyTo>, deadline: Option<Instant>) {
+fn command(
+    device: &Device,
+    target: Option<String>,
+    call: crate::driver::CommandCall,
+    reply: Option<ReplyTo>,
+    deadline: Option<Instant>,
+    context: crate::RequestContext,
+) {
     let answer = |answer: Answer| {
         if let Some(reply) = &reply {
             device.reports.event(Outbound {
+                context: context.clone(),
                 topic: Some(reply.topic.clone()),
                 payload: reply_payload(target.as_deref(), &call.command, &answer),
                 correlation: reply.correlation.clone(),
@@ -1161,7 +1236,7 @@ fn command(device: &Device, target: Option<String>, call: crate::driver::Command
         }
     };
     let refused = |reason: Reason, error: &str| {
-        device.reports.request_error(ErrorReport::new(reason, error).target(target.as_deref()).command(&call.command));
+        device.reports.request_error(ErrorReport::new(reason, error).context(&context).target(target.as_deref()).command(&call.command));
         answer(Answer::Failed { reason, error: error.to_owned() });
     };
     // Past its expiry when the session reads it — it waited behind a stalled broker — a command
@@ -1172,11 +1247,13 @@ fn command(device: &Device, target: Option<String>, call: crate::driver::Command
     }
     match call.command.as_str() {
         "refresh" => {
-            let posted = device.mailbox.post_read(ReadKey::Refresh(target.clone()), None, reply.clone(), deadline);
+            let posted =
+                device.mailbox.post_read_with_context(ReadKey::Refresh(target.clone()), None, reply.clone(), deadline, context.clone());
             if posted == Posted::Dropped {
                 refused(Reason::Refused, "the device is not connected");
             }
         }
+        "assume" if device.reports.fenced() => refused(Reason::Refused, "assume is unavailable for a generation-fenced device"),
         "assume" => match &target {
             // The Store's input: a property that cannot stand as a topic segment is malformed, not
             // a driver's contract violation (Claude's re-gate minor 6).
@@ -1202,12 +1279,16 @@ fn command(device: &Device, target: Option<String>, call: crate::driver::Command
             }
             Some(CommandClass::Read) => {
                 let key = ReadKey::Command { target: target.clone(), command: name.to_owned() };
-                if device.mailbox.post_read(key, Some(call.clone()), reply.clone(), deadline) == Posted::Dropped {
+                if device.mailbox.post_read_with_context(key, Some(call.clone()), reply.clone(), deadline, context.clone())
+                    == Posted::Dropped
+                {
                     refused(Reason::Refused, "the device is not connected");
                 }
             }
             Some(CommandClass::Momentary | CommandClass::WithReply) => {
-                if let Posted::Refused(why) = device.mailbox.post_command(target.clone(), call.clone(), reply.clone(), deadline) {
+                if let Posted::Refused(why) =
+                    device.mailbox.post_command_with_context(target.clone(), call.clone(), reply.clone(), deadline, context.clone())
+                {
                     refused(Reason::Refused, why.as_str());
                 }
             }
@@ -1236,10 +1317,10 @@ fn panic_for_test(_: &str) {}
 /// replacement and assume it (third confirming reviews, Codex 2: withdrawn after, it reverted the
 /// replacement's own assumption). Logged once both locks are released. The worker withdraws the
 /// writes its own takes drop at their deadline.
-fn withdrawing(device: &Device, post: impl FnOnce(&mut dyn FnMut(&str, &str))) {
+fn withdrawing<R>(device: &Device, context: &crate::RequestContext, post: impl FnOnce(&mut dyn FnMut(&str, &str)) -> R) -> R {
     let mut withdrawn: Vec<(String, String)> = Vec::new();
-    post(&mut |target, property| {
-        if device.reports.withdraw_assumption(target, property) {
+    let result = post(&mut |target, property| {
+        if device.reports.withdraw_assumption_with_context(target, property, context) {
             withdrawn.push((target.to_owned(), property.to_owned()));
         }
     });
@@ -1247,6 +1328,7 @@ fn withdrawing(device: &Device, post: impl FnOnce(&mut dyn FnMut(&str, &str))) {
     for (target, property) in withdrawn {
         info!(target, property, "A write the device never proved taken was replaced before proof; its assumed value is withdrawn");
     }
+    result
 }
 
 /// (tests) What runs after a post.

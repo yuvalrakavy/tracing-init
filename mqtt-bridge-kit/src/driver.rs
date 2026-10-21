@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub use serde_json::Value;
 
+use crate::generations::{ContextualState, RequestContext, RequestKind, RequestPolicy};
 use crate::link::LinkContext;
 
 /// Property values by name: a target's state, or the values of one atomic write.
@@ -329,6 +330,22 @@ pub trait DeviceDriver: Send + 'static {
     /// I/O): one that does not return cannot hold up a stop, but the bridge does not start.
     fn info(&self) -> DriverInfo;
 
+    /// Original inventory mapping versions, captured once alongside [`Self::info`].
+    /// Pure and quick, with no I/O. Fencing currently requires a fixed [`crate::Bridge`];
+    /// a dynamic Host factory returning Fenced is rejected before its driver starts.
+    fn request_policy(&self) -> RequestPolicy {
+        RequestPolicy::Unfenced
+    }
+
+    /// Additional pure validation before cached success or outage resolution.
+    /// The runtime independently checks generation fences. No I/O or waits here;
+    /// the ordinary operation clock/watchdog covers this call. An error refuses
+    /// the entire request; Partial is treated as Rejected without assuming any
+    /// value was applied. Use Rejected/Unsupported for invalid intent, not Link.
+    fn validate_request(&self, _target: Option<&str>, _context: &RequestContext, _kind: RequestKind<'_>) -> Result<(), OpError> {
+        Ok(())
+    }
+
     /// Open the device link. Called again, at most one per [`Timing::retry`], after every failed
     /// connect and every lost link; bounded by [`Timing::connect`]. `ctx` lives as long as this
     /// link: helpers started through it (an unsolicited-input reader) are cancelled when the link
@@ -358,6 +375,14 @@ pub trait DeviceDriver: Send + 'static {
     /// them. Bounded by [`Timing::operation`].
     async fn read_state(&mut self, scope: Scope) -> Result<Vec<TargetState>, OpError>;
 
+    /// Read observations with their original mapping context. The default keeps
+    /// legacy observations unversioned; it never stamps a current generation.
+    async fn read_state_with_context(&mut self, scope: Scope) -> Result<Vec<ContextualState>, OpError> {
+        self.read_state(scope)
+            .await
+            .map(|states| states.into_iter().map(|state| ContextualState::new(state, RequestContext::default())).collect())
+    }
+
     /// Write `values` to `target`: several values arrive together when the write is atomic. Apply
     /// every value, in the order the device needs. Bounded by [`Timing::operation`].
     ///
@@ -371,6 +396,12 @@ pub trait DeviceDriver: Send + 'static {
     /// again if the link dies first.
     async fn apply(&mut self, target: &str, values: &PropertyMap) -> Result<(), OpError>;
 
+    /// Apply values sharing exactly one original request context.
+    async fn apply_with_context(&mut self, target: &str, values: &PropertyMap, _context: &RequestContext) -> Result<(), OpError> {
+        // WAIT: device-op
+        self.apply(target, values).await
+    }
+
     /// Run a momentary command, once: never retry (the runtime does not, and a retry here could
     /// act twice). `target` is the command's target, or `None` for a command that names none.
     /// Bounded by [`Timing::operation`].
@@ -381,11 +412,27 @@ pub trait DeviceDriver: Send + 'static {
     /// is an `Error` with the command's name; `Link` also drops the link.
     async fn execute(&mut self, target: Option<&str>, call: &CommandCall) -> Result<Option<Value>, OpError>;
 
+    /// Execute a command with its original packet context.
+    async fn execute_with_context(
+        &mut self,
+        target: Option<&str>,
+        call: &CommandCall,
+        _context: &RequestContext,
+    ) -> Result<Option<Value>, OpError> {
+        // WAIT: device-op
+        self.execute(target, call).await
+    }
+
     /// Accept (`Some`) or withdraw (`None`) a target's setup, as its `Config` intent arrived or was
     /// retracted. Called only while the link is up; a config identical to the one last taken on this
     /// link is not handed over again, and a lost link forgets what was taken. A config's `feedback`
     /// override takes effect once this has returned `Ok`. Bounded by [`Timing::operation`].
     async fn configure(&mut self, target: &str, config: Option<&Value>) -> Result<(), OpError>;
+
+    /// Configure a target with the original packet or installed context.
+    async fn configure_with_context(&mut self, target: &str, config: Option<&Value>, _context: &RequestContext) -> Result<(), OpError> {
+        self.configure(target, config).await
+    }
 
     /// Prove the device is alive, for a driver with [`Writes::Unacknowledged`]: called when the
     /// device has been quiet for [`Timing::probe_interval`], and soon after writes while they are
@@ -397,6 +444,6 @@ pub trait DeviceDriver: Send + 'static {
     /// nothing: from an unacknowledged driver it is a contract violation (ERROR
     /// `driver_contract_violation`, once), after which its writes are taken as proven anyway.
     async fn probe(&mut self) -> Result<(), OpError> {
-        self.read_state(Scope::Any).await.map(drop)
+        self.read_state_with_context(Scope::Any).await.map(drop)
     }
 }

@@ -49,7 +49,8 @@ use tracing::{debug, info, warn, Span};
 
 use crate::config::{self, TimingOverrides};
 use crate::devices::{drop_off_thread, Event, Spawner, Startable};
-use crate::driver::{DriverInfo, PropertyMap};
+use crate::driver::PropertyMap;
+use crate::generations::{DriverDescription, RequestContext};
 use crate::host::{DeviceConfig, Factory, FactoryError};
 use crate::mailbox::Mailbox;
 use crate::pump::PumpEvent;
@@ -233,7 +234,7 @@ struct Rt {
 struct Ready {
     config: Value,
     driver: Box<dyn Startable>,
-    info: DriverInfo,
+    info: DriverDescription,
 }
 
 /// What an instance's read-back last saw on one of its topics: the `via` (exactly one, or none)
@@ -241,6 +242,7 @@ struct Ready {
 struct Seen {
     via: Option<String>,
     payload: Vec<u8>,
+    context: Result<RequestContext, String>,
 }
 
 /// An instance this process owns.
@@ -269,10 +271,10 @@ struct Instance {
     /// seen.
     slot: BTreeMap<String, Seen>,
     /// The target Configs given to the current device (non-empty last).
-    installed: BTreeSet<String>,
+    installed: BTreeMap<String, RequestContext>,
     /// The target Configs present on the current connection since S2 was asked for: replayed by
     /// S2, or written live meanwhile (a live retraction removes one).
-    replayed: BTreeSet<String>,
+    replayed: BTreeMap<String, RequestContext>,
 }
 
 impl Instance {
@@ -292,8 +294,8 @@ impl Instance {
             retry_at: None,
             validated: None,
             slot: BTreeMap::new(),
-            installed: BTreeSet::new(),
-            replayed: BTreeSet::new(),
+            installed: BTreeMap::new(),
+            replayed: BTreeMap::new(),
         }
     }
 
@@ -537,18 +539,20 @@ impl Lifecycle {
         outputs: &mut Outputs,
         name: &str,
         driver: Box<dyn Startable>,
-        info: DriverInfo,
+        info: DriverDescription,
         span: Span,
     ) -> Result<(), String> {
         let device = Arc::new(Device {
             topics: Topics::new(&self.settings.root, name)?,
-            commands: info.commands.clone().into(),
+            commands: info.info.commands.clone().into(),
             mailbox: Mailbox::new(),
             reports: Reports::with_ready(self.ready.clone()),
             tag: None,
             span: span.clone(),
         });
-        self.spawner.start(FIXED_ID, name, false, driver, info, device.mailbox.clone(), device.reports.clone(), span)?;
+        device.mailbox.bind_reports(&device.reports);
+        device.reports.install_policy(*info.policy);
+        self.spawner.start(FIXED_ID, name, false, driver, info.info, device.mailbox.clone(), device.reports.clone(), span)?;
         self.insert_fixed(outputs, device);
         Ok(())
     }
@@ -1112,10 +1116,15 @@ impl Lifecycle {
                     if let Some(rt) = inst.rt.as_mut() {
                         rt.requests = Sub::Granted;
                         if rt.bootstrapped {
-                            let gone: Vec<String> = inst.installed.difference(&inst.replayed).cloned().collect();
-                            for target in gone {
+                            let gone: Vec<(String, RequestContext)> = inst
+                                .installed
+                                .iter()
+                                .filter(|(target, context)| inst.replayed.get(*target) != Some(*context))
+                                .map(|(target, context)| (target.clone(), context.clone()))
+                                .collect();
+                            for (target, context) in gone {
                                 info!(instance = %inst.name, target = %target, "A target Config no longer retained; retracted");
-                                rt.device.mailbox.post_config(&target, None);
+                                rt.device.mailbox.post_config_with_context(&target, None, context);
                                 inst.installed.remove(&target);
                             }
                         }
@@ -1321,7 +1330,7 @@ impl Lifecycle {
                     self.worker_stopped(ctx, outputs, &name).await?;
                 }
             }
-            Event::Built { instance, id, result } => self.built(ctx, outputs, &instance, id, result).await?,
+            Event::Built { instance, id, result } => self.built(ctx, outputs, &instance, id, *result).await?,
         }
         Ok(())
     }
@@ -1789,7 +1798,7 @@ impl Lifecycle {
         outputs: &mut Outputs,
         name: &str,
         id: u64,
-        result: Result<(Box<dyn Startable>, DriverInfo), FactoryError>,
+        result: Result<(Box<dyn Startable>, DriverDescription), FactoryError>,
     ) -> Result<(), Failed> {
         let stale = self.instances.get(name).map_or(true, |i| i.build.as_ref().map(|(b, _)| *b) != Some(id));
         if stale {
@@ -1803,9 +1812,12 @@ impl Lifecycle {
         };
         // The driver's timing, with the host's overrides; timings that cannot run are the Config's
         // failure.
-        let result = result.and_then(|(driver, info)| {
-            match config::device_info(info, &self.settings.overrides, self.settings.device_stable, &self.settings.mqtt) {
-                Ok(info) => Ok((driver, info)),
+        let result = result.and_then(|(driver, mut info)| {
+            match config::device_info(info.info, &self.settings.overrides, self.settings.device_stable, &self.settings.mqtt) {
+                Ok(updated) => {
+                    info.info = updated;
+                    Ok((driver, info))
+                }
                 Err(e) => {
                     drop_off_thread(driver);
                     Err(FactoryError::Unusable(format!("the driver's timing cannot run: {e}")))
@@ -1937,8 +1949,8 @@ impl Lifecycle {
         // Only what carries this process's own tag — the effective owner's (§4.2).
         for (topic, seen) in &instance.slot {
             if let (Inbound::State { target }, true) = (instance.topics.parse(topic), seen.via.as_deref() == Some(own.as_str())) {
-                if let Ok(values) = wire::decode_state(&seen.payload) {
-                    rt.device.reports.read_back(&target, values);
+                if let (Ok(values), Ok(context)) = (wire::decode_state(&seen.payload), &seen.context) {
+                    rt.device.reports.read_back_with_context(&target, values, context);
                 }
             }
         }
@@ -1982,6 +1994,7 @@ impl Lifecycle {
             tag: Some(self.settings.id.clone()),
             span,
         });
+        device.mailbox.bind_reports(&device.reports);
         instance.rt = Some(Rt {
             id,
             device: device.clone(),
@@ -2014,14 +2027,15 @@ impl Lifecycle {
         let Some(rt) = instance.rt.as_mut() else {
             return Ok(());
         };
-        let _ = rt.device.commands.set(ready.info.commands.clone());
+        let _ = rt.device.commands.set(ready.info.info.commands.clone());
+        rt.device.reports.install_policy(*ready.info.policy);
         let device = rt.device.clone();
         match self.spawner.start(
             rt.id,
             name,
             true,
             ready.driver,
-            ready.info,
+            ready.info.info,
             device.mailbox.clone(),
             device.reports.clone(),
             device.span.clone(),
@@ -2278,24 +2292,24 @@ impl Lifecycle {
             ),
             Phase::Disabled => terminal(&device, outputs, topic, publish, "the instance is disabled"),
             Phase::Live => {
-                if let Inbound::Config { target } = &inbound {
-                    // Present on this connection: replayed, or written live since S2 was asked for
-                    // — a target Config the Store creates in S2's window is retained though no
-                    // replay brought it (R2 gate, Codex 5 / Claude 2); a live retraction is gone.
-                    if publish.payload.is_empty() {
-                        instance.installed.remove(target);
-                        instance.replayed.remove(target);
-                    } else {
-                        instance.installed.insert(target.clone());
-                        instance.replayed.insert(target.clone());
-                    }
-                }
                 // A failed instance refuses target-level writes, as commands (multi-device spec §4.3).
                 if failed && matches!(inbound, Inbound::DesiredTarget { .. }) {
                     return terminal(&device, outputs, topic, publish, "the instance's device could not be built from its Config");
                 }
                 let _entered = device.span.enter();
-                session::route(&device, topic, publish, received);
+                session::route_with_config_admission(&device, topic, publish, received, |target, context, present| {
+                    if present {
+                        instance.installed.insert(target.to_owned(), context.clone());
+                        instance.replayed.insert(target.to_owned(), context.clone());
+                    } else {
+                        if instance.installed.get(target) == Some(context) {
+                            instance.installed.remove(target);
+                        }
+                        if instance.replayed.get(target) == Some(context) {
+                            instance.replayed.remove(target);
+                        }
+                    }
+                });
             }
         }
     }
@@ -2312,7 +2326,10 @@ fn observe_slot(instance: &mut Instance, id: &str, topic: &str, inbound: &Inboun
     if payload.is_empty() {
         instance.slot.remove(topic);
     } else {
-        instance.slot.insert(topic.to_owned(), Seen { via: via.clone(), payload: payload.to_vec() });
+        instance.slot.insert(
+            topic.to_owned(),
+            Seen { via: via.clone(), payload: payload.to_vec(), context: wire::request_context(publish.properties.as_ref()) },
+        );
     }
     let Some(rt) = instance.rt.as_ref() else {
         return;
@@ -2324,8 +2341,8 @@ fn observe_slot(instance: &mut Instance, id: &str, topic: &str, inbound: &Inboun
     // Only the effective owner's own tag is a "before" value (§4.2): a State another process
     // tagged is not this owner's knowledge of the device (R2 gate, Codex 6).
     if let (Inbound::State { target }, true, true) = (inbound, publish.retain, via.as_deref() == Some(id)) {
-        match wire::decode_state(payload) {
-            Ok(values) => reports.read_back(target, values),
+        match wire::decode_state(payload).and_then(|values| Ok((values, wire::request_context(publish.properties.as_ref())?))) {
+            Ok((values, context)) => reports.read_back_with_context(target, values, &context),
             Err(e) => {
                 debug!(instance = %instance.name, target = %target, error = %e, "The retained state read back is not a state; ignored")
             }
@@ -2368,8 +2385,9 @@ fn single_via(publish: &Publish) -> Option<String> {
 fn terminal(device: &Device, outputs: &mut Outputs, topic: &str, publish: &Publish, why: &str) {
     let _entered = device.span.enter();
     let payload = &publish.payload[..];
+    let context = wire::request_context(publish.properties.as_ref()).unwrap_or_default();
     let error = |outputs: &mut Outputs, report: ErrorReport| {
-        outputs.queue_outbox(Part::Answers, Out::new(device.topics.error(), false, report.encode(), None, None));
+        outputs.queue_outbox(Part::Answers, Out::new(device.topics.error(), false, report.encode(), None, None).context(&context));
     };
     match device.topics.parse(topic) {
         Inbound::Command => {
@@ -2378,7 +2396,7 @@ fn terminal(device: &Device, outputs: &mut Outputs, topic: &str, publish: &Publi
             if let Ok(Some(reply)) = ReplyTo::from_properties(publish.properties.as_ref(), &device.topics) {
                 let answer = Answer::Failed { reason: Reason::Refused, error: why.to_owned() };
                 let payload = reply_payload(target.as_deref(), &command, &answer);
-                outputs.queue_outbox(Part::Answers, Out::new(reply.topic, false, payload, reply.correlation, None));
+                outputs.queue_outbox(Part::Answers, Out::new(reply.topic, false, payload, reply.correlation, None).context(&context));
             }
             debug!(topic, command = %command, "A command for an instance that takes none; refused");
         }

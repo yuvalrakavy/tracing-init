@@ -27,7 +27,8 @@ use serde_json::Value;
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn, Instrument, Span};
 
-use crate::driver::{DeviceDriver, DriverInfo, FailureClass, Feedback, LinkError, OpError, PropertyMap, Scope, TargetState, Writes};
+use crate::driver::{DeviceDriver, DriverInfo, FailureClass, Feedback, LinkError, OpError, PropertyMap, Scope, Writes};
+use crate::generations::{ContextualState, RequestContext, RequestKind, RequestPolicy};
 use crate::link::{Abandoned, LinkContext, LinkHandle, OpClock};
 use crate::mailbox::{Held, Mailbox, ReadKey, Resolution, StateValue, Unanswered, Work};
 use crate::replies::{reply_payload, Answer, ReplyTo};
@@ -262,6 +263,7 @@ fn index_map(map: &BTreeMap<String, PropertyMap>, into: &mut Values) {
 
 /// What the Up loop does next.
 enum Step {
+    PolicyChanged,
     /// The link on trial has lasted: the outage ends.
     Stable,
     Probe,
@@ -288,12 +290,13 @@ pub(crate) struct Worker<D: DeviceDriver> {
     /// the read-back stands for it. A link lost before its catch-up is done leaves it as it is
     /// (review M1: retaken from the proving read's values, it forgot a change at the wall).
     before: Option<(Instant, BTreeMap<String, PropertyMap>)>,
+    before_policy: Option<RequestPolicy>,
     /// Whether the current link has recovered: proven, and its catch-up done.
     recovered: bool,
     /// The config `configure` last took for each target on this link: one identical is not handed
     /// over again while the link stays up (every reconnect replays the retained configs; review
     /// MINOR 5). Forgotten when the link is lost — the device may have lost its setup with it.
-    configured: HashMap<String, Option<Value>>,
+    configured: HashMap<String, (RequestContext, Option<Value>)>,
     /// Whether the driver's `Unsupported` probe was said (once per process).
     unsupported_probe_said: bool,
     /// The stop, once the worker runs on its thread: asked, no more work is taken.
@@ -314,6 +317,7 @@ impl<D: DeviceDriver> Worker<D> {
             generation: 0,
             last_attempt: None,
             before: None,
+            before_policy: None,
             recovered: false,
             configured: HashMap::new(),
             unsupported_probe_said: false,
@@ -328,10 +332,10 @@ impl<D: DeviceDriver> Worker<D> {
 
     /// The runtime assumes what it wrote to a target with assumed feedback: proven at once for an
     /// acknowledged write, unproven until a probe for an unacknowledged one (re-gate R3).
-    fn assume(&self, target: &str, values: PropertyMap) {
+    fn assume(&self, target: &str, values: PropertyMap, context: &RequestContext) {
         match self.info.writes {
-            Writes::Acknowledged => self.reports.state(target, values, true),
-            Writes::Unacknowledged => self.reports.assume_unproven(target, values),
+            Writes::Acknowledged => self.reports.state_with_context(target, values, true, context),
+            Writes::Unacknowledged => self.reports.assume_unproven_with_context(target, values, context),
         }
     }
 
@@ -357,8 +361,17 @@ impl<D: DeviceDriver> Worker<D> {
         self.reports.status(LinkStatus::Connecting);
         loop {
             if let Some(at) = self.last_attempt {
-                tokio::time::sleep_until((at + self.info.timing.retry).into()).await;
+                let resume = at + self.info.timing.retry;
+                loop {
+                    let mailbox = self.mailbox.clone();
+                    // WAIT: worker-retry
+                    tokio::select! {
+                        () = tokio::time::sleep_until(resume.into()) => break,
+                        () = mailbox.policy_changed() => self.retire_cached(),
+                    }
+                }
             }
+            self.retire_cached();
             self.last_attempt = Some(Instant::now());
             self.generation += 1;
             let mut ctx =
@@ -394,10 +407,10 @@ impl<D: DeviceDriver> Worker<D> {
 
     /// Proof of life: the first good read — or, for a driver that cannot read, probe. A device
     /// that answers with something unusable has answered: that proves it alive too.
-    async fn prove(&mut self, handle: &LinkHandle) -> Result<Option<Vec<TargetState>>, LinkError> {
+    async fn prove(&mut self, handle: &LinkHandle) -> Result<Option<Vec<ContextualState>>, LinkError> {
         let timing = self.info.timing;
         // WAIT: device-op
-        match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::All)).await {
+        match op(handle, timing.operation, "read_state", self.driver.read_state_with_context(Scope::All)).await {
             Ok(states) => {
                 self.proven();
                 self.fold(&states);
@@ -423,7 +436,17 @@ impl<D: DeviceDriver> Worker<D> {
     /// The conflict rule's "before" values, for each way a value can be checked (Store kit spec
     /// §4.5): see [`Befores::of`].
     fn befores(&self) -> Befores {
-        let (device_at, device) = self.before.clone().unwrap_or_else(|| self.reports.read_back_before());
+        let (device_at, mut device) = self.before.clone().unwrap_or_else(|| self.reports.read_back_before());
+        if let Some(RequestPolicy::Fenced(current)) = self.reports.current_policy() {
+            if self.before.is_some() {
+                match &self.before_policy {
+                    Some(RequestPolicy::Fenced(saved)) => device.retain(|target, _| {
+                        current.targets.contains_key(target) && current.targets.get(target) == saved.targets.get(target)
+                    }),
+                    _ => device.clear(),
+                }
+            }
+        }
         let (broker_at, broker) = self.reports.broker_before();
         let (mut device_values, mut broker_values) = (HashMap::new(), HashMap::new());
         index_map(&device, &mut device_values);
@@ -435,21 +458,24 @@ impl<D: DeviceDriver> Worker<D> {
     /// against the proving read — a target it did not give is read on its own — then applied a
     /// target at a time; then, for an unacknowledged device, a probe proves it taken. Returns how
     /// many values were written.
-    async fn catch_up(&mut self, handle: &LinkHandle, read: Option<Vec<TargetState>>) -> Result<usize, LinkError> {
-        let mut proving: BTreeMap<String, PropertyMap> = BTreeMap::new();
+    async fn catch_up(&mut self, handle: &LinkHandle, read: Option<Vec<ContextualState>>) -> Result<usize, LinkError> {
+        let mut proving: BTreeMap<(String, RequestContext), PropertyMap> = BTreeMap::new();
         for state in read.into_iter().flatten() {
-            proving.entry(state.target).or_default().extend(state.values);
+            if self.reports.context_is_current(Some(&state.state.target), &state.context) {
+                let context = if self.reports.fenced() { state.context } else { RequestContext::default() };
+                proving.entry((state.state.target, context)).or_default().extend(state.state.values);
+            }
         }
         let mut applied = 0;
         // A target's setup first, then the held values.
-        while let Some((target, config)) = self.mailbox.take_held_config() {
-            self.configure(handle, &target, config).await?;
+        while let Some((target, config, context)) = self.mailbox.take_held_config_with_context() {
+            self.configure(handle, &target, config, context).await?;
         }
         // Nothing more is taken once the stop is asked (re-gate 4 minor 1).
         while !self.stopping() {
             match self.mailbox.take_held() {
                 None => break,
-                Some(Held::Config { target, config }) => self.configure(handle, &target, config).await?,
+                Some(Held::Config { target, config, context }) => self.configure(handle, &target, config, context).await?,
                 Some(Held::Values(held)) => {
                     let apply = self.decide(handle, &held.target, held.values, &proving).await?;
                     applied += self.write_values(handle, &held.target, apply).await?;
@@ -473,7 +499,9 @@ impl<D: DeviceDriver> Worker<D> {
         };
         for value in values {
             info!(target = %value.target, property = %value.property, unknown, "A held request was superseded by a change at the device");
-            self.reports.request_error(ErrorReport::new(Reason::Superseded, message).target(Some(&value.target)).property(&value.property));
+            self.reports.request_error(
+                ErrorReport::new(Reason::Superseded, message).context(&value.context).target(Some(&value.target)).property(&value.property),
+            );
         }
     }
 
@@ -482,18 +510,62 @@ impl<D: DeviceDriver> Worker<D> {
     /// withdrawn (second final gate, Claude's minor 1). A value never held again has nothing to
     /// withdraw.
     fn abandon<'a>(&self, values: impl Iterator<Item = &'a StateValue>) {
-        let expired = self.mailbox.take_abandoned();
-        let gone = values.filter(|v| v.reheld).map(|v| (v.target.clone(), v.property.clone()));
-        for (target, property) in gone.chain(expired) {
-            self.reports.assumption_abandoned(&target, &property);
+        let expired = self.mailbox.take_abandoned_with_context();
+        let gone = values.filter(|v| v.reheld).map(|v| (v.target.clone(), v.property.clone(), v.context.clone()));
+        for (target, property, context) in gone.chain(expired) {
+            self.reports.assumption_abandoned_with_context(&target, &property, &context);
+        }
+    }
+
+    fn retire_cached(&mut self) {
+        let reports = &self.reports;
+        self.configured.retain(|target, (context, _)| reports.context_is_current(Some(target), context));
+        if let (Some((_, values)), Some(RequestPolicy::Fenced(saved)), Some(RequestPolicy::Fenced(current))) =
+            (&mut self.before, &self.before_policy, reports.current_policy())
+        {
+            values.retain(|target, _| current.targets.contains_key(target) && current.targets.get(target) == saved.targets.get(target));
         }
     }
 
     /// Fold a read into the retained model.
-    fn fold(&self, states: &[TargetState]) {
+    fn fold(&self, states: &[ContextualState]) {
         for state in states {
-            self.reports.state(&state.target, state.values.clone(), false);
+            self.reports.state_with_context(&state.state.target, state.state.values.clone(), false, &state.context);
         }
+    }
+
+    /// Pure driver admission runs under the operation clock, before cached or
+    /// conflict-based acceptance as well as before dispatch.
+    async fn validate(
+        &self,
+        handle: &LinkHandle,
+        target: Option<&str>,
+        context: &RequestContext,
+        kind: RequestKind<'_>,
+        mutation: bool,
+    ) -> Result<(), OpError> {
+        // Pure validation is polled only inside the bounded op below.
+        op(handle, self.info.timing.operation, "validate_request", async {
+            if mutation && !self.reports.context_is_current(target, context) {
+                return Err(OpError::Rejected(crate::mailbox::Refusal::StaleGeneration.as_str().into()));
+            }
+            self.driver.validate_request(target, context, kind).map_err(|error| match error {
+                OpError::Partial(_) => OpError::Rejected("driver validation must reject the complete request".into()),
+                error => error,
+            })
+        })
+        .await
+    }
+
+    fn rejected_values(&self, values: &[StateValue], error: &OpError) {
+        let (reason, message) = classify(error);
+        for value in values {
+            self.reports.request_error(
+                ErrorReport::new(reason, message).context(&value.context).target(Some(&value.target)).property(&value.property),
+            );
+        }
+        self.mailbox.failed();
+        self.abandon(values.iter());
     }
 
     /// Apply one target's values together. A failure of the request alone is reported and the
@@ -504,18 +576,33 @@ impl<D: DeviceDriver> Worker<D> {
             return Ok(0);
         }
         let map: PropertyMap = values.iter().map(|v| (v.property.clone(), v.value.clone())).collect();
+        let context = values[0].context.clone();
+        match self.validate(handle, Some(target), &context, RequestKind::Apply(&map), true).await {
+            Ok(()) => {}
+            Err(OpError::Link(error)) => return Err(error),
+            Err(error) => {
+                self.rejected_values(&values, &error);
+                return Ok(0);
+            }
+        }
+        let values = self.mailbox.revalidate(values);
+        if values.is_empty() {
+            return Ok(0);
+        }
+        let map: PropertyMap = values.iter().map(|v| (v.property.clone(), v.value.clone())).collect();
         let feedback = self.mailbox.feedback(target, self.info.feedback);
         let reported_before = self.reports.reports_for(target);
         let timing = self.info.timing;
-        match op(handle, timing.operation, "apply", self.driver.apply(target, &map)).await {
+        // WAIT: device-op
+        match op(handle, timing.operation, "apply", self.driver.apply_with_context(target, &map, &context)).await {
             Ok(()) => {
                 self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
                 if self.info.writes == Writes::Acknowledged {
                     // What the device acknowledged is what the bridge knows (the lead's F2).
-                    self.reports.written(target, &map, reported_before);
+                    self.reports.written_with_context(target, &map, reported_before, &context);
                 }
                 if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before {
-                    self.assume(target, map);
+                    self.assume(target, map, &context);
                 }
                 Ok(values.len())
             }
@@ -533,10 +620,10 @@ impl<D: DeviceDriver> Worker<D> {
                     .collect();
                 let count = applied.len();
                 if self.info.writes == Writes::Acknowledged {
-                    self.reports.written(target, &applied, reported_before);
+                    self.reports.written_with_context(target, &applied, reported_before, &context);
                 }
                 if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before && !applied.is_empty() {
-                    self.assume(target, applied);
+                    self.assume(target, applied, &context);
                 }
                 for failure in &failures {
                     let reason = match failure.class {
@@ -549,8 +636,9 @@ impl<D: DeviceDriver> Worker<D> {
                     } else {
                         info!(target, property = %failure.property, error = %failure.error, ?reason, "A property of a request failed");
                     }
-                    self.reports
-                        .request_error(ErrorReport::new(reason, failure.error.clone()).target(Some(target)).property(&failure.property));
+                    self.reports.request_error(
+                        ErrorReport::new(reason, failure.error.clone()).context(&context).target(Some(target)).property(&failure.property),
+                    );
                 }
                 Ok(count)
             }
@@ -569,7 +657,8 @@ impl<D: DeviceDriver> Worker<D> {
                     _ => debug!(target, ?properties, error = message, "The device's answer to a request was unusable; passed over"),
                 }
                 for value in &values {
-                    self.reports.request_error(ErrorReport::new(reason, message).target(Some(target)).property(&value.property));
+                    self.reports
+                        .request_error(ErrorReport::new(reason, message).context(&context).target(Some(target)).property(&value.property));
                 }
                 Ok(0)
             }
@@ -577,18 +666,35 @@ impl<D: DeviceDriver> Worker<D> {
     }
 
     /// Hand a target its setup — unless `configure` took the same one on this link already.
-    async fn configure(&mut self, handle: &LinkHandle, target: &str, config: Option<Value>) -> Result<(), LinkError> {
-        if self.configured.get(target) == Some(&config) {
+    async fn configure(
+        &mut self,
+        handle: &LinkHandle,
+        target: &str,
+        config: Option<Value>,
+        context: RequestContext,
+    ) -> Result<(), LinkError> {
+        match self.validate(handle, Some(target), &context, RequestKind::Configure(config.as_ref()), true).await {
+            Ok(()) => {}
+            Err(OpError::Link(error)) => return Err(error),
+            Err(error) => {
+                let (reason, message) = classify(&error);
+                self.reports.request_error(ErrorReport::new(reason, message).context(&context).target(Some(target)));
+                self.mailbox.failed();
+                return Ok(());
+            }
+        }
+        if self.configured.get(target).is_some_and(|(original, previous)| *original == context && *previous == config) {
             debug!(target, "A config identical to the one this link has already taken; not handed over again");
-            self.mailbox.configured(target, config.as_ref());
+            self.mailbox.configured_with_context(target, config.as_ref(), &context);
             return Ok(());
         }
         let timing = self.info.timing;
         // WAIT: device-op
-        match op(handle, timing.operation, "configure", self.driver.configure(target, config.as_ref())).await {
+        match op(handle, timing.operation, "configure", self.driver.configure_with_context(target, config.as_ref(), &context)).await {
             Ok(()) => {
-                self.mailbox.configured(target, config.as_ref());
-                self.configured.insert(target.to_owned(), config);
+                if self.mailbox.configured_with_context(target, config.as_ref(), &context) {
+                    self.configured.insert(target.to_owned(), (context, config));
+                }
                 Ok(())
             }
             Err(OpError::Link(e)) => Err(e),
@@ -598,7 +704,8 @@ impl<D: DeviceDriver> Worker<D> {
                 if reason == Reason::Rejected {
                     warn!(kind = "command_rejected", target, error = message, "The device rejected a target's configuration");
                 }
-                self.reports.request_error(ErrorReport::new(reason, format!("configuration: {message}")).target(Some(target)));
+                self.reports
+                    .request_error(ErrorReport::new(reason, format!("configuration: {message}")).context(&context).target(Some(target)));
                 Ok(())
             }
         }
@@ -666,12 +773,17 @@ impl<D: DeviceDriver> Worker<D> {
             let step = tokio::select! {
                 biased;
                 lost = handle.lost() => return lost,
+                () = mailbox.policy_changed() => Step::PolicyChanged,
                 () = sleep_until(stable_at) => Step::Stable,
                 () = sleep_until(probe_at) => Step::Probe,
                 () = sleep_until(poll_at) => Step::Poll,
                 work = mailbox.take(), if !self.stopping() => Step::Work(work),
             };
             let outcome = match step {
+                Step::PolicyChanged => {
+                    self.retire_cached();
+                    Ok(())
+                }
                 Step::Stable => {
                     self.outage.stable();
                     Ok(())
@@ -679,7 +791,7 @@ impl<D: DeviceDriver> Worker<D> {
                 Step::Probe => self.probe(handle).await.map(|()| last_heard = Instant::now()),
                 Step::Poll => {
                     // WAIT: device-op
-                    let polled = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::All)).await {
+                    let polled = match op(handle, timing.operation, "read_state", self.driver.read_state_with_context(Scope::All)).await {
                         Ok(states) => {
                             last_heard = Instant::now();
                             self.proven();
@@ -722,42 +834,63 @@ impl<D: DeviceDriver> Worker<D> {
                 let values = self.decide(handle, &target, values, &BTreeMap::new()).await?;
                 self.write_values(handle, &target, values).await.map(drop)
             }
-            Work::Configure { target, config } => self.configure(handle, &target, config).await,
-            Work::Expired { target, call, reply } => {
+            Work::Configure { target, config, context } => self.configure(handle, &target, config, context).await,
+            Work::Expired { target, call, reply, context } => {
                 let message = "the command reached its expiry while it waited for the device; not executed";
                 debug!(target = target.as_deref(), command = %call.command, "A command expired while it waited");
                 report_refused(
                     &self.reports,
-                    vec![Unanswered { ran: false, target, command: call.command, momentary: true, replies: reply.into_iter().collect() }],
+                    vec![Unanswered {
+                        context,
+                        ran: false,
+                        target,
+                        command: call.command,
+                        momentary: true,
+                        replies: reply.into_iter().collect(),
+                    }],
                     message,
                 );
                 Ok(())
             }
-            Work::Execute { target, call, reply } => {
-                let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref(), &call)).await;
-                self.answer_once(target.as_deref(), &call.command, result, reply.into_iter().collect())
+            Work::Execute { target, call, reply, context } => {
+                let result = match self.validate(handle, target.as_deref(), &context, RequestKind::Command(&call), true).await {
+                    Err(error) => Err(error),
+                    Ok(()) => {
+                        // WAIT: device-op
+                        let execution = self.driver.execute_with_context(target.as_deref(), &call, &context);
+                        op(handle, timing.operation, "execute", execution).await
+                    }
+                };
+                self.answer_once(target.as_deref(), &call.command, result, reply.into_iter().collect(), &context)
             }
             Work::ReadExpired { expired } => {
                 report_refused(&self.reports, expired, READ_EXPIRED);
                 Ok(())
             }
-            Work::Read { key: ReadKey::Refresh(target), replies, expired, .. } => {
+            Work::Read { key: ReadKey::Refresh(target), replies, expired, context, .. } => {
                 report_refused(&self.reports, expired, READ_EXPIRED);
                 let scope = target.clone().map_or(Scope::All, Scope::Target);
                 // WAIT: device-op
-                let result = op(handle, timing.operation, "read_state", self.driver.read_state(scope)).await.map(|states| {
+                let result = op(handle, timing.operation, "read_state", self.driver.read_state_with_context(scope)).await.map(|states| {
                     self.proven();
                     self.fold(&states);
                     None
                 });
                 // A failure goes to Error too, as every command's does (review C13).
-                self.answer_once(target.as_deref(), "refresh", result, replies)
+                self.answer_once(target.as_deref(), "refresh", result, replies, &context)
             }
-            Work::Read { key: ReadKey::Command { target, command }, call, replies, expired } => {
+            Work::Read { key: ReadKey::Command { target, command }, call, replies, expired, context } => {
                 report_refused(&self.reports, expired, READ_EXPIRED);
                 let call = call.unwrap_or_else(|| crate::driver::CommandCall { command: command.clone(), params: PropertyMap::new() });
-                let result = op(handle, timing.operation, "execute", self.driver.execute(target.as_deref(), &call)).await;
-                self.answer_once(target.as_deref(), &command, result, replies)
+                let result = match self.validate(handle, target.as_deref(), &context, RequestKind::Command(&call), false).await {
+                    Err(error) => Err(error),
+                    Ok(()) => {
+                        // WAIT: device-op
+                        let execution = self.driver.execute_with_context(target.as_deref(), &call, &context);
+                        op(handle, timing.operation, "execute", execution).await
+                    }
+                };
+                self.answer_once(target.as_deref(), &command, result, replies, &context)
             }
         }
     }
@@ -774,36 +907,72 @@ impl<D: DeviceDriver> Worker<D> {
         handle: &LinkHandle,
         target: &str,
         values: Vec<StateValue>,
-        proving: &BTreeMap<String, PropertyMap>,
+        proving: &BTreeMap<(String, RequestContext), PropertyMap>,
     ) -> Result<Vec<StateValue>, LinkError> {
+        let values = self.mailbox.revalidate(values);
+        let Some(first) = values.first() else {
+            return Ok(values);
+        };
+        let map = values.iter().map(|value| (value.property.clone(), value.value.clone())).collect();
+        match self.validate(handle, Some(target), &first.context, RequestKind::Apply(&map), true).await {
+            Ok(()) => {}
+            Err(OpError::Link(error)) => return Err(error),
+            Err(error) => {
+                self.rejected_values(&values, &error);
+                return Ok(Vec::new());
+            }
+        }
         if !values.iter().any(|v| v.check.any()) {
             return Ok(values);
         }
         let timing = self.info.timing;
         let (current, values) = if self.mailbox.feedback(target, self.info.feedback) == Feedback::Assumed {
             (self.reports.values_of(target), values)
-        } else if let Some(read) = proving.get(target) {
+        } else if let Some(read) = values.first().and_then(|value| {
+            let context = if self.reports.fenced() { value.context.clone() } else { RequestContext::default() };
+            proving.get(&(target.to_owned(), context))
+        }) {
             (Some(read.clone()), values)
         } else {
+            let context = values.first().map(|value| value.context.clone()).unwrap_or_default();
             // WAIT: device-op
-            let current = match op(handle, timing.operation, "read_state", self.driver.read_state(Scope::Target(target.to_owned()))).await {
-                Ok(states) => {
-                    self.proven();
-                    self.fold(&states);
-                    let mut current: Option<PropertyMap> = None;
-                    for state in states.into_iter().filter(|s| s.target == target) {
-                        current.get_or_insert_with(PropertyMap::new).extend(state.values);
+            let current =
+                match op(handle, timing.operation, "read_state", self.driver.read_state_with_context(Scope::Target(target.to_owned())))
+                    .await
+                {
+                    Ok(states) => {
+                        self.proven();
+                        self.fold(&states);
+                        let mut current: Option<PropertyMap> = None;
+                        for state in states
+                            .into_iter()
+                            .filter(|s| s.state.target == target && self.reports.observation_matches(target, &s.context, &context))
+                        {
+                            current.get_or_insert_with(PropertyMap::new).extend(state.state.values);
+                        }
+                        current
                     }
-                    current
-                }
-                Err(OpError::Link(e)) => return Err(e),
-                Err(other) => {
-                    debug!(target, error = %other, "The device's answer to the conflict read was unusable; its values are unknown");
-                    None
-                }
-            };
+                    Err(OpError::Link(e)) => return Err(e),
+                    Err(other) => {
+                        debug!(target, error = %other, "The device's answer to the conflict read was unusable; its values are unknown");
+                        None
+                    }
+                };
             (current, self.mailbox.revalidate(values))
         };
+        // The table or driver phase may have changed while a read was awaited.
+        let values = self.mailbox.revalidate(values);
+        if let Some(first) = values.first() {
+            let map = values.iter().map(|value| (value.property.clone(), value.value.clone())).collect();
+            match self.validate(handle, Some(target), &first.context, RequestKind::Apply(&map), true).await {
+                Ok(()) => {}
+                Err(OpError::Link(error)) => return Err(error),
+                Err(error) => {
+                    self.rejected_values(&values, &error);
+                    return Ok(Vec::new());
+                }
+            }
+        }
         let befores = self.befores();
         let (mut apply, mut superseded, mut unknown, mut satisfied) = (Vec::new(), Vec::new(), Vec::new(), 0);
         for value in values {
@@ -839,12 +1008,13 @@ impl<D: DeviceDriver> Worker<D> {
         command: &str,
         result: Result<Option<Value>, OpError>,
         replies: Vec<ReplyTo>,
+        context: &RequestContext,
     ) -> Result<(), LinkError> {
         let mut result = Some(result);
         let mut outcome = None;
         let answered = self.mailbox.command_done_then(|| {
             if let Some(result) = result.take() {
-                outcome = Some(self.answered(target, command, result, replies, true));
+                outcome = Some(self.answered(target, command, result, replies, true, context));
             }
         });
         if let (true, Some(outcome)) = (answered, outcome) {
@@ -869,6 +1039,7 @@ impl<D: DeviceDriver> Worker<D> {
         result: Result<Option<Value>, OpError>,
         replies: Vec<ReplyTo>,
         error_lane: bool,
+        context: &RequestContext,
     ) -> Result<(), LinkError> {
         let (answer, lost) = match result {
             Ok(value) => (Answer::Done(value), None),
@@ -881,7 +1052,7 @@ impl<D: DeviceDriver> Worker<D> {
                     warn!(kind = "command_rejected", target, command, error = message, "The device rejected a command");
                 }
                 if error_lane {
-                    self.reports.request_error(ErrorReport::new(reason, message).target(target).command(command));
+                    self.reports.request_error(ErrorReport::new(reason, message).context(context).target(target).command(command));
                 }
                 let answer = Answer::Failed { reason, error: message.to_owned() };
                 let lost = match failure {
@@ -893,6 +1064,7 @@ impl<D: DeviceDriver> Worker<D> {
         };
         for reply in replies {
             self.reports.event(Outbound {
+                context: context.clone(),
                 topic: Some(reply.topic),
                 payload: reply_payload(target, command, &answer),
                 correlation: reply.correlation,
@@ -910,7 +1082,9 @@ impl<D: DeviceDriver> Worker<D> {
         drop(ctx);
         self.configured.clear();
         if std::mem::take(&mut self.recovered) {
-            self.before = Some((Instant::now(), self.reports.snapshot()));
+            let (values, policy) = self.reports.snapshot_with_policy();
+            self.before = Some((Instant::now(), values));
+            self.before_policy = policy;
         }
         // Watched like an operation: a disconnect that blocks the thread is a dead worker too. Its
         // blocking calls are held to its bound, as an operation's.
@@ -950,10 +1124,11 @@ pub(crate) fn refusals(unanswered: Vec<Unanswered>, message: &str) -> (Vec<Error
         // One the worker was running was cut off, not refused before it ran (re-gate 3 S3).
         let message = if u.ran { CUT_OFF } else { message };
         // A read refused is a failure too: on Error, as every command's (review C13).
-        errors.push(ErrorReport::new(Reason::Refused, message).target(u.target.as_deref()).command(&u.command));
+        errors.push(ErrorReport::new(Reason::Refused, message).context(&u.context).target(u.target.as_deref()).command(&u.command));
         let answer = Answer::Failed { reason: Reason::Refused, error: message.to_owned() };
         for reply in u.replies {
             replies.push(Outbound {
+                context: u.context.clone(),
                 topic: Some(reply.topic),
                 payload: reply_payload(u.target.as_deref(), &u.command, &answer),
                 correlation: reply.correlation,

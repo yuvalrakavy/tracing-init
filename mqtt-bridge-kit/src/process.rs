@@ -195,7 +195,7 @@ impl Bridge {
     pub(crate) fn launch_managed<D: DeviceDriver>(
         self,
         driver: D,
-        info: crate::DriverInfo,
+        info: crate::generations::DriverDescription,
         managed: crate::managed::Managed,
     ) -> Result<Running, String> {
         let mut pending: Option<Box<dyn crate::devices::Startable>> = Some(Box::new(Built(driver)));
@@ -337,7 +337,7 @@ impl Bridge {
         // `info()` should be pure; one that is not must not hold up the stop: it runs on a
         // blocking thread raced against the stop signals (Codex, process.rs:251).
         let describe = move || {
-            let info = driver.info();
+            let info = crate::generations::DriverDescription::new(&driver);
             (driver, info)
         };
         run_with(

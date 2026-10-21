@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{Instrument, Span};
 
 use crate::driver::{DeviceDriver, DriverInfo};
+use crate::generations::DriverDescription;
 use crate::host::{DeviceConfig, Factory, FactoryError};
 use crate::link::{Abandoned, OpClock};
 use crate::mailbox::Mailbox;
@@ -52,8 +53,8 @@ pub(crate) struct Started {
 /// A driver built by the factory (or a fixed bridge's), its type erased: the session is not
 /// generic over it.
 pub(crate) trait Startable: Send + 'static {
-    /// The driver's `info()`.
-    fn info(&self) -> DriverInfo;
+    /// Pure driver information and policy, captured together exactly once.
+    fn describe(&self) -> DriverDescription;
     /// Start R1's worker with this driver on a thread of its own, until `stop` turns true.
     fn start(
         self: Box<Self>,
@@ -70,8 +71,8 @@ pub(crate) trait Startable: Send + 'static {
 pub(crate) struct Built<D>(pub D);
 
 impl<D: DeviceDriver> Startable for Built<D> {
-    fn info(&self) -> DriverInfo {
-        self.0.info()
+    fn describe(&self) -> DriverDescription {
+        DriverDescription::new(&self.0)
     }
 
     fn start(
@@ -98,11 +99,14 @@ pub(crate) fn drop_off_thread(driver: Box<dyn Startable>) {
 }
 
 /// What a device's keeper, or a construction's watcher, tells the session.
+type BuildResult = Result<(Box<dyn Startable>, DriverDescription), FactoryError>;
+
+/// Completion of a device worker or factory.
 pub(crate) enum Event {
     /// Device `id`'s worker has stopped, as asked.
     Stopped { id: u64 },
     /// Construction `id` of `instance` is done: the driver and its `info()`, or why not.
-    Built { instance: String, id: u64, result: Result<(Box<dyn Startable>, DriverInfo), FactoryError> },
+    Built { instance: String, id: u64, result: Box<BuildResult> },
 }
 
 /// A device's keeper, as the registry holds it: the stop request, and the keeper's end.
@@ -250,9 +254,14 @@ impl Spawner {
                 }
                 Ok(driver) => {
                     let _ = tx.send(Stage::Built);
-                    match std::panic::catch_unwind(AssertUnwindSafe(|| driver.info())) {
+                    match std::panic::catch_unwind(AssertUnwindSafe(|| driver.describe())) {
                         Ok(info) => {
-                            let _ = tx.send(Stage::Described(driver, info));
+                            if let Err(error) = info.policy.validate(false) {
+                                let _ = tx.send(Stage::Failed(FactoryError::Unusable(error)));
+                                drop_off_thread(driver);
+                            } else {
+                                let _ = tx.send(Stage::Described(driver, info));
+                            }
                         }
                         Err(_) => {
                             let _ = tx.send(Stage::Failed(FactoryError::Unusable("the driver's info() panicked".into())));
@@ -264,7 +273,7 @@ impl Spawner {
         let spawner = self.clone();
         if let Err(e) = thread {
             let result = Err(FactoryError::Unusable(format!("the factory's thread could not start: {e}")));
-            let _ = spawner.events.send(Event::Built { instance, id, result });
+            let _ = spawner.events.send(Event::Built { instance, id, result: Box::new(result) });
             return;
         }
         let watched = async move {
@@ -292,7 +301,7 @@ impl Spawner {
                 },
                 Ok(None) => Err(FactoryError::Unusable("the factory's thread ended without a word".into())),
             };
-            let _ = spawner.events.send(Event::Built { instance, id, result });
+            let _ = spawner.events.send(Event::Built { instance, id, result: Box::new(result) });
         };
         tokio::spawn(watched.instrument(span));
     }
@@ -303,7 +312,7 @@ enum Stage {
     /// The factory returned a driver; its `info()` is next.
     Built,
     /// The driver and its `info()`.
-    Described(Box<dyn Startable>, DriverInfo),
+    Described(Box<dyn Startable>, DriverDescription),
     /// The factory failed, or panicked (or `info()` did).
     Failed(FactoryError),
 }

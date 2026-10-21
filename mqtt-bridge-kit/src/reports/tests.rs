@@ -11,6 +11,30 @@ fn values(pairs: &[(&str, Value)]) -> PropertyMap {
     pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect()
 }
 
+#[test]
+fn fenced_reports_and_removals_require_the_original_current_context() {
+    let reports = Reports::new();
+    reports.install_policy(RequestPolicy::Fenced(crate::TargetGenerations {
+        instance: "epoch.2".into(),
+        targets: [("u1".into(), "epoch.2".into())].into_iter().collect(),
+    }));
+    let fresh = RequestContext::new("epoch.2").unwrap();
+    reports.state_with_context("u1", values(&[("power", json!(true))]), false, &fresh);
+    for context in [RequestContext::default(), RequestContext::new("epoch.1").unwrap()] {
+        reports.state_with_context("u1", values(&[("power", json!(false))]), false, &context);
+        reports.remove_with_context("u1", &context);
+        reports.remove_property_with_context("u1", "power", &context);
+        reports.read_back_with_context("u1", values(&[("power", json!(false))]), &context);
+        reports.written_with_context("u1", &values(&[("power", json!(false))]), 0, &context);
+        reports.observed_event(Some("u1"), Outbound { context, topic: None, payload: b"{}".to_vec(), correlation: None });
+    }
+    assert_eq!(reports.snapshot()["u1"]["power"], json!(true), "late observations changed a fresh mapping");
+    assert!(reports.read_back_view().1.is_empty(), "stale retained state entered the conflict basis");
+    let changes = reports.take();
+    assert_eq!(changes.states[0].2, fresh, "state lost its original generation");
+    assert!(changes.events.is_empty(), "stale input event was delivered");
+}
+
 /// A target's reports merge into its state and coalesce between takes; one that changes nothing
 /// is not published again; `assumed` is part of the state.
 #[test]
@@ -29,6 +53,25 @@ fn states_merge_and_coalesce() {
     assert_eq!(assumed, json!({"power": true, "temp": 21, "assumed": true}));
 }
 
+#[test]
+fn optional_context_does_not_erase_unfenced_partial_state() {
+    let reports = Reports::new();
+    reports.install_policy(RequestPolicy::Unfenced);
+    reports.state("u1", values(&[("power", json!(true)), ("level", json!(10))]), false);
+    reports.state_with_context("u1", values(&[("level", json!(20))]), true, &RequestContext::new("optional.1").unwrap());
+    assert_eq!(
+        reports.snapshot()["u1"],
+        values(&[("power", json!(true)), ("level", json!(20))]),
+        "optional context erased unrelated legacy state"
+    );
+    reports.state("u1", values(&[("power", json!(false))]), false);
+    assert_eq!(
+        reports.snapshot()["u1"],
+        values(&[("power", json!(false)), ("level", json!(20))]),
+        "a partial legacy report erased another property"
+    );
+}
+
 /// After a CONNACK the whole model is published again, and nothing waits any more; queued
 /// messages stay queued.
 #[test]
@@ -40,7 +83,7 @@ fn the_model_is_everything_known() {
     reports.error(ErrorReport::new(Reason::Rejected, "no"));
     let model = reports.model();
     assert_eq!(model.status, Some(LinkStatus::Connected));
-    assert_eq!(model.states.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(model.states.iter().map(|(t, _, _)| t.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     let changes = reports.take();
     assert!(changes.status.is_none() && changes.states.is_empty(), "what the model published was still waiting");
     assert_eq!(changes.errors.len(), 1, "the model took a queued error");
@@ -54,7 +97,12 @@ fn messages_past_the_cap_displace_the_oldest_said_once_per_episode() {
     let reports = Reports::new();
     for i in 0..ERROR_CAP + 5 {
         reports.error(ErrorReport::new(Reason::Rejected, format!("{i}")));
-        reports.event(Outbound { topic: None, payload: format!("{i}").into_bytes(), correlation: None });
+        reports.event(Outbound {
+            context: crate::RequestContext::default(),
+            topic: None,
+            payload: format!("{i}").into_bytes(),
+            correlation: None,
+        });
     }
     assert_eq!(log.of_kind("error_report_dropped").len(), 1);
     assert_eq!(log.of_kind("event_report_dropped").len(), 1);
@@ -115,8 +163,8 @@ fn a_name_that_is_no_topic_segment_is_dropped_where_it_is_reported() {
         reports.state("t2", values(&[("a/b", json!(1)), ("ok", json!(2))]), false);
     }
     let model = reports.model();
-    assert!(model.states.iter().all(|(t, _)| t != "a#b"), "a target that is no topic segment reached the model: {model:?}");
-    let t2: Value = serde_json::from_slice(&model.states.iter().find(|(t, _)| t == "t2").expect("t2").1).unwrap();
+    assert!(model.states.iter().all(|(t, _, _)| t != "a#b"), "a target that is no topic segment reached the model: {model:?}");
+    let t2: Value = serde_json::from_slice(&model.states.iter().find(|(t, _, _)| t == "t2").expect("t2").1).unwrap();
     assert_eq!(t2, json!({"ok": 2}), "a property that is no topic segment reached the model");
     assert_eq!(log.of_kind("driver_contract_violation").len(), 2, "not one ERROR per bad name: {:#?}", log.records());
 }
@@ -163,6 +211,7 @@ fn an_unproven_assumption_is_left_out_until_proven() {
     assert_eq!(reports.values_of("u1").unwrap()["level"], json!(0), "an unproven assumption counted as the device's value");
     assert_eq!(reports.snapshot()["u1"]["level"], json!(0), "a snapshot counted an unproven assumption");
     let written = crate::mailbox::StateValue {
+        context: crate::RequestContext::default(),
         target: "u1".into(),
         property: "level".into(),
         value: json!(50),

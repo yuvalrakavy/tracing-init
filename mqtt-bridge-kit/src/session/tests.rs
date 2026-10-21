@@ -49,6 +49,84 @@ fn rig_on(port: u16) -> Rig {
     Rig { shared, device, outputs, host, events, _events: events_tx }
 }
 
+#[test]
+fn a_sealed_batch_keeps_original_context_on_state_replies_errors_and_events() {
+    let rig = rig_on(1);
+    let device = &rig.device;
+    device.mailbox.bind_reports(&device.reports);
+    let table =
+        crate::TargetGenerations { instance: "epoch.1".into(), targets: [("Kitchen".into(), "epoch.1".into())].into_iter().collect() };
+    device.reports.install_policy(crate::RequestPolicy::Fenced(table.clone()));
+    let original = crate::RequestContext::new("epoch.1").unwrap();
+    device.reports.state_with_context("Kitchen", serde_json::json!({"level":20}).as_object().unwrap().clone(), false, &original);
+    device.reports.event(Outbound {
+        context: original.clone(),
+        topic: Some("Store/reply".into()),
+        payload: b"{}".to_vec(),
+        correlation: None,
+    });
+    device.reports.request_error(ErrorReport::new(Reason::Rejected, "original failure").context(&original));
+    device.reports.observed_event(None, Outbound { context: original, topic: None, payload: b"{}".to_vec(), correlation: None });
+    let mut sealed = Batch::default();
+    sealed.add(device, device.reports.take());
+    let next =
+        crate::TargetGenerations { instance: "epoch.2".into(), targets: [("Kitchen".into(), "epoch.2".into())].into_iter().collect() };
+    device.reports.replace_generations(&table, next).unwrap();
+    device.reports.state_with_context(
+        "Kitchen",
+        serde_json::json!({"level":70}).as_object().unwrap().clone(),
+        false,
+        &crate::RequestContext::new("epoch.2").unwrap(),
+    );
+    assert_eq!(sealed.len(), 4);
+    for output in sealed.answers.iter().chain(&sealed.model).chain(&sealed.unsolicited) {
+        assert_eq!(
+            output
+                .properties
+                .user_properties
+                .iter()
+                .filter(|(key, _)| key == "target-generation")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            ["epoch.1"],
+            "a sealed output was retagged or lost its original token"
+        );
+    }
+    let mut fresh = Batch::default();
+    fresh.add_model(device, device.reports.model(), false);
+    assert_eq!(fresh.model[0].properties.user_properties.iter().find(|(key, _)| key == "target-generation").unwrap().1, "epoch.2");
+}
+
+#[test]
+fn config_admission_observer_ignores_invalid_and_stale_deliveries() {
+    let rig = rig_on(1);
+    let device = &rig.device;
+    device.mailbox.bind_reports(&device.reports);
+    device.reports.install_policy(crate::RequestPolicy::Fenced(crate::TargetGenerations {
+        instance: "epoch.2".into(),
+        targets: [("Kitchen".into(), "epoch.2".into())].into_iter().collect(),
+    }));
+    let mut admissions = Vec::new();
+    for (payload, generation) in [("{}", "epoch.2"), ("not JSON", "epoch.2"), ("{}", "epoch.1"), ("", "epoch.1")] {
+        let properties = PublishProperties { user_properties: vec![("target-generation".into(), generation.into())], ..Default::default() };
+        let publish = Publish::new("T/Config/session/Kitchen", QoS::AtLeastOnce, payload, Some(properties));
+        route_with_config_admission(device, "T/Config/session/Kitchen", &publish, Instant::now(), |target, context, present| {
+            admissions.push((target.to_owned(), context.clone(), present))
+        });
+    }
+    assert_eq!(
+        admissions,
+        vec![
+            ("Kitchen".into(), crate::RequestContext::new("epoch.2").unwrap(), true),
+            ("Kitchen".into(), crate::RequestContext::new("epoch.1").unwrap(), false)
+        ],
+        "a stale or malformed configuration was remembered as installed"
+    );
+    assert!(
+        matches!(device.mailbox.take_held_config_with_context(), Some((_, Some(_), context)) if context.generation() == Some("epoch.2"))
+    );
+}
+
 /// A publish rumqttc refuses (a topic holding a wildcard) is one message dropped: the ones after it
 /// still go out (review B2: the first refusal ended the CONNACK duties, and the session never
 /// published a report again).
@@ -62,7 +140,13 @@ async fn a_refused_publish_is_one_message_dropped() {
     let (_pump, mut incoming) = Pump::start(events, shared.outage.clone(), Duration::from_secs(10), || {});
     let first = tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await.expect("no CONNACK");
     assert!(matches!(first, Some(PumpEvent::Connected)));
-    let model = Model { status: None, states: vec![("a#b".to_owned(), b"{}".to_vec()), ("t1".to_owned(), br#"{"x":1}"#.to_vec())] };
+    let model = Model {
+        status: None,
+        states: vec![
+            ("a#b".to_owned(), b"{}".to_vec(), crate::RequestContext::default()),
+            ("t1".to_owned(), br#"{"x":1}"#.to_vec(), crate::RequestContext::default()),
+        ],
+    };
     let mut batch = Batch::default();
     batch.add_model(&device, model, false);
     let republished = tokio::time::timeout(Duration::from_secs(5), batch.publish(&shared, &client, &IN_TURN, usize::MAX)).await;
@@ -101,7 +185,12 @@ async fn the_rotation_turns_quanta_round_robin_over_sealed_batches() {
     for t in 0..100 {
         first.reports.state(&format!("m{t:03}"), state(t), false);
     }
-    first.reports.event(Outbound { topic: Some("Store/replies/sealed".into()), payload: b"{}".to_vec(), correlation: None });
+    first.reports.event(Outbound {
+        context: crate::RequestContext::default(),
+        topic: Some("Store/replies/sealed".into()),
+        payload: b"{}".to_vec(),
+        correlation: None,
+    });
     second.reports.state("s1", state(1), false);
     let handed = |shared: &Shared| shared.enqueued.load(std::sync::atomic::Ordering::SeqCst);
     let mut served = Vec::new();
@@ -269,7 +358,12 @@ async fn the_flush_publishes_answers_before_state() {
         device.reports.state(&format!("m{t:04}"), values, false);
     }
     let refusal = crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop").target(Some("t1"));
-    let reply = Outbound { topic: Some("Store/replies/flush".into()), payload: b"{}".to_vec(), correlation: None };
+    let reply = Outbound {
+        context: crate::RequestContext::default(),
+        topic: Some("Store/replies/flush".into()),
+        payload: b"{}".to_vec(),
+        correlation: None,
+    };
     device.reports.refused(vec![refusal], vec![reply]);
     let _ = tokio::time::timeout(Duration::from_secs(5), flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut rig.host)).await;
     let error = shared.topics.error();
@@ -344,7 +438,7 @@ fn a_replacements_withdrawal_never_reverts_the_replacement() {
     route(&device, &topic, &Publish::new(topic.clone(), QoS::AtLeastOnce, b"60".to_vec(), None), Instant::now());
     AFTER_POST.with(|hook| hook.borrow_mut().take());
     let model = device.reports.model();
-    let state = model.states.iter().find(|(t, _)| t == "t1").map(|(_, d)| crate::wire::decode_state(d).expect("a state"));
+    let state = model.states.iter().find(|(t, _, _)| t == "t1").map(|(_, d, _)| crate::wire::decode_state(d).expect("a state"));
     assert_eq!(
         state.and_then(|s| s.get("level").cloned()),
         Some(serde_json::json!(60)),
@@ -391,7 +485,12 @@ async fn the_flush_waits_for_its_own_publishes_to_be_acknowledged() {
     broker.hold_acks();
     device.reports.refused(
         vec![crate::wire::ErrorReport::new(crate::wire::Reason::Refused, "refused at the stop")],
-        vec![Outbound { topic: Some("Store/replies/held".into()), payload: b"{}".to_vec(), correlation: None }],
+        vec![Outbound {
+            context: crate::RequestContext::default(),
+            topic: Some("Store/replies/held".into()),
+            payload: b"{}".to_vec(),
+            correlation: None,
+        }],
     );
     let disconnected = |b: &FakeBroker| b.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Disconnected));
     let flushing = flush(&shared, &client, &mut incoming, &mut rig.outputs, &mut rig.host);
@@ -438,7 +537,12 @@ async fn a_stop_mid_batch_still_publishes_the_batchs_reply() {
         let values = serde_json::json!({"n": t}).as_object().unwrap().clone();
         device.reports.state(&format!("m{t:04}"), values, false);
     }
-    device.reports.event(Outbound { topic: Some("Store/replies/mid-batch".into()), payload: b"{}".to_vec(), correlation: None });
+    device.reports.event(Outbound {
+        context: crate::RequestContext::default(),
+        topic: Some("Store/replies/mid-batch".into()),
+        payload: b"{}".to_vec(),
+        correlation: None,
+    });
     assert!(broker.wait_until(Duration::from_secs(5), |b| b.held_acks() >= 10).await, "the States never filled the window");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(broker.received_on("Store/replies/mid-batch").is_empty(), "the reply went out before the States had backed up");

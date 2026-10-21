@@ -10,6 +10,15 @@ the notes at the end say what it changed here.
 - the Bridge Kit Tutorial;
 - the `developing-mqtt-bridges` skill.
 
+**Development extensions (2026-10-21, not yet upstream/released):**
+[Managed process services](2026-10-21-managed-process-services.md) adds a resource
+owner whose lifetime survives broker/device outages, with one bounded process
+shutdown. [Target generations](2026-10-21-bridge-target-generations.md) adds
+optional fencing for fixed controllers with mutable physical inventories.
+Legacy drivers retain their default methods and unfenced behavior. The extension
+specifications, crate README and tutorial define the additional APIs and tests;
+they continue through the same host/session/publication machinery.
+
 A change to any of them updates the others in the same change. This spec is the source for the bridge
 side; the artifacts follow it:
 - runtime: https://claude.ai/artifact/VtZNayRupmyBtUdcaWbqY3

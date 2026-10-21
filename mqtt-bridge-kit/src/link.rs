@@ -79,6 +79,11 @@ pub struct ReadBack {
 }
 
 impl Reporter {
+    /// Install an already durable inventory mapping and retire old runtime work
+    /// before publishing the inventory or exposing the new mapping to commands.
+    pub fn replace_generations(&self, expected: &crate::TargetGenerations, next: crate::TargetGenerations) -> Result<(), String> {
+        self.reports.replace_generations(expected, next)
+    }
     /// The start-up read-back (see [`ReadBack`]). Never waits.
     pub(crate) fn read_back(&self) -> ReadBack {
         let (complete, targets) = self.reports.read_back_view();
@@ -97,11 +102,21 @@ impl Reporter {
         self.reports.state(target, values, assumed);
     }
 
+    /// Report values read under this original mapping generation.
+    pub fn state_with_context(&self, target: &str, values: PropertyMap, assumed: bool, context: &crate::RequestContext) {
+        self.reports.state_with_context(target, values, assumed, context);
+    }
+
     /// Retract a target gone from the device (a unit no longer in the controller's list): its
     /// retained `State` is cleared — an empty retained payload — and it is left out of the model,
     /// until it is reported again. Never waits.
     pub fn remove(&self, target: &str) {
         self.reports.remove(target);
+    }
+
+    /// Retract only this current mapping's state.
+    pub fn remove_with_context(&self, target: &str, context: &crate::RequestContext) {
+        self.reports.remove_with_context(target, context);
     }
 
     /// Retract one property of a target: left out of its `State` from now on, until reported
@@ -110,16 +125,34 @@ impl Reporter {
         self.reports.remove_property(target, property);
     }
 
+    /// Remove a property only while this mapping remains current.
+    pub fn remove_property_with_context(&self, target: &str, property: &str, context: &crate::RequestContext) {
+        self.reports.remove_property_with_context(target, property, context);
+    }
+
     /// Something that happened, for the `Event` lane: a JSON object with a string `kind` (and a
     /// `target` where it concerns one). Never waits; anything else is a driver bug, logged as an
     /// ERROR (`driver_contract_violation`) and dropped.
     pub fn event(&self, event: Value) {
+        self.event_with_context(event, &crate::RequestContext::default());
+    }
+
+    /// An unsolicited event retains its original target or instance generation.
+    pub fn event_with_context(&self, event: Value, context: &crate::RequestContext) {
         let ok = event.get("kind").is_some_and(Value::is_string);
         if !ok {
             error!(kind = "driver_contract_violation", event = %event, "An event without a string `kind` was dropped");
             return;
         }
-        self.reports.event(Outbound { topic: None, payload: event.to_string().into_bytes(), correlation: None });
+        let target = event.get("target").and_then(Value::as_str);
+        if event.get("target").is_some() && !target.is_some_and(crate::topics::valid_segment) {
+            error!(kind = "driver_contract_violation", "An event with an invalid target was dropped");
+            return;
+        }
+        self.reports.observed_event(
+            target,
+            Outbound { context: context.clone(), topic: None, payload: event.to_string().into_bytes(), correlation: None },
+        );
     }
 }
 

@@ -47,7 +47,7 @@
 //! Nothing waits under the lock and nothing is logged under it.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use lock_order::sync::Mutex;
@@ -56,6 +56,7 @@ use tokio::sync::Notify;
 use tracing::{debug, info};
 
 use crate::driver::{CommandCall, Feedback};
+use crate::generations::{RequestContext, TargetGenerations};
 use crate::replies::ReplyTo;
 use crate::wire::Conflict;
 
@@ -66,9 +67,20 @@ pub const MOMENTARY_CAP: usize = 64;
 /// later is a request of its own.
 pub const COPY_WINDOW: Duration = Duration::from_secs(60);
 
+#[cfg(test)]
+type AdmissionHook = Option<Box<dyn FnMut()>>;
+#[cfg(test)]
+thread_local! {
+    // A test-only scheduling seam immediately after the authority check.
+    // It is absent from production; tests can pause here across a table swap.
+    static AFTER_GENERATION_CHECK: std::cell::RefCell<AdmissionHook> = const { std::cell::RefCell::new(None) };
+}
+
 /// A property's requested value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateValue {
+    /// The original packet's mapping generation, never refreshed while queued.
+    pub context: RequestContext,
     /// The target the value is for.
     pub target: String,
     /// The property.
@@ -164,9 +176,9 @@ impl ReadKey {
 #[derive(Debug)]
 enum Entry {
     State { value: StateValue, held: bool },
-    Config { target: String, config: Option<Value>, held: bool },
-    Momentary { target: Option<String>, call: CommandCall, reply: Option<ReplyTo>, deadline: Option<Instant> },
-    Read { key: ReadKey, call: Option<CommandCall>, callers: Vec<Caller> },
+    Config { target: String, config: Option<Value>, context: RequestContext, held: bool },
+    Momentary { target: Option<String>, call: CommandCall, reply: Option<ReplyTo>, deadline: Option<Instant>, context: RequestContext },
+    Read { key: ReadKey, call: Option<CommandCall>, callers: Vec<Caller>, context: RequestContext },
 }
 
 /// One caller of a coalesced read: its response topic, if it named one, and its deadline.
@@ -204,11 +216,15 @@ pub enum Work {
     Configure {
         /// The target.
         target: String,
+        /// The original configuration request's context.
+        context: RequestContext,
         /// The config, or `None` for a retraction.
         config: Option<Value>,
     },
     /// A momentary command, for `execute`.
     Execute {
+        /// The command's original packet context.
+        context: RequestContext,
         /// The command's target, if it names one.
         target: Option<String>,
         /// The command and its parameters.
@@ -218,6 +234,8 @@ pub enum Work {
     },
     /// A read for its callers still within their deadline; those past it, refused (review R9).
     Read {
+        /// The context shared by these coalesced callers.
+        context: RequestContext,
         /// What the read is for.
         key: ReadKey,
         /// The command to run, for a read-class command; `None` for `refresh`.
@@ -235,6 +253,8 @@ pub enum Work {
     /// A momentary command that reached its expiry while it waited: not executed, but reported
     /// and answered (review MINOR 4, C13).
     Expired {
+        /// The original expired command's context.
+        context: RequestContext,
         /// The command's target, if it names one.
         target: Option<String>,
         /// The command and its parameters.
@@ -277,6 +297,8 @@ pub enum Held {
     Config {
         /// The target.
         target: String,
+        /// The original configuration request's context.
+        context: RequestContext,
         /// The config, or `None` for a retraction.
         config: Option<Value>,
     },
@@ -304,6 +326,8 @@ pub enum Refusal {
     DeviceDown,
     /// [`MOMENTARY_CAP`] commands are already waiting.
     QueueFull,
+    /// The request does not carry the current physical mapping generation.
+    StaleGeneration,
 }
 
 impl Refusal {
@@ -312,6 +336,7 @@ impl Refusal {
         match self {
             Refusal::DeviceDown => "the device is not connected",
             Refusal::QueueFull => "64 momentary commands are already waiting for the device",
+            Refusal::StaleGeneration => "the request generation is absent, retired or unknown; refresh the complete inventory",
         }
     }
 }
@@ -320,6 +345,8 @@ impl Refusal {
 /// waits for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Unanswered {
+    /// The original callers' context, including after disconnect or expiry.
+    pub context: RequestContext,
     /// The command's target, if it names one.
     pub target: Option<String>,
     /// The command's name (`refresh` for a refresh).
@@ -339,15 +366,15 @@ struct Inner {
     momentary: usize,
     /// State values the worker took and has not finished.
     in_flight: Vec<StateValue>,
-    in_flight_config: Option<(String, Option<Value>)>,
+    in_flight_config: Option<(String, Option<Value>, RequestContext)>,
     /// Values applied to a `Writes::Unacknowledged` device and not proven yet, in the order last
     /// written, each with when its key's oldest unproven write was made: a newer value of a key
     /// replaces its older one, and keeps the older one's proof deadline.
     unproven: Vec<(StateValue, Instant)>,
     /// The property copies a target-level write expects: the value, and until when.
-    copies: HashMap<(String, String), (Value, Instant)>,
+    copies: HashMap<(String, String), (Value, Instant, RequestContext)>,
     /// Targets whose `Config` overrides the driver's feedback mode.
-    feedback: HashMap<String, Feedback>,
+    feedback: HashMap<String, (Feedback, RequestContext)>,
     /// Momentary commands refused during this outage, for its recovery line.
     refused: u32,
     refusal_logged: bool,
@@ -358,14 +385,14 @@ struct Inner {
     /// later — the Store has not retracted it yet — is decided against it again, not against a
     /// later snapshot that holds the change at the device (re-gate R12). Dropped when the Store
     /// retracts the key or writes it live, or a replay of another value replaces it.
-    bases: HashMap<(String, String), (Value, Basis)>,
+    bases: HashMap<(String, String), (Value, Basis, RequestContext)>,
     /// The command the worker took and has not answered: refused at a stop or a watchdog's end,
     /// which cancel it mid-operation (re-gate 3 S3).
     in_flight_command: Option<Unanswered>,
     /// Writes held again before proof that reached their deadline unapplied, in the worker's takes:
     /// their assumptions are withdrawn by the worker ([`take_abandoned`](Mailbox::take_abandoned)).
     /// One a post replaces is withdrawn by the post itself.
-    abandoned: Vec<(String, String)>,
+    abandoned: Vec<(String, String, RequestContext)>,
 }
 
 impl Inner {
@@ -387,6 +414,7 @@ impl Inner {
                 !std::mem::replace(&mut self.refusal_logged, true)
             }
             Refusal::QueueFull => !std::mem::replace(&mut self.full_logged, true),
+            Refusal::StaleGeneration => false,
         }
     }
 
@@ -394,14 +422,14 @@ impl Inner {
     /// one, and every later one for the same target with the same `held`, up to the first entry for
     /// that target that is not a state value (a command or a config keeps its place after them).
     fn take_group(&mut self, first: usize) -> (String, Vec<StateValue>) {
-        let (target, held) = match &self.pending[first] {
-            Entry::State { value, held, .. } => (value.target.clone(), *held),
+        let (target, held, context) = match &self.pending[first] {
+            Entry::State { value, held, .. } => (value.target.clone(), *held, value.context.clone()),
             _ => unreachable!("take_group starts at a state value"),
         };
         let mut indices = Vec::new();
         for (i, entry) in self.pending.iter().enumerate().skip(first) {
             match entry {
-                Entry::State { value, held: h, .. } if value.target == target && *h == held => indices.push(i),
+                Entry::State { value, held: h, .. } if value.target == target && value.context == context && *h == held => indices.push(i),
                 other if other.target() == Some(target.as_str()) => break,
                 _ => {}
             }
@@ -419,8 +447,11 @@ impl Inner {
     /// Drop the values past their deadline, counting them.
     fn drop_expired(&mut self, values: &mut Vec<StateValue>, now: Instant) -> usize {
         let before = values.len();
-        let abandoned: Vec<(String, String)> =
-            values.iter().filter(|v| v.reheld && v.expired(now)).map(|v| (v.target.clone(), v.property.clone())).collect();
+        let abandoned: Vec<(String, String, RequestContext)> = values
+            .iter()
+            .filter(|v| v.reheld && v.expired(now))
+            .map(|v| (v.target.clone(), v.property.clone(), v.context.clone()))
+            .collect();
         self.abandoned.extend(abandoned);
         values.retain(|v| !v.expired(now));
         let dropped = before - values.len();
@@ -442,8 +473,10 @@ fn log_refusal(command: &str, target: Option<&str>, why: Refusal, first: bool) {
 /// See the module documentation.
 #[derive(Debug)]
 pub struct Mailbox {
+    reports: OnceLock<Weak<crate::reports::Reports>>,
     inner: Mutex<Inner>,
     posted: Notify,
+    policy_changed: Notify,
 }
 
 impl Mailbox {
@@ -452,7 +485,102 @@ impl Mailbox {
     /// C10: started as connected, a momentary command posted before the first connect was queued
     /// and applied whenever that connect came).
     pub fn new() -> Arc<Mailbox> {
-        Arc::new(Mailbox { inner: Mutex::new("mailbox-lock", Inner::default()), posted: Notify::new() })
+        Arc::new(Mailbox {
+            reports: OnceLock::new(),
+            inner: Mutex::new("mailbox-lock", Inner::default()),
+            posted: Notify::new(),
+            policy_changed: Notify::new(),
+        })
+    }
+
+    pub(crate) fn bind_reports(self: &Arc<Self>, reports: &Arc<crate::reports::Reports>) {
+        assert!(self.reports.set(Arc::downgrade(reports)).is_ok(), "mailbox reports bound twice");
+        reports.bind_mailbox(self);
+    }
+
+    // Called only with the mailbox lock held. Replacement must take that lock
+    // before Reports too, so authority cannot change between this check and post.
+    fn context_is_current(&self, target: Option<&str>, context: &RequestContext) -> bool {
+        let current = match self.reports.get() {
+            None => true,
+            Some(reports) => reports.upgrade().is_some_and(|reports| reports.context_is_current(target, context)),
+        };
+        #[cfg(test)]
+        if current {
+            AFTER_GENERATION_CHECK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
+        }
+        current
+    }
+
+    fn fenced(&self) -> bool {
+        self.reports.get().is_some_and(|reports| reports.upgrade().map_or(true, |reports| reports.fenced()))
+    }
+
+    /// Atomic table replacement and exact-old retirement. Mailbox precedes
+    /// Reports in the lock order, the same order as request admission.
+    pub(crate) fn replace_generations(
+        &self,
+        reports: &crate::reports::Reports,
+        expected: &TargetGenerations,
+        next: TargetGenerations,
+    ) -> Result<Vec<Unanswered>, String> {
+        let mut unanswered = Vec::new();
+        {
+            let mut inner = self.locked();
+            let retired = reports.retire_generations(expected, next)?;
+            inner.pending.retain_mut(|entry| match entry {
+                Entry::State { value, .. } => !retired.contains(Some(&value.target), &value.context),
+                Entry::Config { target, context, .. } => !retired.contains(Some(target), context),
+                Entry::Momentary { target, call, reply, context, .. } if retired.contains(target.as_deref(), context) => {
+                    unanswered.push(Unanswered {
+                        context: context.clone(),
+                        ran: false,
+                        target: target.clone(),
+                        command: call.command.clone(),
+                        momentary: true,
+                        replies: reply.take().into_iter().collect(),
+                    });
+                    false
+                }
+                Entry::Read { key, callers, context, .. } if retired.contains(key.names().0.as_deref(), context) => {
+                    let (target, command) = key.names();
+                    unanswered.push(Unanswered {
+                        context: context.clone(),
+                        ran: false,
+                        target,
+                        command,
+                        momentary: false,
+                        replies: callers.drain(..).filter_map(|caller| caller.reply).collect(),
+                    });
+                    false
+                }
+                _ => true,
+            });
+            inner.momentary = inner.pending.iter().filter(|entry| matches!(entry, Entry::Momentary { .. })).count();
+            inner.in_flight.retain(|value| !retired.contains(Some(&value.target), &value.context));
+            inner.unproven.retain(|(value, _)| !retired.contains(Some(&value.target), &value.context));
+            if inner.in_flight_config.as_ref().is_some_and(|(target, _, context)| retired.contains(Some(target), context)) {
+                inner.in_flight_config = None;
+            }
+            if inner.in_flight_command.as_ref().is_some_and(|command| retired.contains(command.target.as_deref(), &command.context)) {
+                unanswered.extend(inner.in_flight_command.take());
+            }
+            inner.copies.retain(|(target, _), (_, _, context)| !retired.contains(Some(target), context));
+            inner.bases.retain(|(target, _), (_, _, context)| !retired.contains(Some(target), context));
+            inner.feedback.retain(|target, (_, context)| !retired.contains(Some(target), context));
+            inner.abandoned.retain(|(target, _, context)| !retired.contains(Some(target), context));
+        }
+        self.policy_changed.notify_one();
+        Ok(unanswered)
+    }
+
+    pub(crate) async fn policy_changed(&self) {
+        // WAIT: mailbox-policy
+        self.policy_changed.notified().await;
     }
 
     fn locked(&self) -> lock_order::sync::MutexGuard<'_, Inner> {
@@ -478,9 +606,12 @@ impl Mailbox {
         let now = Instant::now();
         let posted = {
             let mut inner = self.locked();
+            if !self.context_is_current(Some(&value.target), &value.context) {
+                return Posted::Refused(Refusal::StaleGeneration);
+            }
             let key = (value.target.clone(), value.property.clone());
             match inner.copies.remove(&key) {
-                Some((copy, until)) if copy == value.value && now < until => Posted::Skipped,
+                Some((copy, until, context)) if copy == value.value && context == value.context && now < until => Posted::Skipped,
                 // (After the copy check above: a target-level write's copy of the same value is that
                 // write, so the copy pin it clears is moot.)
                 // The same value as a write held again before proof, replayed by the broker — the
@@ -489,7 +620,7 @@ impl Mailbox {
                 // final gate 2; confirming review 1).
                 _ if replay
                     && inner.pending.iter().any(
-                        |e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld && v.value == value.value),
+                        |e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.context == value.context && v.reheld && v.value == value.value),
                     ) =>
                 {
                     if inner.connected {
@@ -508,10 +639,10 @@ impl Mailbox {
                     }
                     if replay {
                         match inner.bases.get(&key) {
-                            Some((first, basis)) if *first == value.value => value.basis = Some(basis.clone()),
+                            Some((first, basis, context)) if *first == value.value && *context == value.context => value.basis = Some(basis.clone()),
                             _ => {
                                 if let Some(basis) = &value.basis {
-                                    inner.bases.insert(key, (value.value.clone(), basis.clone()));
+                                    inner.bases.insert(key, (value.value.clone(), basis.clone(), value.context.clone()));
                                 }
                             }
                         }
@@ -544,12 +675,15 @@ impl Mailbox {
         let until = Instant::now() + COPY_WINDOW;
         let posted = {
             let mut inner = self.locked();
+            if values.iter().any(|value| !self.context_is_current(Some(&value.target), &value.context)) {
+                return Posted::Refused(Refusal::StaleGeneration);
+            }
             let held = !inner.connected;
             for mut value in values {
                 if inner.pending.iter().any(|e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld)) {
                     withdraw(&value.target, &value.property);
                 }
-                inner.copies.insert((value.target.clone(), value.property.clone()), (value.value.clone(), until));
+                inner.copies.insert((value.target.clone(), value.property.clone()), (value.value.clone(), until, value.context.clone()));
                 // A live write of the key, as `post_state`'s: the replay pin goes (second final gate 3).
                 inner.bases.remove(&(value.target.clone(), value.property.clone()));
                 value.check = Check { replayed: false, held };
@@ -597,26 +731,58 @@ impl Mailbox {
     /// the link was lost (re-gate 4 minor 7; Codex final gate 5). Returns whether the key has such
     /// a write.
     pub fn retract(&self, target: &str, property: &str) -> bool {
+        self.retract_with_context(target, property, &RequestContext::default()).unwrap_or(true)
+    }
+
+    /// Retract only intent belonging to the original generation. An old cleanup
+    /// may cancel its own work, but cannot cancel a replacement's intent.
+    pub fn retract_with_context(&self, target: &str, property: &str, context: &RequestContext) -> Result<bool, Refusal> {
         let mut inner = self.locked();
-        inner.pending.retain(|e| !matches!(e, Entry::State { value, .. } if value.is_key(target, property) && !value.reheld));
-        inner.in_flight.retain(|v| !v.is_key(target, property) || v.reheld);
-        let reheld = inner.pending.iter().any(|e| matches!(e, Entry::State { value, .. } if value.is_key(target, property)))
-            || inner.in_flight.iter().any(|v| v.is_key(target, property));
-        let unproven = reheld || inner.unproven.iter().any(|(v, _)| v.is_key(target, property));
-        inner.copies.remove(&(target.to_owned(), property.to_owned()));
-        inner.bases.remove(&(target.to_owned(), property.to_owned()));
-        unproven
+        if self.fenced() && context.generation().is_none() {
+            return Err(Refusal::StaleGeneration);
+        }
+        let matches = |value: &StateValue| value.is_key(target, property) && value.context == *context;
+        inner.pending.retain(|e| !matches!(e, Entry::State { value, .. } if matches(value) && !value.reheld));
+        inner.in_flight.retain(|v| !matches(v) || v.reheld);
+        let reheld =
+            inner.pending.iter().any(|e| matches!(e, Entry::State { value, .. } if matches(value))) || inner.in_flight.iter().any(matches);
+        let unproven = reheld || inner.unproven.iter().any(|(v, _)| matches(v));
+        let key = (target.to_owned(), property.to_owned());
+        if inner.copies.get(&key).is_some_and(|(_, _, original)| original == context) {
+            inner.copies.remove(&key);
+        }
+        if inner.bases.get(&key).is_some_and(|(_, _, original)| original == context) {
+            inner.bases.remove(&key);
+        }
+        Ok(unproven)
     }
 
     /// A target's setup, or (`None`) its retraction; the latest per target. Its `feedback`, if it
     /// names one, overrides the driver's for that target once `configure` has taken it
     /// ([`configured`](Self::configured)). Never waits.
     pub fn post_config(&self, target: &str, config: Option<Value>) -> Posted {
+        self.post_config_with_context(target, config, RequestContext::default())
+    }
+
+    /// Post configuration without replacing its original mapping context.
+    pub fn post_config_with_context(&self, target: &str, config: Option<Value>, context: RequestContext) -> Posted {
         let posted = {
             let mut inner = self.locked();
+            if !self.context_is_current(Some(target), &context) {
+                if config.is_none() && context.generation().is_some() {
+                    inner.pending.retain(
+                        |e| !matches!(e, Entry::Config { target: t, context: original, .. } if t == target && *original == context),
+                    );
+                    if inner.in_flight_config.as_ref().is_some_and(|(t, _, original)| t == target && *original == context) {
+                        inner.in_flight_config = None;
+                    }
+                    return Posted::Skipped;
+                }
+                return Posted::Refused(Refusal::StaleGeneration);
+            }
             inner.pending.retain(|e| !matches!(e, Entry::Config { target: t, .. } if t == target));
             let held = !inner.connected;
-            inner.pending.push_back(Entry::Config { target: target.to_owned(), config, held });
+            inner.pending.push_back(Entry::Config { target: target.to_owned(), config, context, held });
             if held {
                 Posted::Held
             } else {
@@ -626,11 +792,25 @@ impl Mailbox {
         self.queued(posted)
     }
 
-    /// A momentary command. Never waits.
+    /// A legacy momentary command without generation metadata. Never waits.
     pub fn post_command(&self, target: Option<String>, call: CommandCall, reply: Option<ReplyTo>, deadline: Option<Instant>) -> Posted {
+        self.post_command_with_context(target, call, reply, deadline, RequestContext::default())
+    }
+
+    /// A momentary command retaining its original packet context. Never waits.
+    pub fn post_command_with_context(
+        &self,
+        target: Option<String>,
+        call: CommandCall,
+        reply: Option<ReplyTo>,
+        deadline: Option<Instant>,
+        context: RequestContext,
+    ) -> Posted {
         let (posted, refusal) = {
             let mut inner = self.locked();
-            let why = if !inner.connected {
+            let why = if !self.context_is_current(target.as_deref(), &context) {
+                Some(Refusal::StaleGeneration)
+            } else if !inner.connected {
                 Some(Refusal::DeviceDown)
             } else if inner.momentary >= MOMENTARY_CAP {
                 Some(Refusal::QueueFull)
@@ -640,7 +820,7 @@ impl Mailbox {
             match why {
                 None => {
                     inner.momentary += 1;
-                    inner.pending.push_back(Entry::Momentary { target: target.clone(), call: call.clone(), reply, deadline });
+                    inner.pending.push_back(Entry::Momentary { target: target.clone(), call: call.clone(), reply, deadline, context });
                     (Posted::Queued, None)
                 }
                 Some(why) => (Posted::Refused(why), Some((why, inner.refuse(why)))),
@@ -652,22 +832,38 @@ impl Mailbox {
         self.queued(posted)
     }
 
-    /// A read; coalesced with one waiting for the same key (the latest parameters, every reply).
-    /// Never waits.
+    /// A legacy read without generation metadata. Never waits.
     pub fn post_read(&self, key: ReadKey, call: Option<CommandCall>, reply: Option<ReplyTo>, deadline: Option<Instant>) -> Posted {
+        self.post_read_with_context(key, call, reply, deadline, RequestContext::default())
+    }
+
+    /// A read; coalesced with the same key and context (latest parameters, every reply).
+    /// Never waits.
+    pub fn post_read_with_context(
+        &self,
+        key: ReadKey,
+        call: Option<CommandCall>,
+        reply: Option<ReplyTo>,
+        deadline: Option<Instant>,
+        context: RequestContext,
+    ) -> Posted {
         let posted = {
             let mut inner = self.locked();
             if !inner.connected {
                 Posted::Dropped
             } else {
                 let mut callers = Vec::new();
-                if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Read { key: k, .. } if *k == key)) {
+                if let Some(i) = inner
+                    .pending
+                    .iter()
+                    .position(|e| matches!(e, Entry::Read { key: k, context: original, .. } if *k == key && *original == context))
+                {
                     if let Some(Entry::Read { callers: earlier, .. }) = inner.pending.remove(i) {
                         callers = earlier;
                     }
                 }
                 callers.push(Caller { reply, deadline });
-                inner.pending.push_back(Entry::Read { key, call, callers });
+                inner.pending.push_back(Entry::Read { key, call, callers, context });
                 Posted::Queued
             }
         };
@@ -717,9 +913,9 @@ impl Mailbox {
                 inner.pending.push_front(Entry::State { value, held: true });
             }
             // A config in flight goes first of all: a target's setup comes before its values.
-            if let Some((target, config)) = inner.in_flight_config.take() {
+            if let Some((target, config, context)) = inner.in_flight_config.take() {
                 if !inner.pending.iter().any(|e| matches!(e, Entry::Config { target: t, .. } if *t == target)) {
-                    inner.pending.push_front(Entry::Config { target, config, held: true });
+                    inner.pending.push_front(Entry::Config { target, config, context, held: true });
                 }
             }
             // The command the worker took and was cut off from answering goes first.
@@ -733,8 +929,11 @@ impl Mailbox {
                         value.check.held = true;
                         inner.pending.push_back(Entry::State { value, held: true });
                     }
-                    Entry::Config { target, config, .. } => inner.pending.push_back(Entry::Config { target, config, held: true }),
-                    Entry::Momentary { target, call, reply, .. } => unanswered.push(Unanswered {
+                    Entry::Config { target, config, context, .. } => {
+                        inner.pending.push_back(Entry::Config { target, config, context, held: true })
+                    }
+                    Entry::Momentary { target, call, reply, context, .. } => unanswered.push(Unanswered {
+                        context,
                         ran: false,
                         target,
                         command: call.command,
@@ -742,10 +941,10 @@ impl Mailbox {
                         replies: reply.into_iter().collect(),
                     }),
                     // Refused, on `Error` and on any response topic, whether or not it named one.
-                    Entry::Read { key, callers, .. } => {
+                    Entry::Read { key, callers, context, .. } => {
                         let (target, command) = key.names();
                         let replies = callers.into_iter().filter_map(|c| c.reply).collect();
-                        unanswered.push(Unanswered { ran: false, target, command, momentary: false, replies });
+                        unanswered.push(Unanswered { context, ran: false, target, command, momentary: false, replies });
                     }
                 }
             }
@@ -775,9 +974,9 @@ impl Mailbox {
             let held = loop {
                 // Every held config before any held value: a target's setup comes first.
                 if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { held: true, .. })) {
-                    if let Some(Entry::Config { target, config, .. }) = inner.pending.remove(i) {
-                        inner.in_flight_config = Some((target.clone(), config.clone()));
-                        break Some(Held::Config { target, config });
+                    if let Some(Entry::Config { target, config, context, .. }) = inner.pending.remove(i) {
+                        inner.in_flight_config = Some((target.clone(), config.clone(), context.clone()));
+                        break Some(Held::Config { target, config, context });
                     }
                 }
                 let target = match inner.pending.front() {
@@ -787,9 +986,9 @@ impl Mailbox {
                 // A target's config goes before its values, whatever its own `held` flag: one that
                 // came during the catch-up waits as not held (review R5).
                 if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { target: t, .. } if *t == target)) {
-                    if let Some(Entry::Config { target, config, .. }) = inner.pending.remove(i) {
-                        inner.in_flight_config = Some((target.clone(), config.clone()));
-                        break Some(Held::Config { target, config });
+                    if let Some(Entry::Config { target, config, context, .. }) = inner.pending.remove(i) {
+                        inner.in_flight_config = Some((target.clone(), config.clone(), context.clone()));
+                        break Some(Held::Config { target, config, context });
                     }
                 }
                 let (target, mut values) = inner.take_group(0);
@@ -817,9 +1016,9 @@ impl Mailbox {
                     // A target's waiting config goes before its values.
                     let target = value.target.clone();
                     if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { target: t, .. } if *t == target)) {
-                        if let Some(Entry::Config { target, config, .. }) = inner.pending.remove(i) {
-                            inner.in_flight_config = Some((target.clone(), config.clone()));
-                            return Some(Work::Configure { target, config });
+                        if let Some(Entry::Config { target, config, context, .. }) = inner.pending.remove(i) {
+                            inner.in_flight_config = Some((target.clone(), config.clone(), context.clone()));
+                            return Some(Work::Configure { target, config, context });
                         }
                     }
                     let (target, mut values) = inner.take_group(0);
@@ -831,32 +1030,33 @@ impl Mailbox {
                     return Some(Work::Apply { target, values });
                 }
                 Entry::Config { .. } => {
-                    if let Some(Entry::Config { target, config, .. }) = inner.pending.pop_front() {
-                        inner.in_flight_config = Some((target.clone(), config.clone()));
-                        return Some(Work::Configure { target, config });
+                    if let Some(Entry::Config { target, config, context, .. }) = inner.pending.pop_front() {
+                        inner.in_flight_config = Some((target.clone(), config.clone(), context.clone()));
+                        return Some(Work::Configure { target, config, context });
                     }
                 }
                 Entry::Momentary { .. } => {
-                    if let Some(Entry::Momentary { target, call, reply, deadline }) = inner.pending.pop_front() {
+                    if let Some(Entry::Momentary { target, call, reply, deadline, context }) = inner.pending.pop_front() {
                         inner.momentary = inner.momentary.saturating_sub(1);
                         if inner.momentary == 0 {
                             inner.full_logged = false;
                         }
                         if deadline.is_some_and(|d| now >= d) {
-                            return Some(Work::Expired { target, call, reply });
+                            return Some(Work::Expired { target, call, reply, context });
                         }
                         inner.in_flight_command = Some(Unanswered {
+                            context: context.clone(),
                             ran: true,
                             target: target.clone(),
                             command: call.command.clone(),
                             momentary: true,
                             replies: reply.clone().into_iter().collect(),
                         });
-                        return Some(Work::Execute { target, call, reply });
+                        return Some(Work::Execute { target, call, reply, context });
                     }
                 }
                 Entry::Read { .. } => {
-                    if let Some(Entry::Read { key, call, callers }) = inner.pending.pop_front() {
+                    if let Some(Entry::Read { key, call, callers, context }) = inner.pending.pop_front() {
                         // Each caller past its deadline is refused on its own; the read runs for
                         // the rest, if any remain (review R9).
                         let (target, command) = key.names();
@@ -865,6 +1065,7 @@ impl Mailbox {
                         let expired = late
                             .into_iter()
                             .map(|c| Unanswered {
+                                context: context.clone(),
                                 ran: false,
                                 target: target.clone(),
                                 command: command.clone(),
@@ -877,13 +1078,14 @@ impl Mailbox {
                         }
                         let replies: Vec<ReplyTo> = live.into_iter().filter_map(|c| c.reply).collect();
                         inner.in_flight_command = Some(Unanswered {
+                            context: context.clone(),
                             ran: true,
                             target: target.clone(),
                             command: command.clone(),
                             momentary: false,
                             replies: replies.clone(),
                         });
-                        return Some(Work::Read { key, call, replies, expired });
+                        return Some(Work::Read { key, call, replies, expired, context });
                     }
                 }
             }
@@ -928,13 +1130,17 @@ impl Mailbox {
             let mut dropped = 0;
             for value in values {
                 let in_flight = inner.in_flight.contains(&value);
-                if in_flight && !inner.waits_for(&value) && !value.expired(now) {
+                if in_flight
+                    && !inner.waits_for(&value)
+                    && !value.expired(now)
+                    && self.context_is_current(Some(&value.target), &value.context)
+                {
                     kept.push(value);
                 } else {
                     if in_flight && value.expired(now) {
                         inner.expired += 1;
                         if value.reheld {
-                            inner.abandoned.push((value.target.clone(), value.property.clone()));
+                            inner.abandoned.push((value.target.clone(), value.property.clone(), value.context.clone()));
                         }
                     }
                     dropped += 1;
@@ -952,12 +1158,17 @@ impl Mailbox {
     /// The next config held while the device was down, if any — only configs, values left waiting —
     /// in flight until [`configured`](Self::configured) or [`failed`](Self::failed). Never waits.
     pub fn take_held_config(&self) -> Option<(String, Option<Value>)> {
+        self.take_held_config_with_context().map(|(target, config, _)| (target, config))
+    }
+
+    /// Take a held configuration with its original context intact.
+    pub fn take_held_config_with_context(&self) -> Option<(String, Option<Value>, RequestContext)> {
         let mut inner = self.locked();
         let i = inner.pending.iter().position(|e| matches!(e, Entry::Config { held: true, .. }))?;
         match inner.pending.remove(i) {
-            Some(Entry::Config { target, config, .. }) => {
-                inner.in_flight_config = Some((target.clone(), config.clone()));
-                Some((target, config))
+            Some(Entry::Config { target, config, context, .. }) => {
+                inner.in_flight_config = Some((target.clone(), config.clone(), context.clone()));
+                Some((target, config, context))
             }
             _ => None,
         }
@@ -966,6 +1177,11 @@ impl Mailbox {
     /// The keys of writes held again before proof that expired unapplied since the last call: the
     /// device may never have taken them (second final gate, Claude's minor 1). Never waits.
     pub fn take_abandoned(&self) -> Vec<(String, String)> {
+        self.take_abandoned_with_context().into_iter().map(|(target, property, _)| (target, property)).collect()
+    }
+
+    /// Expiry cleanup retains the original context, including after a mapping change.
+    pub fn take_abandoned_with_context(&self) -> Vec<(String, String, RequestContext)> {
         std::mem::take(&mut self.locked().abandoned)
     }
 
@@ -999,12 +1215,24 @@ impl Mailbox {
     /// override (review, mailbox.rs:394: the override took effect at the post, and outlived a
     /// refusal).
     pub fn configured(&self, target: &str, config: Option<&Value>) {
+        self.configured_with_context(target, config, &RequestContext::default());
+    }
+
+    /// Accept setup only while the same original configuration remains in flight.
+    pub fn configured_with_context(&self, target: &str, config: Option<&Value>, context: &RequestContext) -> bool {
         let mut inner = self.locked();
+        if !self.context_is_current(Some(target), context) {
+            return false;
+        }
+        if !inner.in_flight_config.as_ref().is_some_and(|(t, c, original)| t == target && c.as_ref() == config && original == context) {
+            return false;
+        }
         inner.in_flight_config = None;
         match config.and_then(|c| c.get("feedback")).and_then(Value::as_str).and_then(Feedback::parse) {
-            Some(feedback) => inner.feedback.insert(target.to_owned(), feedback),
+            Some(feedback) => inner.feedback.insert(target.to_owned(), (feedback, context.clone())),
             None => inner.feedback.remove(target),
         };
+        true
     }
 
     /// What was in flight failed on its own (refused, unusable, unsupported): passed over.
@@ -1031,7 +1259,7 @@ impl Mailbox {
 
     /// A target's feedback mode: its `Config`'s, else `default`.
     pub fn feedback(&self, target: &str, default: Feedback) -> Feedback {
-        self.locked().feedback.get(target).copied().unwrap_or(default)
+        self.locked().feedback.get(target).map(|(feedback, _)| *feedback).unwrap_or(default)
     }
 
     /// Held values dropped at their deadline since the last call.

@@ -68,7 +68,8 @@ use tokio::task::JoinSet;
 
 use crate::config::{self, Problem, Settings, TimingOverrides};
 use crate::devices::{Spawner, Startable};
-use crate::driver::{DeviceDriver, DriverInfo, PropertyMap, Timing};
+use crate::driver::{DeviceDriver, PropertyMap, Timing};
+use crate::generations::DriverDescription;
 use crate::lifecycle::{self, Lifecycle};
 use crate::process::Running;
 use crate::pump::BrokerOutage;
@@ -415,7 +416,7 @@ impl Host {
     /// instance's driver; or a [`Bridge`](crate::Bridge)'s fixed instance (N = 1), with `fixed`'s
     /// driver — and its `info()`, if [`Bridge::run`](crate::Bridge::run) took it off the runtime
     /// already, else taken here. One session, one lifecycle, either way.
-    pub(crate) fn launch(self, fixed: Option<(Box<dyn Startable>, Option<DriverInfo>)>) -> Result<Running, String> {
+    pub(crate) fn launch(self, fixed: Option<(Box<dyn Startable>, Option<DriverDescription>)>) -> Result<Running, String> {
         if let Some(problem) = &self.problem {
             return Err(match problem {
                 Problem::Help => "--help".to_owned(),
@@ -435,10 +436,11 @@ impl Host {
         let (span, version, factory, fixed) = match (self.fixed, fixed) {
             (true, Some((driver, info))) => {
                 let span = tracing::info_span!("bridge", root = %topics.root(), instance = %id);
-                let info = info.unwrap_or_else(|| driver.info());
+                let mut info = info.unwrap_or_else(|| driver.describe());
                 // The driver's timing, with the command line's overrides: timings that cannot run
                 // are the start's failure.
-                let info = config::device_info(info, &self.settings.timing, self.settings.device_stable, &self.settings.mqtt)?;
+                info.info = config::device_info(info.info, &self.settings.timing, self.settings.device_stable, &self.settings.mqtt)?;
+                info.policy.validate(true)?;
                 let version =
                     self.version.clone().unwrap_or_else(|| format!("{} (mqtt-bridge-kit {})", self.app(), env!("CARGO_PKG_VERSION")));
                 (span, version, None, Some((driver, info)))

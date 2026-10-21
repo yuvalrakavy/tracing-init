@@ -7,6 +7,7 @@ use crate::test_support::Capture;
 
 fn request(value: Value, conflict: Conflict) -> StateValue {
     StateValue {
+        context: crate::RequestContext::default(),
         target: "u1".into(),
         property: "temp".into(),
         value,

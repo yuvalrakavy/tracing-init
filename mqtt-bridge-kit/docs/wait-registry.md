@@ -56,6 +56,8 @@ selects on, and a death goes to a channel `Running::ended` reads.
 | `reports-ready` | acyclic | the next report (`Reports::reported`) | An idle wait for work, the session's. A report never waits — a short lock, then `Notify::notify_one`, which keeps a permit when nobody is waiting — so no reporter waits on the session. The retained model coalesces per target; `Error` and `Event` are capped (64 each), the oldest displaced past it, one WARN per episode. |
 | `reports-lock` | acyclic | the reports' state (`lock-order` mutex, class `reports-lock`) | Held only to change or copy what waits for the session: never across an await, no other lock taken under it, nothing logged under it — the displacement lines are logged after the guard is dropped. |
 | `mailbox-posted` | acyclic | the mailbox, read by the worker (`Mailbox::take`) | An idle wait for work. A post never waits — a short lock, then a notify — so no poster waits on the worker. The worker takes only while the device is up; while it is down nothing takes: state waits (the latest per key, so bounded), momentary commands are refused at once, reads dropped. |
+| `mailbox-policy` | acyclic | complete mapping replacement notification | A replacement never awaits the worker. A persistent Notify permit wakes its connected loop or its outage retry loop to discard retired caches. Retrying retains the original absolute reconnect deadline. No report lock is held while waiting. |
+| `worker-retry` | bounded | the original device retry deadline or a policy-change notification | Mapping changes may wake the loop to clear caches but never extend the deadline; on expiry it retries at the original instant. The notifier never waits on the worker. Process shutdown cancels the worker. |
 | `mailbox-lock` | acyclic | the mailbox's state (`lock-order` mutex, class `mailbox-lock`) | Held only to read or change what waits: never across an await, nothing logged under it — a refusal or a drop at a deadline is logged after the guard is dropped. The one lock taken under it is the reports' (`reports-lock`), which takes none: the worker's answer queued as its command leaves flight (`Mailbox::command_done_then`), and a replaced re-held write's assumption withdrawn as the post replaces it (`Mailbox::post_state_then`, `post_target_then`). Nothing takes the mailbox's lock under the reports', so the order is one way. The conflict rule's resolver runs under it on the worker's own data, taking no lock. |
 | `device-op` | bounded | one driver operation (`connect`, `read_state`, `apply`, `execute`, `configure`, `probe`), raced against the link's `link_lost` | The operation's timing: `connect` for a connect, `probe_deadline` for a probe, `operation` for the rest (driver defaults, each overridable on the command line). On expiry, or when a helper reports the link lost, the operation's future is dropped and the link is lost: helpers cancelled, `disconnect` (bounded), what the device may not have taken held again, momentary commands refused, the outage episode advanced, and the next connect paced. Never a hang. A driver that blocks its thread synchronously holds only the worker's own thread (`worker-thread`), where these timers cannot fire either; the deadline is also on the worker's `OpClock`, which the watchdog on the MQTT side reads (`bridge-parts`): past it and `BLOCKED_GRACE` (2 s) the device worker is dead. |
 | `link-helpers` | acyclic | one link's helper list (`lock-order` mutex, class `link-helpers`) | Held only to push a helper's abort handle or take the list: never across an await, no other lock taken under it, nothing logged under it. Taken on the device worker's thread, by a helper's start and by the link's drop. |
@@ -121,6 +123,8 @@ device-factory src/devices.rs Spawner::build
 device-keeper src/devices.rs all_ended
 device-keeper src/devices.rs keeper
 device-keeper src/devices.rs sleep_until
+device-op src/driver.rs DeviceDriver::apply_with_context
+device-op src/driver.rs DeviceDriver::execute_with_context
 device-op src/link.rs under_deadline
 device-op src/worker.rs Worker::configure
 device-op src/worker.rs Worker::decide
@@ -129,6 +133,7 @@ device-op src/worker.rs Worker::probe
 device-op src/worker.rs Worker::prove
 device-op src/worker.rs Worker::serve
 device-op src/worker.rs Worker::work
+device-op src/worker.rs Worker::write_values
 device-op src/worker.rs op
 devices-registry src/devices.rs Registry::locked
 driver-info src/process.rs serve_with
@@ -137,6 +142,7 @@ link-helpers src/link.rs spawn_helper
 link-lost src/link.rs LinkHandle::lost
 logging-start src/process.rs serve_with
 mailbox-lock src/mailbox.rs Mailbox::locked
+mailbox-policy src/mailbox.rs Mailbox::policy_changed
 mailbox-posted src/mailbox.rs Mailbox::take
 managed-cancel src/managed.rs ServiceContext::cancelled
 managed-fatal src/managed.rs Managed::died
@@ -188,6 +194,7 @@ shutdown src/process.rs stop_before
 shutdown src/process.rs stop_devices_then_session
 shutdown-flush src/session.rs flush
 stop-signal src/process.rs StopSignals::next
+worker-retry src/worker.rs Worker::run
 worker-stop src/worker.rs spawn
 worker-thread src/worker.rs spawn
 worker-up src/worker.rs Worker::serve

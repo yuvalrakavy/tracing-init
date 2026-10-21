@@ -64,6 +64,7 @@ compile_error!(
 pub mod config;
 mod devices;
 pub mod driver;
+pub mod generations;
 pub mod host;
 mod lifecycle;
 pub mod link;
@@ -87,6 +88,7 @@ pub use driver::{
     CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkError, OpError, PropertyFailure,
     PropertyMap, Scope, TargetState, Timing, Value, Writes,
 };
+pub use generations::{ContextualState, RequestContext, RequestKind, RequestPolicy, TargetGenerations};
 pub use host::{DeviceConfig, FactoryError, Host};
 pub use link::{LinkContext, LinkHandle, ReadBack, Reporter};
 pub use managed::{ProcessService, ServiceContext, ServiceTiming};

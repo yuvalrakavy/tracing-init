@@ -29,7 +29,7 @@
 //! under it, and nothing logged under it.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -39,6 +39,7 @@ use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use crate::driver::PropertyMap;
+use crate::generations::{RequestContext, RequestPolicy, RetiredGenerations, TargetGenerations};
 use crate::topics::valid_segment;
 use crate::wire::{encode_state, ErrorReport};
 
@@ -76,6 +77,8 @@ impl LinkStatus {
 /// A message for the `Event` lane (`topic: None`) or a command's response topic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outbound {
+    /// Original event or request generation, retained even after retirement.
+    pub context: RequestContext,
     /// The topic, for a reply; `None` is the `Event` lane.
     pub topic: Option<String>,
     /// The JSON payload.
@@ -86,6 +89,7 @@ pub struct Outbound {
 
 #[derive(Debug, Default)]
 struct TargetModel {
+    context: RequestContext,
     values: PropertyMap,
     assumed: bool,
     /// How many reports this target has had: the worker reads it around an `apply`, to tell
@@ -151,6 +155,7 @@ impl<T> Capped<T> {
 
 #[derive(Debug)]
 struct State {
+    request_policy: Option<RequestPolicy>,
     status: Option<LinkStatus>,
     status_changed: bool,
     targets: BTreeMap<String, TargetModel>,
@@ -179,7 +184,7 @@ struct State {
     refused_names: std::collections::BTreeSet<String>,
     /// Targets removed and not reported since: their `State` is retracted, an empty retained
     /// payload, after every CONNACK too.
-    removed: std::collections::BTreeSet<String>,
+    removed: BTreeMap<String, RequestContext>,
     /// What an acknowledged `apply` wrote, by target, until a report gives the key: what the bridge
     /// knows for the conflict rule's snapshots, never published — the device may have clamped it.
     written: BTreeMap<String, PropertyMap>,
@@ -188,6 +193,7 @@ struct State {
 /// See the module documentation.
 #[derive(Debug)]
 pub struct Reports {
+    mailbox: OnceLock<Weak<crate::mailbox::Mailbox>>,
     state: Mutex<State>,
     /// Told after every report; one per session — every device of a multi-device host shares it
     /// ([`with_ready`](Reports::with_ready)), so one wait serves them all.
@@ -209,7 +215,7 @@ pub struct Changes {
     /// A changed link status.
     pub status: Option<LinkStatus>,
     /// Each changed target's `State` document; an empty one retracts it.
-    pub states: Vec<(String, Vec<u8>)>,
+    pub states: Vec<(String, Vec<u8>, RequestContext)>,
     /// Unsolicited `Error` reports (malformed input among them), capped at [`ERROR_CAP`].
     pub errors: Vec<ErrorReport>,
     /// Unsolicited `Event` reports, capped at [`EVENT_CAP`].
@@ -222,7 +228,7 @@ pub struct Model {
     /// The link status, once one has been reported.
     pub status: Option<LinkStatus>,
     /// Each target's `State` document, by target.
-    pub states: Vec<(String, Vec<u8>)>,
+    pub states: Vec<(String, Vec<u8>, RequestContext)>,
 }
 
 /// What the bridge knows of every target, for the conflict rule: the reported values, and over them
@@ -239,6 +245,97 @@ fn known(state: &State) -> BTreeMap<String, PropertyMap> {
 }
 
 impl Reports {
+    pub(crate) fn bind_mailbox(&self, mailbox: &Arc<crate::mailbox::Mailbox>) {
+        assert!(self.mailbox.set(Arc::downgrade(mailbox)).is_ok(), "reports mailbox bound twice");
+    }
+    pub(crate) fn context_is_current(&self, target: Option<&str>, context: &RequestContext) -> bool {
+        self.locked().context_is_current(target, context)
+    }
+    pub(crate) fn fenced(&self) -> bool {
+        matches!(self.locked().request_policy, Some(RequestPolicy::Fenced(_)))
+    }
+    pub(crate) fn observation_matches(&self, target: &str, observed: &RequestContext, requested: &RequestContext) -> bool {
+        let state = self.locked();
+        state.context_is_current(Some(target), observed)
+            && (!matches!(state.request_policy, Some(RequestPolicy::Fenced(_))) || observed == requested)
+    }
+    pub(crate) fn install_policy(&self, policy: RequestPolicy) {
+        let mut state = self.locked();
+        if let Some(current) = &state.request_policy {
+            assert_eq!(current, &policy, "initial installation cannot replace mapping authority");
+            return;
+        }
+        state.request_policy = Some(policy);
+    }
+
+    /// Replace a fixed bridge's complete routing authority. The expected table
+    /// is a compare-and-swap precondition, including targets that stayed unchanged.
+    pub fn replace_generations(&self, expected: &TargetGenerations, next: TargetGenerations) -> Result<(), String> {
+        next.validate()?;
+        let mailbox = self.mailbox.get().and_then(Weak::upgrade).ok_or("the runtime mailbox is unavailable")?;
+        let unanswered = mailbox.replace_generations(self, expected, next)?;
+        crate::worker::report_refused(self, unanswered, "the request's device mapping was retired; refresh the complete inventory");
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    // Only called under the mailbox lock; Reports never takes that lock itself.
+    pub(crate) fn retire_generations(&self, expected: &TargetGenerations, next: TargetGenerations) -> Result<RetiredGenerations, String> {
+        let mut state = self.locked();
+        if state.request_policy.as_ref() != Some(&RequestPolicy::Fenced(expected.clone())) {
+            return Err("the complete generation table changed or this runtime is unfenced".into());
+        }
+        let retired = RetiredGenerations {
+            instance: (expected.instance != next.instance).then(|| RequestContext::new(&expected.instance).expect("validated table")),
+            targets: expected
+                .targets
+                .iter()
+                .filter(|(target, old)| next.targets.get(*target) != Some(*old))
+                .map(|(target, old)| (target.clone(), RequestContext::new(old).expect("validated table")))
+                .collect(),
+        };
+        state.request_policy = Some(RequestPolicy::Fenced(next));
+        for (target, old) in &retired.targets {
+            if state.targets.get(target).is_some_and(|model| model.context == *old) {
+                state.targets.remove(target);
+            }
+            state.written.remove(target);
+            state.readback.remove(target);
+            if let Some(frozen) = &mut state.readback_frozen {
+                frozen.remove(target);
+            }
+            if let Some((_, values)) = &mut state.broker_lost {
+                values.remove(target);
+            }
+            state.removed.insert(target.clone(), old.clone());
+            if !state.changed.contains(target) {
+                state.changed.push(target.clone());
+            }
+        }
+        Ok(retired)
+    }
+
+    pub(crate) fn current_policy(&self) -> Option<RequestPolicy> {
+        self.locked().request_policy.clone()
+    }
+}
+
+impl State {
+    fn context_is_current(&self, target: Option<&str>, context: &RequestContext) -> bool {
+        match &self.request_policy {
+            None | Some(RequestPolicy::Unfenced) => true,
+            Some(RequestPolicy::Fenced(table)) => {
+                let expected = match target {
+                    Some(target) => table.targets.get(target).map(String::as_str),
+                    None => Some(table.instance.as_str()),
+                };
+                expected.is_some() && expected == context.generation()
+            }
+        }
+    }
+}
+
+impl Reports {
     /// An empty model: nothing reported, no read-back.
     pub fn new() -> Arc<Reports> {
         Reports::with_ready(Arc::new(Notify::new()))
@@ -248,9 +345,11 @@ impl Reports {
     /// of a multi-device host (multi-device spec §4.7).
     pub fn with_ready(ready: Arc<Notify>) -> Arc<Reports> {
         Arc::new(Reports {
+            mailbox: OnceLock::new(),
             state: Mutex::new(
                 "reports-lock",
                 State {
+                    request_policy: None,
                     status: None,
                     status_changed: false,
                     targets: BTreeMap::new(),
@@ -263,7 +362,7 @@ impl Reports {
                     broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
                     answers: (Vec::new(), Vec::new()),
-                    removed: std::collections::BTreeSet::new(),
+                    removed: BTreeMap::new(),
                     written: BTreeMap::new(),
                 },
             ),
@@ -348,7 +447,12 @@ impl Reports {
     /// property name that cannot stand as one topic segment (empty, or holding `/`, `+`, `#`) is
     /// a driver bug: dropped, with one ERROR `driver_contract_violation` per name (review B2: one
     /// such target left the session deaf for the life of the process).
-    pub fn state(&self, target: &str, mut values: PropertyMap, assumed: bool) {
+    pub fn state(&self, target: &str, values: PropertyMap, assumed: bool) {
+        self.state_with_context(target, values, assumed, &RequestContext::default());
+    }
+
+    /// Merge only observations belonging to the current mapping.
+    pub fn state_with_context(&self, target: &str, mut values: PropertyMap, assumed: bool, context: &RequestContext) {
         let mut refused: Vec<String> = Vec::new();
         if !valid_segment(target) {
             refused.push(format!("target `{target}`"));
@@ -363,11 +467,14 @@ impl Reports {
         });
         let (changed, newly_refused) = {
             let mut state = self.locked();
+            if !state.context_is_current(Some(target), context) {
+                return;
+            }
             let newly_refused: Vec<String> = refused.into_iter().filter(|name| state.refused_names.insert(name.clone())).collect();
             if !valid_segment(target) {
                 (false, newly_refused)
             } else {
-                (Self::merge(&mut state, target, values, assumed), newly_refused)
+                (Self::merge(&mut state, target, values, assumed, context), newly_refused)
             }
         };
         for name in newly_refused {
@@ -382,14 +489,22 @@ impl Reports {
     /// (an empty retained payload), after every CONNACK too, until it is reported again. Never
     /// waits.
     pub fn remove(&self, target: &str) {
+        self.remove_with_context(target, &RequestContext::default());
+    }
+
+    /// A delayed removal cannot retract a replacement's model.
+    pub fn remove_with_context(&self, target: &str, context: &RequestContext) {
         if !self.names_stand(target, None) {
             return;
         }
         {
             let mut state = self.locked();
+            if !state.context_is_current(Some(target), context) {
+                return;
+            }
             state.targets.remove(target);
             state.written.remove(target);
-            state.removed.insert(target.to_owned());
+            state.removed.insert(target.to_owned(), context.clone());
             if !state.changed.iter().any(|t| t == target) {
                 state.changed.push(target.to_owned());
             }
@@ -400,11 +515,19 @@ impl Reports {
     /// Retract one property of a target: removed from the model, and the target's `State`
     /// published without it. Never waits.
     pub fn remove_property(&self, target: &str, property: &str) {
+        self.remove_property_with_context(target, property, &RequestContext::default());
+    }
+
+    /// Remove a property only from the original current mapping.
+    pub fn remove_property_with_context(&self, target: &str, property: &str, context: &RequestContext) {
         if !self.names_stand(target, Some(property)) {
             return;
         }
         let changed = {
             let mut state = self.locked();
+            if !state.context_is_current(Some(target), context) {
+                return;
+            }
             if let Some(written) = state.written.get_mut(target) {
                 written.remove(property);
             }
@@ -437,13 +560,19 @@ impl Reports {
     }
 
     /// Merge a validated report into the model; whether anything changed.
-    fn merge(state: &mut State, target: &str, values: PropertyMap, assumed: bool) -> bool {
+    fn merge(state: &mut State, target: &str, values: PropertyMap, assumed: bool, context: &RequestContext) -> bool {
         {
             state.removed.remove(target);
             let new = !state.targets.contains_key(target);
+            let fenced = matches!(state.request_policy, Some(RequestPolicy::Fenced(_)));
             let model = state.targets.entry(target.to_owned()).or_default();
+            let replaced = model.context != *context;
+            if replaced && fenced {
+                *model = TargetModel { context: context.clone(), ..TargetModel::default() };
+            }
+            model.context = context.clone();
             model.reports += 1;
-            let mut changed = new || model.assumed != assumed;
+            let mut changed = new || replaced || model.assumed != assumed;
             model.assumed = assumed;
             for (property, value) in values {
                 // A report replaces what a write left of the key, and settles an unproven
@@ -489,6 +618,21 @@ impl Reports {
         self.ready.notify_one();
     }
 
+    /// An unsolicited observation; retired generations cannot create fresh events.
+    pub fn observed_event(&self, target: Option<&str>, message: Outbound) {
+        let began = {
+            let mut state = self.locked();
+            if !state.context_is_current(target, &message.context) {
+                return;
+            }
+            state.events.push(message)
+        };
+        if began {
+            warn!(kind = "event_report_dropped", waiting = EVENT_CAP, "Event reports are displacing older ones: MQTT is not taking them");
+        }
+        self.ready.notify_one();
+    }
+
     /// A request's terminal `Error` — its failure, a refusal, a supersession: an answer, past
     /// every cap; the capped queue keeps only unsolicited reports (confirming
     /// review 2). Never waits.
@@ -515,10 +659,9 @@ impl Reports {
             let states = std::mem::take(&mut state.changed)
                 .into_iter()
                 .filter_map(|target| match state.targets.get(&target) {
-                    Some(m) => Some((target.clone(), encode_state(&m.values, m.assumed))),
+                    Some(m) => Some((target.clone(), encode_state(&m.values, m.assumed), m.context.clone())),
                     // A retraction: an empty retained payload.
-                    None if state.removed.contains(&target) => Some((target, Vec::new())),
-                    None => None,
+                    None => state.removed.get(&target).map(|context| (target.clone(), Vec::new(), context.clone())),
                 })
                 .collect();
             let (answer_errors, replies) = std::mem::take(&mut state.answers);
@@ -555,9 +698,9 @@ impl Reports {
         let mut state = self.locked();
         state.status_changed = false;
         state.changed.clear();
-        let mut states: Vec<(String, Vec<u8>)> =
-            state.targets.iter().map(|(t, m)| (t.clone(), encode_state(&m.values, m.assumed))).collect();
-        states.extend(state.removed.iter().map(|t| (t.clone(), Vec::new())));
+        let mut states: Vec<(String, Vec<u8>, RequestContext)> =
+            state.targets.iter().map(|(t, m)| (t.clone(), encode_state(&m.values, m.assumed), m.context.clone())).collect();
+        states.extend(state.removed.iter().map(|(t, context)| (t.clone(), Vec::new(), context.clone())));
         Model { status: state.status, states }
     }
 
@@ -574,12 +717,25 @@ impl Reports {
         known(&self.locked())
     }
 
+    pub(crate) fn snapshot_with_policy(&self) -> (BTreeMap<String, PropertyMap>, Option<RequestPolicy>) {
+        let state = self.locked();
+        (known(&state), state.request_policy.clone())
+    }
+
     /// An acknowledged `apply` wrote `values` to `target`: what the bridge knows for the conflict
     /// rule's later snapshots, until a report gives the key. Never published: the device may have
     /// clamped the value. A property the driver reported during the write (since its report count
     /// was `reported_before`) keeps the report. Never waits.
     pub fn written(&self, target: &str, values: &PropertyMap, reported_before: u64) {
+        self.written_with_context(target, values, reported_before, &RequestContext::default());
+    }
+
+    /// Record a completed write only while its mapping remains current.
+    pub fn written_with_context(&self, target: &str, values: &PropertyMap, reported_before: u64, context: &RequestContext) {
         let mut state = self.locked();
+        if !state.context_is_current(Some(target), context) {
+            return;
+        }
         let State { targets, written, .. } = &mut *state;
         let seen = targets.get(target).map(|m| &m.seen);
         for (property, value) in values {
@@ -601,29 +757,53 @@ impl Reports {
     /// [`assumptions_proven`](Self::assumptions_proven) — an unproven write held again must not
     /// meet itself as the device's value (re-gate R3). Never waits.
     pub fn assume_unproven(&self, target: &str, values: PropertyMap) {
-        let before: Vec<(String, Option<Value>)> = {
-            let state = self.locked();
+        self.assume_unproven_with_context(target, values, &RequestContext::default());
+    }
+
+    /// Install an assumption and its proof obligation atomically for this mapping.
+    pub fn assume_unproven_with_context(&self, target: &str, values: PropertyMap, context: &RequestContext) {
+        if !self.names_stand(target, None) {
+            return;
+        }
+        let values: PropertyMap = values.into_iter().filter(|(property, _)| self.names_stand(target, Some(property))).collect();
+        let changed = {
+            let mut state = self.locked();
+            if !state.context_is_current(Some(target), context) {
+                return;
+            }
             let model = state.targets.get(target);
-            values
+            let before: Vec<(String, Option<Value>)> = values
                 .keys()
                 .map(|property| {
                     let earlier = model.and_then(|m| m.unproven.get(property).cloned());
                     let before = earlier.unwrap_or_else(|| model.and_then(|m| m.values.get(property).cloned()));
                     (property.clone(), before)
                 })
-                .collect()
+                .collect();
+            let changed = Self::merge(&mut state, target, values, true, context);
+            if let Some(model) = state.targets.get_mut(target) {
+                model.unproven.extend(before);
+            }
+            changed
         };
-        self.state(target, values, true);
-        let mut state = self.locked();
-        if let Some(model) = state.targets.get_mut(target) {
-            model.unproven.extend(before);
+        if changed {
+            self.ready.notify_one();
         }
     }
 
     /// The Store retracted a request of this key: it saw the assumed State and confirmed it, so the
     /// assumption stands (re-gate 3 S6). Never waits.
     pub fn assumption_settled(&self, target: &str, property: &str) {
-        if let Some(model) = self.locked().targets.get_mut(target) {
+        self.assumption_settled_with_context(target, property, &RequestContext::default());
+    }
+
+    /// Settle an assumption only under its original current mapping.
+    pub fn assumption_settled_with_context(&self, target: &str, property: &str, context: &RequestContext) {
+        let mut state = self.locked();
+        if !state.context_is_current(Some(target), context) {
+            return;
+        }
+        if let Some(model) = state.targets.get_mut(target) {
             model.unproven.remove(property);
         }
     }
@@ -633,7 +813,12 @@ impl Reports {
     /// back to what it was before the write, and `State` says so (second final gate, Claude's
     /// minor 1: the assumed value stood, unproven, for good). Never waits.
     pub fn assumption_abandoned(&self, target: &str, property: &str) {
-        if self.withdraw_assumption(target, property) {
+        self.assumption_abandoned_with_context(target, property, &RequestContext::default());
+    }
+
+    /// Expiry or failure of an old write cannot revert a new mapping's state.
+    pub fn assumption_abandoned_with_context(&self, target: &str, property: &str, context: &RequestContext) {
+        if self.withdraw_assumption_with_context(target, property, context) {
             info!(target, property, "A write the device never proved taken left unapplied; its assumed value is withdrawn");
         }
     }
@@ -642,8 +827,16 @@ impl Reports {
     /// nothing, so a caller under the mailbox's lock may call it (third confirming reviews, Codex
     /// 2). Never waits.
     pub fn withdraw_assumption(&self, target: &str, property: &str) -> bool {
+        self.withdraw_assumption_with_context(target, property, &RequestContext::default())
+    }
+
+    /// Withdraw only an assumption for this still-current mapping. No logging.
+    pub fn withdraw_assumption_with_context(&self, target: &str, property: &str, context: &RequestContext) -> bool {
         let reverted = {
             let mut state = self.locked();
+            if !state.context_is_current(Some(target), context) {
+                return false;
+            }
             let reverted = match state.targets.get_mut(target) {
                 Some(model) => match model.unproven.remove(property) {
                     Some(Some(before)) => {
@@ -673,6 +866,9 @@ impl Reports {
     pub fn assumptions_proven(&self, values: &[crate::mailbox::StateValue]) {
         let mut state = self.locked();
         for value in values {
+            if !state.context_is_current(Some(&value.target), &value.context) {
+                continue;
+            }
             if let Some(model) = state.targets.get_mut(&value.target) {
                 model.unproven.remove(&value.property);
             }
@@ -707,12 +903,20 @@ impl Reports {
     ///
     /// [`broker_before`]: Self::broker_before
     pub fn broker_basis(&self, target: &str, property: &str) -> crate::mailbox::Basis {
+        self.broker_basis_with_context(target, property, &RequestContext::default())
+    }
+
+    /// Capture a basis only for this mapping; a packet for a future generation
+    /// must never inherit the previous occupant's conflict history.
+    pub fn broker_basis_with_context(&self, target: &str, property: &str, context: &RequestContext) -> crate::mailbox::Basis {
         let state = self.locked();
         let (at, values) = match &state.broker_lost {
             Some((at, values)) => (*at, values),
             None => (self.epoch, state.readback_frozen.as_ref().unwrap_or(&state.readback)),
         };
-        crate::mailbox::Basis { at, before: values.get(target).and_then(|v| v.get(property)).cloned() }
+        let before =
+            state.context_is_current(Some(target), context).then(|| values.get(target).and_then(|v| v.get(property)).cloned()).flatten();
+        crate::mailbox::Basis { at, before }
     }
 
     /// The read-back, as of the start: as it stood when it was done, for the conflict rule.
@@ -756,7 +960,15 @@ impl Reports {
 
     /// A target's state as the bridge's retained `State` held it at start.
     pub fn read_back(&self, target: &str, values: PropertyMap) {
+        self.read_back_with_context(target, values, &RequestContext::default());
+    }
+
+    /// Retained state is usable only for the mapping under which it was published.
+    pub fn read_back_with_context(&self, target: &str, values: PropertyMap, context: &RequestContext) {
         let mut state = self.locked();
+        if !state.context_is_current(Some(target), context) {
+            return;
+        }
         // Once frozen, it is what the conflict rule reads; a late State changes nothing.
         if state.readback_frozen.is_none() {
             state.readback.insert(target.to_owned(), values);

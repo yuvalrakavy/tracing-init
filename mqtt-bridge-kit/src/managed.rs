@@ -1,9 +1,10 @@
 //! Process services independent of MQTT and device link lifetimes.
 use crate::config::Settings;
 use crate::devices::{drop_off_thread, Built, Registry};
+use crate::generations::DriverDescription;
 use crate::link::OpClock;
 use crate::process::{Died, PauseGrace, SHUTDOWN_GRACE, WATCH_TICK};
-use crate::{Bridge, DeviceDriver, DriverInfo, Running};
+use crate::{Bridge, DeviceDriver, Running};
 use lock_order::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -135,7 +136,7 @@ impl Control {
 }
 /// One-way startup handoff and cancellation signal; owns no I/O.
 pub struct ServiceContext<D: DeviceDriver> {
-    ready: Option<oneshot::Sender<(D, DriverInfo)>>,
+    ready: Option<oneshot::Sender<(D, DriverDescription)>>,
     control: Arc<Control>,
     settings: Settings,
     stopping: watch::Receiver<bool>,
@@ -154,7 +155,9 @@ impl<D: DeviceDriver> ServiceContext<D> {
                 return Err("service readiness may be published only once".into());
             }
         }
-        let info = crate::config::device_info(driver.info(), &self.settings.timing, self.settings.device_stable, &self.settings.mqtt)?;
+        let mut info = DriverDescription::new(&driver);
+        info.info = crate::config::device_info(info.info, &self.settings.timing, self.settings.device_stable, &self.settings.mqtt)?;
+        info.policy.validate(true)?;
         {
             // WAIT: managed-lifecycle
             let mut p = self.control.phase.lock().unwrap_or_else(|p| p.into_inner());
@@ -246,7 +249,7 @@ impl Managed {
     }
 }
 
-type Readiness<D> = oneshot::Receiver<(D, DriverInfo)>;
+type Readiness<D> = oneshot::Receiver<(D, DriverDescription)>;
 fn spawn<S: ProcessService>(
     service: S,
     settings: Settings,
