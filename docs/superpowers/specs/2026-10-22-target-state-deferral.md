@@ -1,5 +1,14 @@
 # Target-scoped state deferral
 
+**Not pursued — owner decision, 2026-10-22.** DALI bus outages are extremely rare
+in the intended environment, and dropping a command received during an outage is
+acceptable. The owner rejected spending further effort on this behavior. Keep
+the existing explicit rejection and move to the requested switch/color features.
+No production SDK deferral code was implemented and DALI remains pinned to
+153d380. The exploratory DALI test and its scaffolding were removed; it failed
+scenario validation before exercising recovery, so it is not behavioral evidence.
+The proposal below is historical design material, not an implementation mandate.
+
 2026-10-22. T3 continuation of the approved DALI v2 integration. Shared baseline
 153d38051f5197b060fa4281efe6136cffee7419; DALI baseline 9976d9b.
 
