@@ -86,6 +86,16 @@ async fn optional_request_context_preserves_unfenced_proving_and_direct_reads() 
         ));
         assert!(broker.wait_until(Duration::from_secs(3), |b| !b.received_on("Store/legacy-admitted").is_empty()).await);
         device.release_read.notify_one();
+        // Releasing a proving read does not synchronously make the worker Up.
+        // A momentary command posted in that gap is correctly refused.
+        assert!(
+            broker
+                .wait_until(Duration::from_secs(3), |b| b
+                    .received_on("FenceRuntime/Status/Controller")
+                    .iter()
+                    .any(|record| record.payload == "connected"))
+                .await
+        );
         assert!(broker.send_with(
             "FenceRuntime/Command/Controller",
             r#"{"target":"Kitchen","command":"pulse"}"#,

@@ -795,6 +795,26 @@ Notes, each of which is the runtime's behaviour rather than something the unit h
   two processes with the same pair against one broker.
 - **Versioning.** `Bridge::version("lampnet 0.1.0")` is the retained `Version` the Store shows.
 
+### Continuing a request trace
+
+The runtime owns optional MQTT v5 `traceparent` across its queues. If your driver
+passes work to another owner, pass its original `RequestContext` with that work
+and instrument the receiving future with `context.operation_span(instance, operation)`.
+Use `tracing::Instrument`; holding an enter guard over an await attributes unrelated
+tasks to the request. Contextual Reporter methods publish the original cause.
+If a successful edit creates a new mapping generation, construct that generation
+and copy only `context.traceparent()` with `with_traceparent`; never preserve a
+retired mapping token just to preserve a trace.
+
+Trace metadata does not participate in generation comparisons or coalescing.
+Combined writes use the latest surviving cause for execution; errors and coalesced
+replies preserve each caller's cause. `ReplyTo::new(topic, correlation)` replaces
+hand-built literals that predate its added `traceparent` field. None on a reply is
+authoritative absence. Invalid/duplicate/oversized headers do not reject commands.
+Request and operation spans are INFO carriers, with no new INFO event per value;
+State readback remains DEBUG. Valid supplied headers survive even without OTel,
+and no headers are fabricated without an active OTel context.
+
 ## 12. Many devices in one process
 
 LampNet is *controller-fronted*: one controller, its lamps behind it as targets, one process per

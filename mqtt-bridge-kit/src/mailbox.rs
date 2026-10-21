@@ -186,6 +186,7 @@ enum Entry {
 struct Caller {
     reply: Option<ReplyTo>,
     deadline: Option<Instant>,
+    context: RequestContext,
 }
 
 impl Entry {
@@ -887,7 +888,7 @@ impl Mailbox {
                         callers = earlier;
                     }
                 }
-                callers.push(Caller { reply, deadline });
+                callers.push(Caller { reply, deadline, context: context.clone() });
                 inner.pending.push_back(Entry::Read { key, call, callers, context });
                 Posted::Queued
             }
@@ -1092,7 +1093,7 @@ impl Mailbox {
                         let expired = late
                             .into_iter()
                             .map(|c| Unanswered {
-                                context: context.clone(),
+                                context: c.context,
                                 ran: false,
                                 target: target.clone(),
                                 command: command.clone(),

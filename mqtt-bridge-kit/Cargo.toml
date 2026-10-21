@@ -29,6 +29,9 @@ mqtt-test-broker = { path = "../mqtt-test-broker" }
 wait-lint = { path = "../wait-lint" }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 tracing-core = "0.1"
+opentelemetry = "0.31"
+opentelemetry_sdk = "0.31"
+tracing-opentelemetry = "0.32"
 
 # The tutorial's bridge, with its tests (docs/tutorial-writing-a-bridge.md): `cargo test` runs them.
 [[example]]

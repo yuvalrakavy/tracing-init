@@ -18,6 +18,10 @@ optional fencing for fixed controllers with mutable physical inventories.
 [Command completion](2026-10-21-bridge-command-completion.md) allows one exact
 active MQTT command to return its original-context result across its own
 successful inventory commit while all other old work retires.
+[Request traces](2026-10-21-bridge-request-traces.md) owns optional validated
+causal metadata across ingress, worker and publication queues, including
+per-caller coalesced replies. RequestContext comparison remains generation-only;
+ReplyTo gains a traceparent field and a constructor for hand-built callers.
 Legacy drivers retain their default methods and unfenced behavior. The extension
 specifications, crate README and tutorial define the additional APIs and tests;
 they continue through the same host/session/publication machinery.

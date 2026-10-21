@@ -6,6 +6,75 @@ use serde_json::json;
 use super::*;
 use crate::reports::Outbound;
 
+#[test]
+fn dynamic_routing_and_terminal_refusals_keep_the_ingress_cause() {
+    use opentelemetry::trace::TracerProvider;
+    use tracing_subscriber::prelude::*;
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("routing-test"))
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    tracing::subscriber::with_default(subscriber, || {
+        let mut host = lifecycle();
+        let topics = Topics::new("T", "Lamp").unwrap();
+        let device = Arc::new(Device {
+            topics: topics.clone(),
+            commands: Vec::new().into(),
+            mailbox: Mailbox::new(),
+            reports: Reports::new(),
+            tag: Some("host".into()),
+            span: tracing::info_span!(parent: None, "unrelated_device", instance = "Lamp"),
+        });
+        let mut instance = Instance::new("Lamp", topics, Want::Serve(json!({})));
+        instance.rt = Some(Rt {
+            id: 1,
+            device: device.clone(),
+            phase: Phase::Live,
+            worker: true,
+            read: Sub::Granted,
+            setup: Sub::Granted,
+            requests: Sub::Granted,
+            bootstrapped: true,
+            unsubscribing: 0,
+        });
+        host.instances.insert("Lamp".into(), instance);
+        let mut outputs = Outputs::new();
+        let topic = "T/Command/Lamp";
+        let mut publish = Publish::new(
+            topic,
+            rumqttc::v5::mqttbytes::QoS::AtLeastOnce,
+            br#"{"target":"t1","command":"assume","power":true}"#.to_vec(),
+            None,
+        );
+        let (_, ingress) = session::traced(&publish, "host");
+        assert!(!ingress.is_disabled(), "request carrier is disabled at INFO");
+        let readback = Publish::new("T/State/Lamp/t1", rumqttc::v5::mqttbytes::QoS::AtLeastOnce, b"{}".to_vec(), None);
+        assert!(session::traced(&readback, "host").1.is_disabled(), "State readback exports an INFO carrier");
+        let _entered = ingress.enter();
+        let expected = tracing_init::traceparent::current().expect("actual OTel ingress context");
+        host.route_instance(&mut outputs, "Lamp", topic, &publish, Instant::now());
+        assert_eq!(device.reports.take().states[0].2.traceparent(), Some(expected.as_str()), "routing entered an unrelated device trace");
+        let terminal_cause = "00-222233445566778899aabbccddeeff00-1234567890abcdef-01";
+        publish.properties = Some(rumqttc::v5::mqttbytes::v5::PublishProperties {
+            response_topic: Some("Store/Event/replies".into()),
+            user_properties: vec![("target-generation".into(), "invalid generation".into()), ("traceparent".into(), terminal_cause.into())],
+            ..Default::default()
+        });
+        terminal(&device, &mut outputs, topic, &publish, "stopping");
+        let answers = outputs.outbox.drain(Part::Answers);
+        assert_eq!(answers.len(), 2);
+        for answer in answers {
+            assert_eq!(
+                answer.traceparent_for_test(),
+                Some(terminal_cause),
+                "terminal refusal replaced a valid cause accompanying malformed generation"
+            );
+        }
+    });
+}
+
 /// A host's session part, with no broker behind it.
 fn session_part() -> Arc<session::Shared> {
     Arc::new(session::Shared {

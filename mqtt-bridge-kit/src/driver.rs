@@ -396,7 +396,9 @@ pub trait DeviceDriver: Send + 'static {
     /// again if the link dies first.
     async fn apply(&mut self, target: &str, values: &PropertyMap) -> Result<(), OpError>;
 
-    /// Apply values sharing exactly one original request context.
+    /// Apply values sharing one mapping generation. A merged batch uses its
+    /// latest surviving request as the diagnostic cause; property failures keep
+    /// each property's original cause in the runtime.
     async fn apply_with_context(&mut self, target: &str, values: &PropertyMap, _context: &RequestContext) -> Result<(), OpError> {
         // WAIT: device-op
         self.apply(target, values).await

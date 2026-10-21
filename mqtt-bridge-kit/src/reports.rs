@@ -550,7 +550,13 @@ impl Reports {
             if let Some(written) = state.written.get_mut(target) {
                 written.remove(property);
             }
-            let removed = state.targets.get_mut(target).is_some_and(|m| m.values.remove(property).is_some());
+            let removed = state.targets.get_mut(target).is_some_and(|m| {
+                if m.values.remove(property).is_none() {
+                    return false;
+                }
+                m.context = context.clone();
+                true
+            });
             if removed && !state.changed.iter().any(|t| t == target) {
                 state.changed.push(target.to_owned());
             }
@@ -860,10 +866,12 @@ impl Reports {
                 Some(model) => match model.unproven.remove(property) {
                     Some(Some(before)) => {
                         model.values.insert(property.to_owned(), before);
+                        model.context = context.clone();
                         true
                     }
                     Some(None) => {
                         model.values.remove(property);
+                        model.context = context.clone();
                         true
                     }
                     None => false,

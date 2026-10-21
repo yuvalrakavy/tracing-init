@@ -127,13 +127,14 @@ device-op src/completion.rs under_completion
 device-op src/driver.rs DeviceDriver::apply_with_context
 device-op src/driver.rs DeviceDriver::execute_with_context
 device-op src/link.rs under_deadline
+device-op src/worker.rs Worker::catch_up
 device-op src/worker.rs Worker::configure
 device-op src/worker.rs Worker::decide
 device-op src/worker.rs Worker::link
 device-op src/worker.rs Worker::probe
 device-op src/worker.rs Worker::prove
 device-op src/worker.rs Worker::serve
-device-op src/worker.rs Worker::work
+device-op src/worker.rs Worker::work_inner
 device-op src/worker.rs Worker::write_values
 device-op src/worker.rs op
 devices-registry src/devices.rs Registry::locked

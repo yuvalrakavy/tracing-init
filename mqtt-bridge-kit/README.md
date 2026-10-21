@@ -221,6 +221,27 @@ Details the runtime fixes (spec §5.1), which the lanes' payloads rely on:
 - JSON Schemas for each lane's payload are in [`../schemas`](../schemas); the conformance suite
   checks every publish against them.
 
+## Request traces across queues
+
+MQTT v5 `traceparent` is optional diagnostic metadata. The runtime validates and
+owns it in `RequestContext` across mailbox, worker, report and publication
+boundaries. Invalid, duplicate or over-512-byte headers are ignored. Trace
+metadata never changes generation admission, equality, hashing or coalescing.
+An enabled INFO request carrier continues a supplied trace, or starts an ingress
+root when OTel is installed. Without OTel, valid supplied headers still survive;
+headerless requests fabricate no metadata. State readback remains DEBUG.
+
+Contextual driver/report methods preserve that cause. Drivers crossing another
+queue can instrument its future with `context.operation_span(instance, operation)`;
+never hold a span enter guard over an await. A merged atomic apply uses its latest
+surviving request's cause, while property errors retain their own causes.
+Each coalesced reply owns its caller's cause, including explicit absence.
+`ReplyTo` now has a public `traceparent` field: migrate hand-built struct literals
+to `ReplyTo::new(topic, correlation)` or supply that field. `from_properties`
+captures wire callers automatically. Captured absence clears unrelated ambient
+publication metadata; an unspecified constructor context retains legacy behavior.
+See the [trace ownership design](../docs/superpowers/specs/2026-10-21-bridge-request-traces.md).
+
 ## The command line
 
 `Bridge::from_cli()` reads these. The runtime owns them all; a driver adds its own with

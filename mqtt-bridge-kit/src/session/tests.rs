@@ -6,9 +6,133 @@ use std::time::Duration;
 use mqtt_test_broker::FakeBroker;
 
 use super::*;
+
+#[test]
+fn headerless_public_parsing_never_adopts_an_unrelated_ambient_trace() {
+    use opentelemetry::trace::TracerProvider;
+    use tracing_subscriber::prelude::*;
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let subscriber = tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(provider.tracer("parser-test")));
+    tracing::subscriber::with_default(subscriber, || {
+        let unrelated = tracing::info_span!("unrelated_application_operation");
+        let _entered = unrelated.enter();
+        assert!(tracing_init::traceparent::current().is_some(), "test did not establish an actual unrelated OTel context");
+        assert_eq!(wire::request_context(None).unwrap().traceparent(), None, "headerless parser adopted unrelated ambient trace");
+        let properties = PublishProperties { response_topic: Some("Store/Event/replies".into()), ..Default::default() };
+        let reply = crate::replies::ReplyTo::from_properties(Some(&properties), &Topics::new("T", "i").unwrap()).unwrap().unwrap();
+        assert_eq!(reply.traceparent, None, "headerless reply adopted unrelated ambient trace");
+    });
+}
+
+#[test]
+fn builtin_assume_preserves_the_incoming_cause() {
+    let rig = rig_on(1);
+    let trace = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    let topic = rig.device.topics.command();
+    let properties = PublishProperties { user_properties: vec![("traceparent".into(), trace.into())], ..Default::default() };
+    let publish =
+        Publish::new(topic.clone(), QoS::AtLeastOnce, br#"{"target":"t1","command":"assume","power":true}"#.to_vec(), Some(properties));
+    route(&rig.device, &topic, &publish, Instant::now());
+    assert_eq!(rig.device.reports.take().states[0].2.traceparent(), Some(trace));
+}
+
+#[test]
+fn an_original_trace_survives_the_request_queue_and_output_seal() {
+    let trace = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    let properties = PublishProperties {
+        user_properties: vec![("traceparent".into(), trace.into()), ("target-generation".into(), "epoch.1".into())],
+        ..Default::default()
+    };
+    let context = wire::request_context(Some(&properties)).unwrap();
+    let sealed = Out::new("DALI/Event/home".into(), false, b"reply".to_vec(), None, None).context(&context);
+    assert_eq!(
+        sealed.properties.user_properties.iter().find(|(key, _)| key == "traceparent").map(|(_, value)| value.as_str()),
+        Some(trace),
+        "original trace was lost before publication"
+    );
+}
+
+#[test]
+fn captured_absence_and_invalid_reply_overrides_clear_unrelated_ambient_causes() {
+    let trace = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    let owned = crate::RequestContext::new("epoch.1").unwrap().with_traceparent(Some(trace));
+    let oversized = "x".repeat(513);
+    for parent in [None, Some("invalid"), Some(oversized.as_str())] {
+        let reply = crate::replies::ReplyTo { topic: "R/Event/i".into(), correlation: None, traceparent: parent.map(str::to_owned) };
+        let mut ambient = Out::new(reply.topic.clone(), false, vec![], None, None);
+        ambient.properties.user_properties.push(("traceparent".into(), trace.into()));
+        let sealed = ambient.context(&reply.context(&owned));
+        assert!(!sealed.properties.user_properties.iter().any(|(key, _)| key == "traceparent"), "reply inherited another caller's trace");
+        assert!(sealed.properties.user_properties.iter().any(|(key, value)| key == "target-generation" && value == "epoch.1"));
+    }
+}
+
+#[test]
+fn coalesced_read_refusals_preserve_each_callers_trace_and_absence() {
+    use crate::{
+        mailbox::{ReadKey, Work},
+        replies::ReplyTo,
+    };
+    let first = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    let second = "00-222233445566778899aabbccddeeff00-1234567890abcdef-01";
+    let mailbox = Mailbox::new();
+    mailbox.connected();
+    for (index, parent) in [Some(first), Some(second), None].into_iter().enumerate() {
+        let context = crate::RequestContext::new("epoch.1").unwrap().with_traceparent(parent);
+        let reply = ReplyTo { topic: format!("reply/{index}"), correlation: None, traceparent: parent.map(str::to_owned) };
+        mailbox.post_read_with_context(ReadKey::Refresh(None), None, Some(reply), None, context);
+    }
+    let Work::Read { replies, context, .. } = mailbox.try_take().unwrap() else {
+        panic!("reads did not coalesce");
+    };
+    assert_eq!(replies.len(), 3);
+    assert!(mailbox.try_take().is_none());
+    for (reply, parent) in replies.iter().zip([Some(first), Some(second), None]) {
+        assert_eq!(reply.context(&context).traceparent(), parent, "coalesced reply changed its caller's cause");
+    }
+    let (_, refusals) = crate::worker::refusals(mailbox.disconnected(), "test disconnect");
+    assert_eq!(refusals.len(), 3);
+    for (message, parent) in refusals.iter().zip([Some(first), Some(second), None]) {
+        assert_eq!(message.context.traceparent(), parent, "disconnect refusal changed its caller's cause");
+    }
+}
 use crate::mailbox::Mailbox;
 use crate::pump::BrokerOutage;
 use crate::reports::Reports;
+
+#[test]
+fn each_expired_coalesced_read_caller_keeps_its_error_cause() {
+    use crate::{
+        mailbox::{ReadKey, Work},
+        replies::ReplyTo,
+        RequestContext,
+    };
+    let first = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    let second = "00-222233445566778899aabbccddeeff00-1234567890abcdef-01";
+    for response in [false, true] {
+        let mailbox = Mailbox::new();
+        mailbox.connected();
+        let reply = response.then(|| ReplyTo { topic: "reply/expired".into(), correlation: None, traceparent: Some(first.into()) });
+        mailbox.post_read_with_context(
+            ReadKey::Refresh(None),
+            None,
+            reply,
+            Some(Instant::now()),
+            RequestContext::default().with_traceparent(Some(first)),
+        );
+        mailbox.post_read_with_context(ReadKey::Refresh(None), None, None, None, RequestContext::default().with_traceparent(Some(second)));
+        let Work::Read { expired, .. } = mailbox.try_take().unwrap() else {
+            panic!("live caller did not proceed");
+        };
+        let (errors, replies) = crate::worker::refusals(expired, "expired");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].context.traceparent(), Some(first), "expired caller Error inherited the live caller's cause");
+        assert_eq!(replies.len(), usize::from(response));
+        for reply in replies {
+            assert_eq!(reply.context.traceparent(), Some(first));
+        }
+    }
+}
 
 /// A fixed bridge's session parts on `port`: the session part, its one device, the rotation and
 /// the lifecycle (the host's N = 1 mode).

@@ -8,6 +8,54 @@ fn properties(entries: &[(&str, &str)]) -> PublishProperties {
 }
 
 #[test]
+fn diagnostic_traces_never_change_generation_authority_or_coalescing_keys() {
+    use std::{
+        collections::{BTreeSet, HashSet},
+        hash::{Hash, Hasher},
+    };
+    let first = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    let second = "00-222233445566778899aabbccddeeff00-1234567890abcdef-01";
+    let plain = RequestContext::new("epoch.7").unwrap();
+    let a = plain.clone().with_traceparent(Some(first));
+    let b = plain.clone().with_traceparent(Some(second));
+    assert_eq!(a, b, "trace metadata changed mapping authority");
+    assert_eq!(a, plain);
+    assert_eq!(BTreeSet::from([a.clone(), b.clone(), plain.clone()]).len(), 1);
+    assert_eq!(HashSet::from([a.clone(), b.clone(), plain]).len(), 1);
+    let hash = |context: &RequestContext| {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        context.hash(&mut hash);
+        hash.finish()
+    };
+    assert_eq!(hash(&a), hash(&b));
+    assert_eq!(a.traceparent(), Some(first));
+    assert_eq!(b.traceparent(), Some(second));
+    assert_ne!(a, RequestContext::new("epoch.8").unwrap());
+}
+#[test]
+fn wire_trace_capture_is_bounded_optional_and_independent_of_generation_parsing() {
+    let trace = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    for generation in [None, Some("epoch.7")] {
+        let mut values = vec![("traceparent", trace)];
+        if let Some(generation) = generation {
+            values.push(("target-generation", generation));
+        }
+        let context = request_context(Some(&properties(&values))).unwrap();
+        assert_eq!(context.traceparent(), Some(trace));
+    }
+    for invalid in ["garbage".to_owned(), "x".repeat(513), "00-00000000000000000000000000000000-1234567890abcdef-01".into()] {
+        let context = request_context(Some(&properties(&[("traceparent", &invalid)]))).unwrap();
+        assert_eq!(context.traceparent(), None);
+        assert!(context.trace_was_captured());
+    }
+    let duplicate = properties(&[("traceparent", trace), ("traceparent", trace)]);
+    assert_eq!(request_context(Some(&duplicate)).unwrap().traceparent(), None);
+    let malformed = properties(&[("traceparent", trace), ("target-generation", "")]);
+    assert!(request_context(Some(&malformed)).is_err());
+    assert_eq!(crate::wire::trace_context(Some(&malformed)).traceparent(), Some(trace));
+}
+
+#[test]
 fn opaque_context_preserves_the_literal_generation_without_inheriting_lane_policy() {
     assert_eq!(request_context(None).unwrap(), RequestContext::default());
     let props = properties(&[

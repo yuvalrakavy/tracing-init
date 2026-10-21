@@ -2296,7 +2296,6 @@ impl Lifecycle {
                 if failed && matches!(inbound, Inbound::DesiredTarget { .. }) {
                     return terminal(&device, outputs, topic, publish, "the instance's device could not be built from its Config");
                 }
-                let _entered = device.span.enter();
                 session::route_with_config_admission(&device, topic, publish, received, |target, context, present| {
                     if present {
                         instance.installed.insert(target.to_owned(), context.clone());
@@ -2383,9 +2382,8 @@ fn single_via(publish: &Publish) -> Option<String> {
 /// keep arriving through its still-installed subscriptions can never hold the stop open (R2 gate,
 /// Codex 2).
 fn terminal(device: &Device, outputs: &mut Outputs, topic: &str, publish: &Publish, why: &str) {
-    let _entered = device.span.enter();
     let payload = &publish.payload[..];
-    let context = wire::request_context(publish.properties.as_ref()).unwrap_or_default();
+    let context = wire::request_context(publish.properties.as_ref()).unwrap_or_else(|_| wire::trace_context(publish.properties.as_ref()));
     let error = |outputs: &mut Outputs, report: ErrorReport| {
         outputs.queue_outbox(Part::Answers, Out::new(device.topics.error(), false, report.encode(), None, None).context(&context));
     };
@@ -2396,7 +2394,8 @@ fn terminal(device: &Device, outputs: &mut Outputs, topic: &str, publish: &Publi
             if let Ok(Some(reply)) = ReplyTo::from_properties(publish.properties.as_ref(), &device.topics) {
                 let answer = Answer::Failed { reason: Reason::Refused, error: why.to_owned() };
                 let payload = reply_payload(target.as_deref(), &command, &answer);
-                outputs.queue_outbox(Part::Answers, Out::new(reply.topic, false, payload, reply.correlation, None).context(&context));
+                let reply_context = reply.context(&context);
+                outputs.queue_outbox(Part::Answers, Out::new(reply.topic, false, payload, reply.correlation, None).context(&reply_context));
             }
             debug!(topic, command = %command, "A command for an instance that takes none; refused");
         }

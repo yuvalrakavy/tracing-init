@@ -469,16 +469,26 @@ impl<D: DeviceDriver> Worker<D> {
         let mut applied = 0;
         // A target's setup first, then the held values.
         while let Some((target, config, context)) = self.mailbox.take_held_config_with_context() {
-            self.configure(handle, &target, config, context).await?;
+            let span = context.operation_span(handle.instance(), "configure");
+            self.configure(handle, &target, config, context).instrument(span).await?;
         }
         // Nothing more is taken once the stop is asked (re-gate 4 minor 1).
         while !self.stopping() {
             match self.mailbox.take_held() {
                 None => break,
-                Some(Held::Config { target, config, context }) => self.configure(handle, &target, config, context).await?,
+                Some(Held::Config { target, config, context }) => {
+                    let span = context.operation_span(handle.instance(), "configure");
+                    self.configure(handle, &target, config, context).instrument(span).await?;
+                }
                 Some(Held::Values(held)) => {
-                    let apply = self.decide(handle, &held.target, held.values, &proving).await?;
-                    applied += self.write_values(handle, &held.target, apply).await?;
+                    let span =
+                        held.values.last().map(|value| value.context.operation_span(handle.instance(), "apply")).unwrap_or_else(Span::none);
+                    let operation = async {
+                        let apply = self.decide(handle, &held.target, held.values, &proving).await?;
+                        self.write_values(handle, &held.target, apply).await
+                    };
+                    // WAIT: device-op
+                    applied += operation.instrument(span).await?;
                 }
             }
         }
@@ -576,7 +586,7 @@ impl<D: DeviceDriver> Worker<D> {
             return Ok(0);
         }
         let map: PropertyMap = values.iter().map(|v| (v.property.clone(), v.value.clone())).collect();
-        let context = values[0].context.clone();
+        let context = values.last().expect("nonempty values").context.clone();
         match self.validate(handle, Some(target), &context, RequestKind::Apply(&map), true).await {
             Ok(()) => {}
             Err(OpError::Link(error)) => return Err(error),
@@ -591,78 +601,90 @@ impl<D: DeviceDriver> Worker<D> {
         }
         let map: PropertyMap = values.iter().map(|v| (v.property.clone(), v.value.clone())).collect();
         let feedback = self.mailbox.feedback(target, self.info.feedback);
-        let reported_before = self.reports.reports_for(target);
-        let timing = self.info.timing;
+        let context = values.last().expect("revalidated nonempty values").context.clone();
+        let span = context.operation_span(handle.instance(), "apply");
+        let operation = async {
+            let reported_before = self.reports.reports_for(target);
+            let timing = self.info.timing;
+            // WAIT: device-op
+            match op(handle, timing.operation, "apply", self.driver.apply_with_context(target, &map, &context)).await {
+                Ok(()) => {
+                    self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
+                    if self.info.writes == Writes::Acknowledged {
+                        // What the device acknowledged is what the bridge knows (the lead's F2).
+                        self.reports.written_with_context(target, &map, reported_before, &context);
+                    }
+                    if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before {
+                        self.assume(target, map, &context);
+                    }
+                    Ok(values.len())
+                }
+                Err(OpError::Link(e)) => Err(e),
+                Err(OpError::Partial(failures)) => {
+                    // Every value it does not name was applied; those it names failed, each said.
+                    let failed = |v: &StateValue| failures.iter().any(|f| f.property == v.property);
+                    self.abandon(values.iter().filter(|v| failed(v)));
+                    self.mailbox.retain_in_flight(|v| !failed(v));
+                    self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
+                    let applied: PropertyMap = map
+                        .iter()
+                        .filter(|(property, _)| !failures.iter().any(|f| f.property == **property))
+                        .map(|(property, value)| (property.clone(), value.clone()))
+                        .collect();
+                    let count = applied.len();
+                    if self.info.writes == Writes::Acknowledged {
+                        self.reports.written_with_context(target, &applied, reported_before, &context);
+                    }
+                    if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before && !applied.is_empty() {
+                        self.assume(target, applied, &context);
+                    }
+                    for failure in &failures {
+                        let reason = match failure.class {
+                            FailureClass::Rejected => Reason::Rejected,
+                            FailureClass::Unusable => Reason::Unusable,
+                            FailureClass::Unsupported => Reason::Unsupported,
+                        };
+                        if reason == Reason::Rejected {
+                            warn!(kind = "command_rejected", target, property = %failure.property, error = %failure.error, "The device rejected a property of a request");
+                        } else {
+                            info!(target, property = %failure.property, error = %failure.error, ?reason, "A property of a request failed");
+                        }
+                        if let Some(value) = values.iter().find(|value| value.property == failure.property) {
+                            self.reports.request_error(
+                                ErrorReport::new(reason, failure.error.clone())
+                                    .context(&value.context)
+                                    .target(Some(target))
+                                    .property(&failure.property),
+                            );
+                        }
+                    }
+                    Ok(count)
+                }
+                Err(failure) => {
+                    self.mailbox.failed();
+                    self.abandon(values.iter());
+                    let properties: Vec<&str> = values.iter().map(|v| v.property.as_str()).collect();
+                    let (reason, message) = classify(&failure);
+                    match reason {
+                        Reason::Rejected => {
+                            warn!(kind = "command_rejected", target, ?properties, error = message, "The device rejected a request")
+                        }
+                        Reason::Unsupported => {
+                            info!(target, ?properties, error = message, "A request named something the device does not support")
+                        }
+                        _ => debug!(target, ?properties, error = message, "The device's answer to a request was unusable; passed over"),
+                    }
+                    for value in &values {
+                        self.reports.request_error(
+                            ErrorReport::new(reason, message).context(&value.context).target(Some(target)).property(&value.property),
+                        );
+                    }
+                    Ok(0)
+                }
+            }
+        };
         // WAIT: device-op
-        match op(handle, timing.operation, "apply", self.driver.apply_with_context(target, &map, &context)).await {
-            Ok(()) => {
-                self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
-                if self.info.writes == Writes::Acknowledged {
-                    // What the device acknowledged is what the bridge knows (the lead's F2).
-                    self.reports.written_with_context(target, &map, reported_before, &context);
-                }
-                if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before {
-                    self.assume(target, map, &context);
-                }
-                Ok(values.len())
-            }
-            Err(OpError::Link(e)) => Err(e),
-            Err(OpError::Partial(failures)) => {
-                // Every value it does not name was applied; those it names failed, each said.
-                let failed = |v: &StateValue| failures.iter().any(|f| f.property == v.property);
-                self.abandon(values.iter().filter(|v| failed(v)));
-                self.mailbox.retain_in_flight(|v| !failed(v));
-                self.mailbox.applied(self.info.writes == Writes::Unacknowledged);
-                let applied: PropertyMap = map
-                    .iter()
-                    .filter(|(property, _)| !failures.iter().any(|f| f.property == **property))
-                    .map(|(property, value)| (property.clone(), value.clone()))
-                    .collect();
-                let count = applied.len();
-                if self.info.writes == Writes::Acknowledged {
-                    self.reports.written_with_context(target, &applied, reported_before, &context);
-                }
-                if feedback == Feedback::Assumed && self.reports.reports_for(target) == reported_before && !applied.is_empty() {
-                    self.assume(target, applied, &context);
-                }
-                for failure in &failures {
-                    let reason = match failure.class {
-                        FailureClass::Rejected => Reason::Rejected,
-                        FailureClass::Unusable => Reason::Unusable,
-                        FailureClass::Unsupported => Reason::Unsupported,
-                    };
-                    if reason == Reason::Rejected {
-                        warn!(kind = "command_rejected", target, property = %failure.property, error = %failure.error, "The device rejected a property of a request");
-                    } else {
-                        info!(target, property = %failure.property, error = %failure.error, ?reason, "A property of a request failed");
-                    }
-                    self.reports.request_error(
-                        ErrorReport::new(reason, failure.error.clone()).context(&context).target(Some(target)).property(&failure.property),
-                    );
-                }
-                Ok(count)
-            }
-            Err(failure) => {
-                self.mailbox.failed();
-                self.abandon(values.iter());
-                let properties: Vec<&str> = values.iter().map(|v| v.property.as_str()).collect();
-                let (reason, message) = classify(&failure);
-                match reason {
-                    Reason::Rejected => {
-                        warn!(kind = "command_rejected", target, ?properties, error = message, "The device rejected a request")
-                    }
-                    Reason::Unsupported => {
-                        info!(target, ?properties, error = message, "A request named something the device does not support")
-                    }
-                    _ => debug!(target, ?properties, error = message, "The device's answer to a request was unusable; passed over"),
-                }
-                for value in &values {
-                    self.reports
-                        .request_error(ErrorReport::new(reason, message).context(&context).target(Some(target)).property(&value.property));
-                }
-                Ok(0)
-            }
-        }
+        operation.instrument(span).await
     }
 
     /// Hand a target its setup — unless `configure` took the same one on this link already.
@@ -828,6 +850,18 @@ impl<D: DeviceDriver> Worker<D> {
     }
 
     async fn work(&mut self, handle: &LinkHandle, work: Work) -> Result<(), LinkError> {
+        let (context, operation) = match &work {
+            Work::Apply { values, .. } => (values.last().map(|value| &value.context), "apply_dispatch"),
+            Work::Configure { context, .. } => (Some(context), "configure"),
+            Work::Execute { context, call, .. } => (Some(context), call.command.as_str()),
+            Work::Read { context, .. } => (Some(context), "read"),
+            Work::Expired { context, .. } => (Some(context), "expired"),
+            Work::ReadExpired { expired } => (expired.last().map(|value| &value.context), "read_expired"),
+        };
+        let span = context.map(|context| context.operation_span(handle.instance(), operation)).unwrap_or_else(Span::none);
+        self.work_inner(handle, work).instrument(span).await
+    }
+    async fn work_inner(&mut self, handle: &LinkHandle, work: Work) -> Result<(), LinkError> {
         let timing = self.info.timing;
         match work {
             Work::Apply { target, values } => {
@@ -1066,7 +1100,7 @@ impl<D: DeviceDriver> Worker<D> {
         };
         for reply in replies {
             self.reports.event(Outbound {
-                context: context.clone(),
+                context: reply.context(context),
                 topic: Some(reply.topic),
                 payload: reply_payload(target, command, &answer),
                 correlation: reply.correlation,
@@ -1130,7 +1164,7 @@ pub(crate) fn refusals(unanswered: Vec<Unanswered>, message: &str) -> (Vec<Error
         let answer = Answer::Failed { reason: Reason::Refused, error: message.to_owned() };
         for reply in u.replies {
             replies.push(Outbound {
-                context: u.context.clone(),
+                context: reply.context(&u.context),
                 topic: Some(reply.topic),
                 payload: reply_payload(u.target.as_deref(), &u.command, &answer),
                 correlation: reply.correlation,

@@ -101,6 +101,70 @@ fn link_context() -> LinkContext {
     LinkContext::new(1, "i", Reports::new(), Arc::new(crate::link::Abandoned::default()), Arc::new(OpClock::new()))
 }
 
+#[tokio::test]
+async fn merged_writes_use_the_latest_cause_and_each_failed_property_keeps_its_own() {
+    struct Driver {
+        seen: Option<String>,
+        partial: bool,
+    }
+    impl DeviceDriver for Driver {
+        fn info(&self) -> DriverInfo {
+            DriverInfo::default()
+        }
+        async fn connect(&mut self, _: &mut LinkContext) -> Result<(), LinkError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) {}
+        async fn read_state(&mut self, _: Scope) -> Result<Vec<crate::TargetState>, OpError> {
+            Ok(vec![])
+        }
+        async fn apply(&mut self, _: &str, _: &PropertyMap) -> Result<(), OpError> {
+            panic!("contextual apply required")
+        }
+        async fn apply_with_context(&mut self, _: &str, _: &PropertyMap, context: &RequestContext) -> Result<(), OpError> {
+            self.seen = context.traceparent().map(str::to_owned);
+            if self.partial {
+                Err(OpError::Partial(vec![crate::PropertyFailure {
+                    property: "y".into(),
+                    class: FailureClass::Rejected,
+                    error: "no".into(),
+                }]))
+            } else {
+                Err(OpError::Rejected("no".into()))
+            }
+        }
+        async fn execute(&mut self, _: Option<&str>, _: &crate::CommandCall) -> Result<Option<Value>, OpError> {
+            Ok(None)
+        }
+        async fn configure(&mut self, _: &str, _: Option<&Value>) -> Result<(), OpError> {
+            Ok(())
+        }
+    }
+    let a = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    let b = "00-222233445566778899aabbccddeeff00-1234567890abcdef-01";
+    for partial in [false, true] {
+        let mailbox = Mailbox::new();
+        mailbox.connected();
+        for (property, trace) in [("x", a), ("y", b)] {
+            let mut value = request(json!(1), Conflict::RequestWins);
+            value.property = property.into();
+            value.context = RequestContext::default().with_traceparent(Some(trace));
+            mailbox.post_state(value, false);
+        }
+        let reports = Reports::new();
+        let driver = Driver { seen: None, partial };
+        let mut worker = Worker::new(driver, DriverInfo::default(), "i", mailbox.clone(), reports.clone());
+        worker.work(&link_context().handle(), mailbox.try_take().unwrap()).await.unwrap();
+        assert_eq!(worker.driver.seen.as_deref(), Some(b), "combined apply used an earlier request's cause");
+        let changes = reports.take();
+        assert_eq!(changes.answer_errors.len(), if partial { 1 } else { 2 });
+        for error in changes.answer_errors {
+            let expected = if error.property.as_deref() == Some("x") { a } else { b };
+            assert_eq!(error.context.traceparent(), Some(expected), "property failure used another request's cause");
+        }
+    }
+}
+
 /// An operation that has completed wins over a link loss noticed at the same moment: its result is
 /// what the device did, and the loss is seen at the worker's next step. Raced unbiased, a helper's
 /// `link_lost` turned a completed `Ok` into a `Link` error half the time (the mqtt_ac v2 build).

@@ -595,7 +595,7 @@ async fn session(
             match step {
                 Step::Event(Some(PumpEvent::Connected)) => host.on_connack(&ctx, outputs).await.map(|()| None),
                 Step::Event(Some(PumpEvent::Publish(publish, received))) => {
-                    let (topic, span) = traced(&publish);
+                    let (topic, span) = traced(&publish, shared.topics.instance());
                     let flow = host.on_publish(&ctx, outputs, &topic, &publish, received).instrument(span).await;
                     flow.map(ended)
                 }
@@ -688,6 +688,10 @@ pub(crate) struct Out {
 }
 
 impl Out {
+    #[cfg(test)]
+    pub(crate) fn traceparent_for_test(&self) -> Option<&str> {
+        self.properties.user_properties.iter().find(|(key, _)| key == "traceparent").map(|(_, value)| value.as_str())
+    }
     /// A message; `tag`, a configured instance's `via` for its `Status` and `State`.
     pub(crate) fn new(topic: String, retain: bool, payload: Vec<u8>, correlation: Option<bytes::Bytes>, tag: Option<&str>) -> Out {
         let mut properties = tagged(tag);
@@ -702,6 +706,12 @@ impl Out {
 
     /// Stamp the sealed observation/request context, never the current table.
     pub(crate) fn context(mut self, context: &crate::RequestContext) -> Self {
+        if context.trace_was_captured() {
+            self.properties.user_properties.retain(|(key, _)| key != "traceparent");
+            if let Some(parent) = context.traceparent() {
+                self.properties.user_properties.push(("traceparent".into(), parent.into()));
+            }
+        }
         if let Some(generation) = context.generation() {
             self.properties.user_properties.push(("target-generation".into(), generation.to_owned()));
         }
@@ -1026,12 +1036,17 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
 
 /// An incoming publish's topic, and the span it is handled in (its trace's remote parent, if it
 /// carries one). The test seam's panic, if armed for the topic.
-pub(crate) fn traced(publish: &Publish) -> (String, Span) {
+pub(crate) fn traced(publish: &Publish, owner: &str) -> (String, Span) {
     let topic = String::from_utf8_lossy(&publish.topic).into_owned();
     panic_for_test(&topic);
-    let traceparent =
-        publish.properties.as_ref().and_then(|p| p.user_properties.iter().find(|(k, _)| k == "traceparent").map(|(_, v)| v.clone()));
-    let span = tracing::debug_span!("mqtt_request", topic = %topic);
+    let traceparent = wire::incoming_traceparent(publish.properties.as_ref());
+    let instance = topic.split('/').nth(2).unwrap_or(owner);
+    let bridge = (instance != owner).then_some(owner);
+    let span = if matches!(topic.split('/').nth(1), Some("Command" | "Desired" | "Config")) {
+        tracing::info_span!(parent:None,"mqtt_request",topic=%topic,instance,bridge)
+    } else {
+        tracing::debug_span!("mqtt_request",topic=%topic)
+    };
     if let Some(tp) = &traceparent {
         tracing_init::traceparent::set_remote_parent(&span, tp);
     }
@@ -1054,7 +1069,7 @@ pub(crate) fn route_with_config_admission(
     mut admitted: impl FnMut(&str, &crate::RequestContext, bool),
 ) {
     let properties = publish.properties.as_ref();
-    let original_context = wire::request_context(properties).unwrap_or_default();
+    let original_context = wire::request_context(properties).unwrap_or_else(|_| wire::trace_context(properties));
     let payload = &publish.payload[..];
     let malformed = |error: String, report: ErrorReport| {
         info!(kind = "validation_rejected", topic, error = %error, "A request was malformed; answered on Error");
@@ -1160,7 +1175,7 @@ pub(crate) fn route_with_config_admission(
                 if let Ok(Some(reply)) = &reply {
                     let (target, command) = wire::command_names(payload);
                     device.reports.event(Outbound {
-                        context: original_context.clone(),
+                        context: reply.context(&original_context),
                         topic: Some(reply.topic.clone()),
                         payload: reply_payload(
                             target.as_deref(),
@@ -1228,7 +1243,7 @@ fn command(
     let answer = |answer: Answer| {
         if let Some(reply) = &reply {
             device.reports.event(Outbound {
-                context: context.clone(),
+                context: reply.context(&context),
                 topic: Some(reply.topic.clone()),
                 payload: reply_payload(target.as_deref(), &call.command, &answer),
                 correlation: reply.correlation.clone(),
@@ -1262,7 +1277,7 @@ fn command(
                 refused(Reason::Malformed, "`assume` names a property that cannot stand as a topic segment");
             }
             Some(t) if !call.params.is_empty() => {
-                device.reports.state(t, call.params.clone(), true);
+                device.reports.state_with_context(t, call.params.clone(), true, &context);
                 answer(Answer::Done(None));
             }
             _ => {

@@ -14,20 +14,75 @@ impl DriverDescription {
 }
 
 /// Original request metadata. A generation is a mapping fence, not an identity.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Default)]
 pub struct RequestContext {
     target_generation: Option<String>,
+    trace: Option<std::sync::Arc<TraceMetadata>>,
+}
+#[derive(Debug, Clone, Default)]
+struct TraceMetadata {
+    parent: Option<String>,
+}
+// Diagnostic causes never participate in authority, mailbox coalescing or
+// cache identity. Keep every comparison consistent with the original fence.
+impl PartialEq for RequestContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.target_generation == other.target_generation
+    }
+}
+impl Eq for RequestContext {}
+impl PartialOrd for RequestContext {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RequestContext {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.target_generation.cmp(&other.target_generation)
+    }
+}
+impl std::hash::Hash for RequestContext {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.target_generation.hash(state);
+    }
+}
+pub(crate) fn valid_traceparent(parent: &str) -> bool {
+    parent.len() <= 512 && tracing_init::traceparent::set_remote_parent(&tracing::Span::none(), parent)
 }
 impl RequestContext {
     /// Construct a checked generation, without normalizing its spelling.
     pub fn new(generation: impl Into<String>) -> Result<Self, String> {
         let generation = generation.into();
         valid_generation(&generation)?;
-        Ok(Self { target_generation: Some(generation) })
+        Ok(Self { target_generation: Some(generation), trace: None })
     }
     /// The original opaque generation, or none for an unfenced legacy request.
     pub fn generation(&self) -> Option<&str> {
         self.target_generation.as_deref()
+    }
+    /// Owned causal metadata, independent of the mapping fence. Invalid/absent
+    /// metadata records explicit absence; it never rejects a functional request.
+    pub fn with_traceparent(mut self, parent: Option<&str>) -> Self {
+        self.trace =
+            Some(std::sync::Arc::new(TraceMetadata { parent: parent.filter(|parent| valid_traceparent(parent)).map(str::to_owned) }));
+        self
+    }
+    /// The captured W3C cause, if valid. Context equality remains generation-only.
+    pub fn traceparent(&self) -> Option<&str> {
+        self.trace.as_ref().and_then(|trace| trace.parent.as_deref())
+    }
+    pub(crate) fn trace_was_captured(&self) -> bool {
+        self.trace.is_some()
+    }
+    /// Enabled carrier for one operation crossing a queue boundary. Instrument
+    /// the future with this span; never hold an enter guard over an await.
+    pub fn operation_span(&self, instance: &str, operation: &str) -> tracing::Span {
+        let Some(parent) = self.traceparent() else {
+            return tracing::Span::none();
+        };
+        let span = tracing::info_span!(parent:None,"bridge_operation",instance,operation);
+        tracing_init::traceparent::set_remote_parent(&span, parent);
+        span
     }
 }
 /// Complete runtime mapping versions, supplied before a fixed bridge starts.

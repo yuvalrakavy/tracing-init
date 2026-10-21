@@ -56,12 +56,36 @@ pub struct RequestMeta {
 pub fn request_context(properties: Option<&PublishProperties>) -> Result<RequestContext, String> {
     let mut generations = properties.into_iter().flat_map(|p| &p.user_properties).filter(|(key, _)| key == "target-generation");
     let Some((_, generation)) = generations.next() else {
-        return Ok(RequestContext::default());
+        return Ok(trace_context(properties));
     };
     if generations.next().is_some() {
         return Err("target-generation must occur exactly once".into());
     }
-    RequestContext::new(generation.clone())
+    Ok(RequestContext::new(generation.clone())?.with_traceparent(trace_context(properties).traceparent()))
+}
+
+pub(crate) fn incoming_traceparent(properties: Option<&PublishProperties>) -> Option<&str> {
+    let mut parents = properties.into_iter().flat_map(|properties| &properties.user_properties).filter(|(key, _)| key == "traceparent");
+    let (_, parent) = parents.next()?;
+    (parents.next().is_none() && crate::generations::valid_traceparent(parent)).then_some(parent.as_str())
+}
+pub(crate) fn trace_context(properties: Option<&PublishProperties>) -> RequestContext {
+    let incoming = incoming_traceparent(properties);
+    // Only the runtime's own enabled ingress callsite may supply a headerless
+    // root. Public parser calls beneath arbitrary application spans own absence.
+    let span = tracing::Span::current();
+    let ingress = span.metadata().is_some_and(|metadata| {
+        metadata.name() == "mqtt_request" && metadata.target() == "mqtt_bridge_kit::session" && *metadata.level() == tracing::Level::INFO
+    });
+    let current = ingress.then(tracing_init::traceparent::current).flatten();
+    // An enabled ingress span is a child of the supplied cause. Direct parser
+    // users may instead be under an unrelated ambient trace; never adopt it.
+    let parent = match (incoming, current.as_deref()) {
+        (Some(incoming), Some(current)) if incoming.get(3..35) == current.get(3..35) => Some(current),
+        (Some(incoming), _) => Some(incoming),
+        (None, current) => current,
+    };
+    RequestContext::default().with_traceparent(parent)
 }
 
 /// A request's metadata, from the properties of the publish that carried it, arriving `now`.

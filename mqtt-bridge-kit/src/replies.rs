@@ -16,9 +16,20 @@ pub struct ReplyTo {
     pub topic: String,
     /// The correlation data to send back with the answer.
     pub correlation: Option<Bytes>,
+    /// This caller's owned ingress cause. None means no cause, including when
+    /// another caller of a coalesced read has one. Validated again at sealing.
+    pub traceparent: Option<String>,
 }
 
 impl ReplyTo {
+    /// A hand-built reply address with no trace override. Wire callers should
+    /// use from_properties so each coalesced caller owns its ingress context.
+    pub fn new(topic: impl Into<String>, correlation: Option<Bytes>) -> Self {
+        Self { topic: topic.into(), correlation, traceparent: None }
+    }
+    pub(crate) fn context(&self, context: &crate::RequestContext) -> crate::RequestContext {
+        context.clone().with_traceparent(self.traceparent.as_deref())
+    }
     /// The reply address a command's properties give, if any; an error for a response topic the
     /// bridge could never publish to (empty, or holding a wildcard: rumqttc would refuse it), and
     /// for one on the bridge's own request lanes (`Desired`, `Command`, `Config`): the reply would
@@ -34,7 +45,11 @@ impl ReplyTo {
         if topics.is_reserved_for_replies(&topic) {
             return Err(format!("the response topic `{topic}` is a lane of this bridge, or a request lane under its root"));
         }
-        Ok(Some(ReplyTo { topic, correlation: properties.and_then(|p| p.correlation_data.clone()) }))
+        Ok(Some(ReplyTo {
+            topic,
+            correlation: properties.and_then(|p| p.correlation_data.clone()),
+            traceparent: crate::wire::trace_context(properties).traceparent().map(str::to_owned),
+        }))
     }
 }
 
@@ -83,7 +98,7 @@ mod tests {
         };
         let topics = Topics::new("IR", "living").unwrap();
         let to = ReplyTo::from_properties(Some(&props), &topics).unwrap().unwrap();
-        assert_eq!(to, ReplyTo { topic: "IR/Event/living".into(), correlation: Some(Bytes::from_static(b"42")) });
+        assert_eq!(to, ReplyTo::new("IR/Event/living", Some(Bytes::from_static(b"42"))));
         assert_eq!(ReplyTo::from_properties(None, &topics), Ok(None));
         let wild = PublishProperties { response_topic: Some("IR/+/x".into()), ..PublishProperties::default() };
         assert!(ReplyTo::from_properties(Some(&wild), &topics).is_err());

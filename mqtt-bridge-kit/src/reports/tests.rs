@@ -12,6 +12,25 @@ fn values(pairs: &[(&str, Value)]) -> PropertyMap {
 }
 
 #[test]
+fn contextual_removals_publish_the_mutations_cause_including_absence() {
+    let a = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    let b = "00-222233445566778899aabbccddeeff00-1234567890abcdef-01";
+    for cause in [Some(b), None] {
+        let reports = Reports::new();
+        let original = RequestContext::default().with_traceparent(Some(a));
+        let mutation = RequestContext::default().with_traceparent(cause);
+        reports.state_with_context("u1", values(&[("power", json!(false)), ("level", json!(10))]), false, &original);
+        reports.take();
+        reports.remove_property_with_context("u1", "level", &mutation);
+        assert_eq!(reports.take().states[0].2.traceparent(), cause, "property removal retained the old cause");
+        reports.assume_unproven_with_context("u1", values(&[("power", json!(true))]), &original);
+        reports.take();
+        assert!(reports.withdraw_assumption_with_context("u1", "power", &mutation));
+        assert_eq!(reports.take().states[0].2.traceparent(), cause, "assumption withdrawal retained the old cause");
+    }
+}
+
+#[test]
 fn fenced_reports_and_removals_require_the_original_current_context() {
     let reports = Reports::new();
     reports.install_policy(RequestPolicy::Fenced(crate::TargetGenerations {

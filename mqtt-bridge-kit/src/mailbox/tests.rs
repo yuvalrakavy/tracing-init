@@ -534,7 +534,7 @@ fn momentary_commands_and_reads() {
         Posted::Refused(Refusal::QueueFull),
         "a momentary command past the cap was queued"
     );
-    let reply = ReplyTo { topic: "R/Event/i".into(), correlation: None };
+    let reply = ReplyTo::new("R/Event/i", None);
     assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, Some(reply.clone()), None), Posted::Queued);
     assert_eq!(mailbox.post_read(ReadKey::Refresh(Some("u1".into())), None, Some(reply.clone()), None), Posted::Queued);
     let unanswered = mailbox.disconnected();

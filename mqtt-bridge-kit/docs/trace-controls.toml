@@ -1,0 +1,71 @@
+[[control]]
+name = "headerless_parser_adopts_unrelated_ambient"
+file = "mqtt-bridge-kit/src/wire.rs"
+anchor = "let current = ingress.then(tracing_init::traceparent::current).flatten();"
+replacement = "let _ = ingress; let current = tracing_init::traceparent::current();"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(headerless_public_parsing_never_adopts_an_unrelated_ambient_trace)"]
+expect_text = "headerless parser adopted unrelated ambient trace"
+
+[[control]]
+name = "sealed_output_loses_owned_trace"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = "self.properties.user_properties.push((\"traceparent\".into(), parent.into()));"
+replacement = "let _ = parent;"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(an_original_trace_survives_the_request_queue_and_output_seal)"]
+expect_text = "original trace was lost before publication"
+
+[[control]]
+name = "coalesced_reply_inherits_primary_cause"
+file = "mqtt-bridge-kit/src/replies.rs"
+anchor = "context.clone().with_traceparent(self.traceparent.as_deref())"
+replacement = "context.clone()"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(coalesced_read_refusals_preserve_each_callers_trace_and_absence)"]
+expect_text = "coalesced reply changed its caller's cause"
+
+[[control]]
+name = "apply_uses_first_request_cause"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = "values.last().expect(\"revalidated nonempty values\").context.clone()"
+replacement = "values.first().expect(\"revalidated nonempty values\").context.clone()"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(merged_writes_use_the_latest_cause_and_each_failed_property_keeps_its_own)"]
+expect_text = "combined apply used an earlier request's cause"
+
+[[control]]
+name = "property_removal_retains_old_cause"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "                m.context = context.clone();"
+replacement = "                // faulty: retain prior cause"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(contextual_removals_publish_the_mutations_cause_including_absence)"]
+expect_text = "property removal retained the old cause"
+
+[[control]]
+name = "dynamic_routing_reenters_unrelated_lifecycle"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = "                session::route_with_config_admission(&device, topic, publish, received, |target, context, present| {"
+replacement = "                let _entered = device.span.enter();\n                session::route_with_config_admission(&device, topic, publish, received, |target, context, present| {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(dynamic_routing_and_terminal_refusals_keep_the_ingress_cause)"]
+expect_text = "routing entered an unrelated device trace"
+
+[[control]]
+name = "malformed_generation_drops_terminal_trace"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = "let context = wire::request_context(publish.properties.as_ref()).unwrap_or_else(|_| wire::trace_context(publish.properties.as_ref()));"
+replacement = "let context = wire::request_context(publish.properties.as_ref()).unwrap_or_default();"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(dynamic_routing_and_terminal_refusals_keep_the_ingress_cause)"]
+expect_text = "terminal refusal replaced a valid cause accompanying malformed generation"
+
+[[control]]
+name = "expired_read_inherits_live_caller_cause"
+file = "mqtt-bridge-kit/src/mailbox.rs"
+anchor = "context: c.context,"
+replacement = "context: context.clone(),"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(each_expired_coalesced_read_caller_keeps_its_error_cause)"]
+expect_text = "expired caller Error inherited the live caller's cause"
