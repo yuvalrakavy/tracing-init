@@ -18,13 +18,13 @@ bytes = "1"
 lock-order = { path = "../lock-order" }
 rumqttc = { version = "0.25", default-features = false }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.50", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-init = { path = "..", features = ["otel"] }
 
 [dev-dependencies]
 # The tutorial's example (examples/tutorial_bridge.rs) speaks TCP lines: tokio's io-util.
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.50", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 mqtt-test-broker = { path = "../mqtt-test-broker" }
 wait-lint = { path = "../wait-lint" }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }

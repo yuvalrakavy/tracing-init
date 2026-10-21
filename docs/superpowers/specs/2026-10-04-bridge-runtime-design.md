@@ -15,6 +15,9 @@ the notes at the end say what it changed here.
 owner whose lifetime survives broker/device outages, with one bounded process
 shutdown. [Target generations](2026-10-21-bridge-target-generations.md) adds
 optional fencing for fixed controllers with mutable physical inventories.
+[Command completion](2026-10-21-bridge-command-completion.md) allows one exact
+active MQTT command to return its original-context result across its own
+successful inventory commit while all other old work retires.
 Legacy drivers retain their default methods and unfenced behavior. The extension
 specifications, crate README and tutorial define the additional APIs and tests;
 they continue through the same host/session/publication machinery.

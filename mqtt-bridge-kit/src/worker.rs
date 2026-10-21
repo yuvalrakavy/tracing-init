@@ -858,7 +858,9 @@ impl<D: DeviceDriver> Worker<D> {
                     Ok(()) => {
                         // WAIT: device-op
                         let execution = self.driver.execute_with_context(target.as_deref(), &call, &context);
-                        op(handle, timing.operation, "execute", execution).await
+                        // WAIT: device-op
+                        let committing = crate::completion::under_completion(self.mailbox.command_completion(), execution);
+                        op(handle, timing.operation, "execute", committing).await
                     }
                 };
                 self.answer_once(target.as_deref(), &call.command, result, reply.into_iter().collect(), &context)

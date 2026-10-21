@@ -271,9 +271,28 @@ impl Reports {
     /// Replace a fixed bridge's complete routing authority. The expected table
     /// is a compare-and-swap precondition, including targets that stayed unchanged.
     pub fn replace_generations(&self, expected: &TargetGenerations, next: TargetGenerations) -> Result<(), String> {
+        self.replace_generations_inner(expected, next, None)
+    }
+
+    /// Preserve only the final completion of the exact active committing command.
+    pub fn replace_generations_for_command(
+        &self,
+        expected: &TargetGenerations,
+        next: TargetGenerations,
+        completion: &crate::CommandCompletion,
+    ) -> Result<(), String> {
+        self.replace_generations_inner(expected, next, Some(completion))
+    }
+
+    fn replace_generations_inner(
+        &self,
+        expected: &TargetGenerations,
+        next: TargetGenerations,
+        completion: Option<&crate::CommandCompletion>,
+    ) -> Result<(), String> {
         next.validate()?;
         let mailbox = self.mailbox.get().and_then(Weak::upgrade).ok_or("the runtime mailbox is unavailable")?;
-        let unanswered = mailbox.replace_generations(self, expected, next)?;
+        let unanswered = mailbox.replace_generations(self, expected, next, completion)?;
         crate::worker::report_refused(self, unanswered, "the request's device mapping was retired; refresh the complete inventory");
         self.ready.notify_one();
         Ok(())

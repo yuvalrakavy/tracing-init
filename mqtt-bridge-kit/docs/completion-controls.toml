@@ -1,0 +1,39 @@
+[[control]]
+name = "a_foreign_completion_can_change_authority"
+file = "mqtt-bridge-kit/src/mailbox.rs"
+anchor = '''if !inner.command_completion.as_ref().is_some_and(|active| active.same(completion))
+                    || !inner.in_flight_command.as_ref().is_some_and(|command| command.momentary)'''
+replacement = "if false"
+target = "command"
+argv = ["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(only_the_exact_active_committing_command_can_survive_its_single_generation_cas)"]
+expect_text = "foreign capability changed runtime authority"
+
+[[control]]
+name = "a_committing_command_loses_its_own_completion"
+file = "mqtt-bridge-kit/src/mailbox.rs"
+anchor = '''if !preserve
+                && inner.in_flight_command.as_ref().is_some_and(|command| retired.contains(command.target.as_deref(), &command.context))'''
+replacement = '''if inner.in_flight_command.as_ref().is_some_and(|command| retired.contains(command.target.as_deref(), &command.context))'''
+target = "command"
+argv = ["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(only_the_exact_active_committing_command_can_survive_its_single_generation_cas)"]
+expect_text = "queued retirement also refused the committing command"
+
+[[control]]
+name = "a_completion_capability_can_be_used_twice"
+file = "mqtt-bridge-kit/src/mailbox.rs"
+anchor = '''if preserve {
+                inner.command_completion = None;
+            }'''
+replacement = "if preserve {}"
+target = "command"
+argv = ["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(only_the_exact_active_committing_command_can_survive_its_single_generation_cas)"]
+expect_text = "completion capability was reused for another CAS"
+
+[[control]]
+name = "a_momentary_execution_has_no_scoped_capability"
+file = "mqtt-bridge-kit/src/completion.rs"
+anchor = "CURRENT.scope(completion, future).await"
+replacement = "future.await"
+target = "command"
+argv = ["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(a_committing_command_replies_once_with_original_context_while_queued_old_work_is_refused)"]
+expect_text = "momentary execution has no capability"

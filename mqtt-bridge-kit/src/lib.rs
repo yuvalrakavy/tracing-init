@@ -61,6 +61,7 @@ compile_error!(
     "mqtt-bridge-kit's `test-seams` feature is for the Bridge Runtime's conformance suite only: build it from that repository (MQTT_BRIDGE_TEST_SEAMS=1)"
 );
 
+mod completion;
 pub mod config;
 mod devices;
 pub mod driver;
@@ -83,6 +84,7 @@ pub mod worker;
 #[cfg(test)]
 mod test_support;
 
+pub use completion::CommandCompletion;
 pub use config::TimingOverrides;
 pub use driver::{
     CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkError, OpError, PropertyFailure,

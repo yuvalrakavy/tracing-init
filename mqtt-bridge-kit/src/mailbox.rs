@@ -389,6 +389,7 @@ struct Inner {
     /// The command the worker took and has not answered: refused at a stop or a watchdog's end,
     /// which cancel it mid-operation (re-gate 3 S3).
     in_flight_command: Option<Unanswered>,
+    command_completion: Option<crate::CommandCompletion>,
     /// Writes held again before proof that reached their deadline unapplied, in the worker's takes:
     /// their assumptions are withdrawn by the worker ([`take_abandoned`](Mailbox::take_abandoned)).
     /// One a post replaces is withdrawn by the post itself.
@@ -527,11 +528,25 @@ impl Mailbox {
         reports: &crate::reports::Reports,
         expected: &TargetGenerations,
         next: TargetGenerations,
+        completion: Option<&crate::CommandCompletion>,
     ) -> Result<Vec<Unanswered>, String> {
         let mut unanswered = Vec::new();
         {
             let mut inner = self.locked();
+            let preserve = if let Some(completion) = completion {
+                if !inner.command_completion.as_ref().is_some_and(|active| active.same(completion))
+                    || !inner.in_flight_command.as_ref().is_some_and(|command| command.momentary)
+                {
+                    return Err("the committing command is no longer active or its capability was used".into());
+                }
+                true
+            } else {
+                false
+            };
             let retired = reports.retire_generations(expected, next)?;
+            if preserve {
+                inner.command_completion = None;
+            }
             inner.pending.retain_mut(|entry| match entry {
                 Entry::State { value, .. } => !retired.contains(Some(&value.target), &value.context),
                 Entry::Config { target, context, .. } => !retired.contains(Some(target), context),
@@ -566,8 +581,11 @@ impl Mailbox {
             if inner.in_flight_config.as_ref().is_some_and(|(target, _, context)| retired.contains(Some(target), context)) {
                 inner.in_flight_config = None;
             }
-            if inner.in_flight_command.as_ref().is_some_and(|command| retired.contains(command.target.as_deref(), &command.context)) {
+            if !preserve
+                && inner.in_flight_command.as_ref().is_some_and(|command| retired.contains(command.target.as_deref(), &command.context))
+            {
                 unanswered.extend(inner.in_flight_command.take());
+                inner.command_completion = None;
             }
             inner.copies.retain(|(target, _), (_, _, context)| !retired.contains(Some(target), context));
             inner.bases.retain(|(target, _), (_, _, context)| !retired.contains(Some(target), context));
@@ -708,7 +726,13 @@ impl Mailbox {
     /// a stop or a watchdog's verdict took meanwhile was answered by them, "cut off", and is not
     /// answered again (re-gate 4 F3). Never waits.
     pub fn command_done(&self) -> bool {
-        self.locked().in_flight_command.take().is_some()
+        let mut inner = self.locked();
+        inner.command_completion = None;
+        inner.in_flight_command.take().is_some()
+    }
+
+    pub(crate) fn command_completion(&self) -> Option<crate::CommandCompletion> {
+        self.locked().command_completion.clone()
     }
 
     /// The same, and if the command was still in flight, `answer` — its answer queued — run in the
@@ -717,6 +741,7 @@ impl Mailbox {
     /// Returns whether it was.
     pub fn command_done_then(&self, answer: impl FnOnce()) -> bool {
         let mut inner = self.locked();
+        inner.command_completion = None;
         if inner.in_flight_command.take().is_none() {
             return false;
         }
@@ -919,6 +944,7 @@ impl Mailbox {
                 }
             }
             // The command the worker took and was cut off from answering goes first.
+            inner.command_completion = None;
             if let Some(command) = inner.in_flight_command.take() {
                 unanswered.push(command);
             }
@@ -1052,6 +1078,7 @@ impl Mailbox {
                             momentary: true,
                             replies: reply.clone().into_iter().collect(),
                         });
+                        inner.command_completion = Some(crate::CommandCompletion::new());
                         return Some(Work::Execute { target, call, reply, context });
                     }
                 }
@@ -1077,6 +1104,7 @@ impl Mailbox {
                             return Some(Work::ReadExpired { expired });
                         }
                         let replies: Vec<ReplyTo> = live.into_iter().filter_map(|c| c.reply).collect();
+                        inner.command_completion = None;
                         inner.in_flight_command = Some(Unanswered {
                             context: context.clone(),
                             ran: true,

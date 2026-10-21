@@ -123,6 +123,7 @@ device-factory src/devices.rs Spawner::build
 device-keeper src/devices.rs all_ended
 device-keeper src/devices.rs keeper
 device-keeper src/devices.rs sleep_until
+device-op src/completion.rs under_completion
 device-op src/driver.rs DeviceDriver::apply_with_context
 device-op src/driver.rs DeviceDriver::execute_with_context
 device-op src/link.rs under_deadline

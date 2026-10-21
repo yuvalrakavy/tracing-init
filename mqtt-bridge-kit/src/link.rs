@@ -79,6 +79,25 @@ pub struct ReadBack {
 }
 
 impl Reporter {
+    /// Capture the exact active momentary command, only while its execute future
+    /// is being polled. Helpers, validation and reads receive none. Forward this
+    /// explicitly to an inventory owner; it is not an MQTT generation token.
+    pub fn command_completion(&self) -> Option<crate::CommandCompletion> {
+        crate::completion::current()
+    }
+    /// Install a durable inventory while preserving only the exact active
+    /// command that committed it. The capability is consumed on successful CAS;
+    /// a stale, foreign, used or cut-off command fails before authority changes.
+    /// All other retired work is refused normally; final reply metadata stays
+    /// original. Ordinary administrative edits use `replace_generations`.
+    pub fn replace_generations_for_command(
+        &self,
+        expected: &crate::TargetGenerations,
+        next: crate::TargetGenerations,
+        completion: &crate::CommandCompletion,
+    ) -> Result<(), String> {
+        self.reports.replace_generations_for_command(expected, next, completion)
+    }
     /// Install an already durable inventory mapping and retire old runtime work
     /// before publishing the inventory or exposing the new mapping to commands.
     pub fn replace_generations(&self, expected: &crate::TargetGenerations, next: crate::TargetGenerations) -> Result<(), String> {

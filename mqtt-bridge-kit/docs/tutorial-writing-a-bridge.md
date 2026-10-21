@@ -1036,6 +1036,18 @@ The pure `validate_request` hook lets the proxy reject transition-phase work
 before cached Config success or an already-satisfied conflict decision; it does
 no I/O and cannot override the runtime's own fence.
 
+A rename arriving as a momentary MQTT command retires the token of the very
+command that committed it. To return its final success, capture
+`reporter.command_completion()` while that contextual execute future is polled,
+then forward it explicitly to the service owner. After confirming durability,
+use `reporter.replace_generations_for_command(&old_table, new_table, &completion)`
+instead of the ordinary replacement in step 3. Only that active command's final
+completion survives, with original generation/correlation metadata. Queued old
+work still retires. The capability is single-use and cannot be captured by a
+read, validation hook or spawned helper; a stop/disconnect invalidates it too.
+Keep the ordinary replacement API for edits from HTTP or other callers.
+See the [completion contract](../../docs/superpowers/specs/2026-10-21-bridge-command-completion.md).
+
 Test through a local fake broker: stale Desired/Config/commands and retractions,
 rename away and back, address reuse, group-semantic changes, a delayed read across
 replacement, and output sealed before replacement. Verify actual driver calls

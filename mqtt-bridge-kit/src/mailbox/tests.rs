@@ -104,6 +104,80 @@ fn fenced_up() -> (Arc<Mailbox>, Arc<crate::reports::Reports>) {
 }
 
 #[test]
+fn only_the_exact_active_committing_command_can_survive_its_single_generation_cas() {
+    let (mailbox, reports) = fenced_up();
+    let initial = crate::TargetGenerations { instance: "epoch.2".into(), targets: [("u1".into(), "epoch.2".into())].into_iter().collect() };
+    let next = crate::TargetGenerations { instance: "epoch.3".into(), targets: [("u1".into(), "epoch.3".into())].into_iter().collect() };
+    let context = RequestContext::new("epoch.2").unwrap();
+    mailbox.post_command_with_context(Some("u1".into()), call("rename"), None, None, context.clone());
+    assert!(matches!(mailbox.try_take(), Some(Work::Execute { .. })));
+    let completion = mailbox.command_completion().expect("active command has no completion capability");
+    mailbox.post_command_with_context(Some("u1".into()), call("pulse"), None, None, context);
+    assert!(
+        reports.replace_generations_for_command(&initial, next.clone(), &crate::CommandCompletion::new()).is_err(),
+        "foreign capability changed runtime authority"
+    );
+    assert!(reports.replace_generations_for_command(&next, initial.clone(), &completion).is_err(), "stale expected table was accepted");
+    // Failed CAS did not consume the exact active capability.
+    reports.replace_generations_for_command(&initial, next.clone(), &completion).unwrap();
+    assert!(mailbox.try_take().is_none(), "queued retired command survived committing CAS");
+    assert_eq!(reports.take().answer_errors.len(), 1, "queued retirement also refused the committing command");
+    assert!(
+        reports.replace_generations_for_command(&next, initial.clone(), &completion).is_err(),
+        "completion capability was reused for another CAS"
+    );
+    assert!(mailbox.command_done(), "committing command lost its own completion");
+    assert!(!mailbox.command_done(), "committing command completed twice");
+    assert!(reports.replace_generations_for_command(&next, initial, &completion).is_err(), "finished command capability was accepted");
+}
+
+#[test]
+fn stop_and_ordinary_retirement_still_cut_off_an_active_committing_command() {
+    for stop in [false, true] {
+        let (mailbox, reports) = fenced_up();
+        let initial =
+            crate::TargetGenerations { instance: "epoch.2".into(), targets: [("u1".into(), "epoch.2".into())].into_iter().collect() };
+        let next =
+            crate::TargetGenerations { instance: "epoch.3".into(), targets: [("u1".into(), "epoch.3".into())].into_iter().collect() };
+        mailbox.post_command_with_context(None, call("rename_bus"), None, None, RequestContext::new("epoch.2").unwrap());
+        mailbox.try_take().unwrap();
+        let completion = mailbox.command_completion().unwrap();
+        if stop {
+            assert_eq!(mailbox.disconnected().len(), 1);
+        } else {
+            reports.replace_generations(&initial, next.clone()).unwrap();
+        }
+        assert!(mailbox.command_completion().is_none(), "cut-off command kept its completion capability");
+        assert!(!mailbox.command_done(), "cut-off command still owned its reply");
+        assert!(
+            reports.replace_generations_for_command(if stop { &initial } else { &next }, initial.clone(), &completion).is_err(),
+            "cut-off capability changed authority"
+        );
+    }
+}
+
+#[test]
+fn an_identical_later_command_cannot_reuse_a_completed_commands_unused_capability() {
+    let (mailbox, reports) = fenced_up();
+    let initial = crate::TargetGenerations { instance: "epoch.2".into(), targets: [("u1".into(), "epoch.2".into())].into_iter().collect() };
+    let next = crate::TargetGenerations { instance: "epoch.3".into(), targets: [("u1".into(), "epoch.3".into())].into_iter().collect() };
+    let post = || mailbox.post_command_with_context(Some("u1".into()), call("rename"), None, None, RequestContext::new("epoch.2").unwrap());
+    post();
+    mailbox.try_take().unwrap();
+    let old = mailbox.command_completion().unwrap();
+    assert!(mailbox.command_done());
+    post();
+    mailbox.try_take().unwrap();
+    let fresh = mailbox.command_completion().unwrap();
+    assert!(
+        reports.replace_generations_for_command(&initial, next.clone(), &old).is_err(),
+        "old capability authorized an identical later command"
+    );
+    reports.replace_generations_for_command(&initial, next, &fresh).unwrap();
+    assert!(mailbox.command_done());
+}
+
+#[test]
 fn stale_or_missing_state_cannot_replace_fresh_fenced_intent() {
     for context in [RequestContext::default(), RequestContext::new("epoch.1").unwrap()] {
         let (mailbox, _reports) = fenced_up();

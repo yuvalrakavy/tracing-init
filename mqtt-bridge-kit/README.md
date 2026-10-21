@@ -317,6 +317,17 @@ complete inventory before making the new service mapping ready. An uncertain
 save or failed replacement must keep service admission frozen. Never reuse a
 retired token for the same target.
 
+If a momentary MQTT command commits that very change, capture
+`reporter.command_completion()` inside its contextual execute future and forward
+the opaque capability to the inventory owner. After durability, use
+`replace_generations_for_command(&old_table, next_table, &completion)` so that
+exact active command can return its final reply with its original token and
+correlation data. The capability is single-use, checked atomically with CAS,
+and unavailable to reads, validation or spawned helpers. All queued and unrelated
+retired work is still refused; stop/disconnect can still cut off the command.
+HTTP/other administrative edits use the ordinary replacement method. See the
+[command completion contract](../docs/superpowers/specs/2026-10-21-bridge-command-completion.md).
+
 Use the pure `validate_request` hook to reject work during service transitions or
 enforce read-only metadata. It runs before cached Config acceptance and outage
 conflict decisions, under the operation watchdog. It cannot perform I/O. The
