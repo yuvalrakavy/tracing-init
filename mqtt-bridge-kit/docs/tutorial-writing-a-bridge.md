@@ -815,6 +815,16 @@ Request and operation spans are INFO carriers, with no new INFO event per value;
 State readback remains DEBUG. Valid supplied headers survive even without OTel,
 and no headers are fabricated without an active OTel context.
 
+For reads that cross your own queue, override
+`read_state_with_request_context(scope, context)`. Queued refresh and individual
+outage-conflict reads receive their owned request cause through this method.
+Clone it into the queued operation and preserve its trace, including explicit
+absence. Return each observation with the mapping token captured when resolving
+the device; do not copy the request token onto unrelated observations. The
+default calls the existing `read_state_with_context(scope)`, so existing drivers
+remain compatible. Startup proof and periodic polls still use that existing
+hook without an original request cause.
+
 ## 12. Many devices in one process
 
 LampNet is *controller-fronted*: one controller, its lamps behind it as targets, one process per

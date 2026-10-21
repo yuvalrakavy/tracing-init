@@ -2,24 +2,24 @@
  "rows": {
   "apply_uses_first_request_cause": {
    "last_real": {
-    "at": "2026-10-21T20:26:17Z",
+    "at": "2026-10-21T22:43:38Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:12720bf68d3d6c40",
+     "files": "files:d5d6198eff1c9edf",
      "guard": "item:ec1e7c88eb0355aa",
      "row": "7ba3cec107fc7181",
      "test": "test:542e6a5e634740a1"
     },
     "path": "command",
-    "secs": 4.5,
-    "sha": "259d963fd448ea2512e36a00e2f22850af0bc1f7",
+    "secs": 5.6,
+    "sha": "96a03bcb9f932d8d49d479a38cc95f9ad9e08ff6",
     "verdict": "RED"
    }
   },
   "coalesced_reply_inherits_primary_cause": {
    "last_real": {
-    "at": "2026-10-21T20:26:12Z",
+    "at": "2026-10-21T22:43:32Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
@@ -29,8 +29,8 @@
      "test": "test:542e6a5e634740a1"
     },
     "path": "command",
-    "secs": 2.7,
-    "sha": "259d963fd448ea2512e36a00e2f22850af0bc1f7",
+    "secs": 4.7,
+    "sha": "96a03bcb9f932d8d49d479a38cc95f9ad9e08ff6",
     "verdict": "RED"
    }
   },
@@ -53,7 +53,7 @@
   },
   "expired_read_inherits_live_caller_cause": {
    "last_real": {
-    "at": "2026-10-21T20:26:31Z",
+    "at": "2026-10-21T22:43:43Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
@@ -63,8 +63,8 @@
      "test": "test:542e6a5e634740a1"
     },
     "path": "command",
-    "secs": 3.8,
-    "sha": "259d963fd448ea2512e36a00e2f22850af0bc1f7",
+    "secs": 5.5,
+    "sha": "96a03bcb9f932d8d49d479a38cc95f9ad9e08ff6",
     "verdict": "RED"
    }
   },
@@ -121,7 +121,7 @@
   },
   "sealed_output_loses_owned_trace": {
    "last_real": {
-    "at": "2026-10-21T20:26:10Z",
+    "at": "2026-10-21T22:43:28Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
@@ -131,8 +131,8 @@
      "test": "test:542e6a5e634740a1"
     },
     "path": "command",
-    "secs": 3.5,
-    "sha": "259d963fd448ea2512e36a00e2f22850af0bc1f7",
+    "secs": 4.5,
+    "sha": "96a03bcb9f932d8d49d479a38cc95f9ad9e08ff6",
     "verdict": "RED"
    }
   }

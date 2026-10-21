@@ -233,7 +233,13 @@ headerless requests fabricate no metadata. State readback remains DEBUG.
 
 Contextual driver/report methods preserve that cause. Drivers crossing another
 queue can instrument its future with `context.operation_span(instance, operation)`;
-never hold a span enter guard over an await. A merged atomic apply uses its latest
+never hold a span enter guard over an await. Override
+`read_state_with_request_context(scope, context)` to receive the original cause
+for queued refreshes and individual conflict reads. Its default calls the
+existing `read_state_with_context(scope)`, preserving existing drivers. Startup
+proof and periodic polls use that existing hook. Capture returned observations'
+mapping generations during actual resolution; the request token must not
+relabel their authority. A merged atomic apply uses its latest
 surviving request's cause, while property errors retain their own causes.
 Each coalesced reply owns its caller's cause, including explicit absence.
 `ReplyTo` now has a public `traceparent` field: migrate hand-built struct literals

@@ -1,0 +1,28 @@
+# Optional queued-read context dispatch and legacy compatibility controls.
+
+[[control]]
+name = "refresh_bypasses_original_context"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = "self.driver.read_state_with_request_context(scope, &context)"
+replacement = "self.driver.read_state_with_context(scope)"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(queued_refresh_passes_original_context_without_restamping_observations)"]
+expect_text = "queued refresh bypassed its original request context hook"
+
+[[control]]
+name = "conflict_read_bypasses_original_context"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = "self.driver.read_state_with_request_context(Scope::Target(target.to_owned()), &context)"
+replacement = "self.driver.read_state_with_context(Scope::Target(target.to_owned()))"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(conflict_read_passes_the_selected_surviving_original_context)"]
+expect_text = "conflict read bypassed its original request context hook"
+
+[[control]]
+name = "default_read_bypasses_existing_contextual_override"
+file = "mqtt-bridge-kit/src/driver.rs"
+anchor = "        self.read_state_with_context(scope).await"
+replacement = "        let _ = scope; Ok(Vec::new())"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(request_read_default_preserves_existing_contextual_override)"]
+expect_text = "default request read bypassed existing contextual override"

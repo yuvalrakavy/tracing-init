@@ -19,35 +19,35 @@
   },
   "direct_conflict_read_ignores_original_context": {
    "last_real": {
-    "at": "2026-10-21T18:53:08Z",
+    "at": "2026-10-21T22:42:48Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:8a431650da9858c1",
-     "guard": "item:d46f18a9ace3900b",
+     "files": "files:d5d6198eff1c9edf",
+     "guard": "item:a59ab530725e9c1a",
      "row": "db7dde293d4713fe",
-     "test": "test:9b08b0e78134e28d"
+     "test": "test:542e6a5e634740a1"
     },
     "path": "command",
-    "secs": 8.3,
-    "sha": "a3db09e2c1d3c1bb2f344aacf77bf4bab4c7fdea",
+    "secs": 10.3,
+    "sha": "96a03bcb9f932d8d49d479a38cc95f9ad9e08ff6",
     "verdict": "RED"
    }
   },
   "driver_admission_is_skipped": {
    "last_real": {
-    "at": "2026-10-21T18:52:59Z",
+    "at": "2026-10-21T22:42:37Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:8a431650da9858c1",
+     "files": "files:d5d6198eff1c9edf",
      "guard": "item:baf7736465351baa",
      "row": "7213e4a33be33da7",
-     "test": "test:9b08b0e78134e28d"
+     "test": "test:542e6a5e634740a1"
     },
     "path": "command",
-    "secs": 8.5,
-    "sha": "a3db09e2c1d3c1bb2f344aacf77bf4bab4c7fdea",
+    "secs": 13.2,
+    "sha": "96a03bcb9f932d8d49d479a38cc95f9ad9e08ff6",
     "verdict": "RED"
    }
   },
@@ -138,35 +138,35 @@
   },
   "optional_context_blocks_legacy_conflict_reads": {
    "last_real": {
-    "at": "2026-10-21T18:53:54Z",
+    "at": "2026-10-21T22:43:23Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:0fe85af3ce7f4462",
+     "files": "files:d68dedad5b1a6d62",
      "guard": "item:a9d86b6087d24069",
      "row": "53d3375f907ca935",
-     "test": "test:9b08b0e78134e28d"
+     "test": "test:542e6a5e634740a1"
     },
     "path": "command",
-    "secs": 2.6,
-    "sha": "a3db09e2c1d3c1bb2f344aacf77bf4bab4c7fdea",
+    "secs": 4.3,
+    "sha": "96a03bcb9f932d8d49d479a38cc95f9ad9e08ff6",
     "verdict": "RED"
    }
   },
   "optional_context_erases_legacy_partial_state": {
    "last_real": {
-    "at": "2026-10-21T18:53:52Z",
+    "at": "2026-10-21T22:43:18Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:0fe85af3ce7f4462",
+     "files": "files:d68dedad5b1a6d62",
      "guard": "item:b07a7d4f22bc9f44",
      "row": "77dfc82221d82cf2",
-     "test": "test:9b08b0e78134e28d"
+     "test": "test:542e6a5e634740a1"
     },
     "path": "command",
-    "secs": 3.5,
-    "sha": "a3db09e2c1d3c1bb2f344aacf77bf4bab4c7fdea",
+    "secs": 5.8,
+    "sha": "96a03bcb9f932d8d49d479a38cc95f9ad9e08ff6",
     "verdict": "RED"
    }
   },
@@ -189,18 +189,18 @@
   },
   "proving_read_is_retagged_with_the_current_mapping": {
    "last_real": {
-    "at": "2026-10-21T18:53:16Z",
+    "at": "2026-10-21T22:42:58Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:8a431650da9858c1",
-     "guard": "item:b13b9c875dad4def",
+     "files": "files:d5d6198eff1c9edf",
+     "guard": "item:100e8732c9899ccd",
      "row": "c9578dcfab5535c0",
-     "test": "test:9b08b0e78134e28d"
+     "test": "test:542e6a5e634740a1"
     },
     "path": "command",
-    "secs": 8.2,
-    "sha": "a3db09e2c1d3c1bb2f344aacf77bf4bab4c7fdea",
+    "secs": 10.3,
+    "sha": "96a03bcb9f932d8d49d479a38cc95f9ad9e08ff6",
     "verdict": "RED"
    }
   },
@@ -240,18 +240,18 @@
   },
   "successful_config_does_not_replace_obsolete_cache": {
    "last_real": {
-    "at": "2026-10-21T18:53:32Z",
+    "at": "2026-10-21T22:43:12Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:8a431650da9858c1",
+     "files": "files:d5d6198eff1c9edf",
      "guard": "item:8d9e1d6e2d167213",
      "row": "52ae3ca02a8ebd80",
-     "test": "test:9b08b0e78134e28d"
+     "test": "test:542e6a5e634740a1"
     },
     "path": "command",
-    "secs": 11.0,
-    "sha": "a3db09e2c1d3c1bb2f344aacf77bf4bab4c7fdea",
+    "secs": 14.5,
+    "sha": "96a03bcb9f932d8d49d479a38cc95f9ad9e08ff6",
     "verdict": "RED"
    }
   },

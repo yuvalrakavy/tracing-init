@@ -907,11 +907,13 @@ impl<D: DeviceDriver> Worker<D> {
                 report_refused(&self.reports, expired, READ_EXPIRED);
                 let scope = target.clone().map_or(Scope::All, Scope::Target);
                 // WAIT: device-op
-                let result = op(handle, timing.operation, "read_state", self.driver.read_state_with_context(scope)).await.map(|states| {
-                    self.proven();
-                    self.fold(&states);
-                    None
-                });
+                let result = op(handle, timing.operation, "read_state", self.driver.read_state_with_request_context(scope, &context))
+                    .await
+                    .map(|states| {
+                        self.proven();
+                        self.fold(&states);
+                        None
+                    });
                 // A failure goes to Error too, as every command's does (review C13).
                 self.answer_once(target.as_deref(), "refresh", result, replies, &context)
             }
@@ -972,28 +974,32 @@ impl<D: DeviceDriver> Worker<D> {
         } else {
             let context = values.first().map(|value| value.context.clone()).unwrap_or_default();
             // WAIT: device-op
-            let current =
-                match op(handle, timing.operation, "read_state", self.driver.read_state_with_context(Scope::Target(target.to_owned())))
-                    .await
-                {
-                    Ok(states) => {
-                        self.proven();
-                        self.fold(&states);
-                        let mut current: Option<PropertyMap> = None;
-                        for state in states
-                            .into_iter()
-                            .filter(|s| s.state.target == target && self.reports.observation_matches(target, &s.context, &context))
-                        {
-                            current.get_or_insert_with(PropertyMap::new).extend(state.state.values);
-                        }
-                        current
+            let current = match op(
+                handle,
+                timing.operation,
+                "read_state",
+                self.driver.read_state_with_request_context(Scope::Target(target.to_owned()), &context),
+            )
+            .await
+            {
+                Ok(states) => {
+                    self.proven();
+                    self.fold(&states);
+                    let mut current: Option<PropertyMap> = None;
+                    for state in states
+                        .into_iter()
+                        .filter(|s| s.state.target == target && self.reports.observation_matches(target, &s.context, &context))
+                    {
+                        current.get_or_insert_with(PropertyMap::new).extend(state.state.values);
                     }
-                    Err(OpError::Link(e)) => return Err(e),
-                    Err(other) => {
-                        debug!(target, error = %other, "The device's answer to the conflict read was unusable; its values are unknown");
-                        None
-                    }
-                };
+                    current
+                }
+                Err(OpError::Link(e)) => return Err(e),
+                Err(other) => {
+                    debug!(target, error = %other, "The device's answer to the conflict read was unusable; its values are unknown");
+                    None
+                }
+            };
             (current, self.mailbox.revalidate(values))
         };
         // The table or driver phase may have changed while a read was awaited.

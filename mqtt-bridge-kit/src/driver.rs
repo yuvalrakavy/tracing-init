@@ -383,6 +383,16 @@ pub trait DeviceDriver: Send + 'static {
             .map(|states| states.into_iter().map(|state| ContextualState::new(state, RequestContext::default())).collect())
     }
 
+    /// Read for an original queued refresh or individual conflict check. Drivers
+    /// crossing another queue can carry this cause explicitly, including its
+    /// captured trace absence. Observation generations still come from actual
+    /// device mapping resolution, never by restamping with the request token.
+    /// The default preserves existing contextual and plain read implementations.
+    /// Unsolicited startup proof and periodic polls use the existing read hook.
+    async fn read_state_with_request_context(&mut self, scope: Scope, _context: &RequestContext) -> Result<Vec<ContextualState>, OpError> {
+        self.read_state_with_context(scope).await
+    }
+
     /// Write `values` to `target`: several values arrive together when the write is atomic. Apply
     /// every value, in the order the device needs. Bounded by [`Timing::operation`].
     ///

@@ -91,6 +91,13 @@ generation. Do not reuse the retired generation merely to keep a trace.
 
 ## Verification and integration
 
+The queued-read follow-up adds the optional
+`read_state_with_request_context(scope, &RequestContext)` driver hook. Refresh
+and individual conflict reads pass their original owned cause through it; its
+default delegates to the existing contextual read method. Unsolicited reads and
+observation generation authority are unchanged. See
+[the read-context design](2026-10-22-queued-read-request-context.md).
+
 Keep the failing real canonical-daemon test as acceptance, and add shared tests
 for context validation/bounds/duplicates, generation-only Eq/Ord/Hash, original
 sealed trace after unrelated work/table retirement, and separate replies for

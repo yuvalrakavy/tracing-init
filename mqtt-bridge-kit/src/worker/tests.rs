@@ -101,6 +101,183 @@ fn link_context() -> LinkContext {
     LinkContext::new(1, "i", Reports::new(), Arc::new(crate::link::Abandoned::default()), Arc::new(OpClock::new()))
 }
 
+struct QueuedReadDriver {
+    seen: Vec<(Scope, RequestContext)>,
+    legacy_reads: usize,
+    observation: RequestContext,
+}
+impl QueuedReadDriver {
+    fn new() -> Self {
+        Self { seen: vec![], legacy_reads: 0, observation: RequestContext::new("observed.9").unwrap() }
+    }
+}
+impl DeviceDriver for QueuedReadDriver {
+    fn info(&self) -> DriverInfo {
+        DriverInfo::default()
+    }
+    async fn connect(&mut self, _: &mut LinkContext) -> Result<(), LinkError> {
+        Ok(())
+    }
+    async fn disconnect(&mut self) {}
+    async fn read_state(&mut self, _: Scope) -> Result<Vec<crate::TargetState>, OpError> {
+        Ok(vec![])
+    }
+    async fn read_state_with_context(&mut self, _: Scope) -> Result<Vec<ContextualState>, OpError> {
+        self.legacy_reads += 1;
+        Ok(vec![ContextualState::new(
+            crate::TargetState::new("u1", json!({"temp": 18}).as_object().unwrap().clone()),
+            self.observation.clone(),
+        )])
+    }
+    async fn read_state_with_request_context(&mut self, scope: Scope, context: &RequestContext) -> Result<Vec<ContextualState>, OpError> {
+        // Exercise ownership across a separate task with no ambient OTel context.
+        let owned = context.clone();
+        let queued = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            owned
+        })
+        .await
+        .unwrap();
+        self.seen.push((scope, queued.clone()));
+        Ok(vec![ContextualState::new(
+            crate::TargetState::new("u1", json!({"temp": 18 + self.seen.len()}).as_object().unwrap().clone()),
+            self.observation.clone().with_traceparent(queued.traceparent()),
+        )])
+    }
+    async fn apply(&mut self, _: &str, _: &PropertyMap) -> Result<(), OpError> {
+        Ok(())
+    }
+    async fn execute(&mut self, _: Option<&str>, _: &crate::CommandCall) -> Result<Option<Value>, OpError> {
+        Ok(None)
+    }
+    async fn configure(&mut self, _: &str, _: Option<&Value>) -> Result<(), OpError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn queued_refresh_passes_original_context_without_restamping_observations() {
+    let trace = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    for parent in [Some(trace), None] {
+        let mailbox = Mailbox::new();
+        mailbox.connected();
+        let original = RequestContext::new("request.1").unwrap().with_traceparent(parent);
+        mailbox.post_read_with_context(ReadKey::Refresh(Some("u1".into())), None, None, None, original.clone());
+        let reports = Reports::new();
+        let mut worker = Worker::new(QueuedReadDriver::new(), DriverInfo::default(), "i", mailbox.clone(), reports.clone());
+        worker.work(&link_context().handle(), mailbox.try_take().unwrap()).await.unwrap();
+        assert_eq!(worker.driver.seen.len(), 1, "queued refresh bypassed its original request context hook");
+        let (scope, seen) = &worker.driver.seen[0];
+        assert_eq!(scope, &Scope::Target("u1".into()));
+        assert_eq!(seen.generation(), original.generation());
+        assert_eq!(seen.traceparent(), parent, "queued refresh lost its original trace cause");
+        assert!(seen.trace_was_captured(), "queued refresh lost authoritative trace absence");
+        let states = reports.take().states;
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].2.generation(), Some("observed.9"), "request token relabeled independent observation authority");
+        assert_eq!(states[0].2.traceparent(), parent);
+        assert_eq!(worker.driver.legacy_reads, 0);
+    }
+}
+
+#[tokio::test]
+async fn conflict_read_passes_the_selected_surviving_original_context() {
+    let trace = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    for parent in [Some(trace), None] {
+        let mailbox = Mailbox::new();
+        mailbox.connected();
+        let original = RequestContext::new("request.1").unwrap().with_traceparent(parent);
+        let mut desired = request(json!(22), Conflict::RequestWins);
+        desired.context = original.clone();
+        mailbox.post_state(desired, true);
+        let Work::Apply { values, .. } = mailbox.try_take().unwrap() else { panic!("fixture did not produce real checked work") };
+        assert!(values[0].check.any());
+        let reports = Reports::new();
+        let mut worker = Worker::new(QueuedReadDriver::new(), DriverInfo::default(), "i", mailbox, reports);
+        let _ = worker.decide(&link_context().handle(), "u1", values, &BTreeMap::new()).await.unwrap();
+        assert_eq!(worker.driver.seen.len(), 1, "conflict read bypassed its original request context hook");
+        let (scope, seen) = &worker.driver.seen[0];
+        assert_eq!(scope, &Scope::Target("u1".into()));
+        assert_eq!(seen.generation(), original.generation());
+        assert_eq!(seen.traceparent(), parent, "conflict read lost its selected original cause");
+        assert!(seen.trace_was_captured(), "conflict read lost authoritative trace absence");
+        assert_eq!(worker.driver.legacy_reads, 0);
+    }
+}
+
+#[tokio::test]
+async fn request_read_default_preserves_existing_contextual_override() {
+    let mut driver = QueuedReadDriver::new();
+    struct Legacy(QueuedReadDriver);
+    impl DeviceDriver for Legacy {
+        fn info(&self) -> DriverInfo {
+            DriverInfo::default()
+        }
+        async fn connect(&mut self, _: &mut LinkContext) -> Result<(), LinkError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) {}
+        async fn read_state(&mut self, _: Scope) -> Result<Vec<crate::TargetState>, OpError> {
+            Ok(vec![])
+        }
+        async fn read_state_with_context(&mut self, scope: Scope) -> Result<Vec<ContextualState>, OpError> {
+            self.0.read_state_with_context(scope).await
+        }
+        async fn apply(&mut self, _: &str, _: &PropertyMap) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn execute(&mut self, _: Option<&str>, _: &crate::CommandCall) -> Result<Option<Value>, OpError> {
+            Ok(None)
+        }
+        async fn configure(&mut self, _: &str, _: Option<&Value>) -> Result<(), OpError> {
+            Ok(())
+        }
+    }
+    driver.observation = RequestContext::new("legacy.7").unwrap();
+    let mut legacy = Legacy(driver);
+    let states = legacy.read_state_with_request_context(Scope::All, &RequestContext::new("request.1").unwrap()).await.unwrap();
+    assert_eq!(legacy.0.legacy_reads, 1, "default request read bypassed existing contextual override");
+    assert_eq!(states[0].context.generation(), Some("legacy.7"));
+}
+
+#[tokio::test]
+async fn queued_refresh_preserves_wire_trace_and_absence_without_otel() {
+    use mqtt_test_broker::{FakeBroker, SendOptions};
+    let broker = FakeBroker::start().await;
+    let running = crate::Bridge::new("RequestReads").instance("i").broker(&broker.address()).start(QueuedReadDriver::new()).unwrap();
+    assert!(
+        broker
+            .wait_until(Duration::from_secs(3), |b| b.received_on("RequestReads/Status/i").iter().any(|r| r.payload == "connected"))
+            .await
+    );
+    let trace = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
+    for (index, parent) in [Some(trace), None].into_iter().enumerate() {
+        let reply = format!("Reply/read/{index}");
+        let mut options = SendOptions::default().response_topic(&reply);
+        if let Some(parent) = parent {
+            options = options.user_property("traceparent", parent);
+        }
+        assert!(broker.send_with("RequestReads/Command/i", r#"{"target":"u1","command":"refresh"}"#, &options));
+        assert!(broker.wait_until(Duration::from_secs(3), |b| !b.received_on(&reply).is_empty()).await);
+        let expected = json!({"temp": 19 + index});
+        assert!(
+            broker
+                .wait_until(Duration::from_secs(3), |b| b
+                    .received_on("RequestReads/State/i/u1")
+                    .iter()
+                    .any(|r| { serde_json::from_slice::<Value>(&r.payload).ok().as_ref() == Some(&expected) }))
+                .await,
+            "queued refresh did not publish actual new readback"
+        );
+        let states = broker.received_on("RequestReads/State/i/u1");
+        let state = states.iter().find(|r| serde_json::from_slice::<Value>(&r.payload).ok().as_ref() == Some(&expected)).unwrap();
+        assert_eq!(state.user_property("traceparent"), parent, "queued refresh wire readback changed its original cause");
+        let replies = broker.received_on(&reply);
+        assert_eq!(replies[0].user_property("traceparent"), parent, "refresh reply changed its own caller cause");
+    }
+    assert!(running.stop().await);
+}
+
 #[tokio::test]
 async fn merged_writes_use_the_latest_cause_and_each_failed_property_keeps_its_own() {
     struct Driver {
