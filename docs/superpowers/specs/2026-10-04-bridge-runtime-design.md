@@ -12,7 +12,7 @@ the notes at the end say what it changed here.
 
 A change to any of them updates the others in the same change. This spec is the source for the bridge
 side; the artifacts follow it:
-- runtime: https://claude.ai/artifact/VtZNayRupmyBtUdcaWbqY3
+- runtime: this spec (its artifact copy was retired 2026-10-24; read this file)
 - tutorial: https://claude.ai/artifact/23pVXtj2orqEXfGKL9D7zx
 
 ## 1. Why
