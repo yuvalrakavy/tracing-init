@@ -153,6 +153,7 @@ fn rig_on(port: u16) -> Rig {
         broker_host: "127.0.0.1".into(),
         broker_port: port,
         timing: MqttTiming::default(),
+        request_lifetime_limit: None,
         version: "test".into(),
         outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         enqueued: std::sync::atomic::AtomicU64::new(0),
@@ -165,6 +166,7 @@ fn rig_on(port: u16) -> Rig {
         mailbox: Mailbox::new(),
         reports: Reports::with_ready(ready),
         tag: None,
+        request_lifetime_limit: None,
         span: tracing::Span::none(),
     });
     let mut outputs = Outputs::new();
@@ -297,6 +299,7 @@ async fn the_rotation_turns_quanta_round_robin_over_sealed_batches() {
         mailbox: Mailbox::new(),
         reports: Reports::with_ready(shared.ready.clone()),
         tag: None,
+        request_lifetime_limit: None,
         span: tracing::Span::none(),
     });
     rig.outputs.add(&shared, 1, second.clone());

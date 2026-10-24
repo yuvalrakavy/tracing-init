@@ -1,0 +1,9 @@
+[[control]]
+name="request_lifetime_public_builder_propagation"
+guard="request_lifetime_builder_propagation"
+file="mqtt-bridge-kit/src/host.rs"
+anchor="request_lifetime_limit: self.request_lifetime_limit,"
+replacement="request_lifetime_limit: None,"
+target="command"
+argv=["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-conformance/Cargo.toml","--test","request_lifetime"]
+expect_text="lost its expiry policy"

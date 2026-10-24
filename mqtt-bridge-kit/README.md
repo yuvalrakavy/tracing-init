@@ -221,6 +221,27 @@ Details the runtime fixes (spec §5.1), which the lanes' payloads rely on:
 - JSON Schemas for each lane's payload are in [`../schemas`](../schemas); the conformance suite
   checks every publish against them.
 
+### Optional request lifetime limit
+
+`Bridge::request_lifetime_limit(Duration)` and `Host::request_lifetime_limit(Duration)`
+opt into a queued-start deadline. For example, a DALI bridge uses
+`request_lifetime_limit(Duration::from_secs(180))`. Without this call, existing
+request handling and defaults remain unchanged.
+
+With a limit, every nonempty property `Desired` needs an MQTT v5 message expiry
+no longer than that limit, including live deliveries. Missing or longer expiry
+is malformed and cannot replace a pending value. An empty retraction needs no
+expiry. Target-level `Desired` and `Command` use the shorter of their existing
+expiry and the limit; a missing expiry uses the limit. Shorter expiry is preserved.
+The deadline starts at the pump's original receipt, so time in the session queue
+counts. Configuration, State readback and already-started operation timeouts are
+unchanged. Zero or an unrepresentable builder limit fails startup validation.
+
+Publishers must set a bounded expiry when publishing property requests: the
+broker's remaining expiry cannot reveal the original publication age. No publisher
+timestamp or replay journal is added. This optional policy serves generic MQTT
+consumers and is independent of Store.
+
 ## Request traces across queues
 
 MQTT v5 `traceparent` is optional diagnostic metadata. The runtime validates and

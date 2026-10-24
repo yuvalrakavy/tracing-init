@@ -1085,6 +1085,27 @@ and MQTT properties. Also retain the ordinary unfenced conformance suite so the
 optional feature cannot alter existing bridges. The full runtime contract is
 [`bridge-target-generations`](../../docs/superpowers/specs/2026-10-21-bridge-target-generations.md).
 
+## Optional: bound how long requests may wait
+
+If late actions would surprise users, opt into a lifetime ceiling on the process
+builder. The same method exists on `Host`; other bridges keep their existing
+defaults when they omit it.
+
+```rust
+let bridge = mqtt_bridge_kit::Bridge::new("DALI")
+    .request_lifetime_limit(std::time::Duration::from_secs(180));
+```
+
+Publish every nonempty property `Desired` with MQTT v5 message expiry at most180
+seconds. This applies to live and retained packets; a missing or longer expiry
+is refused as malformed. Empty retractions and Config need no expiry. Target
+`Desired` and Commands may omit expiry: the runtime caps their wait at180 seconds,
+while preserving any shorter expiry. The clock starts at MQTT receipt and is not
+reset at dequeue or reconnect. Started operations keep their ordinary timeouts.
+Test both accepted finite requests and rejected missing/long property expiry,
+and retain a default-policy compatibility case. The broker exposes remaining TTL,
+not original publication time, so publishers must bound the initial expiry too.
+
 ## A checklist before you ship a driver
 
 - `info()` declares what is true: `writes`, `feedback`, every command and its class. A driver with

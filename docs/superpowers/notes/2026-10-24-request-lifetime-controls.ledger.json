@@ -1,0 +1,22 @@
+{
+ "rows": {
+  "request_lifetime_public_builder_propagation": {
+   "last_real": {
+    "at": "2026-10-24T13:00:25Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:842c4da49e51f77b",
+     "guard": "item:5d2c636e8fe6b475",
+     "row": "8ec7bdc56aab546b",
+     "test": "test:9b47cd0cde370436"
+    },
+    "path": "command",
+    "secs": 11.8,
+    "sha": "ab8a2ba6fc2070562a85f1a1d7fd576a64f6cacf",
+    "verdict": "RED"
+   }
+  }
+ },
+ "version": 1
+}

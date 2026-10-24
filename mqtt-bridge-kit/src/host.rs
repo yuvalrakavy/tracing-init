@@ -152,6 +152,7 @@ pub struct Host {
     /// N = 1: a [`Bridge`](crate::Bridge)'s one fixed instance (`--instance`), its driver handed
     /// over at the start; no factory, no Configs.
     fixed: bool,
+    request_lifetime_limit: Option<Duration>,
 }
 
 impl std::fmt::Debug for Host {
@@ -191,6 +192,7 @@ impl Host {
             problem: None,
             factory: None,
             fixed: false,
+            request_lifetime_limit: None,
         }
     }
 
@@ -350,6 +352,20 @@ impl Host {
         self
     }
 
+    /// Opt into a maximum queued request lifetime, measured from MQTT receipt.
+    /// Nonempty property Desired must carry a finite MQTT expiry no longer than
+    /// this limit. Target Desired and Commands use the shorter of their expiry
+    /// and this limit; missing expiry uses the limit. Configuration and empty
+    /// retractions are unchanged. By default no additional limit is imposed.
+    /// Zero or a duration outside the clock range is a startup usage error.
+    pub fn request_lifetime_limit(mut self, limit: Duration) -> Host {
+        if limit.is_zero() || std::time::Instant::now().checked_add(limit).is_none() {
+            return self.usage_error("request lifetime limit must be positive and fit the clock range");
+        }
+        self.request_lifetime_limit = Some(limit);
+        self
+    }
+
     /// The settings as given.
     pub fn settings(&self) -> &Settings {
         &self.settings
@@ -467,6 +483,7 @@ impl Host {
             broker_host,
             broker_port,
             timing: self.settings.mqtt,
+            request_lifetime_limit: self.request_lifetime_limit,
             version,
             outage: Arc::new(BrokerOutage::new(self.settings.mqtt.warn_after, self.settings.mqtt.stable_after)),
             enqueued: std::sync::atomic::AtomicU64::new(0),

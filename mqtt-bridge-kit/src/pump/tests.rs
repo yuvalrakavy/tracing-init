@@ -162,6 +162,7 @@ fn mqtt_side_through(relay: &Relay, timing: MqttTiming, stop: tokio::sync::watch
         broker_host: host.to_owned(),
         broker_port: port.parse().expect("the relay's port"),
         timing,
+        request_lifetime_limit: None,
         version: "test".into(),
         outage: Arc::new(BrokerOutage::new(timing.warn_after, timing.stable_after)),
         enqueued: std::sync::atomic::AtomicU64::new(0),
@@ -174,6 +175,7 @@ fn mqtt_side_through(relay: &Relay, timing: MqttTiming, stop: tokio::sync::watch
         mailbox: crate::mailbox::Mailbox::new(),
         reports: crate::reports::Reports::with_ready(ready),
         tag: None,
+        request_lifetime_limit: None,
         span: tracing::Span::none(),
     });
     let mut outputs = crate::session::Outputs::new();

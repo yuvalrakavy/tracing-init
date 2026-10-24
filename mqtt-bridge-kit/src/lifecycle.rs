@@ -548,6 +548,7 @@ impl Lifecycle {
             mailbox: Mailbox::new(),
             reports: Reports::with_ready(self.ready.clone()),
             tag: None,
+            request_lifetime_limit: self.shared.request_lifetime_limit,
             span: span.clone(),
         });
         device.mailbox.bind_reports(&device.reports);
@@ -1992,6 +1993,7 @@ impl Lifecycle {
             mailbox: Mailbox::new(),
             reports,
             tag: Some(self.settings.id.clone()),
+            request_lifetime_limit: self.shared.request_lifetime_limit,
             span,
         });
         device.mailbox.bind_reports(&device.reports);

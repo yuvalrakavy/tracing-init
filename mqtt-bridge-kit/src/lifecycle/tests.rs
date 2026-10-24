@@ -25,6 +25,7 @@ fn dynamic_routing_and_terminal_refusals_keep_the_ingress_cause() {
             mailbox: Mailbox::new(),
             reports: Reports::new(),
             tag: Some("host".into()),
+            request_lifetime_limit: None,
             span: tracing::info_span!(parent: None, "unrelated_device", instance = "Lamp"),
         });
         let mut instance = Instance::new("Lamp", topics, Want::Serve(json!({})));
@@ -82,6 +83,7 @@ fn session_part() -> Arc<session::Shared> {
         broker_host: "127.0.0.1".into(),
         broker_port: 1,
         timing: MqttTiming::default(),
+        request_lifetime_limit: None,
         version: "kind test".into(),
         outage: Arc::new(crate::pump::BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         enqueued: std::sync::atomic::AtomicU64::new(0),
@@ -125,6 +127,7 @@ fn a_retired_runtimes_answers_go_to_the_outbox() {
             mailbox: Mailbox::new(),
             reports: Reports::with_ready(shared.ready.clone()),
             tag: Some("host".into()),
+            request_lifetime_limit: None,
             span: Span::none(),
         })
     };

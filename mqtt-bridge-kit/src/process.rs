@@ -262,6 +262,13 @@ impl Bridge {
         Bridge(self.0.version(version))
     }
 
+    /// Opt into the request lifetime policy described by
+    /// [`Host::request_lifetime_limit`]. Other bridges keep their existing
+    /// deadline behavior unless they call this method.
+    pub fn request_lifetime_limit(self, limit: Duration) -> Bridge {
+        Bridge(self.0.request_lifetime_limit(limit))
+    }
+
     /// Read the process's command line.
     pub fn from_cli(self) -> Bridge {
         Bridge(self.0.from_cli())

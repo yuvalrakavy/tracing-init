@@ -138,6 +138,7 @@ pub(crate) struct Shared {
     pub broker_host: String,
     pub broker_port: u16,
     pub timing: MqttTiming,
+    pub request_lifetime_limit: Option<Duration>,
     /// The text of the retained `Version`.
     pub version: String,
     pub outage: Arc<BrokerOutage>,
@@ -176,8 +177,32 @@ pub(crate) struct Device {
     /// property `via` = this bridge id (multi-device spec §4.5). A fixed device: `None`, never
     /// tagged.
     pub tag: Option<String>,
+    pub request_lifetime_limit: Option<Duration>,
     /// The device's span: its instance (and the host's bridge id, from its parent).
     pub span: Span,
+}
+
+impl Device {
+    fn bound_request_deadline(&self, deadline: Option<Instant>, received: Instant) -> Result<Option<Instant>, String> {
+        let Some(limit) = self.request_lifetime_limit else {
+            return Ok(deadline);
+        };
+        let bound = received.checked_add(limit).ok_or("request lifetime limit exceeds the clock range")?;
+        Ok(Some(deadline.map_or(bound, |deadline| deadline.min(bound))))
+    }
+
+    fn request_meta(&self, properties: Option<&PublishProperties>, received: Instant, property: bool) -> Result<wire::RequestMeta, String> {
+        let mut meta = wire::request_meta(properties, received)?;
+        if let Some(limit) = self.request_lifetime_limit {
+            // Live delivery's RETAIN bit does not reveal whether the publisher
+            // retained it. Every nonempty property request needs a wire expiry.
+            if property && !meta.deadline.is_some_and(|deadline| deadline.duration_since(received) <= limit) {
+                return Err(format!("property Desired requires a finite MQTT message expiry no longer than {limit:?}"));
+            }
+        }
+        meta.deadline = self.bound_request_deadline(meta.deadline, received)?;
+        Ok(meta)
+    }
 }
 
 /// After a turn of the rotation, how many ready incoming events go before the next turn.
@@ -1121,7 +1146,7 @@ pub(crate) fn route_with_config_admission(
                         },
                     }
                 }
-                Ok(Some(value)) => match wire::request_meta(properties, now) {
+                Ok(Some(value)) => match device.request_meta(properties, now, true) {
                     Err(e) => malformed(e, report),
                     Ok(meta) => {
                         // A replay's "before" basis, as of its arrival (re-gate R2).
@@ -1158,7 +1183,7 @@ pub(crate) fn route_with_config_admission(
             if publish.retain {
                 return malformed("a target-level Desired is never retained".into(), report);
             }
-            match wire::decode_desired_target(payload).and_then(|values| Ok((values, wire::request_meta(properties, now)?))) {
+            match wire::decode_desired_target(payload).and_then(|values| Ok((values, device.request_meta(properties, now, false)?))) {
                 Err(e) => malformed(e, report),
                 Ok((values, meta)) => {
                     let values = values
@@ -1220,14 +1245,14 @@ pub(crate) fn route_with_config_admission(
                 Ok(context) => context,
                 Err(error) => return refuse(error),
             };
-            command(
-                device,
-                target,
-                call,
-                reply,
-                properties.and_then(|p| p.message_expiry_interval).map(|s| now + Duration::from_secs(u64::from(s))),
-                context,
-            );
+            // Commands retain their existing context parsing: unlike Desired,
+            // they do not interpret the conflict property.
+            let deadline = properties.and_then(|p| p.message_expiry_interval).map(|s| now + Duration::from_secs(u64::from(s)));
+            let deadline = match device.bound_request_deadline(deadline, now) {
+                Ok(deadline) => deadline,
+                Err(error) => return refuse(error),
+            };
+            command(device, target, call, reply, deadline, context);
         }
         Inbound::Config { target } => {
             match wire::decode_config(payload).and_then(|config| Ok((config, wire::request_context(properties)?))) {
@@ -1402,3 +1427,6 @@ pub(crate) fn spawn(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod request_lifetime_tests;
