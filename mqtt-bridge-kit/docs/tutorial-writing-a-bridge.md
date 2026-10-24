@@ -1091,10 +1091,8 @@ If late actions would surprise users, opt into a lifetime ceiling on the process
 builder. The same method exists on `Host`; other bridges keep their existing
 defaults when they omit it.
 
-```rust
-let bridge = mqtt_bridge_kit::Bridge::new("DALI")
-    .request_lifetime_limit(std::time::Duration::from_secs(180));
-```
+For DALI, add `.request_lifetime_limit(std::time::Duration::from_secs(180))`
+to the `Bridge::new("DALI")` builder chain before starting it.
 
 Publish every nonempty property `Desired` with MQTT v5 message expiry at most180
 seconds. This applies to live and retained packets; a missing or longer expiry

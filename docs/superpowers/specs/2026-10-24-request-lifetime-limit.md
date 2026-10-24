@@ -92,3 +92,28 @@ low guardrails are implemented: Commands retain their existing parsing and ignor
 the Desired-only conflict property; zero/unrepresentable limits are refused before
 managed resource acquisition, with checked admission addition retained. Coverage
 is source-only and same-family.
+
+
+## SDK acceptance
+
+Source review approved `ab8a2ba..ab8ffd8` plus the tutorial-only correction with
+no serious findings. The review traced private propagation, both Device creation
+paths, receipt timestamps, all three admissions, context/replies and unchanged
+absent-option behavior. It was read-only and same-family.
+
+- Before enforcement: nine focused cases ran; four failed for the missing guards
+  and five compatibility cases passed. After enforcement:9/9 passed.
+- Both real public-builder broker cases pass. Removing Host-to-Shared propagation
+  makes them fail for the expected expiry-policy assertion; the control restored
+  source, and its final plan check reports zero rot.
+- Final all-target SDK/API/example run:231/231 passed in10.363s.
+- Full unfenced plus opt-in conformance:176/176 passed in61.209s.
+- Strict all-target SDK Clippy passed in3.81s.
+
+The first SDK run caught an unquoted tutorial code fence, fixed as inline usage
+instructions; the final run executed all cases. The first conformance run inherited
+`RUST_LOG=warn`, hiding the INFO shutdown line asserted by an existing SIGINT test.
+The same isolated test failed at WARN and passed at INFO without a source change;
+the final complete conformance command used `RUST_LOG=info`. No runtime timeout or
+assertion was weakened. DALI integration and its dependency pin are the next step;
+other consumers' dependency pins remain unchanged.
