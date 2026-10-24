@@ -380,8 +380,11 @@ impl Line {
     /// How many of the session's publishes the broker has acknowledged: written, less those in
     /// flight (QoS 1 acknowledgements come in order).
     pub fn acknowledged(&self) -> u64 {
+        // The pump increments inflight before written. Read in the opposite
+        // order so an outgoing publish cannot look acknowledged mid-update.
+        let written = self.written.load(Ordering::SeqCst);
         let inflight = u64::try_from(self.inflight.load(Ordering::SeqCst)).unwrap_or(u64::MAX);
-        self.written.load(Ordering::SeqCst).saturating_sub(inflight)
+        written.saturating_sub(inflight)
     }
 
     /// How many packet ids rumqttc 0.25 cycles through on this connection — the broker's receive

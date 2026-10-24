@@ -338,3 +338,69 @@ fn a_reasserted_slot_is_published_again_once() {
     assert_eq!(serde_json::from_slice::<Value>(&changes.states[0].1).unwrap(), json!({"power": true}));
     assert_eq!(reports.take(), Changes::default(), "a reassertion was published twice");
 }
+
+#[test]
+fn offline_retired_names_do_not_accumulate_without_bound() {
+    let reports = Reports::new();
+    for i in 0..1200 {
+        let target = format!("OldLight{i}");
+        reports.state(&target, values(&[("power", json!(true))]), false);
+        reports.remove(&target);
+    }
+    assert!(reports.locked().changed.len() <= 1024);
+    let model = reports.model();
+    assert!(model.states.len() <= 1024, "retired names grew to {}", model.states.len());
+    let strings: usize = model.states.iter().map(|(name, _, _)| name.len()).sum();
+    assert!(strings <= 128 * 1024, "retired-name storage grew to {strings} bytes");
+    assert!(reports.take().states.is_empty());
+}
+
+#[test]
+fn retired_names_wait_for_their_publish_acknowledgement() {
+    let reports = Reports::new();
+    reports.remove("Light1");
+    let nonce = reports.take_sealed().retractions["Light1"];
+    reports.retire_acknowledged_removals(100);
+    assert_eq!(reports.model().states.len(), 1, "enqueue was never confirmed");
+    reports.removal_sent("Light1", nonce, 101);
+    reports.retire_acknowledged_removals(100);
+    assert_eq!(reports.model().states.len(), 1, "an earlier PUBACK cleared this removal");
+    reports.retire_acknowledged_removals(101);
+    assert!(reports.model().states.is_empty());
+    assert!(!reports.removals_inflight());
+}
+
+#[test]
+fn retired_name_receipts_cannot_clear_a_new_removal_and_reconnect_retries() {
+    let reports = Reports::new();
+    reports.remove("Light1");
+    let old = reports.take_sealed().retractions["Light1"];
+    reports.state("Light1", values(&[("power", json!(true))]), false);
+    reports.remove("Light1");
+    let new = reports.take_sealed().retractions["Light1"];
+    assert_ne!(old, new);
+    reports.removal_sent("Light1", old, 1);
+    reports.retire_acknowledged_removals(1);
+    assert_eq!(reports.model_sealed().retractions["Light1"], new);
+    reports.removal_sent("Light1", new, 2);
+    reports.removals_connection_started();
+    reports.retire_acknowledged_removals(10);
+    assert_eq!(reports.model_sealed().retractions["Light1"], new, "old connection's sequence was reused");
+    reports.removal_sent("Light1", new, 3);
+    reports.retire_acknowledged_removals(3);
+    assert!(reports.model().states.is_empty());
+}
+
+#[test]
+fn offline_retired_name_bytes_and_changed_queue_are_bounded() {
+    let reports = Reports::new();
+    for i in 0..100 {
+        reports.remove(&format!("{i}{}", "x".repeat(5000)));
+    }
+    assert!(reports.locked().changed.len() < 100);
+    let model = reports.model();
+    assert!(model.states.iter().map(|(name, _, _)| name.len()).sum::<usize>() <= 128 * 1024);
+    assert!(model.states.iter().any(|(name, _, _)| name.starts_with("99x")));
+    reports.remove(&"x".repeat(129 * 1024));
+    assert!(!reports.locked().changed.iter().any(|name| name.len() > 128 * 1024));
+}

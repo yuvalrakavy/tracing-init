@@ -1070,7 +1070,7 @@ impl Lifecycle {
                 // reviews).
                 if self.current(&instance, rt).is_some_and(|rt| matches!(rt.phase, Phase::Live | Phase::Disabled)) {
                     if let Some(slot) = outputs.slot(rt) {
-                        slot.batch.add_model(&device, device.reports.model(), true);
+                        slot.batch.add_model(&device, device.reports.model_sealed(), true);
                     }
                     outputs.announce(rt);
                 }
@@ -1234,7 +1234,7 @@ impl Lifecycle {
         // without persistence lost it (the fleet's F4) — then its reports from now on.
         if let Some((id, _, device)) = fixed {
             if let Some(slot) = outputs.slot(id) {
-                slot.batch.add_model(&device, device.reports.model(), false);
+                slot.batch.add_model(&device, device.reports.model_sealed(), false);
             }
             outputs.announce(id);
         }
@@ -2113,7 +2113,7 @@ impl Lifecycle {
         // to the outbox (`terminal`), so no flood can keep the stop open (R2 gate, Codex 2).
         let (id, device) = (rt.id, rt.device.clone());
         if let Some(slot) = outputs.slot(id) {
-            slot.batch.add(&device, device.reports.take());
+            slot.batch.add(&device, device.reports.take_sealed());
         }
         self.check_retired(ctx, outputs, name).await
     }
@@ -2143,7 +2143,7 @@ impl Lifecycle {
             let mut lost = outputs.slot(id).map_or(0, |slot| std::mem::take(&mut slot.batch).len());
             if device.reports.has_untaken() {
                 let mut batch = Batch::default();
-                batch.add(&device, device.reports.take());
+                batch.add(&device, device.reports.take_sealed());
                 lost += batch.len();
             }
             if lost > 0 {
@@ -2418,7 +2418,7 @@ fn retire_slot(shared: &session::Shared, outputs: &mut Outputs, id: u64, name: &
     let Some(mut slot) = outputs.remove(shared, id) else {
         return;
     };
-    slot.batch.add(&slot.device, slot.device.reports.take());
+    slot.batch.add(&slot.device, slot.device.reports.take_sealed());
     let answers = slot.batch.drain(Part::Answers);
     let unsolicited = slot.batch.drain(Part::Unsolicited);
     if connected {

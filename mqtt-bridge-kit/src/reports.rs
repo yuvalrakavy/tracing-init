@@ -7,7 +7,8 @@
 //! included — until the broker recovered.
 //!
 //! - **Retractions:** a target removed (gone from the device) is published as an empty retained
-//!   `State`, clearing it at the broker, and again after every CONNACK until it is reported again;
+//!   `State`, clearing it at the broker. Unacknowledged cleanup retries after a CONNACK, within
+//!   a 1,024-entry/128-KiB backlog; overflow drops oldest retries with a WARN;
 //!   a property removed leaves the target's `State` without it.
 //! - **The retained model** — `Status`, and each target's latest `State` — is folded in at once,
 //!   before anything waits, so what is published is always the latest, and a publish cut short
@@ -153,6 +154,16 @@ impl<T> Capped<T> {
     }
 }
 
+const REMOVAL_CAP: usize = 1024;
+const REMOVAL_BYTES: usize = 128 * 1024;
+
+#[derive(Debug)]
+struct Removal {
+    context: RequestContext,
+    nonce: u64,
+    enqueued: Option<u64>,
+}
+
 #[derive(Debug)]
 struct State {
     request_policy: Option<RequestPolicy>,
@@ -182,9 +193,10 @@ struct State {
     broker_lost: Option<(Instant, BTreeMap<String, PropertyMap>)>,
     /// The names a driver reported that cannot stand as a topic segment, each said once.
     refused_names: std::collections::BTreeSet<String>,
-    /// Targets removed and not reported since: their `State` is retracted, an empty retained
-    /// payload, after every CONNACK too.
-    removed: BTreeMap<String, RequestContext>,
+    /// Pending retained-State cleanup, retired at PUBACK. Reconnect retries the bounded backlog.
+    removed: BTreeMap<String, Removal>,
+    removal_seq: u64,
+    removal_drops: usize,
     /// What an acknowledged `apply` wrote, by target, until a report gives the key: what the bridge
     /// knows for the conflict rule's snapshots, never published — the device may have clamped it.
     written: BTreeMap<String, PropertyMap>,
@@ -229,6 +241,12 @@ pub struct Model {
     pub status: Option<LinkStatus>,
     /// Each target's `State` document, by target.
     pub states: Vec<(String, Vec<u8>, RequestContext)>,
+}
+
+/// Runtime-only publication metadata, sealed atomically with its public snapshot.
+pub(crate) struct Sealed<T> {
+    pub(crate) snapshot: T,
+    pub(crate) retractions: BTreeMap<String, u64>,
 }
 
 /// What the bridge knows of every target, for the conflict rule: the reported values, and over them
@@ -326,10 +344,7 @@ impl Reports {
             if let Some((_, values)) = &mut state.broker_lost {
                 values.remove(target);
             }
-            state.removed.insert(target.clone(), old.clone());
-            if !state.changed.contains(target) {
-                state.changed.push(target.clone());
-            }
+            Self::remember_removal(&mut state, target, old);
         }
         Ok(retired)
     }
@@ -382,6 +397,8 @@ impl Reports {
                     refused_names: std::collections::BTreeSet::new(),
                     answers: (Vec::new(), Vec::new()),
                     removed: BTreeMap::new(),
+                    removal_seq: 0,
+                    removal_drops: 0,
                     written: BTreeMap::new(),
                 },
             ),
@@ -505,8 +522,8 @@ impl Reports {
     }
 
     /// Retract a target gone from the device: removed from the model, its retained `State` cleared
-    /// (an empty retained payload), after every CONNACK too, until it is reported again. Never
-    /// waits.
+    /// (an empty retained payload). Retry until PUBACK or replacement state, within the bounded
+    /// backlog. Overflow drops oldest cleanup retries with a WARN. Never waits.
     pub fn remove(&self, target: &str) {
         self.remove_with_context(target, &RequestContext::default());
     }
@@ -523,12 +540,71 @@ impl Reports {
             }
             state.targets.remove(target);
             state.written.remove(target);
-            state.removed.insert(target.to_owned(), context.clone());
-            if !state.changed.iter().any(|t| t == target) {
-                state.changed.push(target.to_owned());
-            }
+            Self::remember_removal(&mut state, target, context);
         }
         self.ready.notify_one();
+    }
+
+    fn remember_removal(state: &mut State, target: &str, context: &RequestContext) {
+        state.removal_seq = state.removal_seq.checked_add(1).expect("removal nonce exhausted");
+        state.removed.insert(target.to_owned(), Removal { context: context.clone(), nonce: state.removal_seq, enqueued: None });
+        while state.removed.len() > REMOVAL_CAP
+            || state
+                .removed
+                .iter()
+                .map(|(name, entry)| {
+                    name.len()
+                        + entry.context.generation().map_or(0, str::len)
+                        + entry.context.traceparent().map_or(0, str::len)
+                        + std::mem::size_of::<(String, Removal)>()
+                })
+                .sum::<usize>()
+                > REMOVAL_BYTES
+        {
+            let oldest = state.removed.iter().min_by_key(|(_, entry)| entry.nonce).map(|(name, _)| name.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            state.removed.remove(&oldest);
+            state.changed.retain(|name| name != &oldest || state.targets.contains_key(name));
+            state.removal_drops = state.removal_drops.saturating_add(1);
+        }
+        if state.removed.contains_key(target) && !state.changed.iter().any(|name| name == target) {
+            state.changed.push(target.to_owned());
+        }
+    }
+
+    pub(crate) fn removal_sent(&self, target: &str, nonce: u64, sequence: u64) {
+        if let Some(entry) = self.locked().removed.get_mut(target).filter(|entry| entry.nonce == nonce) {
+            // The first successful enqueue is enough. Repeating it cannot postpone retirement.
+            entry.enqueued.get_or_insert(sequence);
+        }
+    }
+
+    pub(crate) fn removals_connection_started(&self) {
+        for entry in self.locked().removed.values_mut() {
+            entry.enqueued = None;
+        }
+    }
+
+    pub(crate) fn retire_acknowledged_removals(&self, acknowledged: u64) {
+        let mut state = self.locked();
+        let retired: Vec<String> = state
+            .removed
+            .iter()
+            .filter(|(_, entry)| entry.enqueued.is_some_and(|sequence| sequence <= acknowledged))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in retired {
+            state.removed.remove(&name);
+            if !state.targets.contains_key(&name) {
+                state.changed.retain(|changed| changed != &name);
+            }
+        }
+    }
+
+    pub(crate) fn removals_inflight(&self) -> bool {
+        self.locked().removed.values().any(|entry| entry.enqueued.is_some())
     }
 
     /// Retract one property of a target: removed from the model, and the target's `State`
@@ -678,26 +754,35 @@ impl Reports {
 
     /// What changed since the last take; the queued messages are taken out.
     pub fn take(&self) -> Changes {
-        let (changes, errors_ended, events_ended) = {
+        self.take_sealed().snapshot
+    }
+
+    pub(crate) fn take_sealed(&self) -> Sealed<Changes> {
+        let (changes, errors_ended, events_ended, dropped) = {
             let mut state = self.locked();
             let status = if std::mem::take(&mut state.status_changed) { state.status } else { None };
+            let dropped = std::mem::take(&mut state.removal_drops);
+            let retractions =
+                state.changed.iter().filter_map(|target| state.removed.get(target).map(|entry| (target.clone(), entry.nonce))).collect();
             let states = std::mem::take(&mut state.changed)
                 .into_iter()
                 .filter_map(|target| match state.targets.get(&target) {
                     Some(m) => Some((target.clone(), encode_state(&m.values, m.assumed), m.context.clone())),
                     // A retraction: an empty retained payload.
-                    None => state.removed.get(&target).map(|context| (target.clone(), Vec::new(), context.clone())),
+                    None => state.removed.get(&target).map(|entry| (target.clone(), Vec::new(), entry.context.clone())),
                 })
                 .collect();
             let (answer_errors, replies) = std::mem::take(&mut state.answers);
             let errors = state.errors.items.drain(..).collect();
             let events = state.events.items.drain(..).collect();
             (
-                Changes { answer_errors, replies, status, states, errors, events },
+                Sealed { snapshot: Changes { answer_errors, replies, status, states, errors, events }, retractions },
                 state.errors.displacing.take(),
                 state.events.displacing.take(),
+                dropped,
             )
         };
+        Self::say_removal_overflow(dropped);
         if let Some((since, dropped)) = errors_ended {
             info!(
                 kind = "error_report_drop_ended",
@@ -720,13 +805,32 @@ impl Reports {
     /// Everything known, for the session to publish again after a CONNACK; what changed is then
     /// published with it, so it is no longer waiting. Queued messages stay: they are not state.
     pub fn model(&self) -> Model {
+        self.model_sealed().snapshot
+    }
+
+    pub(crate) fn model_sealed(&self) -> Sealed<Model> {
         let mut state = self.locked();
         state.status_changed = false;
         state.changed.clear();
         let mut states: Vec<(String, Vec<u8>, RequestContext)> =
             state.targets.iter().map(|(t, m)| (t.clone(), encode_state(&m.values, m.assumed), m.context.clone())).collect();
-        states.extend(state.removed.iter().map(|(t, context)| (t.clone(), Vec::new(), context.clone())));
-        Model { status: state.status, states }
+        states.extend(state.removed.iter().map(|(t, entry)| (t.clone(), Vec::new(), entry.context.clone())));
+        let retractions = state.removed.iter().map(|(target, entry)| (target.clone(), entry.nonce)).collect();
+        let model = Sealed { snapshot: Model { status: state.status, states }, retractions };
+        let dropped = std::mem::take(&mut state.removal_drops);
+        drop(state);
+        Self::say_removal_overflow(dropped);
+        model
+    }
+
+    fn say_removal_overflow(dropped: usize) {
+        if dropped > 0 {
+            tracing::warn!(
+                kind = "retained_cleanup_overflow",
+                dropped,
+                "Retired MQTT State cleanup exceeded its bounded backlog; oldest retries dropped"
+            );
+        }
     }
 
     /// Wait for a report. Cancellation-safe: a report made meanwhile leaves a permit, and `take` is

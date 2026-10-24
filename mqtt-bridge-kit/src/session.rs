@@ -64,7 +64,7 @@ use crate::lifecycle::Lifecycle;
 use crate::mailbox::{Check, Mailbox, Posted, ReadKey, StateValue};
 use crate::pump::{stall_bound, BrokerOutage, Incoming, Pump, PumpEvent, MAX_CONSECUTIVE_ERRORS};
 use crate::replies::{reply_payload, Answer, ReplyTo};
-use crate::reports::{Changes, Model, Outbound, Reports};
+use crate::reports::{Changes, Model, Outbound, Reports, Sealed};
 use crate::topics::{Inbound, Topics};
 use crate::wire::{self, ErrorReport, Reason};
 
@@ -385,7 +385,7 @@ impl Outputs {
             }
             // Sealed: a new batch only once the last one is published.
             if slot.batch.is_empty() {
-                slot.batch.add(&slot.device, slot.device.reports.take());
+                slot.batch.add(&slot.device, slot.device.reports.take_sealed());
             }
             if slot.batch.is_empty() {
                 continue;
@@ -486,18 +486,19 @@ pub(crate) async fn emit(
     let refused_topic = topic.clone();
     // WAIT: mqtt-request
     let sent = client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await;
-    enqueued(shared, &refused_topic, sent);
+    let _ = enqueued(shared, &refused_topic, sent);
 }
 
 /// What came of a publish: counted when rumqttc took it — the shutdown waits until the pump has
 /// written, and the broker acknowledged, every publish enqueued (the second confirming review's
 /// minor) — else that one message dropped, said at DEBUG.
-fn enqueued(shared: &Shared, topic: &str, sent: Result<(), rumqttc::v5::ClientError>) {
+fn enqueued(shared: &Shared, topic: &str, sent: Result<(), rumqttc::v5::ClientError>) -> Option<u64> {
     match sent {
-        Ok(()) => {
-            shared.enqueued.fetch_add(1, Ordering::SeqCst);
+        Ok(()) => Some(shared.enqueued.fetch_add(1, Ordering::SeqCst) + 1),
+        Err(e) => {
+            debug!(topic, error = %e, "An MQTT publish was refused; this message is dropped");
+            None
         }
-        Err(e) => debug!(topic, error = %e, "An MQTT publish was refused; this message is dropped"),
     }
 }
 
@@ -520,6 +521,9 @@ async fn session(
     // Nothing is published before the CONNACK's duties allow it: the subscriptions come first,
     // and a state published ahead of the read-back's subscription would overwrite the retained
     // state it is there to read.
+    for slot in &outputs.slots {
+        slot.device.reports.removals_connection_started();
+    }
     outputs.session_started();
     // When the broker accepted this session's connection, if it did.
     let mut accepted: Option<Instant> = None;
@@ -532,10 +536,16 @@ async fn session(
         let owed = open && outputs.owed;
         // A SUBSCRIBE or UNSUBSCRIBE waiting for the line to clear of publishes: the pump's next
         // event may clear it (enabled before the check, so no clearing is missed).
-        let line_wait = host.line_wait();
+        if incoming.connected() {
+            let acknowledged = ctx.line.acknowledged();
+            for slot in &outputs.slots {
+                slot.device.reports.retire_acknowledged_removals(acknowledged);
+            }
+        }
+        let line_wait = host.line_wait() || outputs.slots.iter().any(|slot| slot.device.reports.removals_inflight());
         let mut progress = Box::pin(incoming.progress());
         progress.as_mut().enable();
-        let line_cleared = line_wait && ctx.line_clear();
+        let line_cleared = host.line_wait() && ctx.line_clear();
         // The stop first: its flush publishes what is pending anyway (re-gate R15). Then, after a
         // turn of the rotation, the incoming events that are ready — up to READS_PER_BATCH — and
         // the lifecycle's, before the next turn: a steady stream of reports to a broker slow to
@@ -685,6 +695,7 @@ pub(crate) struct Out {
     /// A host's: said before `Active=true` on this connection (multi-device spec §4.6) — the
     /// session's `Active` waits until no such message waits ([`Outputs::firsts_waiting`]).
     first: bool,
+    cleanup: Option<(Arc<Reports>, String, u64)>,
 }
 
 impl Out {
@@ -696,7 +707,7 @@ impl Out {
     pub(crate) fn new(topic: String, retain: bool, payload: Vec<u8>, correlation: Option<bytes::Bytes>, tag: Option<&str>) -> Out {
         let mut properties = tagged(tag);
         properties.correlation_data = correlation;
-        Out { topic, retain, payload, properties, first: false }
+        Out { topic, retain, payload, properties, first: false, cleanup: None }
     }
 
     /// The same, said before `Active=true` (multi-device spec §4.6).
@@ -725,7 +736,9 @@ impl Out {
 }
 
 /// A publish under way: its topic, for the refusal's line, and rumqttc's request.
-type Sending = std::pin::Pin<Box<dyn std::future::Future<Output = (String, Result<(), rumqttc::v5::ClientError>)> + Send>>;
+type CleanupReceipt = (Arc<Reports>, String, u64);
+type Sending =
+    std::pin::Pin<Box<dyn std::future::Future<Output = (String, Result<(), rumqttc::v5::ClientError>, Option<CleanupReceipt>)> + Send>>;
 
 /// A part of a batch, in the order a publication takes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,10 +782,10 @@ pub(crate) struct Batch {
 
 impl Batch {
     /// Add what a device's reports gave, behind what is still waiting.
-    pub(crate) fn add(&mut self, device: &Device, changes: Changes) {
+    pub(crate) fn add(&mut self, device: &Device, changes: Sealed<Changes>) {
         let topics = &device.topics;
         let tag = device.tag.as_deref();
-        let Changes { answer_errors, replies, status, states, errors, events } = changes;
+        let Sealed { snapshot: Changes { answer_errors, replies, status, states, errors, events }, retractions } = changes;
         self.answers.extend(answer_errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None, None).context(&e.context)));
         self.answers.extend(
             replies
@@ -780,11 +793,11 @@ impl Batch {
                 .map(|r| Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation, None).context(&r.context)),
         );
         self.model.extend(status.map(|s| Out::new(topics.status(), true, s.as_str().as_bytes().to_vec(), None, tag)));
-        self.model.extend(
-            states
-                .into_iter()
-                .map(|(target, document, context)| Out::new(topics.state(&target), true, document, None, tag).context(&context)),
-        );
+        self.model.extend(states.into_iter().map(|(target, document, context)| {
+            let mut out = Out::new(topics.state(&target), true, document, None, tag).context(&context);
+            out.cleanup = retractions.get(&target).map(|nonce| (device.reports.clone(), target, *nonce));
+            out
+        }));
         self.unsolicited.extend(errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None, None).context(&e.context)));
         self.unsolicited.extend(
             events
@@ -804,7 +817,8 @@ impl Batch {
     /// the R2 confirming reviews: the model went out by direct publishes, outside the budget).
     /// `first`: said before `Active=true` — a configured instance's, once its read-back is granted
     /// (§4.6); the fixed instance's goes after it, as R1's did.
-    pub(crate) fn add_model(&mut self, device: &Device, model: Model, first: bool) {
+    pub(crate) fn add_model(&mut self, device: &Device, model: Sealed<Model>, first: bool) {
+        let Sealed { snapshot: model, retractions } = model;
         let (topics, tag) = (&device.topics, device.tag.as_deref());
         debug!(targets = model.states.len(), "Publishing the retained model again after a CONNACK");
         let said = |out: Out| if first { out.first() } else { out };
@@ -812,7 +826,9 @@ impl Batch {
             self.push(Part::Model, said(Out::new(topics.status(), true, status.as_str().as_bytes().to_vec(), None, tag)));
         }
         for (target, document, context) in model.states {
-            self.push(Part::Model, said(Out::new(topics.state(&target), true, document, None, tag).context(&context)));
+            let mut out = Out::new(topics.state(&target), true, document, None, tag).context(&context);
+            out.cleanup = retractions.get(&target).map(|nonce| (device.reports.clone(), target, *nonce));
+            self.push(Part::Model, said(out));
         }
     }
 
@@ -868,12 +884,14 @@ impl Batch {
         loop {
             if let Some(sending) = self.sending.as_mut() {
                 // WAIT: mqtt-request
-                let (topic, sent) = sending.await;
+                let (topic, sent, cleanup) = sending.await;
                 self.sending = None;
                 if std::mem::take(&mut self.sending_first) {
                     self.firsts -= 1;
                 }
-                enqueued(shared, &topic, sent);
+                if let (Some(sequence), Some((reports, target, nonce))) = (enqueued(shared, &topic, sent), cleanup) {
+                    reports.removal_sent(&target, nonce, sequence);
+                }
                 handed += 1;
             }
             if handed >= limit {
@@ -892,10 +910,10 @@ impl Batch {
             let client = client.clone();
             self.sending_first = out.first;
             self.sending = Some(Box::pin(async move {
-                let Out { topic, retain, payload, properties, .. } = out;
+                let Out { topic, retain, payload, properties, cleanup, .. } = out;
                 // WAIT: mqtt-request
                 let sent = client.publish_with_properties(topic.clone(), QoS::AtLeastOnce, retain, payload, properties).await;
-                (topic, sent)
+                (topic, sent, cleanup)
             }));
         }
     }
@@ -932,7 +950,7 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
         // confirming reviews 2, Claude minor 3). Its answers and unsolicited reports still go.
         for slot in &mut outputs.slots {
             crate::worker::report_refused(&slot.device.reports, slot.device.mailbox.disconnected(), STOPPED_BEFORE);
-            slot.batch.add(&slot.device, slot.device.reports.take());
+            slot.batch.add(&slot.device, slot.device.reports.take_sealed());
             if !slot.announced {
                 let unpublished = slot.batch.drain(Part::Model).len();
                 if unpublished > 0 {

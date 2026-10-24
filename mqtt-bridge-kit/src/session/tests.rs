@@ -192,7 +192,7 @@ fn a_sealed_batch_keeps_original_context_on_state_replies_errors_and_events() {
     device.reports.request_error(ErrorReport::new(Reason::Rejected, "original failure").context(&original));
     device.reports.observed_event(None, Outbound { context: original, topic: None, payload: b"{}".to_vec(), correlation: None });
     let mut sealed = Batch::default();
-    sealed.add(device, device.reports.take());
+    sealed.add(device, device.reports.take_sealed());
     let next =
         crate::TargetGenerations { instance: "epoch.2".into(), targets: [("Kitchen".into(), "epoch.2".into())].into_iter().collect() };
     device.reports.replace_generations(&table, next).unwrap();
@@ -217,7 +217,7 @@ fn a_sealed_batch_keeps_original_context_on_state_replies_errors_and_events() {
         );
     }
     let mut fresh = Batch::default();
-    fresh.add_model(device, device.reports.model(), false);
+    fresh.add_model(device, device.reports.model_sealed(), false);
     assert_eq!(fresh.model[0].properties.user_properties.iter().find(|(key, _)| key == "target-generation").unwrap().1, "epoch.2");
 }
 
@@ -272,7 +272,7 @@ async fn a_refused_publish_is_one_message_dropped() {
         ],
     };
     let mut batch = Batch::default();
-    batch.add_model(&device, model, false);
+    batch.add_model(&device, Sealed { snapshot: model, retractions: Default::default() }, false);
     let republished = tokio::time::timeout(Duration::from_secs(5), batch.publish(&shared, &client, &IN_TURN, usize::MAX)).await;
     assert!(republished.is_ok(), "the republish did not end");
     let t1 = shared.topics.state("t1");
@@ -797,4 +797,36 @@ fn an_outbox_dropped_at_a_new_session_is_said() {
     assert!(outputs.outbox.is_empty());
     outputs.session_started();
     assert_eq!(capture.of_kind("output_lost_at_session_end").len(), 1, "an empty outbox was said lost");
+}
+
+#[tokio::test]
+async fn an_idle_session_forgets_retired_state_only_after_the_broker_ack() {
+    let broker = FakeBroker::start().await;
+    broker.cap_connections(5);
+    let rig = rig_on(broker.port());
+    let (shared, reports) = (rig.shared.clone(), rig.device.reports.clone());
+    let topic = rig.device.topics.state("RetiredLight");
+    let (stop, mut stopped) = watch::channel(false);
+    let running = tokio::spawn(async move {
+        let mut rig = rig;
+        session(&rig.shared, &mut rig.host, &mut rig.outputs, &mut rig.events, &mut stopped).await
+    });
+    assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&shared.topics.active()).is_empty()).await);
+    assert!(
+        broker
+            .wait_until(Duration::from_secs(5), |b| b.events().iter().any(|e| matches!(e, mqtt_test_broker::BrokerEvent::Unsubscribed(_))))
+            .await
+    );
+    broker.hold_acks();
+    reports.remove("RetiredLight");
+    assert!(broker.wait_until(Duration::from_secs(5), |b| !b.received_on(&topic).is_empty()).await);
+    assert_eq!(reports.model_sealed().retractions.len(), 1, "enqueue alone discarded cleanup");
+    broker.release_acks();
+    // No new reports: the pump's PUBACK progress must wake the idle session.
+    assert!(
+        broker.wait_until(Duration::from_secs(5), |_| reports.model_sealed().retractions.is_empty()).await,
+        "acknowledged cleanup stayed in the reconnect model"
+    );
+    stop.send(true).unwrap();
+    assert!(matches!(tokio::time::timeout(Duration::from_secs(5), running).await, Ok(Ok(SessionEnd::Shutdown))));
 }

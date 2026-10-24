@@ -97,8 +97,10 @@ lost link, never a hang.
 - `ctx.report.state(target, values, assumed?)`: observed or assumed state, from an operation or a
   helper.
 - `ctx.report.remove(target)` and `ctx.report.remove_property(target, property)`: a target gone
-  from the device (its retained `State` cleared with an empty retained payload, after every CONNACK
-  too, until it is reported again), or one property of it.
+  from the device (its retained `State` cleared with an empty retained payload). Cleanup retries
+  after CONNACK until PUBACK, within a 1,024-entry/128-KiB backlog; overflow drops the oldest
+  unconfirmed cleanup retries with a WARN. Public report snapshots keep their existing shape.
+  `remove_property` removes one property of the target.
 - `ctx.report.event(event)`: something that happened.
 - `ctx.spawn(task)`: a helper the runtime owns (an unsolicited-input reader), for the life of the link:
   cancelled when the link drops, and watched — a helper that ends, by returning or panicking, is the
