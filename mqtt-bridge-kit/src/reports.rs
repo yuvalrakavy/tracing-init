@@ -8,7 +8,8 @@
 //!
 //! - **Retractions:** a target removed (gone from the device) is published as an empty retained
 //!   `State`, clearing it at the broker. Unacknowledged cleanup retries after a CONNACK, within
-//!   a 1,024-entry/128-KiB backlog; overflow drops oldest retries with a WARN;
+//!   a 1,024-entry/128-KiB backlog; overflow drops oldest retries and reports a WARN on the
+//!   next snapshot drain. A broker refusal PUBACK is terminal (rumqttc logs its reason);
 //!   a property removed leaves the target's `State` without it.
 //! - **The retained model** — `Status`, and each target's latest `State` — is folded in at once,
 //!   before anything waits, so what is published is always the latest, and a publish cut short

@@ -1,0 +1,62 @@
+[[control]]
+name="retired_name_count"
+file="mqtt-bridge-kit/src/reports.rs"
+anchor="const REMOVAL_CAP: usize = 1024;"
+replacement="const REMOVAL_CAP: usize = usize::MAX;"
+target="command"
+argv=["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(offline_retired_names_do_not_accumulate_without_bound)"]
+expect_text="reports.locked().changed.len() <= 1024"
+
+[[control]]
+name="retired_name_bytes"
+file="mqtt-bridge-kit/src/reports.rs"
+anchor="const REMOVAL_BYTES: usize = 128 * 1024;"
+replacement="const REMOVAL_BYTES: usize = usize::MAX;"
+target="command"
+argv=["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(offline_retired_name_bytes_and_changed_queue_are_bounded)"]
+expect_text="assertion failed"
+
+[[control]]
+name="retired_changed_queue"
+file="mqtt-bridge-kit/src/reports.rs"
+anchor="            state.changed.retain(|name| name != &oldest || state.targets.contains_key(name));"
+replacement="            // mutation: keep names of evicted removals"
+target="command"
+argv=["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(offline_retired_names_do_not_accumulate_without_bound)"]
+expect_text="reports.locked().changed.len() <= 1024"
+
+[[control]]
+name="retired_receipt_nonce"
+file="mqtt-bridge-kit/src/reports.rs"
+anchor="self.locked().removed.get_mut(target).filter(|entry| entry.nonce == nonce)"
+replacement="self.locked().removed.get_mut(target).filter(|_| nonce > 0)"
+target="command"
+argv=["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(retired_name_receipts_cannot_clear_a_new_removal_and_reconnect_retries)"]
+expect_text="no entry found for key"
+
+[[control]]
+name="retired_puback_progress"
+file="mqtt-bridge-kit/src/session.rs"
+anchor="let line_wait = host.line_wait() || outputs.slots.iter().any(|slot| slot.device.reports.removals_inflight());"
+replacement="let line_wait = host.line_wait();"
+target="command"
+argv=["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(an_idle_session_forgets_retired_state_only_after_the_broker_ack)"]
+expect_text="acknowledged cleanup stayed in the reconnect model"
+
+[[control]]
+name="sealed_changes_keeps_original_removal_nonce"
+file="mqtt-bridge-kit/src/session.rs"
+anchor="let Sealed { snapshot: Changes { answer_errors, replies, status, states, errors, events }, retractions } = changes;"
+replacement="let Sealed { snapshot: Changes { answer_errors, replies, status, states, errors, events }, retractions: _ } = changes; let retractions = device.reports.model_sealed().retractions;"
+target="command"
+argv=["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(an_old_sealed_cleanup_cannot_acknowledge_a_new_removal_of_the_same_name)"]
+expect_text="no entry found for key"
+
+[[control]]
+name="sealed_model_keeps_original_removal_nonce"
+file="mqtt-bridge-kit/src/session.rs"
+anchor="let Sealed { snapshot: model, retractions } = model;"
+replacement="let Sealed { snapshot: model, retractions: _ } = model; let retractions = device.reports.model_sealed().retractions;"
+target="command"
+argv=["cargo","nextest","run","--offline","--manifest-path","mqtt-bridge-kit/Cargo.toml","--lib","-E","test(an_old_sealed_cleanup_cannot_acknowledge_a_new_removal_of_the_same_name)"]
+expect_text="no entry found for key"

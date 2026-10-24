@@ -534,8 +534,10 @@ async fn session(
         let wake = host.next_wake();
         let open = outputs.open();
         let owed = open && outputs.owed;
-        // A SUBSCRIBE or UNSUBSCRIBE waiting for the line to clear of publishes: the pump's next
-        // event may clear it (enabled before the check, so no clearing is missed).
+        // Register before reading either watermark: PUBACK is signalled with notify_waiters,
+        // so checking first could lose the final acknowledgement while this session is idle.
+        let mut progress = Box::pin(incoming.progress());
+        progress.as_mut().enable();
         if incoming.connected() {
             let acknowledged = ctx.line.acknowledged();
             for slot in &outputs.slots {
@@ -543,8 +545,6 @@ async fn session(
             }
         }
         let line_wait = host.line_wait() || outputs.slots.iter().any(|slot| slot.device.reports.removals_inflight());
-        let mut progress = Box::pin(incoming.progress());
-        progress.as_mut().enable();
         let line_cleared = host.line_wait() && ctx.line_clear();
         // The stop first: its flush publishes what is pending anyway (re-gate R15). Then, after a
         // turn of the rotation, the incoming events that are ready — up to READS_PER_BATCH — and

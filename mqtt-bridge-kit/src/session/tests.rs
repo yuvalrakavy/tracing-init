@@ -830,3 +830,35 @@ async fn an_idle_session_forgets_retired_state_only_after_the_broker_ack() {
     stop.send(true).unwrap();
     assert!(matches!(tokio::time::timeout(Duration::from_secs(5), running).await, Ok(Ok(SessionEnd::Shutdown))));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_sealed_cleanup_cannot_acknowledge_a_new_removal_of_the_same_name() {
+    for full_model in [false, true] {
+        let broker = FakeBroker::start().await;
+        broker.cap_connections(5);
+        let rig = rig_on(broker.port());
+        let reports = &rig.device.reports;
+        let (client, events) = client(&rig.shared);
+        let (_pump, mut incoming) = Pump::start(events, rig.shared.outage.clone(), Duration::from_secs(10), || {});
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(5), incoming.recv()).await, Ok(Some(PumpEvent::Connected))));
+        let mut batch = Batch::default();
+        reports.remove("RetiredLight");
+        if full_model {
+            let sealed = reports.model_sealed();
+            reports.state("RetiredLight", crate::PropertyMap::new(), false);
+            reports.remove("RetiredLight");
+            batch.add_model(&rig.device, sealed, false);
+        } else {
+            let sealed = reports.take_sealed();
+            reports.state("RetiredLight", crate::PropertyMap::new(), false);
+            reports.remove("RetiredLight");
+            batch.add(&rig.device, sealed);
+        }
+        let newer = reports.model_sealed().retractions["RetiredLight"];
+        assert!(tokio::time::timeout(Duration::from_secs(5), batch.publish(&rig.shared, &client, &IN_TURN, usize::MAX)).await.is_ok());
+        assert!(broker.wait_until(Duration::from_secs(5), |_| incoming.line().acknowledged() >= 1).await);
+        reports.retire_acknowledged_removals(incoming.line().acknowledged());
+        assert_eq!(reports.model_sealed().retractions["RetiredLight"], newer, "old sealed model={full_model} retired the newer removal");
+        assert!(!reports.removals_inflight(), "the newer removal was incorrectly marked sent");
+    }
+}

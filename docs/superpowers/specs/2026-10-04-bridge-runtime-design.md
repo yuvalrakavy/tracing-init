@@ -99,7 +99,9 @@ lost link, never a hang.
 - `ctx.report.remove(target)` and `ctx.report.remove_property(target, property)`: a target gone
   from the device (its retained `State` cleared with an empty retained payload). Cleanup retries
   after CONNACK until PUBACK, within a 1,024-entry/128-KiB backlog; overflow drops the oldest
-  unconfirmed cleanup retries with a WARN. Public report snapshots keep their existing shape.
+  unconfirmed cleanup retries with a WARN on the next snapshot drain. A refusal PUBACK is
+  terminal and rumqttc logs its reason; it is not retried indefinitely. Public report snapshots
+  keep their existing shape.
   `remove_property` removes one property of the target.
 - `ctx.report.event(event)`: something that happened.
 - `ctx.spawn(task)`: a helper the runtime owns (an unsolicited-input reader), for the life of the link:
