@@ -133,6 +133,7 @@ async fn isolated_mosquitto_orders_retained_snapshot_before_the_later_barrier_ac
         .instance("i")
         .broker(&format!("127.0.0.1:{}", broker.port))
         .recovery(RecoveryOptions { target: "_recovery".into(), max_bytes: 4096 })
+        .buffers(BufferLimits { incoming_bytes: 1024 * 1024, reply_bytes: 1024 * 1024 })
         .start_managed(Owner { calls: Calls::default(), handle: send })
         .await
         .unwrap();

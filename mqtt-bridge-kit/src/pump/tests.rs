@@ -50,7 +50,7 @@ fn requests_left_unread_when_the_session_ends_are_reported() {
     for _ in 0..HIGH_WATER {
         backlog.pushed();
         let publish = Publish::new("t", QoS::AtLeastOnce, "x", None);
-        assert!(tx.send(PumpEvent::Publish(publish, std::time::Instant::now())).is_ok());
+        assert!(tx.send(PumpEvent::Publish(publish, std::time::Instant::now()).into()).is_ok());
     }
     drop(Incoming {
         rx,
@@ -159,6 +159,7 @@ fn mqtt_side_through(relay: &Relay, timing: MqttTiming, stop: tokio::sync::watch
     let topics = crate::topics::Topics::new("T", "outage").expect("topics");
     let ready = Arc::new(tokio::sync::Notify::new());
     let shared = Arc::new(crate::session::Shared {
+        buffers: None,
         topics: topics.clone(),
         broker_host: host.to_owned(),
         broker_port: port.parse().expect("the relay's port"),

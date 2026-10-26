@@ -644,7 +644,7 @@ impl Lifecycle {
             topics: Topics::new(&self.settings.root, name)?,
             commands: info.info.commands.clone().into(),
             mailbox: Mailbox::new(),
-            reports: Reports::with_ready(self.ready.clone()),
+            reports: Reports::with_buffers(self.ready.clone(), self.shared.buffers.clone()),
             tag: None,
             request_lifetime_limit: self.shared.request_lifetime_limit,
             span: span.clone(),
@@ -1634,6 +1634,17 @@ impl Lifecycle {
     /// yet published is dropped (WARN `output_lost_at_session_end`), as R1 drops unpublished output
     /// at process shutdown; the next CONNACK bootstraps every owned instance again.
     pub(crate) async fn on_session_lost(&mut self, outputs: &mut Outputs) {
+        if self.shared.buffers.is_some() {
+            let mut discarded = 0;
+            for slot in &mut outputs.slots {
+                discarded += slot.device.reports.discard_buffered_answers();
+                slot.batch = Batch::default();
+            }
+            outputs.outbox = Batch::default();
+            if discarded > 0 {
+                info!(discarded, "Unpublished terminal answers abandoned with their bounded MQTT connection");
+            }
+        }
         if let Some(recovery) = &self.recovery {
             recovery.lost();
         }

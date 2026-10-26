@@ -153,6 +153,7 @@ pub struct Host {
     /// over at the start; no factory, no Configs.
     fixed: bool,
     request_lifetime_limit: Option<Duration>,
+    buffers: Option<crate::BufferLimits>,
     pub(crate) recovery: Option<crate::RecoveryOptions>,
     pub(crate) recovery_shared: Option<Arc<crate::recovery::RecoveryShared>>,
 }
@@ -195,6 +196,7 @@ impl Host {
             factory: None,
             fixed: false,
             request_lifetime_limit: None,
+            buffers: None,
             recovery: None,
             recovery_shared: None,
         }
@@ -212,6 +214,13 @@ impl Host {
         }
         self.recovery = Some(options);
         self.recovery_shared = None;
+        self
+    }
+    pub(crate) fn buffers(mut self, limits: crate::BufferLimits) -> Host {
+        if let Err(error) = limits.validate() {
+            return self.usage_error(error);
+        }
+        self.buffers = Some(limits);
         self
     }
 
@@ -492,6 +501,7 @@ impl Host {
         };
         let ready = Arc::new(Notify::new());
         let shared = Arc::new(session::Shared {
+            buffers: self.buffers.map(crate::buffering::Buffers::new),
             topics,
             broker_host,
             broker_port,

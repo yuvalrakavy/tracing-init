@@ -16,10 +16,13 @@
 //!   (its session ended) loses nothing: the next session publishes the whole model again after its
 //!   CONNACK ([`Reports::model`]). Between takes a target's states coalesce to its latest; one that
 //!   did not change is not published again.
-//! - **`Error` and `Event`** (replies included) are events, queued in order: at most
+//! - **Unsolicited `Error` and `Event`** are events, queued in order: at most
 //!   [`ERROR_CAP`] and [`EVENT_CAP`], the oldest displaced past it — one WARN
 //!   (`error_report_dropped`, `event_report_dropped`) when an episode of displacement starts, and an
 //!   INFO (`…_drop_ended`, with how many and how long) once the session takes the queue.
+//!   Terminal answers are separate: uncapped by default. An opt-in byte budget follows
+//!   each answer through the sealed batch and MQTT acknowledgment. Exhaustion closes
+//!   the MQTT connection without waiting in the device/managed engine.
 //! - **The read-back:** the bridge's own retained `State` as it found it at start, for the outage
 //!   conflict rule's "before" values after a restart (Store kit spec §4.5). Never published.
 //! - **The broker-loss snapshot:** the model as it stood when the MQTT connection was last lost —
@@ -47,7 +50,7 @@ use crate::wire::{encode_state, ErrorReport};
 
 /// `Error` messages that may wait for the session; past it, the oldest is displaced.
 pub const ERROR_CAP: usize = 64;
-/// `Event` messages (replies included) that may wait for the session; past it, the oldest is
+/// Unsolicited `Event` messages that may wait for the session; past it, the oldest is
 /// displaced.
 pub const EVENT_CAP: usize = 64;
 
@@ -178,10 +181,10 @@ struct State {
     errors: Capped<ErrorReport>,
     events: Capped<Outbound>,
     /// Answers to requests: every reply (an `Outbound` with a response topic), and every terminal
-    /// `Error` of a request — uncapped, bounded by what the mailbox holds and the Store asks: the
-    /// capped queues displace only unsolicited reports, never an answer (Codex final gate 2, second
-    /// final gate 1, confirming review 2).
+    /// `Error` of a request. Uncapped by default; an opt-in byte budget retries MQTT
+    /// on exhaustion. Unsolicited report caps never displace an answer.
     answers: (Vec<ErrorReport>, Vec<Outbound>),
+    answer_charges: crate::buffering::AnswerCharges,
     readback: BTreeMap<String, PropertyMap>,
     /// The read-back as it stood when it was first done, complete or not: the conflict rule's
     /// "before" values, which a retained State arriving later does not change in mid-process
@@ -208,6 +211,7 @@ struct State {
 /// See the module documentation.
 #[derive(Debug)]
 pub struct Reports {
+    buffers: Option<Arc<crate::buffering::Buffers>>,
     mailbox: OnceLock<Weak<crate::mailbox::Mailbox>>,
     state: Mutex<State>,
     /// Told after every report; one per session — every device of a multi-device host shares it
@@ -257,6 +261,7 @@ pub struct Model {
 pub(crate) struct Sealed<T> {
     pub(crate) snapshot: T,
     pub(crate) retractions: BTreeMap<String, u64>,
+    pub(crate) charges: crate::buffering::AnswerCharges,
 }
 
 /// What the bridge knows of every target, for the conflict rule: the reported values, and over them
@@ -416,6 +421,7 @@ impl Reports {
         state.readback_level = 2;
         state.broker_lost = None;
         state.answers = (Vec::new(), Vec::new());
+        state.answer_charges = Default::default();
         state.errors = Capped::new(ERROR_CAP);
         state.events = Capped::new(EVENT_CAP);
         state.removed.clear();
@@ -467,7 +473,11 @@ impl Reports {
     /// An empty model whose reports tell `ready` — the session's one signal, shared by every device
     /// of a multi-device host (multi-device spec §4.7).
     pub fn with_ready(ready: Arc<Notify>) -> Arc<Reports> {
+        Self::with_buffers(ready, None)
+    }
+    pub(crate) fn with_buffers(ready: Arc<Notify>, buffers: Option<Arc<crate::buffering::Buffers>>) -> Arc<Reports> {
         Arc::new(Reports {
+            buffers,
             mailbox: OnceLock::new(),
             state: Mutex::new(
                 "reports-lock",
@@ -487,6 +497,7 @@ impl Reports {
                     broker_lost: None,
                     refused_names: std::collections::BTreeSet::new(),
                     answers: (Vec::new(), Vec::new()),
+                    answer_charges: Default::default(),
                     removed: BTreeMap::new(),
                     removal_seq: 0,
                     removal_drops: 0,
@@ -796,10 +807,30 @@ impl Reports {
     }
 
     /// An `Event` message, or a reply. Never waits: past [`EVENT_CAP`] waiting, the oldest event
-    /// goes; a reply — it has a response topic — is an answer, and is never displaced.
+    /// goes. A reply has a response topic and is never displaced by unsolicited events.
+    /// Opt-in reply-budget exhaustion requests an MQTT retry instead of waiting.
     pub fn event(&self, message: Outbound) {
         if message.topic.is_some() {
-            self.locked().answers.1.push(message);
+            let bytes = message
+                .payload
+                .len()
+                .saturating_add(message.topic.as_ref().map_or(0, String::len))
+                .saturating_add(message.correlation.as_ref().map_or(0, Bytes::len))
+                .saturating_add(crate::buffering::context_bytes(&message.context))
+                .saturating_add(256);
+            let charge = match &self.buffers {
+                Some(buffers) => match buffers.reserve_reply(bytes) {
+                    Some(charge) => Some(charge),
+                    None => return,
+                },
+                None => None,
+            };
+            let mut state = self.locked();
+            if let Some(charge) = charge {
+                state.answer_charges.replies.push_back(charge);
+            }
+            state.answers.1.push(message);
+            drop(state);
             self.ready.notify_one();
             return;
         }
@@ -825,16 +856,40 @@ impl Reports {
         self.ready.notify_one();
     }
 
-    /// A request's terminal `Error` — its failure, a refusal, a supersession: an answer, past
-    /// every cap; the capped queue keeps only unsolicited reports (confirming
-    /// review 2). Never waits.
+    /// A request's terminal Error, separate from unsolicited caps. An opt-in byte
+    /// budget requests an MQTT retry on exhaustion; this call never waits for MQTT.
     pub fn request_error(&self, report: ErrorReport) {
-        self.locked().answers.0.push(report);
+        let charge = match &self.buffers {
+            Some(buffers) => {
+                let bytes = report.encode().len().saturating_add(crate::buffering::context_bytes(&report.context)).saturating_add(256);
+                match buffers.reserve_reply(bytes) {
+                    Some(charge) => Some(charge),
+                    None => return,
+                }
+            }
+            None => None,
+        };
+        let mut state = self.locked();
+        if let Some(charge) = charge {
+            state.answer_charges.errors.push_back(charge);
+        }
+        state.answers.0.push(report);
+        drop(state);
         self.ready.notify_one();
     }
 
-    /// Refused commands' `Error`s and replies: answers, past every cap. Never waits.
+    /// Refused commands' Errors and replies, subject to an optional answer byte budget.
+    /// Never waits for MQTT.
     pub fn refused(&self, errors: Vec<ErrorReport>, replies: Vec<Outbound>) {
+        if self.buffers.is_some() {
+            for error in errors {
+                self.request_error(error);
+            }
+            for reply in replies {
+                self.event(reply);
+            }
+            return;
+        }
         {
             let mut state = self.locked();
             state.answers.0.extend(errors);
@@ -846,6 +901,17 @@ impl Reports {
     /// What changed since the last take; the queued messages are taken out.
     pub fn take(&self) -> Changes {
         self.take_sealed().snapshot
+    }
+
+    pub(crate) fn discard_buffered_answers(&self) -> usize {
+        if self.buffers.is_none() {
+            return 0;
+        }
+        let mut state = self.locked();
+        let discarded = state.answers.0.len() + state.answers.1.len();
+        state.answers = Default::default();
+        state.answer_charges = Default::default();
+        discarded
     }
 
     pub(crate) fn take_sealed(&self) -> Sealed<Changes> {
@@ -864,10 +930,11 @@ impl Reports {
                 })
                 .collect();
             let (answer_errors, replies) = std::mem::take(&mut state.answers);
+            let charges = std::mem::take(&mut state.answer_charges);
             let errors = state.errors.items.drain(..).collect();
             let events = state.events.items.drain(..).collect();
             (
-                Sealed { snapshot: Changes { answer_errors, replies, status, states, errors, events }, retractions },
+                Sealed { snapshot: Changes { answer_errors, replies, status, states, errors, events }, retractions, charges },
                 state.errors.displacing.take(),
                 state.events.displacing.take(),
                 dropped,
@@ -907,7 +974,7 @@ impl Reports {
             state.targets.iter().map(|(t, m)| (t.clone(), encode_state(&m.values, m.assumed), m.context.clone())).collect();
         states.extend(state.removed.iter().map(|(t, entry)| (t.clone(), Vec::new(), entry.context.clone())));
         let retractions = state.removed.iter().map(|(target, entry)| (target.clone(), entry.nonce)).collect();
-        let model = Sealed { snapshot: Model { status: state.status, states }, retractions };
+        let model = Sealed { snapshot: Model { status: state.status, states }, retractions, charges: Default::default() };
         let dropped = std::mem::take(&mut state.removal_drops);
         drop(state);
         Self::say_removal_overflow(dropped);

@@ -189,6 +189,10 @@ impl PanicReports {
 pub struct Bridge(Host);
 
 impl Bridge {
+    /// Bound MQTT forwarding and terminal replies; exhaustion retries MQTT only.
+    pub fn buffers(self, limits: crate::BufferLimits) -> Bridge {
+        Bridge(self.0.buffers(limits))
+    }
     /// Require a completed retained-snapshot replay and explicit engine install
     /// on every connection. Use with a managed service; legacy bootstrap is unchanged.
     pub fn recovery(self, options: crate::RecoveryOptions) -> Bridge {

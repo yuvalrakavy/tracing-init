@@ -146,9 +146,13 @@ struct Rig {
 }
 
 fn rig_on(port: u16) -> Rig {
+    rig_with_buffers(port, None)
+}
+fn rig_with_buffers(port: u16, buffers: Option<Arc<crate::buffering::Buffers>>) -> Rig {
     let topics = Topics::new("T", "session").expect("topics");
     let ready = Arc::new(tokio::sync::Notify::new());
     let shared = Arc::new(Shared {
+        buffers: buffers.clone(),
         topics: topics.clone(),
         broker_host: "127.0.0.1".into(),
         broker_port: port,
@@ -164,7 +168,7 @@ fn rig_on(port: u16) -> Rig {
         topics,
         commands: Vec::new().into(),
         mailbox: Mailbox::new(),
-        reports: Reports::with_ready(ready),
+        reports: Reports::with_buffers(ready, buffers),
         tag: None,
         request_lifetime_limit: None,
         span: tracing::Span::none(),
@@ -186,6 +190,48 @@ fn metadata_device() -> Device {
         request_lifetime_limit: Some(Duration::from_secs(20)),
         span: Span::none(),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_exhaustion_interrupts_publication_blocked_on_the_mqtt_request_channel() {
+    let broker = FakeBroker::start_with_receive_max(1).await;
+    let buffers = crate::buffering::Buffers::new(crate::BufferLimits { incoming_bytes: 65536, reply_bytes: 1024 });
+    let rig = rig_with_buffers(broker.port(), Some(buffers));
+    let (shared, reports) = (rig.shared.clone(), rig.device.reports.clone());
+    let (_stop, mut stopped) = watch::channel(false);
+    let running = tokio::spawn(async move {
+        let mut rig = rig;
+        session(&rig.shared, &mut rig.host, &mut rig.outputs, &mut rig.events, &mut stopped).await
+    });
+    assert!(
+        broker
+            .wait_until(Duration::from_secs(2), |broker| broker
+                .events()
+                .iter()
+                .any(|event| matches!(event, mqtt_test_broker::BrokerEvent::Unsubscribed(_))))
+            .await
+    );
+    let baseline = shared.enqueued.load(std::sync::atomic::Ordering::SeqCst);
+    broker.hold_acks();
+    for target in 0..400 {
+        reports.state(&format!("m{target:04}"), serde_json::json!({"level": target}).as_object().unwrap().clone(), false);
+    }
+    // One packet is held by the broker, 100 by the client's request channel.
+    // 101 is inside the 32-message quantum, so the next send waits in that same turn.
+    assert!(
+        broker.wait_until(Duration::from_secs(2), |_| shared.enqueued.load(std::sync::atomic::Ordering::SeqCst) >= baseline + 101).await,
+        "fixture did not fill the actual MQTT request channel"
+    );
+    reports.event(Outbound {
+        context: crate::RequestContext::default(),
+        topic: Some("Client/replies".into()),
+        payload: vec![0; 1024],
+        correlation: None,
+    });
+    assert!(
+        matches!(tokio::time::timeout(Duration::from_secs(2), running).await, Ok(Ok(SessionEnd::Ended { .. }))),
+        "reply overflow waited behind a blocked MQTT publish"
+    );
 }
 
 #[test]
@@ -379,7 +425,7 @@ async fn a_refused_publish_is_one_message_dropped() {
         ],
     };
     let mut batch = Batch::default();
-    batch.add_model(&device, Sealed { snapshot: model, retractions: Default::default() }, false);
+    batch.add_model(&device, Sealed { snapshot: model, retractions: Default::default(), charges: Default::default() }, false);
     let republished = tokio::time::timeout(Duration::from_secs(5), batch.publish(&shared, &client, &IN_TURN, usize::MAX)).await;
     assert!(republished.is_ok(), "the republish did not end");
     let t1 = shared.topics.state("t1");

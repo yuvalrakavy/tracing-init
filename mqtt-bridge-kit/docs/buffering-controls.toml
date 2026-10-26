@@ -1,0 +1,220 @@
+# New controls for opt-in MQTT buffering. Existing control tables are plan-checked.
+[[control]]
+name = "reply_overflow_cannot_interrupt_a_blocked_publish"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = "() = crate::buffering::overflowed(buffers.clone()) => Ok(Some(SessionEnd::Ended { connected: None })),"
+replacement = "// faulty: overflow waits behind the in-progress publish"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(reply_exhaustion_interrupts_publication_blocked)"]
+expect_text = "reply overflow waited behind a blocked MQTT publish"
+
+[[control]]
+name = "buffer_limits_are_not_wired_into_the_launched_session"
+file = "mqtt-bridge-kit/src/host.rs"
+anchor = "buffers: self.buffers.map(crate::buffering::Buffers::new),"
+replacement = "buffers: None,"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(incoming_budget_exhaustion)"]
+expect_text = "incoming budget exhaustion did not retry the MQTT connection"
+
+[[control]]
+name = "incoming_accounting_checks_only_individual_messages"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "if next > self.limit {"
+replacement = "if bytes > self.limit {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(unread_pump_publications)"]
+expect_text = "many small unread publishes escaped the aggregate incoming budget"
+
+[[control]]
+name = "byte_accounting_wraps_on_addition"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "let next = used.checked_add(bytes)?;"
+replacement = "let next = used.wrapping_add(bytes);"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(byte_reservation_rejects_overflow)"]
+expect_text = "byte accounting wrapped past its ceiling"
+
+[[control]]
+name = "incoming_budget_ignores_decoded_user_property_storage"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "properties.user_properties.capacity().saturating_mul(std::mem::size_of::<(String, String)>())"
+replacement = "0"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(byte_reservation_rejects_overflow)"]
+expect_text = "decoded MQTT metadata bypassed incoming accounting"
+
+[[control]]
+name = "incoming_charge_is_released_before_queue_dispatch"
+file = "mqtt-bridge-kit/src/pump.rs"
+anchor = "Queued { event: forward, _charge: charge }"
+replacement = "{ drop(charge); Queued { event: forward, _charge: None } }"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(unread_pump_publications)"]
+expect_text = "many small unread publishes escaped the aggregate incoming budget"
+
+[[control]]
+name = "reply_charge_is_lost_during_sealing_into_the_batch"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = ".charged(charges.replies.pop_front())"
+replacement = ".charged(None)"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(replies_keep_their_budget_through_stalled_pubacks)"]
+expect_text = "reply budget exhaustion did not interrupt stalled MQTT publication"
+
+[[control]]
+name = "reply_charge_is_freed_at_client_enqueue"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).sent.insert(sequence, Flight { packet: None, _charge: charge });"
+replacement = "let _ = sequence; drop(charge);"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(replies_keep_their_budget_through_stalled_pubacks)"]
+expect_text = "reply budget exhaustion did not interrupt stalled MQTT publication"
+
+[[control]]
+name = "reply_capacity_credits_an_unrelated_outgoing_sequence"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "state.sent.get_mut(&sequence)"
+replacement = "state.sent.values_mut().next()"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(charges_survive_handoff)"]
+expect_text = "an unrelated outgoing sequence released reply capacity"
+
+[[control]]
+name = "reply_capacity_credits_an_unrelated_puback"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "state.sent.retain(|_, flight| flight.packet != Some(packet));"
+replacement = "state.sent.clear();"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(charges_survive_handoff)"]
+expect_text = "an unrelated outgoing sequence released reply capacity"
+
+[[control]]
+name = "acknowledging_reply_capacity_never_releases_the_charge"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "self.budget.used.fetch_sub(self.bytes, Ordering::SeqCst);"
+replacement = "// faulty: leak the byte reservation"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(charges_survive_handoff)"]
+expect_text = "exact PUBACK did not release reply capacity"
+
+[[control]]
+name = "new_connection_keeps_old_reply_packet_charges"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "state.sent.clear();"
+replacement = "// faulty: keep the prior connection's flight table"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(charges_survive_handoff)"]
+expect_text = "new connection kept the old in-flight reply budget"
+
+[[control]]
+name = "old_connection_rebinds_a_new_reply_packet"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = '''if !self.current(&state) {
+            return;
+        }
+        if packet != 0 {'''
+replacement = "if packet != 0 {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(charges_survive_handoff)"]
+expect_text = "old connection rebound a new outgoing packet"
+
+[[control]]
+name = "old_connection_credits_a_reused_reply_packet"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = '''if !self.current(&state) {
+            return;
+        }
+        state.sent.retain'''
+replacement = "state.sent.retain"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(charges_survive_handoff)"]
+expect_text = "old connection credited a reused packet identifier"
+
+[[control]]
+name = "old_pump_trips_a_successor_connections_budget"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "if !self.current(&state) || state.overflow.is_some() {"
+replacement = "if state.overflow.is_some() {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(charges_survive_handoff)"]
+expect_text = "an old pump tripped the new connection's budget"
+
+[[control]]
+name = "startup_erases_an_already_reported_reply_overflow"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "if state.started {"
+replacement = "if true {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(overflow_notifications_survive_idle)"]
+expect_text = "startup erased an earlier reply overflow"
+
+[[control]]
+name = "overflow_waiter_trusts_only_a_future_notification"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "if connection.reason().is_some() {"
+replacement = "if false {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(overflow_notifications_survive_idle)"]
+expect_text = "overflow was lost before the session registered its waiter"
+
+[[control]]
+name = "broker_loss_snapshot_can_be_taken_twice"
+file = "mqtt-bridge-kit/src/buffering.rs"
+anchor = "if !self.current(&state) || state.loss_taken {"
+replacement = "if !self.current(&state) {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(charges_survive_handoff)"]
+expect_text = "broker-loss snapshot was taken twice"
+
+[[control]]
+name = "terminal_errors_bypass_their_reply_byte_charge"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "let bytes = report.encode().len().saturating_add(crate::buffering::context_bytes(&report.context)).saturating_add(256);"
+replacement = "let bytes = 1;"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(terminal_errors_and_batch_refusals)"]
+expect_text = "terminal Errors escaped reply accounting"
+
+[[control]]
+name = "refusal_batches_bypass_reply_admission"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = '''if self.buffers.is_some() {
+            for error in errors {'''
+replacement = '''if false {
+            for error in errors {'''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(terminal_errors_and_batch_refusals)"]
+expect_text = "batch refusals bypassed terminal reply accounting"
+
+[[control]]
+name = "local_queue_pressure_is_reported_as_broker_failure"
+file = "mqtt-bridge-kit/src/pump.rs"
+anchor = "if broker_failure {"
+replacement = "if true {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(unread_pump_publications)"]
+expect_text = "local buffer exhaustion was mislabeled as an unreachable broker"
+
+[[control]]
+name = "invalid_buffer_limits_start_the_managed_engine"
+file = "mqtt-bridge-kit/src/host.rs"
+anchor = '''if let Err(error) = limits.validate() {
+            return self.usage_error(error);
+        }'''
+replacement = "// faulty: admit a zero-capacity buffer"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(buffer_limits_refuse_zero)"]
+expect_text = "invalid buffer limits started a bridge"
+
+[[control]]
+name = "cloned_builders_share_their_live_buffer_coordinator"
+file = "mqtt-bridge-kit/src/host.rs"
+anchor = "buffers: self.buffers.map(crate::buffering::Buffers::new),"
+replacement = '''buffers: self.buffers.map(|limits| {
+                static SHARED: std::sync::OnceLock<std::sync::Arc<crate::buffering::Buffers>> = std::sync::OnceLock::new();
+                SHARED.get_or_init(|| crate::buffering::Buffers::new(limits)).clone()
+            }),'''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(cloned_builders_do_not_share_buffer_exhaustion)"]
+expect_text = "another bridge's buffering state prevented a healthy reply"

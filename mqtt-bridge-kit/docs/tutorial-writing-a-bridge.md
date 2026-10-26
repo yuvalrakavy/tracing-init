@@ -1140,6 +1140,13 @@ packet, and can report a broker refusal or packet-size fault. Keep the latest lo
 image across link loss and seed it again after the next completed readback. RecoveryOnly
 images must have no snapshot, preserving the broker's existing recovery evidence.
 
+For a managed engine that keeps rendering during MQTT pressure, opt into
+`Bridge::buffers(BufferLimits { incoming_bytes, reply_bytes })`. The runtime then
+retries MQTT if those queues exhaust their byte capacity, including while a publish
+is blocked. Keep the engine loop independent of reply delivery; an unanswered call
+can time out after its engine change committed. See [bounded MQTT buffering](../README.md#bounded-mqtt-buffering)
+for the accounting scope and exact acknowledgment lifetime.
+
 ## A checklist before you ship a driver
 
 - `info()` declares what is true: `writes`, `feedback`, every command and its class. A driver with

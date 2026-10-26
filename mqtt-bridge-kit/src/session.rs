@@ -132,6 +132,7 @@ impl Default for MqttTiming {
 /// The session part (multi-device spec §4.1): what every session shares, for the life of the
 /// bridge or host.
 pub(crate) struct Shared {
+    pub buffers: Option<Arc<crate::buffering::Buffers>>,
     /// The process's own lanes — `Active/{bridge id}` (and its last will) and `Version/{bridge
     /// id}` — and its MQTT client id. A fixed bridge's bridge id is its instance.
     pub topics: Topics,
@@ -541,12 +542,19 @@ async fn session(
     // When the connection is lost, what the bridge knew then is the conflict rule's "before" values
     // for what the broker replays on the next one (review B1).
     let lost = shared.clone();
-    let (_pump, mut incoming) = Pump::start_with_receipts(
+    let buffers = shared.buffers.as_ref().map(|buffers| buffers.begin());
+    let lost_buffers = buffers.clone();
+    let (_pump, mut incoming) = Pump::start_with_buffers(
         pump_events,
         shared.outage.clone(),
         stall_bound(shared.timing.keep_alive),
-        move || lost.broker_lost(),
-        host.recovery.is_some(),
+        move || {
+            if lost_buffers.as_ref().map_or(true, |buffers| buffers.claim_loss()) {
+                lost.broker_lost();
+            }
+        },
+        host.recovery.is_some() || buffers.is_some(),
+        buffers.clone(),
     );
     // Nothing is published before the CONNACK's duties allow it: the subscriptions come first,
     // and a state published ahead of the read-back's subscription would overwrite the retained
@@ -599,6 +607,7 @@ async fn session(
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
+                () = crate::buffering::overflowed(buffers.clone()) => Step::Overflow,
                 () = sleep_until(wake) => Step::Tick,
                 () = host.recovery_changed() => Step::Recovery,
                 () = std::future::ready(()), if line_cleared => Step::Line,
@@ -613,6 +622,7 @@ async fn session(
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
+                () = crate::buffering::overflowed(buffers.clone()) => Step::Overflow,
                 () = sleep_until(wake) => Step::Tick,
                 () = host.recovery_changed() => Step::Recovery,
                 () = std::future::ready(()), if line_cleared => Step::Line,
@@ -635,6 +645,7 @@ async fn session(
         }
         let work = async {
             match step {
+                Step::Overflow => Ok(Some(SessionEnd::Ended { connected: None })),
                 Step::Recovery => host.on_recovery(&ctx, outputs).await.map(|()| None),
                 Step::Event(Some(PumpEvent::Connected)) => host.on_connack(&ctx, outputs).await.map(|()| None),
                 Step::Event(Some(PumpEvent::Publish(publish, received))) => {
@@ -644,6 +655,13 @@ async fn session(
                 }
                 Step::Event(Some(PumpEvent::Disconnected)) => Ok(None),
                 Step::Event(Some(event @ (PumpEvent::Publishing { .. } | PumpEvent::PubAck { .. }))) => {
+                    if let Some(buffers) = &buffers {
+                        match &event {
+                            PumpEvent::Publishing { sequence, pkid } => buffers.written(*sequence, *pkid),
+                            PumpEvent::PubAck { pkid, .. } => buffers.acknowledged(*pkid),
+                            _ => {}
+                        }
+                    }
                     host.on_publication(event);
                     host.on_line(&ctx, outputs).await.map(ended)
                 }
@@ -657,7 +675,7 @@ async fn session(
                 // The pump went without a word — it panicked — so it never said the connection was
                 // lost: the broker snapshot is taken here (Claude's re-gate minor 14).
                 Step::Event(None) => {
-                    if accepted.is_some() {
+                    if accepted.is_some() && buffers.as_ref().map_or(true, |buffers| buffers.claim_loss()) {
                         shared.broker_lost();
                     }
                     Ok(Some(SessionEnd::Ended { connected: None }))
@@ -676,11 +694,22 @@ async fn session(
         // WAIT: session-work
         let done = tokio::select! {
             done = work => done,
+            () = crate::buffering::overflowed(buffers.clone()) => Ok(Some(SessionEnd::Ended { connected: None })),
             _ = shutdown.wait_for(|stop| *stop) => Ok(Some(SessionEnd::Shutdown)),
         };
         match done {
             Ok(None) => {}
             Ok(Some(SessionEnd::Ended { .. })) => {
+                if let Some(reason) = buffers.as_ref().and_then(|buffers| buffers.reason()) {
+                    info!(
+                        kind = "mqtt_buffer_full",
+                        queue = reason.as_str(),
+                        "MQTT buffering exhausted; retrying the connection while the managed service keeps running"
+                    );
+                    if incoming.connected() && buffers.as_ref().is_some_and(|buffers| buffers.claim_loss()) {
+                        shared.broker_lost();
+                    }
+                }
                 host.on_session_lost(outputs).await;
                 return SessionEnd::Ended { connected: accepted };
             }
@@ -714,6 +743,7 @@ async fn sleep_until(at: Option<Instant>) {
 // Transient: one per pass of the session's loop, never stored.
 #[allow(clippy::large_enum_variant)]
 enum Step {
+    Overflow,
     Recovery,
     Event(Option<PumpEvent>),
     Lifecycle(Event),
@@ -726,6 +756,7 @@ enum Step {
 
 /// One message of a batch, ready to publish.
 pub(crate) struct Out {
+    charge: Option<crate::buffering::Charge>,
     topic: String,
     retain: bool,
     payload: bytes::Bytes,
@@ -746,12 +777,13 @@ impl Out {
     pub(crate) fn new(topic: String, retain: bool, payload: Vec<u8>, correlation: Option<bytes::Bytes>, tag: Option<&str>) -> Out {
         let mut properties = tagged(tag);
         properties.correlation_data = correlation;
-        Out { topic, retain, payload: payload.into(), properties, first: false, cleanup: None, publication: None }
+        Out { topic, retain, payload: payload.into(), properties, first: false, cleanup: None, publication: None, charge: None }
     }
 
     pub(crate) fn recovery(topic: String, snapshot: crate::RecoverySnapshot, shared: Arc<crate::recovery::RecoveryShared>) -> Self {
         let context = crate::RequestContext::default().with_traceparent(snapshot.context().traceparent());
         Self {
+            charge: None,
             topic,
             retain: true,
             payload: snapshot.document().clone(),
@@ -772,6 +804,11 @@ impl Out {
         );
         packet.pkid = 1;
         packet.size()
+    }
+
+    fn charged(mut self, charge: Option<crate::buffering::Charge>) -> Self {
+        self.charge = charge;
+        self
     }
 
     /// The same, said before `Active=true` (multi-device spec §4.6).
@@ -802,12 +839,9 @@ impl Out {
 /// A publish under way: its topic, for the refusal's line, and rumqttc's request.
 type CleanupReceipt = (Arc<Reports>, String, u64);
 type PublicationReceipt = (Arc<crate::recovery::RecoveryShared>, u64);
-type Sending = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = (String, Result<(), rumqttc::v5::ClientError>, Option<CleanupReceipt>, Option<PublicationReceipt>)>
-            + Send,
-    >,
->;
+type Sent =
+    (String, Result<(), rumqttc::v5::ClientError>, Option<CleanupReceipt>, Option<PublicationReceipt>, Option<crate::buffering::Charge>);
+type Sending = std::pin::Pin<Box<dyn std::future::Future<Output = Sent> + Send>>;
 
 /// A part of a batch, in the order a publication takes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -854,13 +888,17 @@ impl Batch {
     pub(crate) fn add(&mut self, device: &Device, changes: Sealed<Changes>) {
         let topics = &device.topics;
         let tag = device.tag.as_deref();
-        let Sealed { snapshot: Changes { answer_errors, replies, status, states, errors, events }, retractions } = changes;
-        self.answers.extend(answer_errors.into_iter().map(|e| Out::new(topics.error(), false, e.encode(), None, None).context(&e.context)));
+        let Sealed { snapshot: Changes { answer_errors, replies, status, states, errors, events }, retractions, mut charges } = changes;
         self.answers.extend(
-            replies
+            answer_errors
                 .into_iter()
-                .map(|r| Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation, None).context(&r.context)),
+                .map(|e| Out::new(topics.error(), false, e.encode(), None, None).context(&e.context).charged(charges.errors.pop_front())),
         );
+        self.answers.extend(replies.into_iter().map(|r| {
+            Out::new(r.topic.unwrap_or_else(|| topics.event()), false, r.payload, r.correlation, None)
+                .context(&r.context)
+                .charged(charges.replies.pop_front())
+        }));
         self.model.extend(status.map(|s| Out::new(topics.status(), true, s.as_str().as_bytes().to_vec(), None, tag)));
         self.model.extend(states.into_iter().map(|(target, document, context)| {
             let mut out = Out::new(topics.state(&target), true, document, None, tag).context(&context);
@@ -887,7 +925,7 @@ impl Batch {
     /// `first`: said before `Active=true` — a configured instance's, once its read-back is granted
     /// (§4.6); the fixed instance's goes after it, as R1's did.
     pub(crate) fn add_model(&mut self, device: &Device, model: Sealed<Model>, first: bool) {
-        let Sealed { snapshot: model, retractions } = model;
+        let Sealed { snapshot: model, retractions, .. } = model;
         let (topics, tag) = (&device.topics, device.tag.as_deref());
         debug!(targets = model.states.len(), "Publishing the retained model again after a CONNACK");
         let said = |out: Out| if first { out.first() } else { out };
@@ -953,12 +991,15 @@ impl Batch {
         loop {
             if let Some(sending) = self.sending.as_mut() {
                 // WAIT: mqtt-request
-                let (topic, sent, cleanup, publication) = sending.await;
+                let (topic, sent, cleanup, publication, charge) = sending.await;
                 self.sending = None;
                 if std::mem::take(&mut self.sending_first) {
                     self.firsts -= 1;
                 }
                 let sequence = enqueued(shared, &topic, sent);
+                if let (Some(sequence), Some(charge), Some(buffers)) = (sequence, charge, &shared.buffers) {
+                    buffers.sent(sequence, charge);
+                }
                 if let (Some(sequence), Some((reports, target, nonce))) = (sequence, cleanup) {
                     reports.removal_sent(&target, nonce, sequence);
                 }
@@ -983,10 +1024,10 @@ impl Batch {
             let client = client.clone();
             self.sending_first = out.first;
             self.sending = Some(Box::pin(async move {
-                let Out { topic, retain, payload, properties, cleanup, publication, .. } = out;
+                let Out { topic, retain, payload, properties, cleanup, publication, charge, .. } = out;
                 // WAIT: mqtt-request
                 let sent = client.publish_with_properties(topic.clone(), QoS::AtLeastOnce, retain, payload, properties).await;
-                (topic, sent, cleanup, publication)
+                (topic, sent, cleanup, publication, charge)
             }));
         }
     }

@@ -5,6 +5,8 @@
 //! request channel (its publishes and subscribes), so a poller that did any of that work could wait
 //! on itself. So the pump polls, and forwards what arrives on an unbounded queue — with a
 //! high-water episode, since growth is a symptom to see — and the session does the rest.
+//! With opt-in buffering, every queued PUBLISH retains a byte reservation. A full
+//! incoming budget ends the connection immediately; the pump never waits for space.
 //!
 //! **One connection per event loop.** The pump never lets rumqttc reconnect inside an event loop:
 //! the first failed poll ends the session, and the MQTT worker makes a fresh client for the next
@@ -102,6 +104,16 @@ pub enum PumpEvent {
     /// The connection failed or stalled, and its event loop is dropped: the session ends and the
     /// MQTT worker makes a fresh one.
     Ended(String),
+}
+
+pub(crate) struct Queued {
+    event: PumpEvent,
+    _charge: Option<crate::buffering::Charge>,
+}
+impl From<PumpEvent> for Queued {
+    fn from(event: PumpEvent) -> Self {
+        Self { event, _charge: None }
+    }
 }
 
 /// The forward queue's depth, and whether its high-water WARN is standing. Atomics only, so
@@ -303,7 +315,7 @@ impl Drop for Pump {
 
 /// The session's end of the pump's queue.
 pub struct Incoming {
-    rx: UnboundedReceiver<PumpEvent>,
+    rx: UnboundedReceiver<Queued>,
     backlog: Arc<Backlog>,
     /// The QoS 1 publishes the event loop has written and the broker not yet acknowledged.
     inflight: Arc<AtomicUsize>,
@@ -367,7 +379,7 @@ impl Incoming {
     /// The next event from the pump, waiting for it; `None` once the pump has ended.
     pub async fn recv(&mut self) -> Option<PumpEvent> {
         // WAIT: mqtt-pump-queue
-        let event = self.rx.recv().await;
+        let event = self.rx.recv().await.map(|queued| queued.event);
         if matches!(event, Some(PumpEvent::Publish(..))) {
             self.backlog.popped();
         }
@@ -448,6 +460,16 @@ impl Pump {
         on_lost: impl FnOnce() + Send + 'static,
         receipts: bool,
     ) -> (Pump, Incoming) {
+        Self::start_with_buffers(events, outage, stall, on_lost, receipts, None)
+    }
+    pub(crate) fn start_with_buffers(
+        events: EventLoop,
+        outage: Arc<BrokerOutage>,
+        stall: Duration,
+        on_lost: impl FnOnce() + Send + 'static,
+        receipts: bool,
+        buffers: Option<crate::buffering::Connection>,
+    ) -> (Pump, Incoming) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let backlog = Arc::new(Backlog::new());
         let inflight = Arc::new(AtomicUsize::new(0));
@@ -459,6 +481,7 @@ impl Pump {
         let accepted = Arc::new(AtomicBool::new(false));
         let ended = Arc::new(AtomicBool::new(false));
         let counts = Counts {
+            buffers,
             receipts,
             inflight: inflight.clone(),
             written: written.clone(),
@@ -475,7 +498,7 @@ impl Pump {
 
     async fn run(
         mut events: EventLoop,
-        tx: UnboundedSender<PumpEvent>,
+        tx: UnboundedSender<Queued>,
         backlog: Arc<Backlog>,
         counts: Counts,
         outage: Arc<BrokerOutage>,
@@ -485,7 +508,7 @@ impl Pump {
         let mut outstanding = Outstanding::default();
         let mut on_lost = Some(on_lost);
         let mut connected = false;
-        let mut end = |reason: String, connected: bool| {
+        let mut end = |reason: String, connected: bool, broker_failure: bool| {
             if connected {
                 if let Some(on_lost) = on_lost.take() {
                     on_lost();
@@ -493,9 +516,11 @@ impl Pump {
             }
             // Part of the outage's one episode; the event loop goes with this task, and the MQTT
             // worker makes a fresh client.
-            outage.failed(&reason);
+            if broker_failure {
+                outage.failed(&reason);
+            }
             debug!(error = %reason, "The MQTT connection ended; its session ends with it");
-            let _ = tx.send(PumpEvent::Ended(reason));
+            let _ = tx.send(PumpEvent::Ended(reason).into());
         };
         loop {
             let polled_at = Instant::now();
@@ -507,7 +532,7 @@ impl Pump {
             let polled = tokio::time::timeout_at(deadline.into(), events.poll()).await;
             let event = match polled {
                 Ok(Ok(event)) => event,
-                Ok(Err(e)) => return end(e.to_string(), connected),
+                Ok(Err(e)) => return end(e.to_string(), connected, true),
                 Err(_) => {
                     let stall_ms = stall.as_millis() as u64;
                     return end(
@@ -518,6 +543,7 @@ impl Pump {
                             _ => format!("a poll did not return within {stall_ms} ms: the broker stopped reading"),
                         },
                         connected,
+                        true,
                     );
                 }
             };
@@ -585,7 +611,16 @@ impl Pump {
                 _ => continue,
             };
             let disconnected = matches!(forward, PumpEvent::Disconnected);
-            if tx.send(forward).is_err() || disconnected {
+            let charge = match (&forward, &counts.buffers) {
+                (PumpEvent::Publish(publish, _), Some(buffers)) => {
+                    match buffers.reserve_incoming(crate::buffering::incoming_bytes(publish)) {
+                        Some(charge) => Some(charge),
+                        None => return end("the bounded incoming MQTT queue exhausted its byte capacity".into(), connected, false),
+                    }
+                }
+                _ => None,
+            };
+            if tx.send(Queued { event: forward, _charge: charge }).is_err() || disconnected {
                 // The session is gone, or asked to disconnect: polling on would reconnect.
                 return;
             }
@@ -597,6 +632,7 @@ impl Pump {
 /// task however it ends — returned, panicked or aborted, polled or not — it says the pump ended,
 /// and wakes a wait on its progress.
 struct Counts {
+    buffers: Option<crate::buffering::Connection>,
     receipts: bool,
     inflight: Arc<AtomicUsize>,
     written: Arc<AtomicU64>,

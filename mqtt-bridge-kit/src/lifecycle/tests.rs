@@ -79,6 +79,7 @@ fn dynamic_routing_and_terminal_refusals_keep_the_ingress_cause() {
 /// A host's session part, with no broker behind it.
 fn session_part() -> Arc<session::Shared> {
     Arc::new(session::Shared {
+        buffers: None,
         topics: Topics::new("T", "host").expect("topics"),
         broker_host: "127.0.0.1".into(),
         broker_port: 1,

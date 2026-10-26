@@ -68,6 +68,11 @@ this snapshot-only proof and still require the service-wide admission work.
 
 ## Queue-exhaustion policy question
 
+Resolved by the owner on 2026-10-27: disconnect and retry MQTT while lighting and
+animations keep running. The implementation continuation is recorded in
+[MQTT buffering](2026-10-27-mqtt-buffering.md). The following proposal records the
+question as it stood at this checkpoint.
+
 The next increment must bound the mailbox, coalesced read callers, pump forwarding
 and terminal-answer backlog. The existing pump uses an unbounded forwarding channel,
 and Reports deliberately keeps terminal answers outside unsolicited-report caps

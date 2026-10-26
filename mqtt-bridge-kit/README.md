@@ -68,6 +68,34 @@ does not automatically fail the service. Keep resources inside `run` or its
 runtime-owned tasks: detached OS threads need an explicit lifetime/bound policy.
 The full contract is [managed process services](../docs/superpowers/specs/2026-10-21-managed-process-services.md).
 
+## Bounded MQTT buffering
+
+A fixed `Bridge` can opt into `buffers(BufferLimits { incoming_bytes, reply_bytes })`.
+Both limits must be positive. Existing bridges retain their defaults unless they opt in.
+Incoming accounting covers queued PUBLISH contents and decoded MQTT metadata, including
+repeated user properties. Terminal-reply accounting follows each reply or request Error
+through Reports, sealed output, the client request channel and the exact packet's PUBACK.
+Enqueue alone does not free reply capacity. Successful and negative acknowledgments both
+end that packet's reservation.
+
+Exhaustion ends and retries only the MQTT connection, including when a publish is already
+waiting for the client request channel. The managed service and its timers keep running.
+The connection closes without a shutdown flush that could wait on the exhausted queue;
+the broker's last will supplies offline status. Unanswered calls may time out and queued
+answers may be abandoned. Committed engine changes are not rolled back. The retry logs
+the exhausted queue; local buffering pressure is separate from broker unavailability.
+
+Reservations release when queued input is dispatched/dropped or the reply's exact
+packet is acknowledged. Connection loss discards queued answers; the next connection
+clears the old in-flight reply table (final coordinator drop clears it too).
+Connection capabilities prevent an old
+pump from exhausting or crediting a new connection's budget. Cloned builders allocate
+independent buffering state when started.
+
+These are accounted queue byte limits, not a process resident-memory measurement.
+Request-mailbox limits, model/unsolicited-report storage and aggregate engine/recovery
+allocation admission remain separate responsibilities; this API does not establish them.
+
 ## What the runtime owns, and what a driver writes
 
 | The runtime owns | A driver writes |
