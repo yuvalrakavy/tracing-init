@@ -832,6 +832,8 @@ impl Mailbox {
         deadline: Option<Instant>,
         context: RequestContext,
     ) -> Posted {
+        let context = context.bounded_deadline(deadline);
+        let deadline = context.deadline();
         let (posted, refusal) = {
             let mut inner = self.locked();
             let why = if !self.context_is_current(target.as_deref(), &context) {
@@ -873,6 +875,8 @@ impl Mailbox {
         deadline: Option<Instant>,
         context: RequestContext,
     ) -> Posted {
+        let context = context.bounded_deadline(deadline);
+        let deadline = context.deadline();
         let posted = {
             let mut inner = self.locked();
             if !inner.connected {
@@ -1084,7 +1088,7 @@ impl Mailbox {
                     }
                 }
                 Entry::Read { .. } => {
-                    if let Some(Entry::Read { key, call, callers, context }) = inner.pending.pop_front() {
+                    if let Some(Entry::Read { key, call, callers, .. }) = inner.pending.pop_front() {
                         // Each caller past its deadline is refused on its own; the read runs for
                         // the rest, if any remain (review R9).
                         let (target, command) = key.names();
@@ -1104,6 +1108,12 @@ impl Mailbox {
                         if live.is_empty() {
                             return Some(Work::ReadExpired { expired });
                         }
+                        let context = live
+                            .last()
+                            .expect("nonempty live callers")
+                            .context
+                            .clone()
+                            .bounded_deadline(live.iter().filter_map(|caller| caller.deadline).min());
                         let replies: Vec<ReplyTo> = live.into_iter().filter_map(|c| c.reply).collect();
                         inner.command_completion = None;
                         inner.in_flight_command = Some(Unanswered {

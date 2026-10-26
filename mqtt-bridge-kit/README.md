@@ -242,6 +242,24 @@ broker's remaining expiry cannot reveal the original publication age. No publish
 timestamp or replay journal is added. This optional policy serves generic MQTT
 consumers and is independent of Store.
 
+Contextual driver methods receive this absolute monotonic expiry through
+`RequestContext::deadline()`. Pass the original context through any driver-owned queue
+and check it again before committing a side effect. Do not start another TTL at that queue.
+An atomic write spanning several properties carries the earliest surviving deadline;
+a coalesced read excludes expired callers before selecting its context and deadline.
+
+### Optional request identity
+
+MQTT v5 `request-id` identifies an operation independently of `traceparent`. If supplied,
+it must occur once and contain exactly 64 lowercase hexadecimal characters (the publisher's
+SHA-256 of its canonical operation). Invalid or duplicate identifiers reject the request.
+The runtime validates the spelling; the driver owns operation-specific digest validation.
+`RequestContext::request_id()` preserves the value across driver queues. Request `Error`
+documents echo it as the optional JSON field `"request-id"`, including malformed requests
+whose identifier itself is valid. Invalid or duplicate identifiers are never echoed.
+Requests without it retain their existing wire behavior. Expiry and request identity do
+not change generation authority, equality, hashing or mailbox coalescing keys.
+
 ## Request traces across queues
 
 MQTT v5 `traceparent` is optional diagnostic metadata. The runtime validates and

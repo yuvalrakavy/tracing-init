@@ -825,6 +825,15 @@ default calls the existing `read_state_with_context(scope)`, so existing drivers
 remain compatible. Startup proof and periodic polls still use that existing
 hook without an original request cause.
 
+When your driver has its own work queue, clone the whole request context into that work.
+`context.deadline()` is the original absolute expiry, including any configured lifetime
+limit. Check it before committing a side effect; a fresh timeout would give old work extra
+time. Combined writes use the earliest deadline of their surviving properties.
+`context.request_id()` carries an optional publisher operation digest, distinct from the
+trace ID. It is echoed on request Error documents so a publisher can match a refusal to
+its pending operation. See the [request identity contract](../README.md#optional-request-identity)
+for its wire spelling and validation. Neither field changes mapping authority.
+
 ## 12. Many devices in one process
 
 LampNet is *controller-fronted*: one controller, its lamps behind it as targets, one process per

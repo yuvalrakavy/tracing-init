@@ -175,6 +175,111 @@ fn rig_on(port: u16) -> Rig {
     Rig { shared, device, outputs, host, events, _events: events_tx }
 }
 
+fn metadata_device() -> Device {
+    Device {
+        topics: Topics::new("Meta", "i").unwrap(),
+        commands: vec![crate::CommandSpec::new("pulse", CommandClass::Momentary), crate::CommandSpec::new("inspect", CommandClass::Read)]
+            .into(),
+        mailbox: Mailbox::new(),
+        reports: Reports::new(),
+        tag: None,
+        request_lifetime_limit: Some(Duration::from_secs(20)),
+        span: Span::none(),
+    }
+}
+
+#[test]
+fn capped_original_deadlines_and_ids_survive_every_ingress_queue_form() {
+    use crate::mailbox::Work;
+    let id = "ab".repeat(32);
+    let received = Instant::now();
+    for lane in ["property", "target", "command", "read"] {
+        let device = metadata_device();
+        device.mailbox.connected();
+        let (topic, payload, expiry) = match lane {
+            "property" => ("Meta/Desired/i/array/playback", r#""request""#, 5),
+            "target" => ("Meta/Desired/i/array", r#"{"playback":"request"}"#, 30),
+            "command" => ("Meta/Command/i", r#"{"target":"array","command":"pulse"}"#, 30),
+            _ => ("Meta/Command/i", r#"{"target":"array","command":"inspect"}"#, 30),
+        };
+        let properties = PublishProperties {
+            message_expiry_interval: Some(expiry),
+            user_properties: vec![("request-id".into(), id.clone())],
+            ..Default::default()
+        };
+        route(&device, topic, &Publish::new(topic, QoS::AtLeastOnce, payload.as_bytes().to_vec(), Some(properties)), received);
+        let context = match device.mailbox.try_take().expect("ingress did not queue real work") {
+            Work::Apply { values, .. } => {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0].deadline, Some(received + Duration::from_secs(if lane == "property" { 5 } else { 20 })), "{lane}");
+                values[0].context.clone()
+            }
+            Work::Execute { context, .. } | Work::Read { context, .. } => context,
+            other => panic!("unexpected work {other:?}"),
+        };
+        assert_eq!(context.request_id(), Some(id.as_str()), "{lane}");
+        assert_eq!(context.deadline(), Some(received + Duration::from_secs(if lane == "property" { 5 } else { 20 })), "{lane}");
+    }
+}
+
+#[test]
+fn ingress_request_errors_echo_the_original_valid_id_across_rejection_paths() {
+    for case in ["payload", "generation", "conflict", "expired", "overload", "unsupported", "device_down", "reply", "retained"] {
+        let device = metadata_device();
+        if case != "device_down" {
+            device.mailbox.connected();
+        }
+        if case == "overload" {
+            for _ in 0..crate::mailbox::MOMENTARY_CAP {
+                route(
+                    &device,
+                    "Meta/Command/i",
+                    &Publish::new("Meta/Command/i", QoS::AtLeastOnce, br#"{"command":"pulse"}"#.to_vec(), None),
+                    Instant::now(),
+                );
+            }
+            assert!(device.reports.take().answer_errors.is_empty());
+        }
+        let id = "cd".repeat(32);
+        let mut properties = PublishProperties {
+            message_expiry_interval: Some(5),
+            user_properties: vec![("request-id".into(), id.clone())],
+            ..Default::default()
+        };
+        if case == "generation" {
+            properties.user_properties.push(("target-generation".into(), "".into()));
+        }
+        if case == "conflict" {
+            properties.user_properties.push(("conflict".into(), "invalid".into()));
+        }
+        if case == "expired" {
+            properties.message_expiry_interval = Some(0);
+        }
+        if case == "reply" {
+            properties.response_topic = Some("Meta/Desired/i/array/playback".into());
+        }
+        let desired = matches!(case, "payload" | "generation" | "conflict");
+        let topic = if desired { "Meta/Desired/i/array/playback" } else { "Meta/Command/i" };
+        let payload = if case == "payload" {
+            "{"
+        } else if desired {
+            "1"
+        } else if case == "unsupported" {
+            r#"{"command":"not_supported"}"#
+        } else {
+            r#"{"command":"pulse"}"#
+        };
+        let mut publish = Publish::new(topic, QoS::AtLeastOnce, payload.as_bytes().to_vec(), Some(properties));
+        publish.retain = case == "retained";
+        route(&device, topic, &publish, Instant::now());
+        let changes = device.reports.take();
+        let errors: Vec<_> = changes.answer_errors.into_iter().chain(changes.errors).collect();
+        assert_eq!(errors.len(), 1, "{case}");
+        let encoded: serde_json::Value = serde_json::from_slice(&errors[0].encode()).unwrap();
+        assert_eq!(encoded["request-id"], id, "{case}");
+    }
+}
+
 #[test]
 fn a_sealed_batch_keeps_original_context_on_state_replies_errors_and_events() {
     let rig = rig_on(1);

@@ -170,6 +170,10 @@ async fn sleep_until(at: Option<Instant>) {
     }
 }
 
+fn batch_context(original: &RequestContext, values: &[StateValue]) -> RequestContext {
+    original.clone().bounded_deadline(values.iter().filter_map(|value| value.deadline).min())
+}
+
 /// How the outage conflict rule decides a checked value (Store kit spec §4.5): against the
 /// device's current value (`None`: the device did not say) and the last value the bridge saw
 /// before the outage (`None`: none, a first install). The first row that holds decides:
@@ -586,7 +590,7 @@ impl<D: DeviceDriver> Worker<D> {
             return Ok(0);
         }
         let map: PropertyMap = values.iter().map(|v| (v.property.clone(), v.value.clone())).collect();
-        let context = values.last().expect("nonempty values").context.clone();
+        let context = batch_context(&values.last().expect("nonempty values").context, &values);
         match self.validate(handle, Some(target), &context, RequestKind::Apply(&map), true).await {
             Ok(()) => {}
             Err(OpError::Link(error)) => return Err(error),
@@ -601,7 +605,7 @@ impl<D: DeviceDriver> Worker<D> {
         }
         let map: PropertyMap = values.iter().map(|v| (v.property.clone(), v.value.clone())).collect();
         let feedback = self.mailbox.feedback(target, self.info.feedback);
-        let context = values.last().expect("revalidated nonempty values").context.clone();
+        let context = batch_context(&values.last().expect("revalidated nonempty values").context, &values);
         let span = context.operation_span(handle.instance(), "apply");
         let operation = async {
             let reported_before = self.reports.reports_for(target);
@@ -952,7 +956,8 @@ impl<D: DeviceDriver> Worker<D> {
             return Ok(values);
         };
         let map = values.iter().map(|value| (value.property.clone(), value.value.clone())).collect();
-        match self.validate(handle, Some(target), &first.context, RequestKind::Apply(&map), true).await {
+        let context = batch_context(&first.context, &values);
+        match self.validate(handle, Some(target), &context, RequestKind::Apply(&map), true).await {
             Ok(()) => {}
             Err(OpError::Link(error)) => return Err(error),
             Err(error) => {
@@ -972,7 +977,7 @@ impl<D: DeviceDriver> Worker<D> {
         }) {
             (Some(read.clone()), values)
         } else {
-            let context = values.first().map(|value| value.context.clone()).unwrap_or_default();
+            let context = values.first().map(|value| batch_context(&value.context, &values)).unwrap_or_default();
             // WAIT: device-op
             let current = match op(
                 handle,
@@ -1006,7 +1011,8 @@ impl<D: DeviceDriver> Worker<D> {
         let values = self.mailbox.revalidate(values);
         if let Some(first) = values.first() {
             let map = values.iter().map(|value| (value.property.clone(), value.value.clone())).collect();
-            match self.validate(handle, Some(target), &first.context, RequestKind::Apply(&map), true).await {
+            let context = batch_context(&first.context, &values);
+            match self.validate(handle, Some(target), &context, RequestKind::Apply(&map), true).await {
                 Ok(()) => {}
                 Err(OpError::Link(error)) => return Err(error),
                 Err(error) => {

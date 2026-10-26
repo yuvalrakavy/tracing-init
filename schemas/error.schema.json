@@ -21,6 +21,13 @@
     "command": {
       "type": "string"
     },
+    "request-id": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Original optional canonical SHA-256 request identity; independent of traceparent."
+    },
     "reason": {
       "enum": [
         "malformed",

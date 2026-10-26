@@ -17,14 +17,17 @@ impl DriverDescription {
 #[derive(Debug, Clone, Default)]
 pub struct RequestContext {
     target_generation: Option<String>,
-    trace: Option<std::sync::Arc<TraceMetadata>>,
+    metadata: Option<std::sync::Arc<RequestMetadata>>,
 }
 #[derive(Debug, Clone, Default)]
-struct TraceMetadata {
+struct RequestMetadata {
     parent: Option<String>,
+    trace_captured: bool,
+    deadline: Option<std::time::Instant>,
+    request_id: Option<String>,
 }
-// Diagnostic causes never participate in authority, mailbox coalescing or
-// cache identity. Keep every comparison consistent with the original fence.
+// Expiry and diagnostic metadata do not participate in authority, mailbox
+// coalescing or cache keys. Expiry is enforced separately on each request.
 impl PartialEq for RequestContext {
     fn eq(&self, other: &Self) -> bool {
         self.target_generation == other.target_generation
@@ -50,11 +53,44 @@ pub(crate) fn valid_traceparent(parent: &str) -> bool {
     parent.len() <= 512 && tracing_init::traceparent::set_remote_parent(&tracing::Span::none(), parent)
 }
 impl RequestContext {
+    fn metadata_mut(&mut self) -> &mut RequestMetadata {
+        std::sync::Arc::make_mut(self.metadata.get_or_insert_with(Default::default))
+    }
+    /// Original pump-arrival expiry, carried unchanged across driver queues.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.metadata.as_ref().and_then(|metadata| metadata.deadline)
+    }
+    /// Attach the original absolute expiry; never derive another TTL at a queue.
+    pub fn with_deadline(mut self, deadline: Option<std::time::Instant>) -> Self {
+        if self.deadline() != deadline {
+            self.metadata_mut().deadline = deadline;
+        }
+        self
+    }
+    pub(crate) fn bounded_deadline(self, bound: Option<std::time::Instant>) -> Self {
+        let deadline = [self.deadline(), bound].into_iter().flatten().min();
+        self.with_deadline(deadline)
+    }
+    /// Optional canonical SHA-256 operation identity, separate from trace causality.
+    pub fn request_id(&self) -> Option<&str> {
+        self.metadata.as_ref().and_then(|metadata| metadata.request_id.as_deref())
+    }
+    /// Capture exactly 64 lowercase hexadecimal bytes, or explicit absence.
+    /// Invalid identifiers are refused rather than normalized into another key.
+    pub fn with_request_id(mut self, request_id: Option<&str>) -> Result<Self, String> {
+        if request_id.is_some_and(|id| id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))) {
+            return Err("request-id must be exactly 64 lowercase hexadecimal bytes".into());
+        }
+        if self.request_id() != request_id {
+            self.metadata_mut().request_id = request_id.map(str::to_owned);
+        }
+        Ok(self)
+    }
     /// Construct a checked generation, without normalizing its spelling.
     pub fn new(generation: impl Into<String>) -> Result<Self, String> {
         let generation = generation.into();
         valid_generation(&generation)?;
-        Ok(Self { target_generation: Some(generation), trace: None })
+        Ok(Self { target_generation: Some(generation), ..Self::default() })
     }
     /// The original opaque generation, or none for an unfenced legacy request.
     pub fn generation(&self) -> Option<&str> {
@@ -63,16 +99,17 @@ impl RequestContext {
     /// Owned causal metadata, independent of the mapping fence. Invalid/absent
     /// metadata records explicit absence; it never rejects a functional request.
     pub fn with_traceparent(mut self, parent: Option<&str>) -> Self {
-        self.trace =
-            Some(std::sync::Arc::new(TraceMetadata { parent: parent.filter(|parent| valid_traceparent(parent)).map(str::to_owned) }));
+        let metadata = self.metadata_mut();
+        metadata.parent = parent.filter(|parent| valid_traceparent(parent)).map(str::to_owned);
+        metadata.trace_captured = true;
         self
     }
     /// The captured W3C cause, if valid. Context equality remains generation-only.
     pub fn traceparent(&self) -> Option<&str> {
-        self.trace.as_ref().and_then(|trace| trace.parent.as_deref())
+        self.metadata.as_ref().and_then(|metadata| metadata.parent.as_deref())
     }
     pub(crate) fn trace_was_captured(&self) -> bool {
-        self.trace.is_some()
+        self.metadata.as_ref().is_some_and(|metadata| metadata.trace_captured)
     }
     /// Enabled carrier for one operation crossing a queue boundary. Instrument
     /// the future with this span; never hold an enter guard over an await.

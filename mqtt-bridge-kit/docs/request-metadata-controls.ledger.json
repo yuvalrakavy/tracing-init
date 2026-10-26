@@ -1,0 +1,141 @@
+{
+ "rows": {
+  "accept_noncanonical_request_identity": {
+   "last_real": {
+    "at": "2026-10-26T16:44:29Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:7a9590af0e69a843",
+     "guard": "item:5307c98347e9c415",
+     "row": "72945ccb8f878ea4",
+     "test": "test:542e6a5e634740a1"
+    },
+    "path": "command",
+    "secs": 3.3,
+    "sha": "d83fa224bf04216dcde4be4102b1b2dc98fd7010",
+    "verdict": "RED"
+   }
+  },
+  "batch_uses_latest_requests_later_expiry": {
+   "last_real": {
+    "at": "2026-10-26T16:45:01Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:f0298de7276f6043",
+     "guard": "item:abd2888ad0f62b8c",
+     "row": "a1ac184bed33118e",
+     "test": "test:542e6a5e634740a1"
+    },
+    "path": "command",
+    "secs": 6.7,
+    "sha": "d83fa224bf04216dcde4be4102b1b2dc98fd7010",
+    "verdict": "RED"
+   }
+  },
+  "coalesced_read_uses_an_expired_callers_context": {
+   "last_real": {
+    "at": "2026-10-26T16:44:54Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:a0192a73b0f7a62d",
+     "guard": "item:a73f7661f86bf6db",
+     "row": "f90a1e4511d8cc0e",
+     "test": "test:542e6a5e634740a1"
+    },
+    "path": "command",
+    "secs": 6.9,
+    "sha": "d83fa224bf04216dcde4be4102b1b2dc98fd7010",
+    "verdict": "RED"
+   }
+  },
+  "drop_error_request_identity": {
+   "last_real": {
+    "at": "2026-10-26T16:44:36Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:93f12a658cc7f1f8",
+     "guard": "item:d76129ed46ade04d",
+     "row": "a6617a8c6c2b7212",
+     "test": "test:542e6a5e634740a1"
+    },
+    "path": "command",
+    "secs": 3.2,
+    "sha": "d83fa224bf04216dcde4be4102b1b2dc98fd7010",
+    "verdict": "RED"
+   }
+  },
+  "drop_wire_request_identity": {
+   "last_real": {
+    "at": "2026-10-26T16:44:33Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:93f12a658cc7f1f8",
+     "guard": "item:fdcf760885a3531a",
+     "row": "a48f16f753384952",
+     "test": "test:542e6a5e634740a1"
+    },
+    "path": "command",
+    "secs": 3.5,
+    "sha": "d83fa224bf04216dcde4be4102b1b2dc98fd7010",
+    "verdict": "RED"
+   }
+  },
+  "property_context_loses_lifetime_cap": {
+   "last_real": {
+    "at": "2026-10-26T16:44:43Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:63338b9bce13dd3c",
+     "guard": "item:2c7917dd65da52b8",
+     "row": "0cfa70ef009cc1cf",
+     "test": "test:542e6a5e634740a1"
+    },
+    "path": "command",
+    "secs": 3.3,
+    "sha": "d83fa224bf04216dcde4be4102b1b2dc98fd7010",
+    "verdict": "RED"
+   }
+  },
+  "queue_replaces_original_expiry_with_a_later_bound": {
+   "last_real": {
+    "at": "2026-10-26T16:44:47Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:7a9590af0e69a843",
+     "guard": "item:5d078a1b589ca47c",
+     "row": "093064b3479e8c88",
+     "test": "test:542e6a5e634740a1"
+    },
+    "path": "command",
+    "secs": 4.5,
+    "sha": "d83fa224bf04216dcde4be4102b1b2dc98fd7010",
+    "verdict": "RED"
+   }
+  },
+  "wire_context_loses_original_expiry": {
+   "last_real": {
+    "at": "2026-10-26T16:44:39Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:93f12a658cc7f1f8",
+     "guard": "item:6439aab09d126297",
+     "row": "76a79c10d82ae030",
+     "test": "test:542e6a5e634740a1"
+    },
+    "path": "command",
+    "secs": 3.2,
+    "sha": "d83fa224bf04216dcde4be4102b1b2dc98fd7010",
+    "verdict": "RED"
+   }
+  }
+ },
+ "version": 1
+}

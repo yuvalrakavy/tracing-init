@@ -8,6 +8,147 @@ fn properties(entries: &[(&str, &str)]) -> PublishProperties {
 }
 
 #[test]
+fn original_deadline_and_request_id_survive_cloning_without_changing_routing_identity() {
+    use std::collections::{BTreeSet, HashSet};
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let first = "a1".repeat(32);
+    let second = "b2".repeat(32);
+    let plain = RequestContext::new("history.7").unwrap();
+    let a = plain.clone().with_deadline(Some(deadline)).with_request_id(Some(&first)).unwrap();
+    let b = plain.clone().with_deadline(Some(deadline + Duration::from_secs(1))).with_request_id(Some(&second)).unwrap();
+    assert_eq!(a.clone().deadline(), Some(deadline));
+    assert_eq!(a.clone().request_id(), Some(first.as_str()));
+    let changed = a.clone().with_deadline(None).with_request_id(Some(&second)).unwrap().with_traceparent(None);
+    assert_eq!(changed.deadline(), None);
+    assert_eq!(changed.request_id(), Some(second.as_str()));
+    assert_eq!(a.deadline(), Some(deadline), "editing a clone changed its queued original");
+    assert_eq!(a.request_id(), Some(first.as_str()));
+    assert!(!a.trace_was_captured(), "deadline/id fabricated an absent trace override");
+    assert_eq!(b.request_id(), Some(second.as_str()));
+    assert_eq!(a, plain);
+    assert_eq!(a, b);
+    assert_eq!(BTreeSet::from([plain.clone(), a.clone(), b.clone()]).len(), 1);
+    assert_eq!(HashSet::from([plain, a, b]).len(), 1);
+    assert_eq!(RequestContext::default().deadline(), None);
+    assert_eq!(RequestContext::default().request_id(), None);
+}
+
+#[test]
+fn request_identity_is_bounded_canonical_sha256_and_never_normalized() {
+    for invalid in ["a".repeat(63), "a".repeat(65), "A".repeat(64), "g".repeat(64), " ".repeat(64)] {
+        assert!(RequestContext::default().with_request_id(Some(&invalid)).is_err(), "accepted noncanonical request-id");
+    }
+    let valid = "0123456789abcdef".repeat(4);
+    let context = RequestContext::default().with_request_id(Some(&valid)).unwrap();
+    assert_eq!(context.request_id(), Some(valid.as_str()));
+    assert_eq!(context.with_request_id(None).unwrap().request_id(), None);
+}
+
+#[test]
+fn request_identity_is_captured_from_wire_and_preserved_for_malformed_generation_errors() {
+    let id = "0123456789abcdef".repeat(4);
+    for generation in [None, Some("epoch.7")] {
+        let mut entries = vec![("request-id", id.as_str())];
+        if let Some(generation) = generation {
+            entries.push(("target-generation", generation));
+        }
+        let context = request_context(Some(&properties(&entries))).unwrap();
+        assert_eq!(context.request_id(), Some(id.as_str()));
+    }
+    let malformed = properties(&[("request-id", &id), ("target-generation", "")]);
+    assert!(request_context(Some(&malformed)).is_err());
+    assert_eq!(crate::wire::trace_context(Some(&malformed)).request_id(), Some(id.as_str()));
+    for invalid in ["a".repeat(63), "A".repeat(64)] {
+        assert!(request_context(Some(&properties(&[("request-id", &invalid)]))).is_err());
+    }
+    assert!(request_context(Some(&properties(&[("request-id", &id), ("request-id", &id)]))).is_err());
+    assert_eq!(request_context(None).unwrap().request_id(), None);
+}
+
+#[test]
+fn wire_deadline_enters_the_context_once_and_errors_echo_only_an_original_request_id() {
+    let id = "ab".repeat(32);
+    let now = Instant::now();
+    let mut props = properties(&[("request-id", &id)]);
+    props.message_expiry_interval = Some(30);
+    let meta = request_meta(Some(&props), now).unwrap();
+    assert_eq!(meta.context.deadline(), meta.deadline);
+    assert_eq!(meta.context.deadline(), Some(now + Duration::from_secs(30)));
+    let error = crate::wire::ErrorReport::new(crate::wire::Reason::Rejected, "no").context(&meta.context).property("playback");
+    let document: serde_json::Value = serde_json::from_slice(&error.encode()).unwrap();
+    assert_eq!(document["request-id"], id);
+    let plain = crate::wire::ErrorReport::new(crate::wire::Reason::Rejected, "no");
+    assert!(serde_json::from_slice::<serde_json::Value>(&plain.encode()).unwrap().get("request-id").is_none());
+}
+
+#[test]
+fn coalesced_read_context_comes_from_a_surviving_caller_and_keeps_its_deadline() {
+    use crate::mailbox::{Mailbox, ReadKey, Work};
+    let mailbox = Mailbox::new();
+    mailbox.connected();
+    let now = Instant::now();
+    let live_id = "aa".repeat(32);
+    let expired_id = "bb".repeat(32);
+    let context = |id: &str| RequestContext::default().with_request_id(Some(id)).unwrap();
+    mailbox.post_read_with_context(ReadKey::Refresh(None), None, None, Some(now + Duration::from_secs(30)), context(&live_id));
+    mailbox.post_read_with_context(ReadKey::Refresh(None), None, None, Some(now), context(&expired_id));
+    let Work::Read { context, expired, .. } = mailbox.try_take().unwrap() else { panic!("live read was lost") };
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].context.request_id(), Some(expired_id.as_str()));
+    assert_eq!(context.request_id(), Some(live_id.as_str()));
+    assert_eq!(context.deadline(), Some(now + Duration::from_secs(30)));
+}
+
+#[test]
+fn momentary_queue_carries_the_supplied_deadline_into_driver_context() {
+    use crate::mailbox::{Mailbox, Work};
+    let mailbox = Mailbox::new();
+    mailbox.connected();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let id = "cc".repeat(32);
+    let context = RequestContext::default().with_request_id(Some(&id)).unwrap();
+    mailbox.post_command_with_context(
+        None,
+        CommandCall { command: "pulse".into(), params: PropertyMap::new() },
+        None,
+        Some(deadline),
+        context,
+    );
+    let Work::Execute { context, .. } = mailbox.try_take().unwrap() else { panic!("momentary was not queued") };
+    assert_eq!(context.request_id(), Some(id.as_str()));
+    assert_eq!(context.deadline(), Some(deadline));
+}
+
+#[test]
+fn queue_bounds_never_extend_a_context_deadline_or_erase_unbounded_absence() {
+    use crate::mailbox::{Mailbox, ReadKey, Work};
+    let earlier = Instant::now() + Duration::from_secs(10);
+    let later = earlier + Duration::from_secs(20);
+    for (original, supplied, expected) in [
+        (Some(earlier), Some(later), Some(earlier)),
+        (Some(later), Some(earlier), Some(earlier)),
+        (Some(earlier), None, Some(earlier)),
+        (None, None, None),
+    ] {
+        let mailbox = Mailbox::new();
+        mailbox.connected();
+        let context = RequestContext::default().with_deadline(original);
+        mailbox.post_command_with_context(
+            None,
+            CommandCall { command: "pulse".into(), params: PropertyMap::new() },
+            None,
+            supplied,
+            context.clone(),
+        );
+        let Work::Execute { context: command, .. } = mailbox.try_take().unwrap() else { panic!("command missing") };
+        assert_eq!(command.deadline(), expected, "command extended or erased the original expiry");
+        mailbox.post_read_with_context(ReadKey::Refresh(None), None, None, supplied, context);
+        let Work::Read { context: read, .. } = mailbox.try_take().unwrap() else { panic!("read missing") };
+        assert_eq!(read.deadline(), expected, "read extended or erased the original expiry");
+    }
+}
+
+#[test]
 fn diagnostic_traces_never_change_generation_authority_or_coalescing_keys() {
     use std::{
         collections::{BTreeSet, HashSet},
@@ -380,11 +521,13 @@ async fn command_context_survives_momentary_and_read_queues_and_duplicates_never
             .await
     );
     for (index, (command, generation)) in [("pulse", "epoch.1"), ("status", "epoch.2")].into_iter().enumerate() {
+        let id = format!("{index:064x}");
+        let sent = Instant::now();
         let payload = serde_json::json!({"target":"Kitchen","command":command}).to_string();
         assert!(broker.send_with(
             "FenceTest/Command/Controller",
             payload,
-            &SendOptions::default().user_property("target-generation", generation)
+            &SendOptions::default().expiry(10).user_property("target-generation", generation).user_property("request-id", &id)
         ));
         let reached = broker.wait_until(Duration::from_secs(2), |_| contexts.lock().unwrap().len() > index).await;
         if !reached {
@@ -396,17 +539,27 @@ async fn command_context_survives_momentary_and_read_queues_and_duplicates_never
             assert!(running.stop().await);
             panic!("command lost its original generation context");
         }
+        let context = contexts.lock().unwrap()[index].clone();
+        assert_eq!(context.request_id(), Some(id.as_str()), "MQTT command lost its operation identity");
+        let deadline = context.deadline().expect("MQTT command lost its original expiry");
+        assert!(deadline >= sent + Duration::from_secs(9) && deadline <= Instant::now() + Duration::from_secs(10));
     }
+    let rejected_id = "cd".repeat(32);
     assert!(broker.send_with(
         "FenceTest/Command/Controller",
         r#"{"target":"Kitchen","command":"pulse"}"#,
-        &SendOptions::default().user_property("target-generation", "epoch.2").user_property("target-generation", "epoch.2")
+        &SendOptions::default()
+            .user_property("target-generation", "epoch.2")
+            .user_property("target-generation", "epoch.2")
+            .user_property("request-id", &rejected_id)
     ));
     let rejected = broker
         .wait_until(Duration::from_secs(2), |b| {
-            b.received_on("FenceTest/Error/Controller")
-                .iter()
-                .any(|r| String::from_utf8_lossy(&r.payload).contains("target-generation must occur exactly once"))
+            b.received_on("FenceTest/Error/Controller").iter().any(|r| {
+                let document: serde_json::Value = serde_json::from_slice(&r.payload).unwrap();
+                document["request-id"] == rejected_id
+                    && document["error"].as_str().unwrap_or_default().contains("target-generation must occur exactly once")
+            })
         })
         .await;
     assert!(running.stop().await);

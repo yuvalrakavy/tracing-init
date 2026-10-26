@@ -54,14 +54,27 @@ pub struct RequestMeta {
 
 /// Decode only opaque context, leaving each lane's expiry/conflict semantics alone.
 pub fn request_context(properties: Option<&PublishProperties>) -> Result<RequestContext, String> {
+    let id = incoming_request_id(properties)?;
+    let captured = trace_context(properties).with_request_id(id)?;
     let mut generations = properties.into_iter().flat_map(|p| &p.user_properties).filter(|(key, _)| key == "target-generation");
     let Some((_, generation)) = generations.next() else {
-        return Ok(trace_context(properties));
+        return Ok(captured);
     };
     if generations.next().is_some() {
         return Err("target-generation must occur exactly once".into());
     }
-    Ok(RequestContext::new(generation.clone())?.with_traceparent(trace_context(properties).traceparent()))
+    RequestContext::new(generation.clone())?.with_traceparent(captured.traceparent()).with_request_id(captured.request_id())
+}
+
+fn incoming_request_id(properties: Option<&PublishProperties>) -> Result<Option<&str>, String> {
+    let mut ids = properties.into_iter().flat_map(|p| &p.user_properties).filter(|(key, _)| key == "request-id");
+    let Some((_, id)) = ids.next() else {
+        return Ok(None);
+    };
+    if ids.next().is_some() {
+        return Err("request-id must occur exactly once".into());
+    }
+    Ok(Some(id.as_str()))
 }
 
 pub(crate) fn incoming_traceparent(properties: Option<&PublishProperties>) -> Option<&str> {
@@ -85,7 +98,10 @@ pub(crate) fn trace_context(properties: Option<&PublishProperties>) -> RequestCo
         (Some(incoming), _) => Some(incoming),
         (None, current) => current,
     };
-    RequestContext::default().with_traceparent(parent)
+    let context = RequestContext::default().with_traceparent(parent);
+    // Keep a valid request id available even when another metadata field is
+    // malformed. Invalid/duplicate ids cannot be used for error correlation.
+    incoming_request_id(properties).and_then(|id| context.clone().with_request_id(id)).unwrap_or(context)
 }
 
 /// A request's metadata, from the properties of the publish that carried it, arriving `now`.
@@ -97,7 +113,7 @@ pub fn request_meta(properties: Option<&PublishProperties>, now: Instant) -> Res
             Conflict::parse(v).ok_or_else(|| format!("the user property `conflict` is `{v}`, not `DeviceWins` or `RequestWins`"))?
         }
     };
-    Ok(RequestMeta { deadline, conflict, context: request_context(properties)? })
+    Ok(RequestMeta { deadline, conflict, context: request_context(properties)?.with_deadline(deadline) })
 }
 
 fn parse(payload: &[u8]) -> Result<Value, String> {
@@ -277,6 +293,9 @@ impl ErrorReport {
     /// The JSON payload of the `Error` lane message.
     pub fn encode(&self) -> Vec<u8> {
         let mut document = json!({ "error": self.error, "reason": self.reason.as_str() });
+        if let Some(id) = self.context.request_id() {
+            document["request-id"] = Value::String(id.to_owned());
+        }
         for (key, value) in [("target", &self.target), ("property", &self.property), ("command", &self.command)] {
             if let Some(value) = value {
                 document[key] = Value::String(value.clone());

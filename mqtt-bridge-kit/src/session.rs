@@ -201,6 +201,7 @@ impl Device {
             }
         }
         meta.deadline = self.bound_request_deadline(meta.deadline, received)?;
+        meta.context = meta.context.with_deadline(meta.deadline);
         Ok(meta)
     }
 }
@@ -1252,7 +1253,7 @@ pub(crate) fn route_with_config_admission(
                 Ok(deadline) => deadline,
                 Err(error) => return refuse(error),
             };
-            command(device, target, call, reply, deadline, context);
+            command(device, target, call, reply, deadline, context.with_deadline(deadline));
         }
         Inbound::Config { target } => {
             match wire::decode_config(payload).and_then(|config| Ok((config, wire::request_context(properties)?))) {

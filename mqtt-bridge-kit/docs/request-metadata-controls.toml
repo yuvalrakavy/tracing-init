@@ -1,0 +1,77 @@
+# Original request identity and expiry must survive runtime-owned queues.
+[[control]]
+name = "accept_noncanonical_request_identity"
+file = "mqtt-bridge-kit/src/generations.rs"
+anchor = "if request_id.is_some_and(|id| id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))"
+replacement = "if false"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(request_identity_is_bounded_canonical_sha256_and_never_normalized)"]
+expect_text = "accepted noncanonical request-id"
+
+[[control]]
+name = "drop_wire_request_identity"
+file = "mqtt-bridge-kit/src/wire.rs"
+anchor = "let captured = trace_context(properties).with_request_id(id)?;"
+replacement = "let _ = id; let captured = trace_context(properties).with_request_id(None)?;"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(request_identity_is_captured_from_wire_and_preserved_for_malformed_generation_errors)"]
+expect_text = "assertion `left == right` failed"
+
+[[control]]
+name = "drop_error_request_identity"
+file = "mqtt-bridge-kit/src/wire.rs"
+anchor = "document[\"request-id\"] = Value::String(id.to_owned());"
+replacement = "let _ = id;"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(ingress_request_errors_echo_the_original_valid_id_across_rejection_paths)"]
+expect_text = "assertion `left == right` failed"
+
+[[control]]
+name = "wire_context_loses_original_expiry"
+file = "mqtt-bridge-kit/src/wire.rs"
+anchor = "context: request_context(properties)?.with_deadline(deadline)"
+replacement = "context: request_context(properties)?"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(wire_deadline_enters_the_context_once_and_errors_echo_only_an_original_request_id)"]
+expect_text = "assertion `left == right` failed"
+
+[[control]]
+name = "property_context_loses_lifetime_cap"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = "meta.context = meta.context.with_deadline(meta.deadline);"
+replacement = "// faulty: keep the uncapped wire deadline"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(capped_original_deadlines_and_ids_survive_every_ingress_queue_form)"]
+expect_text = "assertion `left == right` failed"
+
+[[control]]
+name = "queue_replaces_original_expiry_with_a_later_bound"
+file = "mqtt-bridge-kit/src/generations.rs"
+anchor = "let deadline = [self.deadline(), bound].into_iter().flatten().min();"
+replacement = "let deadline = bound;"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(queue_bounds_never_extend_a_context_deadline_or_erase_unbounded_absence)"]
+expect_text = "command extended or erased the original expiry"
+
+[[control]]
+name = "coalesced_read_uses_an_expired_callers_context"
+file = "mqtt-bridge-kit/src/mailbox.rs"
+anchor = '''let context = live
+                            .last()
+                            .expect("nonempty live callers")
+                            .context
+                            .clone()
+                            .bounded_deadline(live.iter().filter_map(|caller| caller.deadline).min());'''
+replacement = '''let context = expired.last().map(|caller| caller.context.clone()).unwrap_or_else(|| live.last().unwrap().context.clone());'''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(coalesced_read_context_comes_from_a_surviving_caller_and_keeps_its_deadline)"]
+expect_text = "assertion `left == right` failed"
+
+[[control]]
+name = "batch_uses_latest_requests_later_expiry"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = "original.clone().bounded_deadline(values.iter().filter_map(|value| value.deadline).min())"
+replacement = "let _ = values; original.clone()"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(batched_apply_carries_earliest_original_deadline_and_errors_keep_each_propertys_id)"]
+expect_text = "assertion `left == right` failed"

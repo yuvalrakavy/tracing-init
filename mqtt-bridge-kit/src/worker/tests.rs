@@ -19,6 +19,83 @@ fn request(value: Value, conflict: Conflict) -> StateValue {
     }
 }
 
+#[derive(Default)]
+struct RequestMetadataDriver {
+    seen: Vec<RequestContext>,
+}
+impl DeviceDriver for RequestMetadataDriver {
+    fn info(&self) -> DriverInfo {
+        DriverInfo::default()
+    }
+    async fn connect(&mut self, _: &mut LinkContext) -> Result<(), LinkError> {
+        Ok(())
+    }
+    async fn disconnect(&mut self) {}
+    async fn read_state(&mut self, _: Scope) -> Result<Vec<crate::TargetState>, OpError> {
+        Ok(vec![])
+    }
+    async fn apply(&mut self, _: &str, _: &PropertyMap) -> Result<(), OpError> {
+        panic!("contextual apply was bypassed")
+    }
+    async fn apply_with_context(&mut self, _: &str, _: &PropertyMap, context: &RequestContext) -> Result<(), OpError> {
+        self.seen.push(context.clone());
+        Err(OpError::Rejected("device refusal".into()))
+    }
+    async fn execute(&mut self, _: Option<&str>, _: &crate::CommandCall) -> Result<Option<Value>, OpError> {
+        Ok(None)
+    }
+    async fn configure(&mut self, _: &str, _: Option<&Value>) -> Result<(), OpError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn batched_apply_carries_earliest_original_deadline_and_errors_keep_each_propertys_id() {
+    let mailbox = Mailbox::new();
+    mailbox.connected();
+    let received = Instant::now();
+    let first = "aa".repeat(32);
+    let second = "bb".repeat(32);
+    for (property, id, seconds) in [("early", &first, 10), ("late", &second, 30)] {
+        let properties = rumqttc::v5::mqttbytes::v5::PublishProperties {
+            message_expiry_interval: Some(seconds),
+            user_properties: vec![("request-id".into(), id.clone())],
+            ..Default::default()
+        };
+        let meta = crate::wire::request_meta(Some(&properties), received).unwrap();
+        let mut value = request(json!(22), Conflict::RequestWins);
+        value.property = property.into();
+        value.context = meta.context;
+        value.deadline = meta.deadline;
+        mailbox.post_state(value, false);
+    }
+    let Work::Apply { target, values } = mailbox.try_take().expect("no batched work") else { panic!("not Apply") };
+    assert_eq!(values.len(), 2);
+    assert_eq!(
+        values.last().unwrap().deadline,
+        Some(received + Duration::from_secs(30)),
+        "fixture must make the last request differ from the earliest expiry"
+    );
+    let reports = Reports::new();
+    let mut worker = Worker::new(RequestMetadataDriver::default(), DriverInfo::default(), "i", mailbox, reports.clone());
+    worker.write_values(&link_context().handle(), &target, values).await.unwrap();
+    assert_eq!(worker.driver.seen.len(), 1);
+    assert_eq!(worker.driver.seen[0].deadline(), Some(received + Duration::from_secs(10)));
+    let changes = reports.take();
+    assert_eq!(changes.answer_errors.len(), 2);
+    let errors: BTreeMap<_, _> = changes
+        .answer_errors
+        .iter()
+        .map(|error| {
+            (
+                error.property.clone().unwrap(),
+                serde_json::from_slice::<Value>(&error.encode()).unwrap()["request-id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(errors, BTreeMap::from([("early".into(), first), ("late".into(), second)]));
+}
+
 /// The outage conflict rule (Store kit spec §4.5), every row: unchanged → applied; changed and
 /// `DeviceWins` → superseded; changed and `RequestWins` → applied; no "before" value → applied;
 /// the device already at the requested value → nothing to write; the device's value unknown →
