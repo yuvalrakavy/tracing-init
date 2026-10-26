@@ -1,0 +1,158 @@
+{
+ "rows": {
+  "active_parameters_release_capacity_at_dispatch": {
+   "last_real": {
+    "at": "2026-10-26T23:54:38Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:46da049b53780d49",
+     "guard": "item:7c7a4073f86c6196",
+     "row": "417cb1b0149c7685",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 5.2,
+    "sha": "bc27350f3c85a5ac63950b63e498da8afe467c49",
+    "verdict": "RED"
+   }
+  },
+  "coalesced_read_callers_are_not_counted": {
+   "last_real": {
+    "at": "2026-10-26T23:54:33Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:46da049b53780d49",
+     "guard": "item:2d9ae12c916f0d65",
+     "row": "eea3db96f72cea9a",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.8,
+    "sha": "bc27350f3c85a5ac63950b63e498da8afe467c49",
+    "verdict": "RED"
+   }
+  },
+  "custom_read_refusals_are_silent": {
+   "last_real": {
+    "at": "2026-10-26T23:55:02Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:39b9f4dc67430990",
+     "guard": "item:155d864ed31c2224",
+     "row": "4e0eec5c4b3fa81e",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.6,
+    "sha": "bc27350f3c85a5ac63950b63e498da8afe467c49",
+    "verdict": "RED"
+   }
+  },
+  "escaped_encoding_is_not_counted": {
+   "last_real": {
+    "at": "2026-10-26T23:54:43Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:46da049b53780d49",
+     "guard": "item:f3c023b13d3cde65",
+     "row": "71851576db96ac45",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.5,
+    "sha": "bc27350f3c85a5ac63950b63e498da8afe467c49",
+    "verdict": "RED"
+   }
+  },
+  "mailbox_byte_ceiling_disabled": {
+   "last_real": {
+    "at": "2026-10-26T23:54:24Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:46da049b53780d49",
+     "guard": "item:b5c64ca98fd247e5",
+     "row": "57de82802ed577eb",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 13.9,
+    "sha": "bc27350f3c85a5ac63950b63e498da8afe467c49",
+    "verdict": "RED"
+   }
+  },
+  "mailbox_setting_not_passed_to_fixed_device": {
+   "last_real": {
+    "at": "2026-10-26T23:54:49Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:d656bc3c97f7f78b",
+     "guard": "item:ee227d3181f1fa87",
+     "row": "722d7214f43fb105",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 6.4,
+    "sha": "bc27350f3c85a5ac63950b63e498da8afe467c49",
+    "verdict": "RED"
+   }
+  },
+  "read_refusals_are_silent": {
+   "last_real": {
+    "at": "2026-10-26T23:54:57Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:39b9f4dc67430990",
+     "guard": "item:155d864ed31c2224",
+     "row": "db827ba9a2ba0434",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.4,
+    "sha": "bc27350f3c85a5ac63950b63e498da8afe467c49",
+    "verdict": "RED"
+   }
+  },
+  "refused_candidate_is_not_rolled_back": {
+   "last_real": {
+    "at": "2026-10-26T23:54:28Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:46da049b53780d49",
+     "guard": "item:b5c64ca98fd247e5",
+     "row": "99d1792bb8539ae2",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.3,
+    "sha": "bc27350f3c85a5ac63950b63e498da8afe467c49",
+    "verdict": "RED"
+   }
+  },
+  "zero_mailbox_limit_is_accepted": {
+   "last_real": {
+    "at": "2026-10-26T23:54:53Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:80664a34857d8829",
+     "guard": "item:72fd2dfd5f59e3c2",
+     "row": "8683d43b947b9e8a",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 3.7,
+    "sha": "bc27350f3c85a5ac63950b63e498da8afe467c49",
+    "verdict": "RED"
+   }
+  }
+ },
+ "version": 1
+}

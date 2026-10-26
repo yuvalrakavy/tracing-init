@@ -4,8 +4,9 @@ mod publication;
 pub use publication::{RecoveryReceipt, RecoverySnapshot};
 
 use bytes::Bytes;
+use lock_order::sync::Mutex;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Notify};
 
 /// Maximum wait for the engine's initial decision after a connection's replay.
@@ -232,10 +233,10 @@ pub(crate) struct RecoveryShared {
 }
 impl RecoveryShared {
     pub(crate) fn new(options: RecoveryOptions) -> Result<Arc<Self>, String> {
-        static OWNERS: Mutex<u64> = Mutex::new(0);
+        static OWNERS: Mutex<u64> = Mutex::new("recovery-identity", 0);
         options.validate()?;
-        // WAIT: recovery-identity
         let owner = {
+            // WAIT: recovery-identity
             let mut owners = OWNERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *owners = owners.checked_add(1).ok_or("recovery owner identity exhausted")?;
             *owners
@@ -244,14 +245,17 @@ impl RecoveryShared {
         Ok(Arc::new(Self {
             options,
             owner,
-            state: Mutex::new(State {
-                epoch: 0,
-                connection: None,
-                phase: Phase::Closed,
-                pending: None,
-                install_until: None,
-                publication: Default::default(),
-            }),
+            state: Mutex::new(
+                "recovery-state",
+                State {
+                    epoch: 0,
+                    connection: None,
+                    phase: Phase::Closed,
+                    pending: None,
+                    install_until: None,
+                    publication: Default::default(),
+                },
+            ),
             readback,
             changed: Notify::new(),
         }))

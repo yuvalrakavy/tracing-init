@@ -140,6 +140,7 @@ pub(crate) struct Shared {
     pub broker_port: u16,
     pub timing: MqttTiming,
     pub request_lifetime_limit: Option<Duration>,
+    pub request_queue_bytes: Option<usize>,
     /// The text of the retained `Version`.
     pub version: String,
     pub outage: Arc<BrokerOutage>,
@@ -1400,8 +1401,10 @@ fn command(
         "refresh" => {
             let posted =
                 device.mailbox.post_read_with_context(ReadKey::Refresh(target.clone()), None, reply.clone(), deadline, context.clone());
-            if posted == Posted::Dropped {
-                refused(Reason::Refused, "the device is not connected");
+            match posted {
+                Posted::Dropped => refused(Reason::Refused, "the device is not connected"),
+                Posted::Refused(why) => refused(Reason::Refused, why.as_str()),
+                _ => {}
             }
         }
         "assume" if device.reports.fenced() => refused(Reason::Refused, "assume is unavailable for a generation-fenced device"),
@@ -1430,10 +1433,10 @@ fn command(
             }
             Some(CommandClass::Read) => {
                 let key = ReadKey::Command { target: target.clone(), command: name.to_owned() };
-                if device.mailbox.post_read_with_context(key, Some(call.clone()), reply.clone(), deadline, context.clone())
-                    == Posted::Dropped
-                {
-                    refused(Reason::Refused, "the device is not connected");
+                match device.mailbox.post_read_with_context(key, Some(call.clone()), reply.clone(), deadline, context.clone()) {
+                    Posted::Dropped => refused(Reason::Refused, "the device is not connected"),
+                    Posted::Refused(why) => refused(Reason::Refused, why.as_str()),
+                    _ => {}
                 }
             }
             Some(CommandClass::Momentary | CommandClass::WithReply) => {

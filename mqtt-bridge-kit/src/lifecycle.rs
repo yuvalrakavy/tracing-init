@@ -551,8 +551,14 @@ impl Lifecycle {
         let recovery = self.recovery.clone();
         async move {
             match recovery {
-                Some(recovery) => recovery.changed().await,
-                None => std::future::pending::<()>().await,
+                Some(recovery) => {
+                    // WAIT: recovery-install
+                    recovery.changed().await
+                }
+                None => {
+                    // WAIT: recovery-install
+                    std::future::pending::<()>().await
+                }
             }
         }
     }
@@ -643,7 +649,7 @@ impl Lifecycle {
         let device = Arc::new(Device {
             topics: Topics::new(&self.settings.root, name)?,
             commands: info.info.commands.clone().into(),
-            mailbox: Mailbox::new(),
+            mailbox: Mailbox::with_byte_limit(self.shared.request_queue_bytes),
             reports: Reports::with_buffers(self.ready.clone(), self.shared.buffers.clone()),
             tag: None,
             request_lifetime_limit: self.shared.request_lifetime_limit,

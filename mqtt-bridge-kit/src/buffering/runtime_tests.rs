@@ -91,6 +91,53 @@ async fn buffer_limits_refuse_zero_before_starting_the_managed_service() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launched_mailbox_limit_refuses_large_commands_without_restarting_mqtt_or_engine() {
+    let broker = FakeBroker::start().await;
+    let activity = Activity::default();
+    let invalid =
+        Bridge::new("Buffers").instance("i").broker(&broker.address()).request_queue_bytes(0).start_managed(Owner(activity.clone())).await;
+    match invalid {
+        Err(error) => assert!(error.contains("request queue byte limit must be positive")),
+        Ok(running) => {
+            running.stop().await;
+            panic!("zero mailbox limit started a service");
+        }
+    }
+    assert_eq!(activity.starts.load(Ordering::SeqCst), 0);
+    let running = Bridge::new("Buffers")
+        .instance("i")
+        .broker(&broker.address())
+        .request_queue_bytes(2048)
+        .start_managed(Owner(activity.clone()))
+        .await
+        .unwrap();
+    assert!(broker.wait_for_subscription("Buffers/Command/i", Duration::from_secs(2)).await);
+    let before = activity.ticks.load(Ordering::SeqCst);
+    assert!(broker.send("Buffers/Command/i", format!("{{\"command\":\"echo\",\"data\":\"{}\"}}", "x".repeat(8192))));
+    assert!(
+        broker
+            .wait_until(Duration::from_secs(2), |broker| broker
+                .received_on("Buffers/Error/i")
+                .iter()
+                .any(|message| String::from_utf8_lossy(&message.payload).contains("mailbox byte budget")))
+            .await,
+        "launched bridge ignored its mailbox byte limit"
+    );
+    let options = SendOptions { response_topic: Some("Client/replies".into()), ..Default::default() };
+    assert!(broker.send_with("Buffers/Command/i", r#"{"command":"echo"}"#, &options));
+    assert!(
+        broker
+            .wait_until(Duration::from_secs(2), |broker| !broker.received_on("Client/replies").is_empty()
+                && activity.ticks.load(Ordering::SeqCst) > before + 2)
+            .await,
+        "mailbox refusal stopped the worker or engine timeline"
+    );
+    assert_eq!(broker.accepted(), 1, "mailbox overload reconnected MQTT");
+    assert_eq!(activity.starts.load(Ordering::SeqCst), 1);
+    assert!(running.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incoming_budget_exhaustion_retries_mqtt_while_the_engine_keeps_ticking() {
     let broker = FakeBroker::start().await;
     let activity = Activity::default();

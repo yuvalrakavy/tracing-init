@@ -1,0 +1,99 @@
+# New guards for accounted request-mailbox contents. Run only these new controls;
+# existing tables are checked for anchor rot without rerunning their mutations.
+[[control]]
+name = "mailbox_byte_ceiling_disabled"
+guard = "aggregate candidate admission"
+file = "mqtt-bridge-kit/src/mailbox/budget.rs"
+anchor = "inner.request_bytes() > limit"
+replacement = "inner.request_bytes() > limit.saturating_add(1048576)"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(oversized_property_and_target)"]
+expect_text = "oversized target update bypassed mailbox admission"
+
+[[control]]
+name = "refused_candidate_is_not_rolled_back"
+guard = "atomic refusal rollback"
+file = "mqtt-bridge-kit/src/mailbox/budget.rs"
+anchor = "*inner = before;"
+replacement = "drop(before);"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(oversized_property_and_target)"]
+expect_text = "rejected target update changed the old copy pin"
+
+[[control]]
+name = "coalesced_read_callers_are_not_counted"
+guard = "coalesced caller accounting"
+file = "mqtt-bridge-kit/src/mailbox/budget.rs"
+anchor = "sum(callers.iter().map(|caller| sum([128, context(&caller.context), caller.reply.as_ref().map_or(0, reply)])))"
+replacement = "{ let _ = callers; 0 }"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(coalesced_reads_cannot_accumulate)"]
+expect_text = "coalesced callers escaped mailbox byte admission"
+
+[[control]]
+name = "active_parameters_release_capacity_at_dispatch"
+guard = "worker-owned parameter reservation"
+file = "mqtt-bridge-kit/src/mailbox/budget.rs"
+anchor = "self.in_flight_command.as_ref().map_or(0, |_| self.in_flight_command_bytes)"
+replacement = "0"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(dispatch_never_increases)"]
+expect_text = "active read or command parameters escaped admission"
+
+[[control]]
+name = "escaped_encoding_is_not_counted"
+guard = "encoded and decoded maximum"
+file = "mqtt-bridge-kit/src/mailbox/budget.rs"
+anchor = "decoded(value).max(encoded.0)"
+replacement = "decoded(value)"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(escaped_wire_contents)"]
+expect_text = "escaped JSON bypassed encoded-content admission"
+
+[[control]]
+name = "mailbox_setting_not_passed_to_fixed_device"
+guard = "launched fixed-mailbox wiring"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = "Mailbox::with_byte_limit(self.shared.request_queue_bytes)"
+replacement = "Mailbox::new()"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(launched_mailbox_limit)"]
+expect_text = "launched bridge ignored its mailbox byte limit"
+
+[[control]]
+name = "zero_mailbox_limit_is_accepted"
+guard = "positive mailbox limit"
+file = "mqtt-bridge-kit/src/host.rs"
+anchor = "if limit == 0 {"
+replacement = "if limit == usize::MAX {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(launched_mailbox_limit)"]
+expect_text = "zero mailbox limit started a service"
+
+[[control]]
+name = "read_refusals_are_silent"
+guard = "read and refresh refusal routing"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = '''            match posted {
+                Posted::Dropped => refused(Reason::Refused, "the device is not connected"),
+                Posted::Refused(why) => refused(Reason::Refused, why.as_str()),'''
+replacement = '''            match posted {
+                Posted::Dropped => refused(Reason::Refused, "the device is not connected"),
+                Posted::Refused(_) => {},'''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(mailbox_byte_refusals)"]
+expect_text = "missing mailbox refusal"
+
+[[control]]
+name = "custom_read_refusals_are_silent"
+guard = "custom read refusal routing"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = '''                match device.mailbox.post_read_with_context(key, Some(call.clone()), reply.clone(), deadline, context.clone()) {
+                    Posted::Dropped => refused(Reason::Refused, "the device is not connected"),
+                    Posted::Refused(why) => refused(Reason::Refused, why.as_str()),'''
+replacement = '''                match device.mailbox.post_read_with_context(key, Some(call.clone()), reply.clone(), deadline, context.clone()) {
+                    Posted::Dropped => refused(Reason::Refused, "the device is not connected"),
+                    Posted::Refused(_) => {},'''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(mailbox_byte_refusals)"]
+expect_text = "missing mailbox refusal"

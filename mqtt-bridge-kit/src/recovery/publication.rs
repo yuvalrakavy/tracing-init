@@ -18,9 +18,9 @@ impl RecoverySnapshot {
         if document.is_empty() || document.len() > crate::session::MAX_PACKET_SIZE as usize {
             return Err("recovery snapshot must be nonempty and fit MAX_PACKET_SIZE".into());
         }
-        static IDS: Mutex<u64> = Mutex::new(0);
-        // WAIT: recovery-snapshot-identity
+        static IDS: Mutex<u64> = Mutex::new("recovery-snapshot-identity", 0);
         let id = {
+            // WAIT: recovery-snapshot-identity
             let mut ids = IDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *ids = ids.checked_add(1).ok_or("recovery snapshot identity exhausted")?;
             *ids

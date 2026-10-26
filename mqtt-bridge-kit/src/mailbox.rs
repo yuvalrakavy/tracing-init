@@ -173,7 +173,7 @@ impl ReadKey {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Entry {
     State { value: StateValue, held: bool },
     Config { target: String, config: Option<Value>, context: RequestContext, held: bool },
@@ -182,7 +182,7 @@ enum Entry {
 }
 
 /// One caller of a coalesced read: its response topic, if it named one, and its deadline.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Caller {
     reply: Option<ReplyTo>,
     deadline: Option<Instant>,
@@ -327,6 +327,8 @@ pub enum Refusal {
     DeviceDown,
     /// [`MOMENTARY_CAP`] commands are already waiting.
     QueueFull,
+    /// The configured accounted request-mailbox byte limit would be exceeded.
+    ByteLimit,
     /// The request does not carry the current physical mapping generation.
     StaleGeneration,
 }
@@ -337,6 +339,7 @@ impl Refusal {
         match self {
             Refusal::DeviceDown => "the device is not connected",
             Refusal::QueueFull => "64 momentary commands are already waiting for the device",
+            Refusal::ByteLimit => "the request would exceed the configured mailbox byte budget",
             Refusal::StaleGeneration => "the request generation is absent, retired or unknown; refresh the complete inventory",
         }
     }
@@ -360,8 +363,9 @@ pub struct Unanswered {
     pub ran: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Inner {
+    account_requests: bool,
     connected: bool,
     pending: VecDeque<Entry>,
     momentary: usize,
@@ -390,6 +394,7 @@ struct Inner {
     /// The command the worker took and has not answered: refused at a stop or a watchdog's end,
     /// which cancel it mid-operation (re-gate 3 S3).
     in_flight_command: Option<Unanswered>,
+    in_flight_command_bytes: usize,
     command_completion: Option<crate::CommandCompletion>,
     /// Writes held again before proof that reached their deadline unapplied, in the worker's takes:
     /// their assumptions are withdrawn by the worker ([`take_abandoned`](Mailbox::take_abandoned)).
@@ -416,7 +421,7 @@ impl Inner {
                 !std::mem::replace(&mut self.refusal_logged, true)
             }
             Refusal::QueueFull => !std::mem::replace(&mut self.full_logged, true),
-            Refusal::StaleGeneration => false,
+            Refusal::StaleGeneration | Refusal::ByteLimit => false,
         }
     }
 
@@ -475,6 +480,7 @@ fn log_refusal(command: &str, target: Option<&str>, why: Refusal, first: bool) {
 /// See the module documentation.
 #[derive(Debug)]
 pub struct Mailbox {
+    byte_limit: Option<usize>,
     reports: OnceLock<Weak<crate::reports::Reports>>,
     inner: Mutex<Inner>,
     posted: Notify,
@@ -487,9 +493,13 @@ impl Mailbox {
     /// C10: started as connected, a momentary command posted before the first connect was queued
     /// and applied whenever that connect came).
     pub fn new() -> Arc<Mailbox> {
+        Self::with_byte_limit(None)
+    }
+    pub(crate) fn with_byte_limit(bytes: Option<usize>) -> Arc<Mailbox> {
         Arc::new(Mailbox {
+            byte_limit: bytes,
             reports: OnceLock::new(),
-            inner: Mutex::new("mailbox-lock", Inner::default()),
+            inner: Mutex::new("mailbox-lock", Inner { account_requests: bytes.is_some(), ..Default::default() }),
             posted: Notify::new(),
             policy_changed: Notify::new(),
         })
@@ -659,7 +669,9 @@ impl Mailbox {
                 return Posted::Refused(Refusal::StaleGeneration);
             }
             let key = (value.target.clone(), value.property.clone());
-            match inner.copies.remove(&key) {
+            let before = self.admission_backup(&inner);
+            let mut withdrawals = Vec::new();
+            let posted = match inner.copies.remove(&key) {
                 Some((copy, until, context)) if copy == value.value && context == value.context && now < until => Posted::Skipped,
                 // (After the copy check above: a target-level write's copy of the same value is that
                 // write, so the copy pin it clears is moot.)
@@ -684,7 +696,7 @@ impl Mailbox {
                     // A request replacing a write held again before proof ends that write: its
                     // assumption goes with it (second confirming review 1).
                     if inner.pending.iter().any(|e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld)) {
-                        withdraw(&key.0, &key.1);
+                        withdrawals.push(key.clone());
                     }
                     if replay {
                         match inner.bases.get(&key) {
@@ -706,7 +718,14 @@ impl Mailbox {
                         Posted::Queued
                     }
                 }
+            };
+            let posted = self.admit(&mut inner, before, posted);
+            if !matches!(posted, Posted::Refused(_)) {
+                for (target, property) in withdrawals {
+                    withdraw(&target, &property);
+                }
             }
+            posted
         };
         self.queued(posted)
     }
@@ -727,10 +746,12 @@ impl Mailbox {
             if values.iter().any(|value| !self.context_is_current(Some(&value.target), &value.context)) {
                 return Posted::Refused(Refusal::StaleGeneration);
             }
+            let before = self.admission_backup(&inner);
+            let mut withdrawals = Vec::new();
             let held = !inner.connected;
             for mut value in values {
                 if inner.pending.iter().any(|e| matches!(e, Entry::State { value: v, .. } if v.same_key(&value) && v.reheld)) {
-                    withdraw(&value.target, &value.property);
+                    withdrawals.push((value.target.clone(), value.property.clone()));
                 }
                 inner.copies.insert((value.target.clone(), value.property.clone()), (value.value.clone(), until, value.context.clone()));
                 // A live write of the key, as `post_state`'s: the replay pin goes (second final gate 3).
@@ -738,11 +759,13 @@ impl Mailbox {
                 value.check = Check { replayed: false, held };
                 inner.replace_state(value, held);
             }
-            if held {
-                Posted::Held
-            } else {
-                Posted::Queued
+            let posted = self.admit(&mut inner, before, if held { Posted::Held } else { Posted::Queued });
+            if !matches!(posted, Posted::Refused(_)) {
+                for (target, property) in withdrawals {
+                    withdraw(&target, &property);
+                }
             }
+            posted
         };
         self.queued(posted)
     }
@@ -836,14 +859,11 @@ impl Mailbox {
                 }
                 return Posted::Refused(Refusal::StaleGeneration);
             }
+            let before = self.admission_backup(&inner);
             inner.pending.retain(|e| !matches!(e, Entry::Config { target: t, .. } if t == target));
             let held = !inner.connected;
             inner.pending.push_back(Entry::Config { target: target.to_owned(), config, context, held });
-            if held {
-                Posted::Held
-            } else {
-                Posted::Queued
-            }
+            self.admit(&mut inner, before, if held { Posted::Held } else { Posted::Queued })
         };
         self.queued(posted)
     }
@@ -866,6 +886,7 @@ impl Mailbox {
         let deadline = context.deadline();
         let (posted, refusal) = {
             let mut inner = self.locked();
+            let before = self.admission_backup(&inner);
             let why = if !self.context_is_current(target.as_deref(), &context) {
                 Some(Refusal::StaleGeneration)
             } else if !inner.connected {
@@ -875,14 +896,15 @@ impl Mailbox {
             } else {
                 None
             };
-            match why {
+            let (posted, refusal) = match why {
                 None => {
                     inner.momentary += 1;
                     inner.pending.push_back(Entry::Momentary { target: target.clone(), call: call.clone(), reply, deadline, context });
                     (Posted::Queued, None)
                 }
                 Some(why) => (Posted::Refused(why), Some((why, inner.refuse(why)))),
-            }
+            };
+            (self.admit(&mut inner, before, posted), refusal)
         };
         if let Some((why, first)) = refusal {
             log_refusal(&call.command, target.as_deref(), why, first);
@@ -909,7 +931,8 @@ impl Mailbox {
         let deadline = context.deadline();
         let posted = {
             let mut inner = self.locked();
-            if !inner.connected {
+            let before = self.admission_backup(&inner);
+            let posted = if !inner.connected {
                 Posted::Dropped
             } else {
                 let mut callers = Vec::new();
@@ -925,7 +948,8 @@ impl Mailbox {
                 callers.push(Caller { reply, deadline, context: context.clone() });
                 inner.pending.push_back(Entry::Read { key, call, callers, context });
                 Posted::Queued
-            }
+            };
+            self.admit(&mut inner, before, posted)
         };
         self.queued(posted)
     }
@@ -1072,6 +1096,7 @@ impl Mailbox {
     /// caller to log once the lock is released.
     fn next(inner: &mut Inner, now: Instant, dropped: &mut usize) -> Option<Work> {
         loop {
+            let charge = if inner.account_requests { inner.pending.front().map_or(0, budget::entry) } else { 0 };
             match inner.pending.front()? {
                 Entry::State { value, .. } => {
                     // A target's waiting config goes before its values.
@@ -1105,6 +1130,7 @@ impl Mailbox {
                         if deadline.is_some_and(|d| now >= d) {
                             return Some(Work::Expired { target, call, reply, context });
                         }
+                        inner.in_flight_command_bytes = charge;
                         inner.in_flight_command = Some(Unanswered {
                             context: context.clone(),
                             ran: true,
@@ -1145,6 +1171,7 @@ impl Mailbox {
                             .clone()
                             .bounded_deadline(live.iter().filter_map(|caller| caller.deadline).min());
                         let replies: Vec<ReplyTo> = live.into_iter().filter_map(|c| c.reply).collect();
+                        inner.in_flight_command_bytes = charge;
                         inner.command_completion = None;
                         inner.in_flight_command = Some(Unanswered {
                             context: context.clone(),
@@ -1367,5 +1394,8 @@ impl Mailbox {
     }
 }
 
+mod budget;
+#[cfg(test)]
+mod budget_tests;
 #[cfg(test)]
 mod tests;

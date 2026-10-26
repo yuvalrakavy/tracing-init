@@ -1,8 +1,9 @@
 //! Opt-in bounded MQTT buffering; the managed engine survives connection overload.
+use lock_order::sync::Mutex;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use tokio::sync::Notify;
 
@@ -30,7 +31,7 @@ struct Budget {
     used: AtomicUsize,
 }
 impl Budget {
-    fn reserve(self: &Arc<Self>, bytes: usize) -> Option<Charge> {
+    fn try_charge(self: &Arc<Self>, bytes: usize) -> Option<Charge> {
         let bytes = bytes.max(1);
         let mut used = self.used.load(Ordering::SeqCst);
         loop {
@@ -101,7 +102,10 @@ impl Buffers {
         Arc::new(Self {
             incoming: Arc::new(Budget { limit: limits.incoming_bytes, used: AtomicUsize::new(0) }),
             replies: Arc::new(Budget { limit: limits.reply_bytes, used: AtomicUsize::new(0) }),
-            state: Mutex::new(State { started: false, epoch: Arc::new(()), overflow: None, loss_taken: false, sent: BTreeMap::new() }),
+            state: Mutex::new(
+                "mqtt-buffer-state",
+                State { started: false, epoch: Arc::new(()), overflow: None, loss_taken: false, sent: BTreeMap::new() },
+            ),
             changed: Notify::new(),
         })
     }
@@ -123,7 +127,7 @@ impl Buffers {
         if state.overflow.is_some() {
             return None;
         }
-        let charge = self.replies.reserve(bytes);
+        let charge = self.replies.try_charge(bytes);
         if charge.is_none() {
             state.overflow = Some(Overflow::Replies);
             self.changed.notify_waiters();
@@ -151,7 +155,7 @@ impl Connection {
         if !self.current(&state) || state.overflow.is_some() {
             return None;
         }
-        let charge = self.owner.incoming.reserve(bytes);
+        let charge = self.owner.incoming.try_charge(bytes);
         if charge.is_none() {
             state.overflow = Some(Overflow::Incoming);
             self.owner.changed.notify_waiters();
@@ -195,8 +199,12 @@ impl Connection {
 }
 
 pub(crate) async fn overflowed(connection: Option<Connection>) {
-    let Some(connection) = connection else { return std::future::pending::<()>().await };
+    let Some(connection) = connection else {
+        // WAIT: mqtt-buffer-overflow
+        return std::future::pending::<()>().await;
+    };
     loop {
+        // WAIT: mqtt-buffer-overflow
         let notified = connection.owner.changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -290,8 +298,8 @@ mod tests {
     #[test]
     fn byte_reservation_rejects_overflow_and_counts_decoded_metadata() {
         let budget = Arc::new(Budget { limit: usize::MAX, used: AtomicUsize::new(0) });
-        let one = budget.reserve(1).unwrap();
-        assert!(budget.reserve(usize::MAX).is_none(), "byte accounting wrapped past its ceiling");
+        let one = budget.try_charge(1).unwrap();
+        assert!(budget.try_charge(usize::MAX).is_none(), "byte accounting wrapped past its ceiling");
         assert_eq!(budget.used.load(Ordering::SeqCst), 1);
         drop(one);
         let properties = rumqttc::v5::mqttbytes::v5::PublishProperties {

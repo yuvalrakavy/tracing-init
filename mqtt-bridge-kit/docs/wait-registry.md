@@ -91,7 +91,23 @@ selects on, and a death goes to a channel `Running::ended` reads.
 | `managed-runtime` | acyclic | actual service runtime destruction | After dropping the service future and LocalSet, runtime drop confirms its blocking helpers have ended. This may block only the isolated service thread: nobody joins it. The parent's `managed-stop` deadline independently reports failure/abandonment, and no completion fact is published while a runtime helper or destructor is still running. |
 | `process-launch` | acyclic | bridge launch raced against OS stop | Ordinary launch is immediate; managed launch waits on `managed-start`. A signal drops the startup future, retaining `StartupSlot` to confirm service teardown within the original component ceiling. No-ready workers cannot leave live resources behind a successful process exit. |
 
+| Key | Kind | Waits on | Argument |
+|---|---|---|---|
+| `mqtt-buffer-state` | acyclic | connection epoch, overflow and charged publication map | Short synchronous critical sections. Reports may reserve an answer under its lock; buffering never takes Reports, the mailbox, or recovery locks, and never awaits or invokes callbacks under its lock. Charge destruction changes atomic counters only. |
+| `mqtt-buffer-overflow` | acyclic | overflow notification, or disabled pending future | Session selects this independently of publication work and shutdown. Producers latch overflow without waiting on consumers; registering the notification precedes reading the latch. A disabled future is always raced against normal work and shutdown. |
+| `recovery-state` | acyclic | recovery phase, pending installation, snapshot publication state | No awaited I/O or engine/driver call under the lock. Installation is taken out before mailbox/Reports replacement. Watch receivers release their borrows before acquiring this lock. |
+| `recovery-identity` | acyclic | process-local owner identity counter | Checked increment only; no other locks, callbacks, or waits under the lock. Exhaustion returns an error. |
+| `recovery-snapshot-identity` | acyclic | immutable snapshot identity counter | Checked increment only; no other locks, callbacks, or waits under the lock. Exhaustion returns an error. |
+| `recovery-install` | acyclic | session installation request/result notification | Engine and session run independently; the session takes installation requests without waiting on the engine. The initial decision has INSTALL_WAIT (10 s); session loss abandons the request and closes its result. Service code races completion with cancellation. Disabled session notification is pending and raced with shutdown. |
+| `recovery-readback` | acyclic | session replay watch | Session independently produces a complete replay or ends/retries its connection. The service races readback with cancellation; no MQTT progress depends on a waiting reader. |
+
 ## Settings
+
+The recovery state lock is released before model/mailbox installation, awaiting an
+engine decision, or publishing to MQTT. Watch borrows are cloned and released before
+taking it. The identity locks only increment checked integers. The buffering lock
+contains no awaits or callbacks; Reports may take it while reserving answers, but
+buffering never takes Reports or the mailbox, so that edge cannot return.
 
 ```wait-lint
 # rumqttc's client calls, which wait on its request channel, and its event loop's poll.
@@ -107,7 +123,7 @@ local-methods = died
 local-methods = read_state, configure, probe, blocking
 # The host lifecycle's handlers and the publication rotation's turn, awaited by the session: this
 # code's own; the waits inside them are tagged.
-local-methods = on_connack, on_ack, on_event, on_event_offline, on_timer, on_turn_done, on_session_lost, on_publish, on_line, turn
+local-methods = on_connack, on_ack, on_event, on_event_offline, on_timer, on_turn_done, on_session_lost, on_publish, on_line, on_recovery, turn
 raw-locks = forbid
 ```
 
@@ -156,8 +172,8 @@ managed-lifecycle src/managed.rs Control::stopping
 managed-lifecycle src/managed.rs Managed::admit
 managed-lifecycle src/managed.rs Managed::already_failed
 managed-lifecycle src/managed.rs ServiceContext::ready
-managed-run src/managed.rs spawn
-managed-runtime src/managed.rs spawn
+managed-run src/managed.rs spawn_recovery
+managed-runtime src/managed.rs spawn_recovery
 managed-start src/managed.rs Bridge::start_managed_in
 managed-stop src/managed.rs Bridge::start_managed_in
 managed-stop src/managed.rs Control::stop_until
@@ -165,9 +181,18 @@ managed-stop src/managed.rs Managed::stop_until
 managed-stop src/managed.rs StartupSlot::stop
 managed-stop src/process.rs Running::stop
 managed-stop src/process.rs serve_with
-managed-thread src/managed.rs spawn
-managed-watch src/managed.rs spawn
+managed-thread src/managed.rs spawn_recovery
+managed-watch src/managed.rs spawn_recovery
 managed-watch src/managed.rs watch
+mqtt-buffer-overflow src/buffering.rs overflowed
+mqtt-buffer-state src/buffering.rs Buffers::begin
+mqtt-buffer-state src/buffering.rs Buffers::reserve_reply
+mqtt-buffer-state src/buffering.rs Buffers::sent
+mqtt-buffer-state src/buffering.rs Connection::acknowledged
+mqtt-buffer-state src/buffering.rs Connection::claim_loss
+mqtt-buffer-state src/buffering.rs Connection::reason
+mqtt-buffer-state src/buffering.rs Connection::reserve_incoming
+mqtt-buffer-state src/buffering.rs Connection::written
 mqtt-poll src/pump.rs Pump::run
 mqtt-poll src/pump.rs linger
 mqtt-pump-queue src/pump.rs Incoming::recv
@@ -180,6 +205,27 @@ mqtt-request src/session.rs flush
 panic-report src/process.rs PanicReports::report
 panic-report src/process.rs PanicReports::start
 process-launch src/process.rs serve_with
+recovery-identity src/recovery.rs RecoveryShared::new
+recovery-install src/lifecycle.rs Lifecycle::recovery_changed
+recovery-install src/recovery.rs RecoveryHandle::complete
+recovery-install src/recovery.rs RecoveryShared::changed
+recovery-readback src/recovery.rs RecoveryHandle::readback
+recovery-snapshot-identity src/recovery/publication.rs RecoverySnapshot::new
+recovery-state src/recovery.rs RecoveryHandle::complete
+recovery-state src/recovery.rs RecoveryHandle::receipt
+recovery-state src/recovery.rs RecoveryShared::begin
+recovery-state src/recovery.rs RecoveryShared::install_deadline
+recovery-state src/recovery.rs RecoveryShared::install_pending
+recovery-state src/recovery.rs RecoveryShared::lost
+recovery-state src/recovery.rs RecoveryShared::readback_result
+recovery-state src/recovery.rs RecoveryShared::readiness
+recovery-state src/recovery/publication.rs RecoveryShared::offer
+recovery-state src/recovery/publication.rs RecoveryShared::publication_ack
+recovery-state src/recovery/publication.rs RecoveryShared::publication_deadline
+recovery-state src/recovery/publication.rs RecoveryShared::publication_rejected
+recovery-state src/recovery/publication.rs RecoveryShared::publication_sent
+recovery-state src/recovery/publication.rs RecoveryShared::publication_written
+recovery-state src/recovery/publication.rs RecoveryShared::take_publication
 reports-lock src/reports.rs Reports::locked
 reports-ready src/reports.rs Reports::reported
 runtime src/process.rs run_with

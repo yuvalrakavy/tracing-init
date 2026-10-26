@@ -189,6 +189,11 @@ impl PanicReports {
 pub struct Bridge(Host);
 
 impl Bridge {
+    /// Bound accounted pending/in-flight request contents and mailbox copy/basis caches.
+    /// Oversized updates are refused atomically; the device worker never waits for space.
+    pub fn request_queue_bytes(self, limit: usize) -> Bridge {
+        Bridge(self.0.request_queue_bytes(limit))
+    }
     /// Bound MQTT forwarding and terminal replies; exhaustion retries MQTT only.
     pub fn buffers(self, limits: crate::BufferLimits) -> Bridge {
         Bridge(self.0.buffers(limits))

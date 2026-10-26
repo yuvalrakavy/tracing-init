@@ -158,6 +158,7 @@ fn rig_with_buffers(port: u16, buffers: Option<Arc<crate::buffering::Buffers>>) 
         broker_port: port,
         timing: MqttTiming::default(),
         request_lifetime_limit: None,
+        request_queue_bytes: None,
         version: "test".into(),
         outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         enqueued: std::sync::atomic::AtomicU64::new(0),
@@ -189,6 +190,51 @@ fn metadata_device() -> Device {
         tag: None,
         request_lifetime_limit: Some(Duration::from_secs(20)),
         span: Span::none(),
+    }
+}
+
+#[test]
+fn mailbox_byte_refusals_cross_ingress_with_original_ids_and_correlated_command_replies() {
+    use serde_json::json;
+    for lane in ["property", "target", "command", "read", "refresh"] {
+        let mut device = metadata_device();
+        device.mailbox = Mailbox::with_byte_limit(Some(2048));
+        device.mailbox.connected();
+        let large = "z".repeat(8192);
+        let (topic, payload) = match lane {
+            "property" => ("Meta/Desired/i/array/playback", json!(large)),
+            "target" => ("Meta/Desired/i/array", json!({"playback":large})),
+            "command" => ("Meta/Command/i", json!({"command":"pulse","data":large})),
+            "read" => ("Meta/Command/i", json!({"command":"inspect","data":large})),
+            _ => ("Meta/Command/i", json!({"command":"refresh"})),
+        };
+        // Refresh has no parameters: caller correlation is the pressure source.
+        let correlation = bytes::Bytes::from(vec![7; if lane == "refresh" { 8192 } else { 3 }]);
+        let id = "ef".repeat(32);
+        let properties = PublishProperties {
+            response_topic: Some("Client/replies".into()),
+            correlation_data: Some(correlation.clone()),
+            message_expiry_interval: Some(5),
+            user_properties: vec![("request-id".into(), id.clone())],
+            ..Default::default()
+        };
+        route(
+            &device,
+            topic,
+            &Publish::new(topic, QoS::AtLeastOnce, serde_json::to_vec(&payload).unwrap(), Some(properties)),
+            Instant::now(),
+        );
+        let changes = device.reports.take();
+        let errors: Vec<_> = changes.answer_errors.iter().chain(&changes.errors).collect();
+        assert_eq!(errors.len(), 1, "{lane}: missing mailbox refusal");
+        let error: serde_json::Value = serde_json::from_slice(&errors[0].encode()).unwrap();
+        assert_eq!(error["request-id"], id, "{lane}: mailbox refusal lost request identity");
+        assert!(error.to_string().contains("mailbox byte budget"), "{lane}: a different guard refused the fixture: {error}");
+        if matches!(lane, "command" | "read" | "refresh") {
+            assert_eq!(changes.replies.len(), 1, "{lane}: mailbox refusal silently lost its reply");
+            assert_eq!(changes.replies[0].correlation, Some(correlation));
+        }
+        assert!(!device.mailbox.waiting(), "{lane}: refused request entered the mailbox");
     }
 }
 

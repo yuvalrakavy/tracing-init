@@ -92,6 +92,21 @@ Connection capabilities prevent an old
 pump from exhausting or crediting a new connection's budget. Cloned builders allocate
 independent buffering state when started.
 
+`Bridge::request_queue_bytes(limit)` separately bounds accounted request contents in
+the fixed device's mailbox. The positive limit includes pending and in-flight state,
+configuration and command parameters, coalesced read callers, and copy/conflict-basis
+caches. Accounting uses the larger of encoded JSON and decoded contents, plus keys,
+request metadata and fixed entry overhead; it is not an allocator or RSS measurement.
+The default is unchanged when this option is absent.
+
+An update is checked as a complete candidate: replacing a value credits the superseded
+contents, and refusal leaves earlier work and its assumptions intact. The worker never
+waits for space. A refused command/read receives a request Error and any correlated
+reply; mailbox pressure alone does not reconnect MQTT or restart the managed service.
+If those terminal answers exhaust the separately configured reply budget, the MQTT
+retry policy above applies. Driver-owned allocations and temporary ingress parsing
+are outside the mailbox budget and need their own bounds.
+
 These are accounted queue byte limits, not a process resident-memory measurement.
 Request-mailbox limits, model/unsolicited-report storage and aggregate engine/recovery
 allocation admission remain separate responsibilities; this API does not establish them.
