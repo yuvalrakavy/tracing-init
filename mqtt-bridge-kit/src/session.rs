@@ -493,10 +493,9 @@ pub(crate) fn tagged(tag: Option<&str>) -> PublishProperties {
     properties
 }
 
-/// A request rumqttc refused (it carries the refused request): the session ends on it. Boxed, as
-/// it passes up every handler's `Result`, and the bare `ClientError` is over 200 bytes
-/// (`clippy::result_large_err`).
-pub(crate) type Failed = Box<rumqttc::v5::ClientError>;
+/// A session-handler failure, including a refused MQTT request or recovery validation.
+/// Boxed so every handler's Result stays small; ClientError alone exceeds 200 bytes.
+pub(crate) type Failed = Box<dyn std::error::Error + Send + Sync>;
 
 /// Publish one message. A refusal — a topic rumqttc does not publish to, or the event loop gone —
 /// is that one message dropped, said at DEBUG; the caller goes on with the rest (review B2: the
@@ -596,6 +595,7 @@ async fn session(
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
                 () = sleep_until(wake) => Step::Tick,
+                () = host.recovery_changed() => Step::Recovery,
                 () = std::future::ready(()), if line_cleared => Step::Line,
                 Some(event) = events.recv() => Step::Lifecycle(event),
                 event = incoming.recv() => Step::Event(event),
@@ -609,6 +609,7 @@ async fn session(
                 biased;
                 _ = shutdown.wait_for(|stop| *stop) => Step::Shutdown,
                 () = sleep_until(wake) => Step::Tick,
+                () = host.recovery_changed() => Step::Recovery,
                 () = std::future::ready(()), if line_cleared => Step::Line,
                 () = std::future::ready(()), if owed => Step::Reported,
                 () = shared.ready.notified(), if open => Step::Reported,
@@ -629,6 +630,7 @@ async fn session(
         }
         let work = async {
             match step {
+                Step::Recovery => host.on_recovery(&ctx, outputs).await.map(|()| None),
                 Step::Event(Some(PumpEvent::Connected)) => host.on_connack(&ctx, outputs).await.map(|()| None),
                 Step::Event(Some(PumpEvent::Publish(publish, received))) => {
                     let (topic, span) = traced(&publish, shared.topics.instance());
@@ -703,6 +705,7 @@ async fn sleep_until(at: Option<Instant>) {
 // Transient: one per pass of the session's loop, never stored.
 #[allow(clippy::large_enum_variant)]
 enum Step {
+    Recovery,
     Event(Option<PumpEvent>),
     Lifecycle(Event),
     Reported,
@@ -975,6 +978,10 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
         // before its grant — is still reading the retained State it would overwrite (the R2
         // confirming reviews 2, Claude minor 3). Its answers and unsolicited reports still go.
         for slot in &mut outputs.slots {
+            if !host.recovery_output_open() {
+                slot.batch = Batch::default();
+                continue;
+            }
             crate::worker::report_refused(&slot.device.reports, slot.device.mailbox.disconnected(), STOPPED_BEFORE);
             slot.batch.add(&slot.device, slot.device.reports.take_sealed());
             if !slot.announced {

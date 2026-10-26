@@ -260,6 +260,62 @@ whose identifier itself is valid. Invalid or duplicate identifiers are never ech
 Requests without it retain their existing wire behavior. Expiry and request identity do
 not change generation authority, equality, hashing or mailbox coalescing keys.
 
+## Retained recovery for managed bridges
+
+`Bridge::recovery(RecoveryOptions { target, max_bytes })` opts a fixed managed bridge
+into snapshot readback and exact model installation on every MQTT connection. Use
+`start_managed` or `run_managed`. Its proxy must initially advertise a fenced policy
+with an empty target table and a valid instance generation. Other bridges keep their
+existing bootstrap.
+
+The runtime subscribes to exactly `State/{instance}/{target}`, waits for that
+subscription's successful SUBACK, then subscribes to a separate `_sync` nonce topic.
+The second matched SUBACK closes replay. This requires a broker that orders earlier
+retained replay before a later subscription acknowledgment. No retained marker is
+written. Refused or overdue subscriptions end the connection and never prove absence.
+The temporary subscriptions are removed afterwards.
+The engine has ten seconds after replay to install its initial image. An overdue
+decision ends and retries the MQTT connection while the managed engine keeps running.
+
+`ServiceContext::recovery()` supplies a `RecoveryHandle`. Its `readback().await`
+receives the latest completed replay once, with an opaque connection capability and
+`Result<Option<Bytes>, String>`: absence, a bounded encoded payload, or an invalid
+oversized replay. The engine validates its own snapshot format and chooses its recovery
+policy. Race this wait with service cancellation; MQTT loss does not stop the service.
+
+The engine calls `complete(connection, image, readiness, command_completion).await`.
+`RecoveryImage` contains the complete generation table, assumed target model, accepted
+target configurations and original request context. Installation replaces old state,
+acknowledged writes, conflict/readback caches, setup caches and queued work, including
+work whose mapping generation stayed unchanged. The original deadline is checked again
+at installation. Trace causality is copied to the new model's own generations.
+Only the exact initiating command capability can preserve its final completion.
+The encoded model/setup seed is bounded at 1 MiB independently of the retained
+snapshot's `max_bytes` limit.
+
+Normal state and request admission wait for successful installation. `Ready` opens
+ordinary requests; `RecoveryOnly` requires empty target/model/setup maps and allows
+registered targetless recovery commands, which the proxy must validate. Builtin refresh
+stays closed in RecoveryOnly; fenced assume stays unavailable. Refusals preserve a valid
+command response topic and correlation data. An install abandoned before commit,
+stale connection, invalid image or expired request cannot open the gates. RecoveryOnly
+can promote to Ready on the current connection through another exact installation.
+Shutdown keeps output gated if no image was installed.
+Keep the engine's staged installation job alive until its result is known, even if
+the originating command caller disappears. Cancellation after commit cannot undo
+an installed image; apply the committed engine candidate before answering later work.
+
+This API currently supplies replay and model installation. Snapshot publication and
+its broker acceptance receipts are not yet available through `RecoveryHandle`.
+
+The explicit broker acceptance test requires `mosquitto` on PATH and runs only on
+an owned ephemeral loopback listener with persistence disabled:
+
+```sh
+cargo nextest run --manifest-path mqtt-bridge-kit/Cargo.toml --lib \
+  --features mosquitto-acceptance -E 'test(isolated_mosquitto_orders)'
+```
+
 ## Request traces across queues
 
 MQTT v5 `traceparent` is optional diagnostic metadata. The runtime validates and

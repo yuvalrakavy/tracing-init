@@ -153,6 +153,8 @@ pub struct Host {
     /// over at the start; no factory, no Configs.
     fixed: bool,
     request_lifetime_limit: Option<Duration>,
+    pub(crate) recovery: Option<crate::RecoveryOptions>,
+    pub(crate) recovery_shared: Option<Arc<crate::recovery::RecoveryShared>>,
 }
 
 impl std::fmt::Debug for Host {
@@ -193,6 +195,8 @@ impl Host {
             factory: None,
             fixed: false,
             request_lifetime_limit: None,
+            recovery: None,
+            recovery_shared: None,
         }
     }
 
@@ -200,6 +204,15 @@ impl Host {
     /// command line R1's (`--instance`, no `--name`), its `Version` text R1's.
     pub(crate) fn fixed(family: &str) -> Host {
         Host { program: program(family.to_lowercase()), fixed: true, ..Host::new(family) }
+    }
+
+    pub(crate) fn recovery(mut self, options: crate::RecoveryOptions) -> Host {
+        if let Err(error) = options.validate() {
+            return self.usage_error(error);
+        }
+        self.recovery = Some(options);
+        self.recovery_shared = None;
+        self
     }
 
     /// The kind.
@@ -505,6 +518,7 @@ impl Host {
             mqtt: self.settings.mqtt,
         };
         let mut lifecycle = Lifecycle::new(settings, shared.clone(), spawner, span.clone(), ready);
+        lifecycle.recovery = self.recovery_shared.clone();
         let mut outputs = Outputs::new();
         if let Some((driver, info)) = fixed {
             lifecycle.start_fixed(&mut outputs, &id, driver, info, span.clone())?;

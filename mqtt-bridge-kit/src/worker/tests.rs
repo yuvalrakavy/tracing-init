@@ -23,6 +23,30 @@ fn request(value: Value, conflict: Conflict) -> StateValue {
 struct RequestMetadataDriver {
     seen: Vec<RequestContext>,
 }
+
+#[test]
+fn recovery_replaces_worker_setup_and_conflict_caches_even_when_generation_is_unchanged() {
+    let mailbox = Mailbox::new();
+    let reports = Reports::new();
+    let table = crate::TargetGenerations { instance: "instance.1".into(), targets: [("a".into(), "generation.a".into())].into() };
+    reports.install_policy(RequestPolicy::Fenced(table.clone()));
+    let mut worker = Worker::new(RequestMetadataDriver::default(), DriverInfo::default(), "i", mailbox.clone(), reports.clone());
+    worker.configured.insert("a".into(), (RequestContext::new("generation.a").unwrap(), Some(json!({"channel":21}))));
+    worker.before = Some((Instant::now(), [("a".into(), json!({"level":1}).as_object().unwrap().clone())].into()));
+    worker.before_policy = Some(RequestPolicy::Fenced(table.clone()));
+    let image = crate::RecoveryImage {
+        context: RequestContext::default(),
+        generations: table,
+        states: [("a".into(), json!({"level":22}).as_object().unwrap().clone())].into(),
+        configurations: [("a".into(), json!({"channel":2}))].into(),
+    };
+    mailbox.replace_recovery(&reports, &image, None).unwrap();
+    worker.retire_cached();
+    assert_eq!(worker.configured.len(), 1);
+    assert_eq!(worker.configured["a"].1, Some(json!({"channel":2})), "worker retained old setup across exact recovery");
+    assert_eq!(worker.before.as_ref().unwrap().1, image.states, "worker retained an old conflict basis across recovery");
+    assert_eq!(worker.recovery_epoch, 1);
+}
 impl DeviceDriver for RequestMetadataDriver {
     fn info(&self) -> DriverInfo {
         DriverInfo::default()

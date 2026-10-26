@@ -301,6 +301,7 @@ pub(crate) struct Worker<D: DeviceDriver> {
     /// over again while the link stays up (every reconnect replays the retained configs; review
     /// MINOR 5). Forgotten when the link is lost — the device may have lost its setup with it.
     configured: HashMap<String, (RequestContext, Option<Value>)>,
+    recovery_epoch: u64,
     /// Whether the driver's `Unsupported` probe was said (once per process).
     unsupported_probe_said: bool,
     /// The stop, once the worker runs on its thread: asked, no more work is taken.
@@ -324,6 +325,7 @@ impl<D: DeviceDriver> Worker<D> {
             before_policy: None,
             recovered: false,
             configured: HashMap::new(),
+            recovery_epoch: 0,
             unsupported_probe_said: false,
             stopping: None,
         }
@@ -533,6 +535,20 @@ impl<D: DeviceDriver> Worker<D> {
 
     fn retire_cached(&mut self) {
         let reports = &self.reports;
+        if let Some(seed) = reports.recovery_cache(self.recovery_epoch) {
+            self.recovery_epoch = seed.epoch;
+            self.configured = seed
+                .configurations
+                .into_iter()
+                .map(|(target, config)| {
+                    let context = RequestContext::new(&seed.generations.targets[&target]).expect("validated recovery setup generation");
+                    (target, (context, Some(config)))
+                })
+                .collect();
+            self.before = Some((Instant::now(), seed.states));
+            self.before_policy = Some(RequestPolicy::Fenced(seed.generations));
+            return;
+        }
         self.configured.retain(|target, (context, _)| reports.context_is_current(Some(target), context));
         if let (Some((_, values)), Some(RequestPolicy::Fenced(saved)), Some(RequestPolicy::Fenced(current))) =
             (&mut self.before, &self.before_policy, reports.current_policy())

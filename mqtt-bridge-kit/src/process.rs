@@ -189,6 +189,18 @@ impl PanicReports {
 pub struct Bridge(Host);
 
 impl Bridge {
+    /// Require a completed retained-snapshot replay and explicit engine install
+    /// on every connection. Use with a managed service; legacy bootstrap is unchanged.
+    pub fn recovery(self, options: crate::RecoveryOptions) -> Bridge {
+        Bridge(self.0.recovery(options))
+    }
+    pub(crate) fn recovery_handle(&self) -> Option<crate::RecoveryHandle> {
+        self.0.recovery_shared.as_ref().map(|recovery| recovery.handle())
+    }
+    pub(crate) fn prepare_recovery(&mut self) -> Result<(), String> {
+        self.0.recovery_shared = self.0.recovery.clone().map(crate::recovery::RecoveryShared::new).transpose()?;
+        Ok(())
+    }
     pub(crate) fn validate_managed_start(&self) -> Result<(), String> {
         self.0.validate_managed_start()
     }
@@ -339,6 +351,10 @@ impl Bridge {
         if let Some(code) = self.usage_exit() {
             return code;
         }
+        if self.0.recovery.is_some() {
+            crate::devices::drop_off_thread(Box::new(Built(driver)));
+            return self.usage_error("recovery requires run_managed or start_managed").usage_exit().unwrap_or(ExitCode::FAILURE);
+        }
         let app = self.0.app();
         let log_config = self.0.settings().log_config.clone();
         // `info()` should be pure; one that is not must not hold up the stop: it runs on a
@@ -391,6 +407,10 @@ impl Bridge {
     /// whether or not it is polled, and says the device unreachable and refuses the waiting
     /// commands at once.
     pub fn start<D: DeviceDriver>(self, driver: D) -> Result<Running, String> {
+        if self.0.recovery.is_some() {
+            crate::devices::drop_off_thread(Box::new(Built(driver)));
+            return Err("recovery requires run_managed or start_managed".into());
+        }
         self.0.launch(Some((Box::new(Built(driver)), None)))
     }
 }

@@ -1113,6 +1113,23 @@ Test both accepted finite requests and rejected missing/long property expiry,
 and retain a default-policy compatibility case. The broker exposes remaining TTL,
 not original publication time, so publishers must bound the initial expiry too.
 
+## Optional: restore retained engine state
+
+For a fixed managed bridge whose own engine chooses a retained recovery image,
+opt into `Bridge::recovery(RecoveryOptions { target, max_bytes })` before starting
+the service. Obtain `context.recovery()` and transfer a fenced proxy with an empty
+initial target table through `context.ready`. Its connect, read and probe methods
+must reflect engine health while recovery is waiting, so recovery commands remain
+reachable once a RecoveryOnly image is installed.
+
+The handle delivers a completed replay with a connection capability. Build a complete
+`RecoveryImage`, carrying the initiating request's original context for expiry and
+trace causality, then await `complete`. Success confirms the runtime installed that
+image; it does not confirm broker snapshot replication. Keep rendering independently
+while a completion waits. A RecoveryOnly image has empty target/model/setup maps;
+ordinary recovery uses Ready. See the [recovery API contract](../README.md#retained-recovery-for-managed-bridges)
+for subscription ordering, exact cache replacement and current publication limits.
+
 ## A checklist before you ship a driver
 
 - `info()` declares what is true: `writes`, `feedback`, every command and its class. A driver with

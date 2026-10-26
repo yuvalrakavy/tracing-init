@@ -531,6 +531,35 @@ impl Mailbox {
         next: TargetGenerations,
         completion: Option<&crate::CommandCompletion>,
     ) -> Result<Vec<Unanswered>, String> {
+        self.replace_authority(completion, || reports.retire_generations(expected, next), |_| {})
+    }
+
+    pub(crate) fn replace_recovery(
+        &self,
+        reports: &crate::reports::Reports,
+        image: &crate::RecoveryImage,
+        completion: Option<&crate::CommandCompletion>,
+    ) -> Result<Vec<Unanswered>, String> {
+        self.replace_authority(
+            completion,
+            || reports.replace_recovery(image),
+            |inner| {
+                for (target, config) in &image.configurations {
+                    if let Some(feedback) = config.get("feedback").and_then(Value::as_str).and_then(Feedback::parse) {
+                        let context = RequestContext::new(&image.generations.targets[target]).expect("validated recovery setup generation");
+                        inner.feedback.insert(target.clone(), (feedback, context));
+                    }
+                }
+            },
+        )
+    }
+
+    fn replace_authority(
+        &self,
+        completion: Option<&crate::CommandCompletion>,
+        retire: impl FnOnce() -> Result<crate::generations::RetiredGenerations, String>,
+        seed: impl FnOnce(&mut Inner),
+    ) -> Result<Vec<Unanswered>, String> {
         let mut unanswered = Vec::new();
         {
             let mut inner = self.locked();
@@ -544,7 +573,7 @@ impl Mailbox {
             } else {
                 false
             };
-            let retired = reports.retire_generations(expected, next)?;
+            let retired = retire()?;
             if preserve {
                 inner.command_completion = None;
             }
@@ -592,6 +621,7 @@ impl Mailbox {
             inner.bases.retain(|(target, _), (_, _, context)| !retired.contains(Some(target), context));
             inner.feedback.retain(|target, (_, context)| !retired.contains(Some(target), context));
             inner.abandoned.retain(|(target, _, context)| !retired.contains(Some(target), context));
+            seed(&mut inner);
         }
         self.policy_changed.notify_one();
         Ok(unanswered)

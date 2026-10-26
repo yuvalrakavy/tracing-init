@@ -167,6 +167,8 @@ struct Removal {
 
 #[derive(Debug)]
 struct State {
+    recovery_epoch: u64,
+    recovery_configurations: BTreeMap<String, Value>,
     request_policy: Option<RequestPolicy>,
     status: Option<LinkStatus>,
     status_changed: bool,
@@ -213,6 +215,13 @@ pub struct Reports {
     ready: Arc<Notify>,
     /// When the bridge started: the read-back is what the bridge knew then.
     epoch: Instant,
+}
+
+pub(crate) struct RecoveryCache {
+    pub epoch: u64,
+    pub generations: TargetGenerations,
+    pub configurations: BTreeMap<String, Value>,
+    pub states: BTreeMap<String, PropertyMap>,
 }
 
 /// What changed since the session last took it.
@@ -353,6 +362,85 @@ impl Reports {
     pub(crate) fn current_policy(&self) -> Option<RequestPolicy> {
         self.locked().request_policy.clone()
     }
+
+    // Called only under the mailbox lock, with recovery publication/admission closed.
+    pub(crate) fn replace_recovery(&self, image: &crate::RecoveryImage) -> Result<RetiredGenerations, String> {
+        image.generations.validate()?;
+        if image.configurations.keys().any(|target| !image.generations.targets.contains_key(target)) {
+            return Err("recovery setup target has no generation".into());
+        }
+        let mut state = self.locked();
+        let Some(RequestPolicy::Fenced(old)) = &state.request_policy else {
+            return Err("recovery replacement requires a fenced runtime".into());
+        };
+        let retired = RetiredGenerations {
+            instance: Some(RequestContext::new(&old.instance)?),
+            targets: old
+                .targets
+                .iter()
+                .map(|(target, generation)| Ok((target.clone(), RequestContext::new(generation)?)))
+                .collect::<Result<_, String>>()?,
+        };
+        let epoch = state.recovery_epoch.checked_add(1).ok_or("recovery cache epoch exhausted")?;
+        let targets = image
+            .states
+            .iter()
+            .map(|(target, values)| {
+                let generation = image.generations.targets.get(target).ok_or("recovery model target has no generation")?;
+                Ok((
+                    target.clone(),
+                    TargetModel {
+                        context: {
+                            let context = RequestContext::new(generation)?;
+                            if image.context.trace_was_captured() {
+                                context.with_traceparent(image.context.traceparent())
+                            } else {
+                                context
+                            }
+                        },
+                        values: values.clone(),
+                        assumed: true,
+                        reports: 1,
+                        ..TargetModel::default()
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        image.check_deadline()?;
+        state.request_policy = Some(RequestPolicy::Fenced(image.generations.clone()));
+        state.targets = targets;
+        state.changed = image.states.keys().cloned().collect();
+        state.written.clear();
+        state.readback = image.states.clone();
+        state.readback_frozen = Some(image.states.clone());
+        state.readback_level = 2;
+        state.broker_lost = None;
+        state.answers = (Vec::new(), Vec::new());
+        state.errors = Capped::new(ERROR_CAP);
+        state.events = Capped::new(EVENT_CAP);
+        state.removed.clear();
+        state.refused_names.clear();
+        state.status_changed = state.status.is_some();
+        state.recovery_configurations = image.configurations.clone();
+        state.recovery_epoch = epoch;
+        Ok(retired)
+    }
+
+    pub(crate) fn recovery_cache(&self, known_epoch: u64) -> Option<RecoveryCache> {
+        let state = self.locked();
+        if state.recovery_epoch == known_epoch {
+            return None;
+        }
+        let Some(RequestPolicy::Fenced(generations)) = &state.request_policy else {
+            return None;
+        };
+        Some(RecoveryCache {
+            epoch: state.recovery_epoch,
+            generations: generations.clone(),
+            configurations: state.recovery_configurations.clone(),
+            states: state.readback_frozen.clone().unwrap_or_default(),
+        })
+    }
 }
 
 impl State {
@@ -384,6 +472,8 @@ impl Reports {
             state: Mutex::new(
                 "reports-lock",
                 State {
+                    recovery_epoch: 0,
+                    recovery_configurations: BTreeMap::new(),
                     request_policy: None,
                     status: None,
                     status_changed: false,

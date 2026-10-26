@@ -2,69 +2,69 @@
  "rows": {
   "a_committing_command_loses_its_own_completion": {
    "last_real": {
-    "at": "2026-10-21T19:23:03Z",
+    "at": "2026-10-26T19:09:12Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:122ebb323fd59340",
-     "guard": "item:7d3af06ba8ce2f68",
+     "files": "files:bbda004ceece3adc",
+     "guard": "item:3d3afc610afd9bd0",
      "row": "4d52b7771d8cfaa0",
-     "test": "test:df35970bdc1ae29c"
+     "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 3.6,
-    "sha": "273062f05c1f0df05cb35f19bad458f2691d8dea",
+    "secs": 8.3,
+    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
     "verdict": "RED"
    }
   },
   "a_completion_capability_can_be_used_twice": {
    "last_real": {
-    "at": "2026-10-21T19:23:08Z",
+    "at": "2026-10-26T19:09:20Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:122ebb323fd59340",
-     "guard": "item:7d3af06ba8ce2f68",
+     "files": "files:bbda004ceece3adc",
+     "guard": "item:3d3afc610afd9bd0",
      "row": "d8f1560951cd903a",
-     "test": "test:df35970bdc1ae29c"
+     "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 5.3,
-    "sha": "273062f05c1f0df05cb35f19bad458f2691d8dea",
+    "secs": 8.3,
+    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
     "verdict": "RED"
    }
   },
   "a_foreign_completion_can_change_authority": {
    "last_real": {
-    "at": "2026-10-21T19:22:59Z",
+    "at": "2026-10-26T19:09:04Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:122ebb323fd59340",
-     "guard": "item:7d3af06ba8ce2f68",
+     "files": "files:bbda004ceece3adc",
+     "guard": "item:3d3afc610afd9bd0",
      "row": "9eac698b7496ac12",
-     "test": "test:df35970bdc1ae29c"
+     "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 5.4,
-    "sha": "273062f05c1f0df05cb35f19bad458f2691d8dea",
+    "secs": 15.2,
+    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
     "verdict": "RED"
    }
   },
   "a_momentary_execution_has_no_scoped_capability": {
    "last_real": {
-    "at": "2026-10-21T19:23:16Z",
+    "at": "2026-10-26T19:09:30Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:c4390d1fc285be11",
+     "files": "files:3171c67c3ac17cef",
      "guard": "item:58a8784af48f6d2c",
      "row": "a5997441ecca9517",
-     "test": "test:df35970bdc1ae29c"
+     "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 7.7,
-    "sha": "273062f05c1f0df05cb35f19bad458f2691d8dea",
+    "secs": 9.7,
+    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
     "verdict": "RED"
    }
   }

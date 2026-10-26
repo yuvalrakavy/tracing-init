@@ -314,6 +314,9 @@ impl Instance {
 /// What a request awaiting its acknowledgement is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Purpose {
+    RecoveryRead(crate::RecoveryConnection),
+    RecoveryBarrier(crate::RecoveryConnection),
+    RecoveryUnsub,
     Configs,
     Barrier,
     Read {
@@ -462,6 +465,12 @@ struct Fixed {
     read_back_until: Option<Instant>,
 }
 
+struct RecoveryBootstrap {
+    connection: crate::RecoveryConnection,
+    document: Result<Option<bytes::Bytes>, String>,
+    barrier: String,
+}
+
 /// What a host is, for its lifecycle.
 pub(crate) struct Settings {
     pub kind: String,
@@ -480,6 +489,8 @@ pub(crate) struct Settings {
 
 /// See the module documentation.
 pub(crate) struct Lifecycle {
+    pub(crate) recovery: Option<Arc<crate::recovery::RecoveryShared>>,
+    recovery_bootstrap: Option<RecoveryBootstrap>,
     settings: Settings,
     /// The session part: the rotation's broker-loss list is its.
     shared: Arc<session::Shared>,
@@ -511,8 +522,73 @@ pub(crate) struct Lifecycle {
 }
 
 impl Lifecycle {
+    pub(crate) fn recovery_output_open(&self) -> bool {
+        self.recovery.as_ref().map_or(true, |recovery| recovery.readiness().is_some())
+    }
+    pub(crate) fn recovery_changed(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let recovery = self.recovery.clone();
+        async move {
+            match recovery {
+                Some(recovery) => recovery.changed().await,
+                None => std::future::pending::<()>().await,
+            }
+        }
+    }
+    pub(crate) async fn on_recovery(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<(), Failed> {
+        let Some(recovery) = self.recovery.clone() else { return Ok(()) };
+        let name = self.fixed_name().ok_or("recovery proxy is missing")?;
+        let (id, device) = self.rt_of(&name).map(|(rt, _)| (rt.id, rt.device.clone())).ok_or("recovery proxy is missing")?;
+        let installed = recovery.install_pending(|install| {
+            let operation = install.image.context.operation_span(&name, "install_recovery");
+            let _entered = operation.enter();
+            let refused = device.mailbox.replace_recovery(&device.reports, &install.image, install.completion.as_ref())?;
+            if let Some(slot) = outputs.slot(id) {
+                slot.batch = Batch::default();
+            }
+            if let Some(instance) = self.instances.get_mut(&name) {
+                instance.installed = install
+                    .image
+                    .configurations
+                    .keys()
+                    .map(|target| {
+                        (
+                            target.clone(),
+                            RequestContext::new(&install.image.generations.targets[target]).expect("validated recovery generation"),
+                        )
+                    })
+                    .collect();
+                instance.replayed.clear();
+            }
+            let retired_requests = refused.len();
+            crate::worker::report_refused(&device.reports, refused, "the request was retired by exact recovery replacement");
+            let recovery_mode = match install.ready {
+                crate::RecoveryReady::Ready => "ready",
+                crate::RecoveryReady::RecoveryOnly => "recovery_only",
+            };
+            info!(
+                recovery_mode,
+                state_targets = install.image.states.len(),
+                setup_targets = install.image.configurations.len(),
+                retired_requests,
+                "Recovery image installed"
+            );
+            Ok(())
+        })?;
+        if installed {
+            outputs.outbox_open = true;
+            if self.rt_of(&name).is_some_and(|(rt, _)| rt.requests == Sub::None) {
+                self.request_fixed_lanes(Some(ctx), &name).await?;
+            }
+            if self.conn.active {
+                outputs.announce(id);
+            }
+        }
+        self.drive(ctx, outputs).await
+    }
     pub(crate) fn new(settings: Settings, shared: Arc<session::Shared>, spawner: Spawner, span: Span, ready: Arc<Notify>) -> Lifecycle {
         Lifecycle {
+            recovery: None,
+            recovery_bootstrap: None,
             settings,
             shared,
             spawner,
@@ -616,7 +692,8 @@ impl Lifecycle {
             .filter(|at| *at > Instant::now());
         let retries = self.instances.values().filter_map(|i| i.retry_at);
         let read_back = self.fixed.as_ref().and_then(|f| f.read_back_until);
-        [self.conn.next_deadline(), fallback, self.next_sweep, read_back].into_iter().flatten().chain(retries).min()
+        let recovery = self.recovery.as_ref().and_then(|recovery| recovery.install_deadline());
+        [self.conn.next_deadline(), fallback, self.next_sweep, read_back, recovery].into_iter().flatten().chain(retries).min()
     }
 
     // ---- Subscriptions ---------------------------------------------------------------------
@@ -856,6 +933,21 @@ impl Lifecycle {
     pub(crate) async fn on_connack(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<(), Failed> {
         self.conn = Conn { connected: true, ..Conn::default() };
         outputs.outbox_open = true;
+        if let Some(recovery) = self.recovery.clone() {
+            outputs.outbox_open = false;
+            let name = self.fixed_name().ok_or("recovery requires a fixed bridge")?;
+            let topics = self.rt_of(&name).ok_or("recovery proxy is missing")?.1.clone();
+            let connection = recovery.begin()?;
+            let barrier = topics.state(&format!("_sync/{}", connection.nonce()));
+            self.recovery_bootstrap = Some(RecoveryBootstrap { connection, document: Ok(None), barrier });
+            self.request_subscription(
+                Some(ctx),
+                Purpose::RecoveryRead(connection),
+                vec![Self::filter(topics.state(&recovery.options.target), false)],
+            )
+            .await?;
+            return self.drive(ctx, outputs).await;
+        }
         // A fixed host (N = 1) owns no instance by Config: no `Config/+`, no barrier, no
         // `Status/+`. Its instance's read-back, once per process, then its requests (R1).
         if let Some(fixed) = &self.fixed {
@@ -1035,6 +1127,35 @@ impl Lifecycle {
 
     async fn granted(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs, purpose: Purpose) -> Result<(), Failed> {
         match purpose {
+            Purpose::RecoveryRead(connection) => {
+                if let Some(bootstrap) = self.recovery_bootstrap.as_ref().filter(|bootstrap| bootstrap.connection == connection) {
+                    self.request_subscription(
+                        Some(ctx),
+                        Purpose::RecoveryBarrier(connection),
+                        vec![Self::filter(bootstrap.barrier.clone(), false)],
+                    )
+                    .await?;
+                }
+            }
+            Purpose::RecoveryBarrier(connection) => {
+                if let Some(bootstrap) = self.recovery_bootstrap.as_ref().filter(|bootstrap| bootstrap.connection == connection) {
+                    let recovery = self.recovery.clone().ok_or("recovery coordinator disappeared")?;
+                    let name = self.fixed_name().ok_or("recovery proxy disappeared")?;
+                    let topics = self.rt_of(&name).ok_or("recovery proxy disappeared")?.1.clone();
+                    let document = bootstrap.document.clone();
+                    let barrier = bootstrap.barrier.clone();
+                    self.request_unsubscription(Some(ctx), Purpose::RecoveryUnsub, topics.state(&recovery.options.target)).await?;
+                    self.request_unsubscription(Some(ctx), Purpose::RecoveryUnsub, barrier).await?;
+                    info!(
+                        replay_valid = document.is_ok(),
+                        snapshot_present = document.as_ref().is_ok_and(Option::is_some),
+                        payload_bytes = document.as_ref().ok().and_then(Option::as_ref).map_or(0, bytes::Bytes::len),
+                        "Recovery replay completed"
+                    );
+                    recovery.readback_result(connection, document)?;
+                }
+            }
+            Purpose::RecoveryUnsub => {}
             Purpose::Configs => self.conn.configs_granted = Some(Instant::now()),
             Purpose::Barrier => {
                 self.conn.barrier_acked = true;
@@ -1198,6 +1319,9 @@ impl Lifecycle {
     /// rotation (Bridge Runtime spec §9: nothing published before the subscriptions, the first
     /// publish `Active=true`). No barrier: a fixed host owns nothing by Config.
     async fn maybe_active(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) {
+        if self.recovery.as_ref().is_some_and(|recovery| recovery.readiness().is_none()) {
+            return;
+        }
         // `Active` and `Version` within the publication's budget (`Conn`): a request outstanding
         // has ids to spare for them — the barrier's, on the fallback — or its acknowledgement
         // checks again. The statuses before it: they go through the rotation, and the turn that
@@ -1271,6 +1395,72 @@ impl Lifecycle {
         // The fixed instance takes every publish, as R1's one device did: its own grammar answers
         // what is none of its lanes (on `Error`); no Config, slot or tag is read.
         if let Some(device) = self.fixed_name().and_then(|name| self.rt_of(&name).map(|(rt, _)| rt.device.clone())) {
+            if let Some(recovery) = self.recovery.clone() {
+                if topic == device.topics.state(&recovery.options.target) {
+                    if let Some(bootstrap) = &mut self.recovery_bootstrap {
+                        bootstrap.document = if publish.payload.len() > recovery.options.max_bytes {
+                            Err("retained recovery payload exceeds max_bytes".into())
+                        } else if publish.payload.is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(publish.payload.clone()))
+                        };
+                    }
+                    return Ok(Flow::Continue);
+                }
+                if matches!(device.topics.parse(topic), Inbound::State { .. }) {
+                    return Ok(Flow::Continue);
+                }
+                let allowed = match recovery.readiness() {
+                    Some(crate::RecoveryReady::Ready) => true,
+                    Some(crate::RecoveryReady::RecoveryOnly) => {
+                        matches!(device.topics.parse(topic), Inbound::Command)
+                            && wire::decode_command(&publish.payload).is_ok_and(|(target, call)| {
+                                target.is_none()
+                                    && call.command != "refresh"
+                                    && call.command != "assume"
+                                    && device
+                                        .commands
+                                        .get()
+                                        .is_some_and(|commands| commands.iter().any(|command| command.name == call.command))
+                            })
+                    }
+                    None => false,
+                };
+                if !allowed {
+                    let context = wire::request_context(publish.properties.as_ref())
+                        .unwrap_or_else(|_| wire::trace_context(publish.properties.as_ref()));
+                    let report = ErrorReport::new(Reason::Refused, "recovery has not opened ordinary request admission").context(&context);
+                    let report = match device.topics.parse(topic) {
+                        Inbound::DesiredProperty { target, property } => report.target(Some(&target)).property(&property),
+                        Inbound::DesiredTarget { target } | Inbound::Config { target } => report.target(Some(&target)),
+                        Inbound::Command => match wire::decode_command(&publish.payload) {
+                            Ok((target, call)) => report.target(target.as_deref()).command(&call.command),
+                            Err(_) => report,
+                        },
+                        _ => report,
+                    };
+                    if matches!(device.topics.parse(topic), Inbound::Command) {
+                        if let Ok(Some(reply)) = ReplyTo::from_properties(publish.properties.as_ref(), &device.topics) {
+                            let (target, command) = wire::command_names(&publish.payload);
+                            device.reports.event(crate::reports::Outbound {
+                                context: reply.context(&context),
+                                topic: Some(reply.topic),
+                                payload: reply_payload(
+                                    target.as_deref(),
+                                    &command,
+                                    &Answer::Failed { reason: report.reason, error: report.error.clone() },
+                                ),
+                                correlation: reply.correlation,
+                            });
+                        }
+                        device.reports.request_error(report);
+                    } else {
+                        device.reports.error(report);
+                    }
+                    return Ok(Flow::Continue);
+                }
+            }
             session::route(&device, topic, publish, received);
             self.drive(ctx, outputs).await?;
             return Ok(Flow::Continue);
@@ -1340,6 +1530,13 @@ impl Lifecycle {
     /// replay's fallback; a failed instance's retry; the sweep of failed instances' held requests.
     pub(crate) async fn on_timer(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<Flow, Failed> {
         let now = Instant::now();
+        if self.recovery.as_ref().and_then(|recovery| recovery.install_deadline()).is_some_and(|until| until <= now) {
+            info!(
+                wait_ms = crate::recovery::INSTALL_WAIT.as_millis() as u64,
+                "Recovery engine decision overdue; ending connection without opening admission"
+            );
+            return Ok(Flow::End);
+        }
         if self.fixed.as_ref().and_then(|f| f.read_back_until).is_some_and(|until| until <= now) && self.fixed_read_back_late() {
             return Ok(Flow::End);
         }
@@ -1413,6 +1610,10 @@ impl Lifecycle {
     /// yet published is dropped (WARN `output_lost_at_session_end`), as R1 drops unpublished output
     /// at process shutdown; the next CONNACK bootstraps every owned instance again.
     pub(crate) async fn on_session_lost(&mut self, outputs: &mut Outputs) {
+        if let Some(recovery) = &self.recovery {
+            recovery.lost();
+        }
+        self.recovery_bootstrap = None;
         self.conn = Conn::default();
         outputs.outbox_open = false;
         outputs.set_budget(None);

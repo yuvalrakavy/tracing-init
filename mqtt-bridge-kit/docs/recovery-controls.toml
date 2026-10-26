@@ -1,0 +1,246 @@
+# Recovery handshake and exact replacement prerequisites; snapshot publication is separate.
+[[control]]
+name = "recovery_refusal_drops_its_correlated_reply"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = '''if let Ok(Some(reply)) = ReplyTo::from_properties(publish.properties.as_ref(), &device.topics) {
+                            let (target, command) = wire::command_names(&publish.payload);'''
+replacement = '''if let Ok(Some(reply)) = ReplyTo::from_properties(publish.properties.as_ref(), &device.topics).map(|_| None::<ReplyTo>) {
+                            let (target, command) = wire::command_names(&publish.payload);'''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(recovery_only_refusals_answer_correlated_callers_and_do_not_run_builtin_refresh)"]
+expect_text = "recovery refusal did not answer its correlated caller"
+
+[[control]]
+name = "builtin_refresh_bypasses_recovery_only_admission"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = '''target.is_none()
+                                    && call.command != "refresh"
+                                    && call.command != "assume"
+                                    && device
+                                        .commands
+                                        .get()
+                                        .is_some_and(|commands| commands.iter().any(|command| command.name == call.command))'''
+replacement = "target.is_none()"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(recovery_only_refusals_answer_correlated_callers_and_do_not_run_builtin_refresh)"]
+expect_text = "a builtin refresh bypassed recovery-only admission"
+
+[[control]]
+name = "engine_decision_timeout_has_no_session_wakeup"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = "let recovery = self.recovery.as_ref().and_then(|recovery| recovery.install_deadline());"
+replacement = "let recovery = None;"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(an_unanswered_engine_bootstrap_expires_the_connection_without_restarting_the_service)"]
+expect_text = "an unanswered engine decision left its connection open indefinitely"
+
+[[control]]
+name = "final_runtime_swap_does_not_recheck_expiry"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = '''image.check_deadline()?;
+        state.request_policy = Some(RequestPolicy::Fenced(image.generations.clone()));'''
+replacement = "state.request_policy = Some(RequestPolicy::Fenced(image.generations.clone()));"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(expired_image_cannot_change_authority_model_or_queued_work_at_the_final_swap)"]
+expect_text = "called `Result::unwrap_err()` on an `Ok` value"
+
+[[control]]
+name = "recovery_setup_feedback_is_not_seeded"
+file = "mqtt-bridge-kit/src/mailbox.rs"
+anchor = "seed(&mut inner);"
+replacement = "// faulty: forget restored setup-derived feedback"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_setup_restores_feedback_overrides_and_later_absence_clears_them)"]
+expect_text = "exact recovery lost the setup feedback override"
+
+[[control]]
+name = "managed_starts_reuse_a_shared_recovery_owner"
+file = "mqtt-bridge-kit/src/process.rs"
+anchor = "self.0.recovery_shared = self.0.recovery.clone().map(crate::recovery::RecoveryShared::new).transpose()?;"
+replacement = '''self.0.recovery_shared = self.0.recovery.clone().map(|options| {
+            static SHARED: std::sync::OnceLock<std::sync::Arc<crate::recovery::RecoveryShared>> = std::sync::OnceLock::new();
+            SHARED.get_or_init(|| crate::recovery::RecoveryShared::new(options).unwrap()).clone()
+        });'''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(cloned_bridge_builders_get_separate_recovery_owners_and_cannot_install_each_others_images)"]
+expect_text = "cloned recovery"
+
+[[control]]
+name = "oversized_runtime_image_bypasses_admission"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = "if bytes > crate::session::MAX_PACKET_SIZE as usize {"
+replacement = "if false {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_image_refuses_unknown_targets_reserved_metadata_and_provisional_state)"]
+expect_text = "oversized runtime image passed model admission"
+
+[[control]]
+name = "completion_acknowledges_before_runtime_install"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = "result.await.map_err(|_| \"recovery installation was abandoned\".to_owned())?"
+replacement = "let _ = result; Ok(())"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(engine_completion_waits_for_exact_install_and_failed_install_keeps_admission_closed)"]
+expect_text = "completion acknowledged an image before installation"
+
+[[control]]
+name = "same_generation_work_survives_exact_replacement"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = '''targets: old
+                .targets
+                .iter()
+                .map(|(target, generation)| Ok((target.clone(), RequestContext::new(generation)?)))'''
+replacement = '''targets: old.targets.iter()
+                .filter(|(target, generation)| image.generations.targets.get(*target) != Some(*generation))
+                .map(|(target, generation)| Ok((target.clone(), RequestContext::new(generation)?)))'''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_replacement_removes_old_model_caches_and_queued_work_even_when_a_generation_stays_the_same)"]
+expect_text = "same-generation queued work was not retired by exact replacement"
+
+[[control]]
+name = "reconnect_keeps_the_previous_open_gate"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = "state.phase = Phase::Reading;"
+replacement = "if matches!(state.phase, Phase::Closed) { state.phase = Phase::Reading; }"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(every_connection_closes_the_gate_and_stale_completions_cannot_reopen_it)"]
+expect_text = "assertion `left == right` failed"
+
+[[control]]
+name = "old_connection_installs_into_a_new_completed_replay"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = "if self.connection != Some(connection) {"
+replacement = "if false {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(every_connection_closes_the_gate_and_stale_completions_cannot_reopen_it)"]
+expect_text = "old completion installed into a newer replay"
+
+[[control]]
+name = "invalid_replay_allows_normal_admission"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = "state.phase = Phase::Awaiting { valid: document.is_ok() };"
+replacement = "state.phase = Phase::Awaiting { valid: true };"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(readback_watch_distinguishes_absence_from_invalid_and_keeps_only_the_latest_connection)"]
+expect_text = "invalid replay opened ordinary admission"
+
+[[control]]
+name = "oversized_replay_is_accepted_as_valid"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = "Err(\"retained recovery payload exceeds max_bytes\".into())"
+replacement = "document"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(readback_watch_distinguishes_absence_from_invalid_and_keeps_only_the_latest_connection)"]
+expect_text = "oversized replay was mistaken for absence"
+
+[[control]]
+name = "consumed_replay_is_delivered_repeatedly"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = "if self.initial {"
+replacement = "if true {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(readback_watch_distinguishes_absence_from_invalid_and_keeps_only_the_latest_connection)"]
+expect_text = "the same replay was delivered twice"
+
+[[control]]
+name = "abandoned_install_reaches_the_commit_callback"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = '''if install.reply.is_closed() {
+            return Ok(false);
+        }'''
+replacement = "// faulty: install even after the owner abandoned its completion"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(cancelled_or_disconnected_installations_never_reach_the_install_callback)"]
+expect_text = "abandoned image was installed"
+
+[[control]]
+name = "original_install_deadline_is_not_rechecked"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = ".and_then(|()| install.image.check_deadline())"
+replacement = ""
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(original_expiry_is_rechecked_at_the_serialized_recovery_install)"]
+expect_text = "an expired recovery image reached the commit callback"
+
+[[control]]
+name = "recovery_merges_the_old_model"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "state.targets = targets;"
+replacement = "state.targets.extend(targets);"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_replacement_removes_old_model_caches_and_queued_work_even_when_a_generation_stays_the_same)"]
+expect_text = "recovery merged old model or acknowledged-write values"
+
+[[control]]
+name = "recovery_keeps_old_acknowledged_writes"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = '''state.written.clear();
+        state.readback = image.states.clone();'''
+replacement = "state.readback = image.states.clone();"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_replacement_removes_old_model_caches_and_queued_work_even_when_a_generation_stays_the_same)"]
+expect_text = "recovery merged old model or acknowledged-write values"
+
+[[control]]
+name = "recovery_keeps_the_frozen_old_readback"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "state.readback_frozen = Some(image.states.clone());"
+replacement = "state.readback_frozen.get_or_insert_with(|| image.states.clone());"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_replacement_removes_old_model_caches_and_queued_work_even_when_a_generation_stays_the_same)"]
+expect_text = "old conflict readback survived replacement"
+
+[[control]]
+name = "worker_keeps_old_setup_with_an_unchanged_generation"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = "if let Some(seed) = reports.recovery_cache(self.recovery_epoch) {"
+replacement = "if let Some(seed) = None::<crate::reports::RecoveryCache> {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(recovery_replaces_worker_setup_and_conflict_caches_even_when_generation_is_unchanged)"]
+expect_text = "worker retained old setup across exact recovery"
+
+[[control]]
+name = "recovery_model_loses_its_initiating_trace"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = "context.with_traceparent(image.context.traceparent())"
+replacement = "context"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_replacement_removes_old_model_caches_and_queued_work_even_when_a_generation_stays_the_same)"]
+expect_text = "recovery model lost the initiating request's cause"
+
+[[control]]
+name = "snapshot_grant_bypasses_the_separate_barrier_ack"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = '''Purpose::RecoveryBarrier(connection),
+                        vec![Self::filter(bootstrap.barrier.clone(), false)],
+                    )
+                    .await?;'''
+replacement = '''Purpose::RecoveryBarrier(connection),
+                        vec![Self::filter(bootstrap.barrier.clone(), false)],
+                    ).await?;
+                    let document = self.recovery_bootstrap.as_ref().unwrap().document.clone();
+                    self.recovery.as_ref().unwrap().readback_result(connection, document)?;'''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(every_connection_needs_its_own_barrier_and_install_before_state_or_ordinary_requests)"]
+expect_text = "snapshot subscription alone completed recovery replay"
+
+[[control]]
+name = "shutdown_flush_ignores_the_closed_recovery_gate"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = "if !host.recovery_output_open() {"
+replacement = "if false {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(shutdown_before_recovery_install_never_flushes_queued_engine_output)"]
+expect_text = "shutdown flushed engine output before recovery installation"
+
+[[control]]
+name = "unmanaged_start_accepts_a_recovery_bridge"
+file = "mqtt-bridge-kit/src/process.rs"
+anchor = '''if self.0.recovery.is_some() {
+            crate::devices::drop_off_thread(Box::new(Built(driver)));
+            return Err("recovery requires run_managed or start_managed".into());
+        }'''
+replacement = "// faulty: start with nobody able to complete recovery"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(recovery_cannot_start_without_a_managed_owner_to_finish_its_handshake)"]
+expect_text = "recovery started without a managed owner"

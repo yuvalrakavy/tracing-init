@@ -12,6 +12,8 @@ publish = false
 # The test seams (the environment variables `MQTT_BRIDGE_TEST_*`) — for the conformance suite only,
 # never in a deployed bridge, debug build or not.
 test-seams = []
+# Opt-in acceptance test: requires a local mosquitto executable on PATH.
+mosquitto-acceptance = ["test-seams", "tokio/process"]
 
 [dependencies]
 bytes = "1"

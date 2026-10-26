@@ -141,8 +141,13 @@ pub struct ServiceContext<D: DeviceDriver> {
     settings: Settings,
     stopping: watch::Receiver<bool>,
     startup_until: Instant,
+    recovery: Option<crate::RecoveryHandle>,
 }
 impl<D: DeviceDriver> ServiceContext<D> {
+    /// The opt-in recovery handshake, independent of MQTT link lifetime.
+    pub fn recovery(&self) -> Option<crate::RecoveryHandle> {
+        self.recovery.clone()
+    }
     /// Transfer a validated proxy once; never wait for MQTT, connect or reads.
     pub fn ready(&mut self, driver: D) -> Result<(), String> {
         {
@@ -158,6 +163,9 @@ impl<D: DeviceDriver> ServiceContext<D> {
         let mut info = DriverDescription::new(&driver);
         info.info = crate::config::device_info(info.info, &self.settings.timing, self.settings.device_stable, &self.settings.mqtt)?;
         info.policy.validate(true)?;
+        if self.recovery.is_some() && !matches!(&*info.policy, crate::RequestPolicy::Fenced(table) if table.targets.is_empty()) {
+            return Err("recovery requires a fenced proxy with an initially empty target table".into());
+        }
         {
             // WAIT: managed-lifecycle
             let mut p = self.control.phase.lock().unwrap_or_else(|p| p.into_inner());
@@ -250,11 +258,21 @@ impl Managed {
 }
 
 type Readiness<D> = oneshot::Receiver<(D, DriverDescription)>;
+#[cfg(test)]
 fn spawn<S: ProcessService>(
     service: S,
     settings: Settings,
     timing: ServiceTiming,
     slot: &StartupSlot,
+) -> Result<(Managed, Readiness<S::Driver>), String> {
+    spawn_recovery(service, settings, timing, slot, None)
+}
+fn spawn_recovery<S: ProcessService>(
+    service: S,
+    settings: Settings,
+    timing: ServiceTiming,
+    slot: &StartupSlot,
+    recovery: Option<crate::RecoveryHandle>,
 ) -> Result<(Managed, Readiness<S::Driver>), String> {
     let (stop, stopping) = watch::channel(false);
     let (force, mut forcing) = watch::channel(false);
@@ -276,7 +294,7 @@ fn spawn<S: ProcessService>(
     });
     slot.control.set(control.clone()).map_err(|_| "managed startup slot already used")?;
     let (ready, receive) = oneshot::channel();
-    let ctx = ServiceContext { ready: Some(ready), control: control.clone(), settings, stopping, startup_until };
+    let ctx = ServiceContext { ready: Some(ready), control: control.clone(), settings, stopping, startup_until, recovery };
     let owner = control.clone();
     let span = Span::current();
     std::thread::Builder::new()
@@ -370,14 +388,15 @@ impl Bridge {
         self.start_managed_in(service, timing, Arc::new(StartupSlot::default())).await
     }
     pub(crate) async fn start_managed_in<S: ProcessService>(
-        self,
+        mut self,
         service: S,
         timing: ServiceTiming,
         slot: Arc<StartupSlot>,
     ) -> Result<Running, String> {
         timing.validate()?;
         self.validate_managed_start()?;
-        let (mut managed, ready) = spawn(service, self.settings().clone(), timing, &slot)?;
+        self.prepare_recovery()?;
+        let (mut managed, ready) = spawn_recovery(service, self.settings().clone(), timing, &slot, self.recovery_handle())?;
         // WAIT: managed-start
         let prepared = tokio::time::timeout(timing.startup, async {
             tokio::select! {biased;
