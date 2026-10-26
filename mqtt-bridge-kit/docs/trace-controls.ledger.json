@@ -2,7 +2,7 @@
  "rows": {
   "apply_uses_first_request_cause": {
    "last_real": {
-    "at": "2026-10-26T19:16:02Z",
+    "at": "2026-10-26T19:41:46Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
@@ -12,14 +12,14 @@
      "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 5.6,
-    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
+    "secs": 6.0,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
     "verdict": "RED"
    }
   },
   "coalesced_reply_inherits_primary_cause": {
    "last_real": {
-    "at": "2026-10-26T19:15:56Z",
+    "at": "2026-10-26T19:41:40Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
@@ -29,31 +29,31 @@
      "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 3.6,
-    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
+    "secs": 4.0,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
     "verdict": "RED"
    }
   },
   "dynamic_routing_reenters_unrelated_lifecycle": {
    "last_real": {
-    "at": "2026-10-26T19:16:11Z",
+    "at": "2026-10-26T19:41:56Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:cbfbd5b566955c25",
+     "files": "files:a72437682f0a4453",
      "guard": "item:2ad600e23c0ce613",
      "row": "8df0e1fab4794e96",
      "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 4.1,
-    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
+    "secs": 4.2,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
     "verdict": "RED"
    }
   },
   "expired_read_inherits_live_caller_cause": {
    "last_real": {
-    "at": "2026-10-26T19:16:20Z",
+    "at": "2026-10-26T19:42:04Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
@@ -63,14 +63,14 @@
      "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 4.2,
-    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
+    "secs": 4.1,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
     "verdict": "RED"
    }
   },
   "headerless_parser_adopts_unrelated_ambient": {
    "last_real": {
-    "at": "2026-10-26T19:15:48Z",
+    "at": "2026-10-26T19:41:31Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
@@ -80,31 +80,31 @@
      "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 5.1,
-    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
+    "secs": 7.0,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
     "verdict": "RED"
    }
   },
   "malformed_generation_drops_terminal_trace": {
    "last_real": {
-    "at": "2026-10-26T19:16:15Z",
+    "at": "2026-10-26T19:42:00Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:cbfbd5b566955c25",
+     "files": "files:a72437682f0a4453",
      "guard": "item:82d0c15f1fb1cc48",
      "row": "71d418311fa61867",
      "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 4.1,
-    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
+    "secs": 4.0,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
     "verdict": "RED"
    }
   },
   "property_removal_retains_old_cause": {
    "last_real": {
-    "at": "2026-10-26T19:16:07Z",
+    "at": "2026-10-26T19:41:52Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
@@ -114,25 +114,25 @@
      "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 5.6,
-    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
+    "secs": 6.0,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
     "verdict": "RED"
    }
   },
   "sealed_output_loses_owned_trace": {
    "last_real": {
-    "at": "2026-10-26T19:15:53Z",
+    "at": "2026-10-26T19:41:36Z",
     "dirty": true,
     "expected": "RED",
     "fingerprints": {
-     "files": "files:b91dd80b1dd159d5",
+     "files": "files:c16d0e00ed1d209a",
      "guard": "item:a55cb48cb4441272",
      "row": "cc65bda08e109dcd",
      "test": "test:9cdd02a7d9a592e5"
     },
     "path": "command",
-    "secs": 4.7,
-    "sha": "0eb9021d4171be301499452c6c0f9ed04e434890",
+    "secs": 5.1,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
     "verdict": "RED"
    }
   }

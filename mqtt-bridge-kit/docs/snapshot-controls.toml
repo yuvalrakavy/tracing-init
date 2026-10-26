@@ -1,0 +1,209 @@
+# Snapshot publication through the existing runtime, not a second MQTT client.
+[[control]]
+name = "installed_snapshot_is_not_selected_for_publication"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = "state.publication.reset(install.image.snapshot.clone());"
+replacement = "state.publication.reset(None);"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(snapshots_publish_through_the_runtime)"]
+expect_text = "the installed snapshot never reached the existing runtime publisher"
+
+[[control]]
+name = "snapshot_identity_reuses_revision"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "Ok(Self { id, revision, document, context })"
+replacement = "let _ = id; Ok(Self { id: revision, revision, document, context })"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(snapshot_identity_is_not_its_revision)"]
+expect_text = "equal revisions reused snapshot identity"
+
+[[control]]
+name = "pending_snapshot_keeps_the_first_update"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "state.publication.pending = Some(snapshot);"
+replacement = "if state.publication.pending.is_none() { state.publication.pending = Some(snapshot); }"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(publication_is_current_ready_only)"]
+expect_text = "assertion `left == right` failed"
+
+[[control]]
+name = "pending_snapshot_can_overwrite_an_inflight_publication"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "self.pending.is_some() && self.flight.is_none()"
+replacement = "self.pending.is_some()"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(publication_is_current_ready_only)"]
+expect_text = "more than one snapshot entered flight"
+
+[[control]]
+name = "snapshot_offer_ignores_current_connection"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "state.connection != Some(connection) || !matches!(state.phase, Phase::Open(RecoveryReady::Ready))"
+replacement = "!matches!(state.phase, Phase::Open(RecoveryReady::Ready))"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(publication_is_current_ready_only)"]
+expect_text = "an old connection replaced a new Ready connection's snapshot"
+
+[[control]]
+name = "recovery_only_allows_snapshot_offers"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "state.connection != Some(connection) || !matches!(state.phase, Phase::Open(RecoveryReady::Ready))"
+replacement = "state.connection != Some(connection)"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(publication_is_current_ready_only)"]
+expect_text = "RecoveryOnly overwrote retained recovery evidence"
+
+[[control]]
+name = "snapshot_offer_skips_encoded_size_admission"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "if snapshot.document.len() > self.options.max_bytes {"
+replacement = "if false {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(snapshot_identity_is_not_its_revision)"]
+expect_text = "oversized pending snapshot was admitted"
+
+[[control]]
+name = "outgoing_sequence_is_not_checked_before_binding_packet"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "if flight.sequence == Some(sequence) && packet != 0 {"
+replacement = "if packet != 0 {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(receipt_requires_both_the_exact_outgoing_sequence)"]
+expect_text = "an unrelated outgoing packet credited the snapshot"
+
+[[control]]
+name = "an_unrelated_puback_credits_the_snapshot"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "state.publication.flight.as_ref().is_some_and(|flight| flight.packet == Some(packet))"
+replacement = "state.publication.flight.is_some()"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(receipt_requires_both_the_exact_outgoing_sequence)"]
+expect_text = "an unrelated outgoing packet credited the snapshot"
+
+[[control]]
+name = "enqueue_is_mistaken_for_broker_acceptance"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "flight.sequence = sequence;"
+replacement = "flight.sequence = sequence; if sequence.is_some() { Self::finish_publication(&mut state, Ok(())); return; }"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(snapshots_publish_through_the_runtime)"]
+expect_text = "enqueuing a snapshot was mistaken for broker acceptance"
+
+[[control]]
+name = "receipt_credits_the_latest_pending_revision"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "revision: flight.snapshot.revision,"
+replacement = "revision: state.publication.pending.as_ref().map_or(flight.snapshot.revision, |snapshot| snapshot.revision),"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(snapshots_publish_through_the_runtime)"]
+expect_text = "the old packet was credited to a newer pending revision"
+
+[[control]]
+name = "pacing_is_not_rebased_at_actual_enqueue"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = '''if sequence.is_some() {
+            state.publication.next = Instant::now().checked_add(PUBLISH_INTERVAL);
+        }'''
+replacement = "// faulty: keep the time at which this snapshot entered the rotation"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(publication_is_current_ready_only)"]
+expect_text = "publication pacing started before the actual enqueue"
+
+[[control]]
+name = "publication_has_no_timer_wakeup"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = "let publication = self.recovery.as_ref().and_then(|recovery| recovery.publication_deadline());"
+replacement = "let publication = None;"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_pending_snapshot_wakes_after_the_publication_pacing_interval)"]
+expect_text = "pending snapshot was stranded without a publication timer"
+
+[[control]]
+name = "snapshot_ignores_broker_packet_ceiling"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = "if out.packet_size() > ctx.line.maximum_packet_size() as usize {"
+replacement = "if false {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_snapshot_above_the_brokers_packet_ceiling)"]
+expect_text = "oversized snapshot produced no explicit publication fault"
+
+[[control]]
+name = "pump_treats_negative_puback_as_acceptance"
+file = "mqtt-bridge-kit/src/pump.rs"
+anchor = "result: if matches!(ack.reason, PubAckReason::Success | PubAckReason::NoMatchingSubscribers) {"
+replacement = "result: if true {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_negative_snapshot_puback)"]
+expect_text = "called `Result::unwrap_err()` on an `Ok` value"
+
+[[control]]
+name = "snapshot_packet_size_omits_its_qos1_identifier"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = "packet.pkid = 1;"
+replacement = "packet.pkid = 0;"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(snapshot_packet_size_matches_real_encoding)"]
+expect_text = "snapshot packet admission omitted wire overhead"
+
+[[control]]
+name = "snapshot_loses_explicit_trace"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = "let context = crate::RequestContext::default().with_traceparent(snapshot.context().traceparent());"
+replacement = "let context = crate::RequestContext::default().with_traceparent(None);"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(snapshot_packet_size_matches_real_encoding)"]
+expect_text = "assertion `left == right` failed"
+
+[[control]]
+name = "snapshot_adopts_unrelated_ambient_trace"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = "let context = crate::RequestContext::default().with_traceparent(snapshot.context().traceparent());"
+replacement = "let context = crate::RequestContext::default();"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(an_autonomous_snapshot_does_not_adopt)"]
+expect_text = "snapshot adopted an unrelated ambient trace"
+
+[[control]]
+name = "recovery_only_image_can_publish_a_snapshot"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = "if ready == RecoveryReady::RecoveryOnly && self.snapshot.is_some() {"
+replacement = "if false {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_images_cannot_publish_oversized)"]
+expect_text = "called `Result::unwrap_err()` on an `Ok` value"
+
+[[control]]
+name = "installed_snapshot_bypasses_encoded_size_admission"
+file = "mqtt-bridge-kit/src/recovery.rs"
+anchor = "if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.document().len() > options.max_bytes) {"
+replacement = "if false {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_images_cannot_publish_oversized)"]
+expect_text = "called `Result::unwrap_err()` on an `Ok` value"
+
+[[control]]
+name = "snapshot_constructor_ignores_its_absolute_bound"
+file = "mqtt-bridge-kit/src/recovery/publication.rs"
+anchor = "if document.is_empty() || document.len() > crate::session::MAX_PACKET_SIZE as usize {"
+replacement = "if false {"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(snapshot_identity_is_not_its_revision)"]
+expect_text = "RecoverySnapshot::new(0, Bytes::new()"
+
+[[control]]
+name = "pump_forgets_the_advertised_packet_ceiling"
+file = "mqtt-bridge-kit/src/pump.rs"
+anchor = "ack.properties.as_ref().and_then(|properties| properties.max_packet_size).unwrap_or(u32::MAX)"
+replacement = "u32::MAX"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_snapshot_above_the_brokers_packet_ceiling)"]
+expect_text = "oversized snapshot produced no explicit publication fault"
+
+[[control]]
+name = "broker_ceiling_can_override_the_local_packet_limit"
+file = "mqtt-bridge-kit/src/pump.rs"
+anchor = "self.max_packet.load(Ordering::SeqCst).min(crate::session::MAX_PACKET_SIZE)"
+replacement = "self.max_packet.load(Ordering::SeqCst)"
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_snapshot_above_the_brokers_packet_ceiling)"]
+expect_text = "oversized snapshot was sent despite the advertised ceiling"

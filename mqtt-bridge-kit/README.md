@@ -285,7 +285,7 @@ policy. Race this wait with service cancellation; MQTT loss does not stop the se
 
 The engine calls `complete(connection, image, readiness, command_completion).await`.
 `RecoveryImage` contains the complete generation table, assumed target model, accepted
-target configurations and original request context. Installation replaces old state,
+target configurations, optional immutable snapshot and original request context. Installation replaces old state,
 acknowledged writes, conflict/readback caches, setup caches and queued work, including
 work whose mapping generation stayed unchanged. The original deadline is checked again
 at installation. Trace causality is copied to the new model's own generations.
@@ -305,8 +305,30 @@ Keep the engine's staged installation job alive until its result is known, even 
 the originating command caller disappears. Cancellation after commit cannot undo
 an installed image; apply the committed engine candidate before answering later work.
 
-This API currently supplies replay and model installation. Snapshot publication and
-its broker acceptance receipts are not yet available through `RecoveryHandle`.
+Capture the complete encoded retained State carrier with
+`RecoverySnapshot::new(revision, bytes, context)` and include it in the selected image.
+The engine validates its snapshot schema; the runtime enforces the encoded byte cap.
+After installation, `handle.publish(connection, snapshot)` replaces the one pending
+snapshot without waiting for MQTT. It requires the current Ready connection;
+RecoveryOnly cannot overwrite retained evidence. While disconnected, keep the latest
+engine image and include its snapshot in the next exact installation.
+
+Publication uses the existing session, packet-id budget and output rotation, with
+one immutable snapshot in flight and one replaceable pending snapshot. Enqueues are
+at least 100 ms apart. A delayed acknowledgment does not block the managed engine.
+The snapshot keeps its explicit trace cause, including absence, without inheriting
+an unrelated lifecycle trace or an array's target generation.
+
+`handle.receipt()` returns the latest publication result. It names the exact
+connection, process-local snapshot identity, engine revision and actual MQTT packet
+identifier. Equal revisions do not imply equal snapshot identities. Successful
+enqueue is not a receipt: acceptance requires the matching outgoing packet and a
+successful PUBACK. A negative PUBACK is a fault. A complete snapshot packet exceeding
+the local or broker-advertised maximum produces a fault with no packet identifier,
+and does not cause a reconnect loop. Receipts reset at connection loss and exact
+installation; they confirm broker acceptance, not broker disk durability.
+This is snapshot-specific accounting; complete service-wide queue/memory limits
+and packet admission for other publication kinds remain separate work.
 
 The explicit broker acceptance test requires `mosquitto` on PATH and runs only on
 an owned ephemeral loopback listener with persistence disabled:

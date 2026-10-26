@@ -95,6 +95,34 @@ async fn seed_snapshot(port: u16, document: Vec<u8>) {
     .expect("snapshot seed client did not disconnect");
 }
 
+async fn read_retained_snapshot(port: u16) -> Bytes {
+    let mut options = MqttOptions::new(format!("recovery-reader-{}", std::process::id()), "127.0.0.1", port);
+    options.set_keep_alive(Duration::from_secs(5));
+    let (client, mut events) = AsyncClient::new(options, 16);
+    client.subscribe("Recovery/State/i/_recovery", QoS::AtLeastOnce).await.unwrap();
+    let document = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Event::Incoming(Packet::Publish(publish)) = events.poll().await.unwrap() {
+                assert!(publish.retain, "snapshot observer did not receive a retained document");
+                break publish.payload;
+            }
+        }
+    })
+    .await
+    .expect("snapshot observer received no retained document");
+    client.disconnect().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(events.poll().await.unwrap(), Event::Outgoing(rumqttc::Outgoing::Disconnect)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("snapshot observer did not disconnect");
+    document
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn isolated_mosquitto_orders_retained_snapshot_before_the_later_barrier_ack() {
     let mut broker = LocalBroker::start().await.expect("local Mosquitto acceptance prerequisite");
@@ -115,10 +143,33 @@ async fn isolated_mosquitto_orders_retained_snapshot_before_the_later_barrier_ac
         Some(Bytes::from(snapshot)),
         "deployment broker's replay did not precede the barrier acknowledgment"
     );
-    tokio::time::timeout(Duration::from_secs(3), handle.complete(readback.connection, image(Some(11)), RecoveryReady::Ready, None))
+    let selected_snapshot = super::snapshot(8);
+    let mut selected = image(Some(11));
+    selected.snapshot = Some(selected_snapshot.clone());
+    tokio::time::timeout(Duration::from_secs(3), handle.complete(readback.connection, selected, RecoveryReady::Ready, None))
         .await
         .unwrap()
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(receipt) = handle.receipt() {
+                assert_eq!(receipt.snapshot_id, selected_snapshot.id());
+                assert_eq!(receipt.revision, 8);
+                assert_eq!(receipt.connection, readback.connection);
+                assert!(receipt.packet.is_some_and(|packet| packet != 0));
+                receipt.result.unwrap();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("real broker acceptance did not produce an exact snapshot receipt");
     assert!(running.stop().await);
+    assert_eq!(
+        read_retained_snapshot(broker.port).await,
+        *selected_snapshot.document(),
+        "new subscribers did not receive the accepted snapshot"
+    );
     broker.stop().await;
 }

@@ -541,8 +541,13 @@ async fn session(
     // When the connection is lost, what the bridge knew then is the conflict rule's "before" values
     // for what the broker replays on the next one (review B1).
     let lost = shared.clone();
-    let (_pump, mut incoming) =
-        Pump::start(pump_events, shared.outage.clone(), stall_bound(shared.timing.keep_alive), move || lost.broker_lost());
+    let (_pump, mut incoming) = Pump::start_with_receipts(
+        pump_events,
+        shared.outage.clone(),
+        stall_bound(shared.timing.keep_alive),
+        move || lost.broker_lost(),
+        host.recovery.is_some(),
+    );
     // Nothing is published before the CONNACK's duties allow it: the subscriptions come first,
     // and a state published ahead of the read-back's subscription would overwrite the retained
     // state it is there to read.
@@ -638,6 +643,10 @@ async fn session(
                     flow.map(ended)
                 }
                 Step::Event(Some(PumpEvent::Disconnected)) => Ok(None),
+                Step::Event(Some(event @ (PumpEvent::Publishing { .. } | PumpEvent::PubAck { .. }))) => {
+                    host.on_publication(event);
+                    host.on_line(&ctx, outputs).await.map(ended)
+                }
                 Step::Event(Some(
                     event @ (PumpEvent::SubAck { .. }
                     | PumpEvent::Subscribing(_)
@@ -719,12 +728,13 @@ enum Step {
 pub(crate) struct Out {
     topic: String,
     retain: bool,
-    payload: Vec<u8>,
+    payload: bytes::Bytes,
     properties: PublishProperties,
     /// A host's: said before `Active=true` on this connection (multi-device spec §4.6) — the
     /// session's `Active` waits until no such message waits ([`Outputs::firsts_waiting`]).
     first: bool,
     cleanup: Option<(Arc<Reports>, String, u64)>,
+    publication: Option<PublicationReceipt>,
 }
 
 impl Out {
@@ -736,7 +746,32 @@ impl Out {
     pub(crate) fn new(topic: String, retain: bool, payload: Vec<u8>, correlation: Option<bytes::Bytes>, tag: Option<&str>) -> Out {
         let mut properties = tagged(tag);
         properties.correlation_data = correlation;
-        Out { topic, retain, payload, properties, first: false, cleanup: None }
+        Out { topic, retain, payload: payload.into(), properties, first: false, cleanup: None, publication: None }
+    }
+
+    pub(crate) fn recovery(topic: String, snapshot: crate::RecoverySnapshot, shared: Arc<crate::recovery::RecoveryShared>) -> Self {
+        let context = crate::RequestContext::default().with_traceparent(snapshot.context().traceparent());
+        Self {
+            topic,
+            retain: true,
+            payload: snapshot.document().clone(),
+            properties: tagged(None),
+            first: false,
+            cleanup: None,
+            publication: Some((shared, snapshot.id())),
+        }
+        .context(&context)
+    }
+
+    pub(crate) fn packet_size(&self) -> usize {
+        let mut packet = rumqttc::v5::mqttbytes::v5::Publish::new(
+            self.topic.clone(),
+            QoS::AtLeastOnce,
+            self.payload.clone(),
+            Some(self.properties.clone()),
+        );
+        packet.pkid = 1;
+        packet.size()
     }
 
     /// The same, said before `Active=true` (multi-device spec §4.6).
@@ -766,8 +801,13 @@ impl Out {
 
 /// A publish under way: its topic, for the refusal's line, and rumqttc's request.
 type CleanupReceipt = (Arc<Reports>, String, u64);
-type Sending =
-    std::pin::Pin<Box<dyn std::future::Future<Output = (String, Result<(), rumqttc::v5::ClientError>, Option<CleanupReceipt>)> + Send>>;
+type PublicationReceipt = (Arc<crate::recovery::RecoveryShared>, u64);
+type Sending = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = (String, Result<(), rumqttc::v5::ClientError>, Option<CleanupReceipt>, Option<PublicationReceipt>)>
+            + Send,
+    >,
+>;
 
 /// A part of a batch, in the order a publication takes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -913,13 +953,17 @@ impl Batch {
         loop {
             if let Some(sending) = self.sending.as_mut() {
                 // WAIT: mqtt-request
-                let (topic, sent, cleanup) = sending.await;
+                let (topic, sent, cleanup, publication) = sending.await;
                 self.sending = None;
                 if std::mem::take(&mut self.sending_first) {
                     self.firsts -= 1;
                 }
-                if let (Some(sequence), Some((reports, target, nonce))) = (enqueued(shared, &topic, sent), cleanup) {
+                let sequence = enqueued(shared, &topic, sent);
+                if let (Some(sequence), Some((reports, target, nonce))) = (sequence, cleanup) {
                     reports.removal_sent(&target, nonce, sequence);
+                }
+                if let Some((recovery, id)) = publication {
+                    recovery.publication_sent(id, sequence);
                 }
                 handed += 1;
             }
@@ -939,10 +983,10 @@ impl Batch {
             let client = client.clone();
             self.sending_first = out.first;
             self.sending = Some(Box::pin(async move {
-                let Out { topic, retain, payload, properties, cleanup, .. } = out;
+                let Out { topic, retain, payload, properties, cleanup, publication, .. } = out;
                 // WAIT: mqtt-request
                 let sent = client.publish_with_properties(topic.clone(), QoS::AtLeastOnce, retain, payload, properties).await;
-                (topic, sent, cleanup)
+                (topic, sent, cleanup, publication)
             }));
         }
     }

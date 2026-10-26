@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rumqttc::v5::mqttbytes::v5::{Packet, Publish, SubscribeReasonCode, UnsubAckReason};
+use rumqttc::v5::mqttbytes::v5::{Packet, PubAckReason, Publish, SubscribeReasonCode, UnsubAckReason};
 use rumqttc::v5::{Event, EventLoop};
 use rumqttc::Outgoing;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -59,6 +59,20 @@ pub enum PumpEvent {
     /// The broker accepted the connection. The broker keeps no session, so the session subscribes
     /// and announces itself.
     Connected,
+    /// Exact outgoing publish sequence and the packet id assigned by rumqttc.
+    Publishing {
+        /// Publish ordinal on this connection, including ordinary traffic.
+        sequence: u64,
+        /// Packet identifier actually assigned to this publish.
+        pkid: u16,
+    },
+    /// Exact QoS 1 acknowledgment, including broker refusal.
+    PubAck {
+        /// Packet identifier acknowledged on this connection.
+        pkid: u16,
+        /// Success or a negative MQTT reason code.
+        result: Result<(), String>,
+    },
     /// A publish, and when the pump received it: a request's expiry counts from then, not from
     /// when the session gets to it (review C7).
     Publish(Publish, Instant),
@@ -297,6 +311,7 @@ pub struct Incoming {
     written: Arc<AtomicU64>,
     /// How many packet ids rumqttc cycles through on this connection (see [`Line::id_space`]).
     ids: Arc<AtomicU16>,
+    max_packet: Arc<AtomicU32>,
     /// Told after each event the pump takes, for a wait on its counts.
     progress: Arc<tokio::sync::Notify>,
     /// The session asked for the DISCONNECT the pump will see: it then reads on until the close.
@@ -339,7 +354,7 @@ impl Incoming {
     /// The pump's publish counts, as a handle of their own (the session's handlers read them while
     /// the session holds this queue).
     pub fn line(&self) -> Line {
-        Line { inflight: self.inflight.clone(), written: self.written.clone(), ids: self.ids.clone() }
+        Line { inflight: self.inflight.clone(), written: self.written.clone(), ids: self.ids.clone(), max_packet: self.max_packet.clone() }
     }
 
     /// The DISCONNECT the session is about to ask for is its own: the pump reads on after it until
@@ -368,9 +383,14 @@ pub struct Line {
     inflight: Arc<AtomicUsize>,
     written: Arc<AtomicU64>,
     ids: Arc<AtomicU16>,
+    max_packet: Arc<AtomicU32>,
 }
 
 impl Line {
+    /// Effective local and broker-advertised ceiling, in complete MQTT packet bytes.
+    pub fn maximum_packet_size(&self) -> u32 {
+        self.max_packet.load(Ordering::SeqCst).min(crate::session::MAX_PACKET_SIZE)
+    }
     /// Whether the event loop has written all `enqueued` publishes and the broker has acknowledged
     /// every one.
     pub fn clear(&self, enqueued: u64) -> bool {
@@ -418,26 +438,39 @@ impl Pump {
         stall: Duration,
         on_lost: impl FnOnce() + Send + 'static,
     ) -> (Pump, Incoming) {
+        Self::start_with_receipts(events, outage, stall, on_lost, false)
+    }
+
+    pub(crate) fn start_with_receipts(
+        events: EventLoop,
+        outage: Arc<BrokerOutage>,
+        stall: Duration,
+        on_lost: impl FnOnce() + Send + 'static,
+        receipts: bool,
+    ) -> (Pump, Incoming) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let backlog = Arc::new(Backlog::new());
         let inflight = Arc::new(AtomicUsize::new(0));
         let written = Arc::new(AtomicU64::new(0));
         let ids = Arc::new(AtomicU16::new(0));
+        let max_packet = Arc::new(AtomicU32::new(crate::session::MAX_PACKET_SIZE));
         let progress = Arc::new(tokio::sync::Notify::new());
         let disconnect_asked = Arc::new(AtomicBool::new(false));
         let accepted = Arc::new(AtomicBool::new(false));
         let ended = Arc::new(AtomicBool::new(false));
         let counts = Counts {
+            receipts,
             inflight: inflight.clone(),
             written: written.clone(),
             ids: ids.clone(),
+            max_packet: max_packet.clone(),
             progress: progress.clone(),
             disconnect_asked: disconnect_asked.clone(),
             accepted: accepted.clone(),
             ended: ended.clone(),
         };
         let task = tokio::spawn(Pump::run(events, tx, backlog.clone(), counts, outage, stall, on_lost).in_current_span());
-        (Pump { task }, Incoming { rx, backlog, inflight, written, ids, progress, disconnect_asked, accepted, ended })
+        (Pump { task }, Incoming { rx, backlog, inflight, written, ids, max_packet, progress, disconnect_asked, accepted, ended })
     }
 
     async fn run(
@@ -505,6 +538,10 @@ impl Pump {
                 Event::Incoming(Packet::ConnAck(ack)) => {
                     let receive_max = ack.properties.as_ref().and_then(|p| p.receive_max).unwrap_or(u16::MAX);
                     counts.ids.store(receive_max, Ordering::SeqCst);
+                    counts.max_packet.store(
+                        ack.properties.as_ref().and_then(|properties| properties.max_packet_size).unwrap_or(u32::MAX),
+                        Ordering::SeqCst,
+                    );
                     outage.connected();
                     connected = true;
                     counts.accepted.store(true, Ordering::SeqCst);
@@ -515,6 +552,17 @@ impl Pump {
                     PumpEvent::Publish(publish, Instant::now())
                 }
                 Event::Outgoing(Outgoing::Subscribe(pkid)) => PumpEvent::Subscribing(pkid),
+                Event::Outgoing(Outgoing::Publish(pkid)) if counts.receipts => {
+                    PumpEvent::Publishing { sequence: counts.written.load(Ordering::SeqCst), pkid }
+                }
+                Event::Incoming(Packet::PubAck(ack)) if counts.receipts => PumpEvent::PubAck {
+                    pkid: ack.pkid,
+                    result: if matches!(ack.reason, PubAckReason::Success | PubAckReason::NoMatchingSubscribers) {
+                        Ok(())
+                    } else {
+                        Err(format!("broker refused snapshot PUBACK: {:?}", ack.reason))
+                    },
+                },
                 Event::Incoming(Packet::SubAck(ack)) => PumpEvent::SubAck {
                     pkid: ack.pkid,
                     granted: ack.return_codes.iter().all(|code| matches!(code, SubscribeReasonCode::Success(_))),
@@ -549,9 +597,11 @@ impl Pump {
 /// task however it ends — returned, panicked or aborted, polled or not — it says the pump ended,
 /// and wakes a wait on its progress.
 struct Counts {
+    receipts: bool,
     inflight: Arc<AtomicUsize>,
     written: Arc<AtomicU64>,
     ids: Arc<AtomicU16>,
+    max_packet: Arc<AtomicU32>,
     progress: Arc<tokio::sync::Notify>,
     disconnect_asked: Arc<AtomicBool>,
     accepted: Arc<AtomicBool>,

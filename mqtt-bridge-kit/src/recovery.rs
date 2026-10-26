@@ -1,5 +1,8 @@
 //! Opt-in retained recovery handshake for a fixed managed bridge.
 
+mod publication;
+pub use publication::{RecoveryReceipt, RecoverySnapshot};
+
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -60,6 +63,8 @@ pub struct RecoveryImage {
     pub states: BTreeMap<String, crate::PropertyMap>,
     /// Complete accepted target setups, used to replace configuration caches.
     pub configurations: BTreeMap<String, crate::Value>,
+    /// Selected immutable retained snapshot, installed with this exact image.
+    pub snapshot: Option<RecoverySnapshot>,
 }
 impl RecoveryImage {
     pub(crate) fn check_deadline(&self) -> Result<(), String> {
@@ -71,6 +76,12 @@ impl RecoveryImage {
     pub(crate) fn validate(&self, options: &RecoveryOptions, ready: RecoveryReady) -> Result<(), String> {
         self.check_deadline()?;
         self.generations.validate()?;
+        if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.document().len() > options.max_bytes) {
+            return Err("recovery snapshot exceeds max_bytes".into());
+        }
+        if ready == RecoveryReady::RecoveryOnly && self.snapshot.is_some() {
+            return Err("recovery-only mode cannot replace retained recovery evidence".into());
+        }
         if self.generations.targets.contains_key(&options.target)
             || self.states.contains_key(&options.target)
             || self.configurations.contains_key(&options.target)
@@ -117,6 +128,16 @@ pub struct RecoveryHandle {
     initial: bool,
 }
 impl RecoveryHandle {
+    /// Replace the pending snapshot on the current Ready connection. This does
+    /// not wait for MQTT or imply broker acceptance.
+    pub fn publish(&self, connection: RecoveryConnection, snapshot: RecoverySnapshot) -> Result<(), String> {
+        self.shared.offer(connection, snapshot)
+    }
+    /// Latest exact broker receipt, if any; a receipt is not broker disk durability.
+    pub fn receipt(&self) -> Option<RecoveryReceipt> {
+        // WAIT: recovery-state
+        self.shared.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).publication.receipt.clone()
+    }
     /// Ask the current session to atomically install a complete seed, then open
     /// its gates. Success confirms installation, not snapshot replication.
     pub async fn complete(
@@ -173,6 +194,7 @@ struct State {
     phase: Phase,
     pending: Option<Install>,
     install_until: Option<std::time::Instant>,
+    publication: publication::Publication,
 }
 impl State {
     fn check_install(&self, connection: RecoveryConnection, ready: RecoveryReady) -> Result<(), String> {
@@ -222,7 +244,14 @@ impl RecoveryShared {
         Ok(Arc::new(Self {
             options,
             owner,
-            state: Mutex::new(State { epoch: 0, connection: None, phase: Phase::Closed, pending: None, install_until: None }),
+            state: Mutex::new(State {
+                epoch: 0,
+                connection: None,
+                phase: Phase::Closed,
+                pending: None,
+                install_until: None,
+                publication: Default::default(),
+            }),
             readback,
             changed: Notify::new(),
         }))
@@ -239,6 +268,7 @@ impl RecoveryShared {
         state.phase = Phase::Reading;
         state.install_until = None;
         state.pending.take();
+        state.publication.reset(None);
         self.readback.send_replace(None);
         Ok(connection)
     }
@@ -279,6 +309,7 @@ impl RecoveryShared {
         state.phase = Phase::Closed;
         state.install_until = None;
         state.pending.take();
+        state.publication.reset(None);
         self.readback.send_replace(None);
     }
     pub(crate) fn readiness(&self) -> Option<RecoveryReady> {
@@ -311,6 +342,7 @@ impl RecoveryShared {
             .and_then(|()| apply(&install));
         let installed = result.is_ok();
         if installed {
+            state.publication.reset(install.image.snapshot.clone());
             state.phase = Phase::Open(install.ready);
             state.install_until = None;
         }
@@ -332,6 +364,7 @@ mod tests {
             generations: crate::TargetGenerations { instance: "instance.1".into(), targets: BTreeMap::new() },
             states: BTreeMap::new(),
             configurations: BTreeMap::new(),
+            snapshot: None,
         }
     }
 
@@ -611,6 +644,7 @@ mod tests {
             generations: crate::TargetGenerations { instance: "instance.1".into(), targets: [("a".into(), "generation.1".into())].into() },
             states: [("a".into(), serde_json::json!({"level":22}).as_object().unwrap().clone())].into(),
             configurations: [("a".into(), serde_json::json!({"channel":1}))].into(),
+            snapshot: None,
         };
         image.validate(&options, RecoveryReady::Ready).unwrap();
         assert!(image.validate(&options, RecoveryReady::RecoveryOnly).is_err());

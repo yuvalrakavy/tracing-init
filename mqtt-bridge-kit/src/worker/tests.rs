@@ -35,6 +35,7 @@ fn recovery_replaces_worker_setup_and_conflict_caches_even_when_generation_is_un
     worker.before = Some((Instant::now(), [("a".into(), json!({"level":1}).as_object().unwrap().clone())].into()));
     worker.before_policy = Some(RequestPolicy::Fenced(table.clone()));
     let image = crate::RecoveryImage {
+        snapshot: None,
         context: RequestContext::default(),
         generations: table,
         states: [("a".into(), json!({"level":22}).as_object().unwrap().clone())].into(),

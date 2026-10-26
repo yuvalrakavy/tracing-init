@@ -1,0 +1,396 @@
+{
+ "rows": {
+  "an_unrelated_puback_credits_the_snapshot": {
+   "last_real": {
+    "at": "2026-10-26T19:37:29Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:b8374747b51ae3b2",
+     "row": "2520ab942f2d5669",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.3,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "broker_ceiling_can_override_the_local_packet_limit": {
+   "last_real": {
+    "at": "2026-10-26T19:38:45Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:323e076948361b21",
+     "guard": "item:8007d489288e465a",
+     "row": "5df8d637ce149f1a",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 6.1,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "enqueue_is_mistaken_for_broker_acceptance": {
+   "last_real": {
+    "at": "2026-10-26T19:37:34Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:cdbec90da27e2e9a",
+     "row": "b05f25d74b01d858",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.3,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "installed_snapshot_bypasses_encoded_size_admission": {
+   "last_real": {
+    "at": "2026-10-26T19:38:27Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:b9b5f85a679e96d4",
+     "guard": "item:af341d728d63cbc4",
+     "row": "7e87502babf744de",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 6.5,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "installed_snapshot_is_not_selected_for_publication": {
+   "last_real": {
+    "at": "2026-10-26T19:36:57Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:b9b5f85a679e96d4",
+     "guard": "item:ee716c2c5a97b4bb",
+     "row": "2315871816b20f0f",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 6.1,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "outgoing_sequence_is_not_checked_before_binding_packet": {
+   "last_real": {
+    "at": "2026-10-26T19:37:25Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:6a27a236dd7a76f5",
+     "row": "1ab168475ea5d4fd",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 3.9,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "pacing_is_not_rebased_at_actual_enqueue": {
+   "last_real": {
+    "at": "2026-10-26T19:37:42Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:cdbec90da27e2e9a",
+     "row": "bdcdfcbe2efbdbaf",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.1,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "pending_snapshot_can_overwrite_an_inflight_publication": {
+   "last_real": {
+    "at": "2026-10-26T19:37:09Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:ce0a494c09f4188d",
+     "row": "30fcb2ec6a490bde",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.2,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "pending_snapshot_keeps_the_first_update": {
+   "last_real": {
+    "at": "2026-10-26T19:37:05Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:0d88f02c7b6ecb6d",
+     "row": "7424f16bea6b0abc",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 3.9,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "publication_has_no_timer_wakeup": {
+   "last_real": {
+    "at": "2026-10-26T19:37:48Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:a72437682f0a4453",
+     "guard": "item:03a9a77f620f766d",
+     "row": "62df7022b5cec7c1",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 6.2,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "pump_forgets_the_advertised_packet_ceiling": {
+   "last_real": {
+    "at": "2026-10-26T19:38:39Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:323e076948361b21",
+     "guard": "item:417d762821b3f29c",
+     "row": "e25279b369eecba9",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 8.6,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "pump_treats_negative_puback_as_acceptance": {
+   "last_real": {
+    "at": "2026-10-26T19:38:01Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:323e076948361b21",
+     "guard": "item:417d762821b3f29c",
+     "row": "a93ce2c6c9cff7ea",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 6.6,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "receipt_credits_the_latest_pending_revision": {
+   "last_real": {
+    "at": "2026-10-26T19:37:38Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:e51878262296b150",
+     "row": "eca5509b5c03ae5d",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.5,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "recovery_only_allows_snapshot_offers": {
+   "last_real": {
+    "at": "2026-10-26T19:37:17Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:0d88f02c7b6ecb6d",
+     "row": "7c1d017f4573c7fd",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 3.9,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "recovery_only_image_can_publish_a_snapshot": {
+   "last_real": {
+    "at": "2026-10-26T19:38:20Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:b9b5f85a679e96d4",
+     "guard": "item:af341d728d63cbc4",
+     "row": "4e9ea4f6f85abf91",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.3,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "snapshot_adopts_unrelated_ambient_trace": {
+   "last_real": {
+    "at": "2026-10-26T19:38:16Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:c16d0e00ed1d209a",
+     "guard": "item:643f0ad2790d580e",
+     "row": "414669ab934d0e27",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.3,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "snapshot_constructor_ignores_its_absolute_bound": {
+   "last_real": {
+    "at": "2026-10-26T19:38:31Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:9f22f118545633ce",
+     "row": "b8a3e95b16bfd42d",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.0,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "snapshot_identity_reuses_revision": {
+   "last_real": {
+    "at": "2026-10-26T19:37:01Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:9f22f118545633ce",
+     "row": "e349132ad976b7c9",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 3.8,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "snapshot_ignores_broker_packet_ceiling": {
+   "last_real": {
+    "at": "2026-10-26T19:37:54Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:a72437682f0a4453",
+     "guard": "item:865442a5c39ee47f",
+     "row": "166ffeb90bf32e7e",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 6.0,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "snapshot_loses_explicit_trace": {
+   "last_real": {
+    "at": "2026-10-26T19:38:11Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:c16d0e00ed1d209a",
+     "guard": "item:643f0ad2790d580e",
+     "row": "0a4ea90ebaba9f97",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 3.9,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "snapshot_offer_ignores_current_connection": {
+   "last_real": {
+    "at": "2026-10-26T19:37:13Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:0d88f02c7b6ecb6d",
+     "row": "085271d6a171fac6",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 3.8,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "snapshot_offer_skips_encoded_size_admission": {
+   "last_real": {
+    "at": "2026-10-26T19:37:21Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:887b497404418197",
+     "guard": "item:1aad45c581da8b41",
+     "row": "a4ee34a7be0b0aae",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.0,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  },
+  "snapshot_packet_size_omits_its_qos1_identifier": {
+   "last_real": {
+    "at": "2026-10-26T19:38:07Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:c16d0e00ed1d209a",
+     "guard": "item:6fba7b42d5bb6c54",
+     "row": "25ca5949d45adb1b",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 6.5,
+    "sha": "bb39bf4f7fd80627833da5aa21940991f78866bb",
+    "verdict": "RED"
+   }
+  }
+ },
+ "version": 1
+}

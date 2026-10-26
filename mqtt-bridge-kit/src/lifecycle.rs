@@ -525,6 +525,28 @@ impl Lifecycle {
     pub(crate) fn recovery_output_open(&self) -> bool {
         self.recovery.as_ref().map_or(true, |recovery| recovery.readiness().is_some())
     }
+    pub(crate) fn on_publication(&self, event: PumpEvent) {
+        if let Some(recovery) = &self.recovery {
+            match event {
+                PumpEvent::Publishing { sequence, pkid } => recovery.publication_written(sequence, pkid),
+                PumpEvent::PubAck { pkid, result } => recovery.publication_ack(pkid, result),
+                _ => {}
+            }
+        }
+    }
+    fn queue_recovery_snapshot(&self, ctx: &Ctx<'_>, outputs: &mut Outputs) {
+        let Some(recovery) = &self.recovery else { return };
+        let Some(snapshot) = recovery.take_publication() else { return };
+        let Some(name) = self.fixed_name() else { return };
+        let Some((_, topics)) = self.rt_of(&name) else { return };
+        let id = snapshot.id();
+        let out = Out::recovery(topics.state(&recovery.options.target), snapshot, recovery.clone());
+        if out.packet_size() > ctx.line.maximum_packet_size() as usize {
+            recovery.publication_rejected(id, "snapshot MQTT packet exceeds the local or broker-advertised maximum".into());
+        } else {
+            outputs.queue_outbox(Part::Model, out);
+        }
+    }
     pub(crate) fn recovery_changed(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let recovery = self.recovery.clone();
         async move {
@@ -693,7 +715,8 @@ impl Lifecycle {
         let retries = self.instances.values().filter_map(|i| i.retry_at);
         let read_back = self.fixed.as_ref().and_then(|f| f.read_back_until);
         let recovery = self.recovery.as_ref().and_then(|recovery| recovery.install_deadline());
-        [self.conn.next_deadline(), fallback, self.next_sweep, read_back, recovery].into_iter().flatten().chain(retries).min()
+        let publication = self.recovery.as_ref().and_then(|recovery| recovery.publication_deadline());
+        [self.conn.next_deadline(), fallback, self.next_sweep, read_back, recovery, publication].into_iter().flatten().chain(retries).min()
     }
 
     // ---- Subscriptions ---------------------------------------------------------------------
@@ -762,6 +785,7 @@ impl Lifecycle {
             }
         }
         self.maybe_active(ctx, outputs).await;
+        self.queue_recovery_snapshot(ctx, outputs);
         outputs.set_budget(self.budget(ctx));
         Ok(())
     }

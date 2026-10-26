@@ -1130,6 +1130,16 @@ while a completion waits. A RecoveryOnly image has empty target/model/setup maps
 ordinary recovery uses Ready. See the [recovery API contract](../README.md#retained-recovery-for-managed-bridges)
 for subscription ordering, exact cache replacement and current publication limits.
 
+If the selected image includes a recovery snapshot, construct its complete encoded
+State carrier as a `RecoverySnapshot` and set `image.snapshot` before installation.
+Later accepted engine changes call `recovery.publish(connection, snapshot)`; this
+replaces one pending value without waiting for MQTT. Keep rendering while a snapshot
+is in flight. Read `recovery.receipt()` to report replication separately from local
+engine acceptance: it names the exact snapshot identity, revision, connection and
+packet, and can report a broker refusal or packet-size fault. Keep the latest local
+image across link loss and seed it again after the next completed readback. RecoveryOnly
+images must have no snapshot, preserving the broker's existing recovery evidence.
+
 ## A checklist before you ship a driver
 
 - `info()` declares what is true: `writes`, `feedback`, every command and its class. A driver with

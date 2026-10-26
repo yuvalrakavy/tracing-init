@@ -216,6 +216,7 @@ impl Drop for FakeBroker {
 struct Shared {
     protocol: Protocol,
     receive_max: u16,
+    advertised_packet_max: AtomicUsize,
     received: Mutex<Vec<Received>>,
     subscriptions: Mutex<Vec<String>>,
     connections: AtomicUsize,
@@ -270,6 +271,7 @@ struct Shared {
     conns: Mutex<Vec<Conn>>,
     /// Filters starting with one of these are refused, `NotAuthorized` (an ACL).
     denied: Mutex<Vec<String>>,
+    denied_publications: Mutex<Vec<String>>,
     /// The client's packet ids whose acknowledgement is held — a SUBACK or an UNSUBACK — by
     /// connection number: in use until released (MQTT §2.2.1).
     pkids_held: Mutex<Vec<(usize, u16)>>,
@@ -315,6 +317,7 @@ impl FakeBroker {
         let shared = Arc::new(Shared {
             protocol,
             receive_max,
+            advertised_packet_max: AtomicUsize::new(0),
             received: Mutex::new(Vec::new()),
             subscriptions: Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
@@ -342,6 +345,7 @@ impl FakeBroker {
             multi,
             conns: Mutex::new(Vec::new()),
             denied: Mutex::new(Vec::new()),
+            denied_publications: Mutex::new(Vec::new()),
             pkids_held: Mutex::new(Vec::new()),
             pkid_reuses: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -358,6 +362,14 @@ impl FakeBroker {
     /// `127.0.0.1:<port>`.
     pub fn address(&self) -> String {
         format!("127.0.0.1:{}", self.port)
+    }
+
+    /// Advertise a maximum complete MQTT packet size in subsequent v5 CONNACKs.
+    /// This deliberately does not enforce the cap: tests can observe a sender
+    /// violating it instead of inferring compliance from a disconnect.
+    pub fn advertise_maximum_packet_size(&self, bytes: u32) {
+        assert!(bytes > 0, "MQTT maximum packet size must be positive");
+        self.shared.advertised_packet_max.store(bytes as usize, Ordering::SeqCst);
     }
 
     /// Send a QoS 0 publish to the connected client. `false` when no client is connected.
@@ -520,6 +532,12 @@ impl FakeBroker {
     /// code `NotAuthorized`: no subscription is made and nothing replayed (a broker's ACL).
     pub fn deny_subscriptions(&self, prefix: &str) {
         self.shared.denied.lock().unwrap().push(prefix.to_owned());
+    }
+
+    /// Reject v5 QoS 1 publications under this topic prefix with NotAuthorized.
+    /// The attempted publish is recorded, but is neither retained nor routed.
+    pub fn deny_publications(&self, prefix: &str) {
+        self.shared.denied_publications.lock().unwrap().push(prefix.to_owned());
     }
 
     /// Hold, from now on, the SUBACK (and replay) of every subscription to a filter starting with
@@ -1062,7 +1080,10 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
                 receive_max: Some(shared.receive_max),
                 max_qos: None,
                 retain_available: None,
-                max_packet_size: None,
+                max_packet_size: match shared.advertised_packet_max.load(Ordering::SeqCst) {
+                    0 => None,
+                    max => Some(max as u32),
+                },
                 assigned_client_identifier: None,
                 topic_alias_max: None,
                 reason_string: None,
@@ -1154,6 +1175,14 @@ fn read_v5(buf: &mut BytesMut, tx: &mpsc::UnboundedSender<BytesMut>, shared: &Sh
                 properties: p.properties.clone(),
             };
             record(shared, received);
+            if p.qos == QoS::AtLeastOnce && shared.denied_publications.lock().unwrap().iter().any(|prefix| topic.starts_with(prefix)) {
+                let _ = tx.send(encode_v5(v5::Packet::PubAck(v5::PubAck {
+                    pkid: p.pkid,
+                    reason: v5::PubAckReason::NotAuthorized,
+                    properties: None,
+                })));
+                return Some(Read::Handled);
+            }
             route(shared, tx, &topic, &p.payload, p.retain, p.properties.clone());
             match p.qos {
                 QoS::AtMostOnce => {}

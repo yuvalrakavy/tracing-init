@@ -67,6 +67,7 @@ fn image(level: Option<u64>) -> RecoveryImage {
         generations: TargetGenerations { instance: "instance.1".into(), targets: BTreeMap::new() },
         states: BTreeMap::new(),
         configurations: BTreeMap::new(),
+        snapshot: None,
     };
     if let Some(level) = level {
         image.generations.targets.insert("a".into(), "generation.a".into());
@@ -76,6 +77,236 @@ fn image(level: Option<u64>) -> RecoveryImage {
 }
 fn subscription_count(broker: &FakeBroker, prefix: &str) -> usize {
     broker.events().iter().filter(|event| matches!(event, BrokerEvent::Subscribed(filter) if filter.starts_with(prefix))).count()
+}
+
+fn snapshot(revision: u64) -> RecoverySnapshot {
+    RecoverySnapshot::new(revision, Bytes::from(format!("{{\"snapshot\":\"revision-{revision}\"}}")), RequestContext::default()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_negative_snapshot_puback_is_a_fault_with_its_exact_identity_and_does_not_restart_the_service() {
+    let broker = FakeBroker::start().await;
+    broker.deny_publications("Recovery/State/i/_recovery");
+    let calls = Calls::default();
+    let (send, receive) = oneshot::channel();
+    let running = Bridge::new("Recovery")
+        .instance("i")
+        .broker(&broker.address())
+        .recovery(RecoveryOptions { target: "_recovery".into(), max_bytes: 4096 })
+        .start_managed(Owner { calls: calls.clone(), handle: send })
+        .await
+        .unwrap();
+    let mut handle = receive.await.unwrap();
+    let readback = tokio::time::timeout(Duration::from_secs(2), handle.readback()).await.unwrap().unwrap();
+    let rejected = snapshot(41);
+    let mut selected = image(Some(22));
+    selected.snapshot = Some(rejected.clone());
+    handle.complete(readback.connection, selected, RecoveryReady::Ready, None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(receipt) = handle.receipt() {
+                assert_eq!(receipt.snapshot_id, rejected.id());
+                assert_eq!(receipt.revision, 41);
+                assert_eq!(receipt.connection, readback.connection);
+                assert!(receipt.packet.is_some_and(|packet| packet != 0));
+                assert!(receipt.result.unwrap_err().contains("NotAuthorized"), "negative PUBACK was mistaken for broker acceptance");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a negative snapshot PUBACK produced no receipt");
+    assert!(broker.wait_for_subscription("Recovery/Desired/i/+/+", Duration::from_secs(2)).await);
+    assert!(broker.send_with(
+        "Recovery/Desired/i/a/level",
+        "23",
+        &SendOptions { user_properties: vec![("target-generation".into(), "generation.a".into())], ..Default::default() }
+    ));
+    assert!(broker.wait_until(Duration::from_secs(2), |_| calls.applies.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(broker.received_on("Recovery/State/i/_recovery").len(), 1);
+    assert_eq!(broker.accepted(), 1);
+    assert_eq!(calls.starts.load(Ordering::SeqCst), 1);
+    assert!(running.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_snapshot_wakes_after_the_publication_pacing_interval_without_other_traffic() {
+    let broker = FakeBroker::start().await;
+    let (send, receive) = oneshot::channel();
+    let running = Bridge::new("Recovery")
+        .instance("i")
+        .broker(&broker.address())
+        .recovery(RecoveryOptions { target: "_recovery".into(), max_bytes: 4096 })
+        .start_managed(Owner { calls: Calls::default(), handle: send })
+        .await
+        .unwrap();
+    let mut handle = receive.await.unwrap();
+    let readback = tokio::time::timeout(Duration::from_secs(2), handle.readback()).await.unwrap().unwrap();
+    let mut selected = image(None);
+    selected.snapshot = Some(snapshot(1));
+    let began = std::time::Instant::now();
+    handle.complete(readback.connection, selected, RecoveryReady::Ready, None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle.receipt().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(began.elapsed() < Duration::from_millis(90), "fixture missed the pacing window");
+    handle.publish(readback.connection, snapshot(2)).unwrap();
+    assert!(
+        broker.wait_until(Duration::from_secs(2), |broker| broker.received_on("Recovery/State/i/_recovery").len() == 2).await,
+        "pending snapshot was stranded without a publication timer"
+    );
+    assert!(began.elapsed() >= Duration::from_millis(95), "snapshots were published faster than once per 100ms");
+    assert!(running.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_discards_old_snapshot_work_and_only_publishes_the_newly_selected_image() {
+    let broker = FakeBroker::start().await;
+    let calls = Calls::default();
+    let (send, receive) = oneshot::channel();
+    let running = Bridge::new("Recovery")
+        .instance("i")
+        .broker(&broker.address())
+        .recovery(RecoveryOptions { target: "_recovery".into(), max_bytes: 4096 })
+        .start_managed(Owner { calls: calls.clone(), handle: send })
+        .await
+        .unwrap();
+    let mut handle = receive.await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), handle.readback()).await.unwrap().unwrap();
+    let mut selected = image(None);
+    selected.snapshot = Some(snapshot(1));
+    broker.hold_acks();
+    handle.complete(first.connection, selected, RecoveryReady::Ready, None).await.unwrap();
+    assert!(broker.wait_until(Duration::from_secs(2), |broker| !broker.received_on("Recovery/State/i/_recovery").is_empty()).await);
+    handle.publish(first.connection, snapshot(2)).unwrap();
+    broker.hold_subacks_matching("Recovery/State/i/_sync/");
+    broker.drop_connection();
+    assert!(broker.wait_until(Duration::from_secs(3), |broker| subscription_count(broker, "Recovery/State/i/_sync/") >= 2).await);
+    assert!(handle.receipt().is_none());
+    assert!(handle.publish(first.connection, snapshot(3)).is_err());
+    assert_eq!(broker.received_on("Recovery/State/i/_recovery").len(), 1, "old snapshot work escaped before the new barrier");
+    broker.release_acks();
+    broker.release_subacks();
+    let second = tokio::time::timeout(Duration::from_secs(2), handle.readback()).await.unwrap().unwrap();
+    assert_ne!(first.connection, second.connection);
+    let mut replacement = image(None);
+    let latest = snapshot(4);
+    replacement.snapshot = Some(latest.clone());
+    handle.complete(second.connection, replacement, RecoveryReady::Ready, None).await.unwrap();
+    assert!(broker.wait_until(Duration::from_secs(2), |broker| broker.received_on("Recovery/State/i/_recovery").len() == 2).await);
+    assert_eq!(
+        broker.received_on("Recovery/State/i/_recovery")[1].payload,
+        *latest.document(),
+        "new connection published a stale pending snapshot"
+    );
+    assert_eq!(calls.starts.load(Ordering::SeqCst), 1);
+    assert!(running.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_above_the_brokers_packet_ceiling_reports_a_fault_without_reconnecting() {
+    assert_snapshot_ceiling(1024, 2000).await;
+    assert_snapshot_ceiling(u32::MAX, crate::session::MAX_PACKET_SIZE as usize).await;
+}
+
+async fn assert_snapshot_ceiling(maximum: u32, payload_bytes: usize) {
+    let broker = FakeBroker::start().await;
+    broker.advertise_maximum_packet_size(maximum);
+    let (send, receive) = oneshot::channel();
+    let running = Bridge::new("Recovery")
+        .instance("i")
+        .broker(&broker.address())
+        .recovery(RecoveryOptions { target: "_recovery".into(), max_bytes: crate::session::MAX_PACKET_SIZE as usize })
+        .start_managed(Owner { calls: Calls::default(), handle: send })
+        .await
+        .unwrap();
+    let mut handle = receive.await.unwrap();
+    let readback = tokio::time::timeout(Duration::from_secs(2), handle.readback()).await.unwrap().unwrap();
+    let oversized = RecoverySnapshot::new(
+        1,
+        Bytes::from(format!("{{\"snapshot\":\"{}\"}}", "x".repeat(payload_bytes - 15))),
+        RequestContext::default(),
+    )
+    .unwrap();
+    assert_eq!(oversized.document().len(), payload_bytes);
+    let mut selected = image(None);
+    selected.snapshot = Some(oversized.clone());
+    handle.complete(readback.connection, selected, RecoveryReady::Ready, None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(receipt) = handle.receipt() {
+                assert_eq!(receipt.snapshot_id, oversized.id());
+                assert!(receipt.packet.is_none(), "oversized snapshot was sent despite the advertised ceiling");
+                assert!(receipt.result.unwrap_err().contains("maximum"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("oversized snapshot produced no explicit publication fault");
+    assert!(broker.received_on("Recovery/State/i/_recovery").is_empty());
+    handle.publish(readback.connection, snapshot(2)).unwrap();
+    assert!(broker.wait_until(Duration::from_secs(2), |broker| !broker.received_on("Recovery/State/i/_recovery").is_empty()).await);
+    assert_eq!(broker.accepted(), 1, "a snapshot size fault caused a reconnect loop");
+    assert!(running.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshots_publish_through_the_runtime_and_receipts_name_the_immutable_inflight_revision() {
+    let broker = FakeBroker::start().await;
+    let (send, receive) = oneshot::channel();
+    let running = Bridge::new("Recovery")
+        .instance("i")
+        .broker(&broker.address())
+        .recovery(RecoveryOptions { target: "_recovery".into(), max_bytes: 4096 })
+        .start_managed(Owner { calls: Calls::default(), handle: send })
+        .await
+        .unwrap();
+    let mut handle = receive.await.unwrap();
+    let readback = tokio::time::timeout(Duration::from_secs(2), handle.readback()).await.unwrap().unwrap();
+    let first = snapshot(7);
+    let mut selected = image(Some(22));
+    selected.snapshot = Some(first.clone());
+    broker.hold_acks();
+    handle.complete(readback.connection, selected, RecoveryReady::Ready, None).await.unwrap();
+    assert!(
+        broker.wait_until(Duration::from_secs(2), |broker| !broker.received_on("Recovery/State/i/_recovery").is_empty()).await,
+        "the installed snapshot never reached the existing runtime publisher"
+    );
+    assert!(handle.receipt().is_none(), "enqueuing a snapshot was mistaken for broker acceptance");
+    for revision in 8..=20 {
+        handle.publish(readback.connection, snapshot(revision)).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(130)).await;
+    assert_eq!(broker.received_on("Recovery/State/i/_recovery").len(), 1, "a second snapshot escaped while its predecessor was in flight");
+    broker.delay_acks(Duration::from_secs(1));
+    broker.release_acks();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(receipt) = handle.receipt() {
+                assert_eq!(receipt.snapshot_id, first.id());
+                assert_eq!(receipt.revision, 7, "the old packet was credited to a newer pending revision");
+                assert_eq!(receipt.connection, readback.connection);
+                assert!(receipt.packet.is_some_and(|packet| packet != 0));
+                assert!(receipt.result.is_ok());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the broker's exact PUBACK produced no receipt");
+    assert!(broker.wait_until(Duration::from_secs(2), |broker| broker.received_on("Recovery/State/i/_recovery").len() == 2).await);
+    let sent = broker.received_on("Recovery/State/i/_recovery");
+    assert_eq!(sent[1].payload, snapshot(20).document().clone(), "pending snapshots did not coalesce to the latest revision");
+    assert!(sent.iter().all(|publish| publish.retain && publish.qos == mqtt_test_broker::QoS::AtLeastOnce));
+    assert!(running.stop().await);
 }
 
 #[tokio::test]
