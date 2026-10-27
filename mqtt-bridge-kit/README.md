@@ -359,6 +359,12 @@ frame ticks and cancellation. Staging validates the current connection, original
 deadline and any active command capability; the ticket confirms runtime installation,
 not broker replication. Keep it alive through the result; a lost connection cannot
 roll back lighting already committed locally.
+If a command-triggered install later expires or loses its command capability after
+local acceptance, preserve the failed/unknown command result and converge the
+already-accepted local state with a fresh autonomous image on the **same original
+connection**. Do not use a newer replay capability: its broker evidence still needs
+the engine's normal selection. A lost original connection instead waits for that
+normal replay; it does not roll lighting back.
 `RecoveryImage` contains the complete generation table, assumed target model, accepted
 target configurations, optional immutable snapshot and original request context. Installation replaces old state,
 acknowledged writes, conflict/readback caches, setup caches and queued work, including
