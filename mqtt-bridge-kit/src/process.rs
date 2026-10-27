@@ -189,6 +189,11 @@ impl PanicReports {
 pub struct Bridge(Host);
 
 impl Bridge {
+    /// Check outgoing publications and subscription controls against the local
+    /// 1 MiB and current broker ceilings before enqueue. Legacy defaults remain.
+    pub fn packet_limits(self) -> Bridge {
+        Bridge(self.0.packet_limits())
+    }
     /// Bound accounted pending/in-flight request contents and mailbox copy/basis caches.
     /// Oversized updates are refused atomically; the device worker never waits for space.
     pub fn request_queue_bytes(self, limit: usize) -> Bridge {

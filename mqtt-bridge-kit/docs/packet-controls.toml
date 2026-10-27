@@ -1,0 +1,92 @@
+[[control]]
+name = "public_packet_setting_not_passed_to_session"
+guard = "public packet policy wiring"
+file = "mqtt-bridge-kit/src/host.rs"
+anchor = 'packet_limits: self.packet_limits,'
+replacement = 'packet_limits: false,'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(public_packet_policy)"]
+expect_text = "public packet policy was ignored"
+
+[[control]]
+name = "bootstrap_fault_does_not_clear_stale_active"
+guard = "fault clears stale online status"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = 'session::emit(ctx, self.shared.topics.active(), true, b"false".to_vec(), session::properties()).await;'
+replacement = ''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(a_bootstrap_packet_fault)"]
+expect_text = "bootstrap size fault left stale Active=true retained"
+
+[[control]]
+name = "ordinary_output_packet_admission_omitted"
+guard = "queued output admission"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = 'if (shared.packet_limits || out.publication.is_some()) && !packet_admitted(&out.topic, &out.payload, &out.properties, maximum) {'
+replacement = 'if false {'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(every_output_lane_refuses)"]
+expect_text = "an oversized output blocked following state"
+
+[[control]]
+name = "lifecycle_packet_admission_omitted"
+guard = "lifecycle output admission"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = 'if ctx.shared.packet_limits && !packet_admitted(&topic, &payload, &properties, ctx.line.maximum_packet_size() as usize) {'
+replacement = 'if false {'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(lifecycle_publications_check)"]
+expect_text = "assertion failed: broker.wait_until"
+
+[[control]]
+name = "packet_size_omits_qos_one_identifier"
+guard = "complete MQTT packet bytes"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = 'packet.pkid = 1;'
+replacement = 'packet.pkid = 0;'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(packet_accounting_matches)"]
+expect_text = "packet size omitted a header/property byte"
+
+[[control]]
+name = "local_packet_ceiling_not_applied"
+guard = "local and peer minimum"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = 'let maximum = maximum.min(MAX_PACKET_SIZE as usize);'
+replacement = 'let maximum = maximum;'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(packet_accounting_matches)"]
+expect_text = "assertion failed: packet_admitted"
+
+[[control]]
+name = "control_packet_admission_omitted"
+guard = "subscription control admission"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = 'if ctx.shared.packet_limits && size > maximum {'
+replacement = 'if false {'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(oversized_subscription)"]
+expect_text = "size fault ended the MQTT session"
+
+[[control]]
+name = "packet_fault_keeps_expired_timers_armed"
+guard = "fault does not spin or reconnect"
+file = "mqtt-bridge-kit/src/lifecycle.rs"
+anchor = '''    pub(crate) fn next_wake(&self) -> Option<Instant> {
+        if self.conn.packet_fault {
+            return None;
+        }'''
+replacement = '''    pub(crate) fn next_wake(&self) -> Option<Instant> {'''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(oversized_subscription)"]
+expect_text = "packet fault retained a reconnect or spinning timer"
+
+[[control]]
+name = "oversized_first_publication_keeps_its_barrier"
+guard = "refusal releases publication barrier"
+file = "mqtt-bridge-kit/src/session.rs"
+anchor = 'self.firsts -= usize::from(out.first);'
+replacement = ''
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(packet_refusal_releases)"]
+expect_text = "packet refusal stranded the first-publication barrier"

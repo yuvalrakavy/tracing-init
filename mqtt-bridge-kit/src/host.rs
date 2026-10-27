@@ -154,6 +154,7 @@ pub struct Host {
     fixed: bool,
     request_lifetime_limit: Option<Duration>,
     request_queue_bytes: Option<usize>,
+    packet_limits: bool,
     buffers: Option<crate::BufferLimits>,
     pub(crate) recovery: Option<crate::RecoveryOptions>,
     pub(crate) recovery_shared: Option<Arc<crate::recovery::RecoveryShared>>,
@@ -198,6 +199,7 @@ impl Host {
             fixed: false,
             request_lifetime_limit: None,
             request_queue_bytes: None,
+            packet_limits: false,
             buffers: None,
             recovery: None,
             recovery_shared: None,
@@ -230,6 +232,10 @@ impl Host {
             return self.usage_error("request queue byte limit must be positive");
         }
         self.request_queue_bytes = Some(limit);
+        self
+    }
+    pub(crate) fn packet_limits(mut self) -> Host {
+        self.packet_limits = true;
         self
     }
 
@@ -517,6 +523,7 @@ impl Host {
             timing: self.settings.mqtt,
             request_lifetime_limit: self.request_lifetime_limit,
             request_queue_bytes: self.request_queue_bytes,
+            packet_limits: self.packet_limits,
             version,
             outage: Arc::new(BrokerOutage::new(self.settings.mqtt.warn_after, self.settings.mqtt.stable_after)),
             enqueued: std::sync::atomic::AtomicU64::new(0),

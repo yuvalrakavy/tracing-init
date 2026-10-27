@@ -1147,6 +1147,13 @@ is blocked. Keep the engine loop independent of reply delivery; an unanswered ca
 can time out after its engine change committed. See [bounded MQTT buffering](../README.md#bounded-mqtt-buffering)
 for the accounting scope and exact acknowledgment lifetime.
 
+DMX v2 also enables `Bridge::request_queue_bytes(1024 * 1024)` and
+`Bridge::packet_limits()`. The first refuses request-mailbox overflow without
+disturbing prior work; the second checks complete outgoing packets against local
+and peer ceilings before enqueue. A large publication is refused alone. A required
+subscription that cannot fit suspends connection admission while rendering continues;
+fix the ceiling/topic setup before reconnecting. Both are opt-in for existing bridges.
+
 ## A checklist before you ship a driver
 
 - `info()` declares what is true: `writes`, `feedback`, every command and its class. A driver with

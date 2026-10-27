@@ -141,6 +141,7 @@ pub(crate) struct Shared {
     pub timing: MqttTiming,
     pub request_lifetime_limit: Option<Duration>,
     pub request_queue_bytes: Option<usize>,
+    pub packet_limits: bool,
     /// The text of the retained `Version`.
     pub version: String,
     pub outage: Arc<BrokerOutage>,
@@ -386,7 +387,7 @@ impl Outputs {
     /// batch, or a new one taken from its reports when it is empty; or the outbox, the member after
     /// the devices — at most [`QUANTUM`] messages. Returns the device served, if any. Cancellation-safe: what is
     /// taken stays in the slot's batch.
-    async fn turn(&mut self, shared: &Shared, client: &AsyncClient) -> Option<u64> {
+    async fn turn(&mut self, shared: &Shared, client: &AsyncClient, maximum: usize) -> Option<u64> {
         let limit = self.budget.map_or(QUANTUM, |budget| budget.min(QUANTUM));
         if limit == 0 {
             return None;
@@ -400,7 +401,7 @@ impl Outputs {
             if i == n {
                 if self.outbox_open && !self.outbox.is_empty() {
                     // WAIT: mqtt-request
-                    self.outbox.publish(shared, client, &IN_TURN, limit).await;
+                    self.outbox.publish(shared, client, &IN_TURN, limit, maximum).await;
                     self.cursor = 0;
                     self.owed = true;
                     return None;
@@ -420,7 +421,7 @@ impl Outputs {
             }
             let id = slot.id;
             // WAIT: mqtt-request
-            slot.batch.publish(shared, client, &IN_TURN, limit).await;
+            slot.batch.publish(shared, client, &IN_TURN, limit, maximum).await;
             self.cursor = (i + 1) % (n + 1);
             self.owed = true;
             return Some(id);
@@ -502,18 +503,50 @@ pub(crate) type Failed = Box<dyn std::error::Error + Send + Sync>;
 /// Publish one message. A refusal — a topic rumqttc does not publish to, or the event loop gone —
 /// is that one message dropped, said at DEBUG; the caller goes on with the rest (review B2: the
 /// first refusal ended the CONNACK duties, and the session never published a report again).
-pub(crate) async fn emit(
-    shared: &Shared,
-    client: &AsyncClient,
-    topic: String,
-    retain: bool,
-    payload: Vec<u8>,
-    properties: PublishProperties,
-) {
+/// Opt-in size refusal happens before enqueue and is logged at INFO.
+pub(crate) async fn emit(ctx: &Ctx<'_>, topic: String, retain: bool, payload: Vec<u8>, properties: PublishProperties) {
+    if ctx.shared.packet_limits && !packet_admitted(&topic, &payload, &properties, ctx.line.maximum_packet_size() as usize) {
+        return;
+    }
     let refused_topic = topic.clone();
     // WAIT: mqtt-request
-    let sent = client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await;
-    let _ = enqueued(shared, &refused_topic, sent);
+    let sent = ctx.client.publish_with_properties(topic, QoS::AtLeastOnce, retain, payload, properties).await;
+    let _ = enqueued(ctx.shared, &refused_topic, sent);
+}
+
+fn packet_admitted(topic: &str, payload: &[u8], properties: &PublishProperties, maximum: usize) -> bool {
+    let size = packet_size(topic, payload, properties);
+    let maximum = maximum.min(MAX_PACKET_SIZE as usize);
+    if size > maximum {
+        info!(
+            kind = "mqtt_packet_rejected",
+            topic,
+            packet_bytes = size,
+            maximum_bytes = maximum,
+            "MQTT output exceeds the local or broker packet ceiling; this message is refused"
+        );
+        return false;
+    }
+    true
+}
+
+fn packet_size(topic: &str, payload: &[u8], properties: &PublishProperties) -> usize {
+    // Let rumqttc account for topic/properties exactly without copying the payload.
+    let mut packet = rumqttc::v5::mqttbytes::v5::Publish::new(topic, QoS::AtLeastOnce, bytes::Bytes::new(), Some(properties.clone()));
+    packet.pkid = 1;
+    let empty = packet.size();
+    let mut length_bytes = 1usize;
+    while empty.saturating_sub(1 + length_bytes) >= (1usize << (7 * length_bytes)) {
+        length_bytes += 1;
+    }
+    let remaining = empty.saturating_sub(1 + length_bytes).saturating_add(payload.len());
+    let mut width = 1usize;
+    let mut rest = remaining;
+    while rest >= 128 {
+        width += 1;
+        rest /= 128;
+    }
+    1usize.saturating_add(width).saturating_add(remaining)
 }
 
 /// What came of a publish: counted when rumqttc took it — the shutdown waits until the pump has
@@ -685,7 +718,7 @@ async fn session(
                 Step::Tick => host.on_timer(&ctx, outputs).await.map(ended),
                 Step::Line => host.on_line(&ctx, outputs).await.map(ended),
                 Step::Reported => {
-                    outputs.turn(shared, &client).await;
+                    outputs.turn(shared, &client, ctx.line.maximum_packet_size() as usize).await;
                     host.on_turn_done(&ctx, outputs).await.map(ended)
                 }
                 Step::Shutdown => Ok(Some(SessionEnd::Shutdown)),
@@ -797,14 +830,7 @@ impl Out {
     }
 
     pub(crate) fn packet_size(&self) -> usize {
-        let mut packet = rumqttc::v5::mqttbytes::v5::Publish::new(
-            self.topic.clone(),
-            QoS::AtLeastOnce,
-            self.payload.clone(),
-            Some(self.properties.clone()),
-        );
-        packet.pkid = 1;
-        packet.size()
+        packet_size(&self.topic, &self.payload, &self.properties)
     }
 
     fn charged(mut self, charge: Option<crate::buffering::Charge>) -> Self {
@@ -982,8 +1008,8 @@ impl Batch {
     /// messages have been handed over. At the stop, answers go first: the flush is bounded, and they
     /// are what must not be cut (confirming review 3). A message refused is dropped alone.
     /// Cancellation-safe: a message leaves the batch only into `sending`, which is kept. Returns how
-    /// many were handed over.
-    pub(crate) async fn publish(&mut self, shared: &Shared, client: &AsyncClient, parts: &[Part], limit: usize) -> usize {
+    /// many messages consumed the turn's budget, including refused messages.
+    pub(crate) async fn publish(&mut self, shared: &Shared, client: &AsyncClient, parts: &[Part], limit: usize, maximum: usize) -> usize {
         let mut handed = 0;
         // No packet id to spare: not even the publish under way is finished.
         if limit == 0 {
@@ -1022,6 +1048,19 @@ impl Batch {
             let Some(out) = next else {
                 return handed;
             };
+            if (shared.packet_limits || out.publication.is_some()) && !packet_admitted(&out.topic, &out.payload, &out.properties, maximum) {
+                self.firsts -= usize::from(out.first);
+                if let Some((recovery, id)) = out.publication {
+                    recovery.publication_rejected(id, "snapshot MQTT packet exceeds the local or broker-advertised maximum".into());
+                }
+                // A refused output consumes this turn's quantum too. Its answer
+                // charge drops here; no packet or cleanup receipt was enqueued.
+                handed += 1;
+                if handed >= limit {
+                    return handed;
+                }
+                continue;
+            }
             let client = client.clone();
             self.sending_first = out.first;
             self.sending = Some(Box::pin(async move {
@@ -1087,10 +1126,10 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
             let mut left = host.flush_budget(&ctx).unwrap_or(usize::MAX);
             for part in [Part::Answers, Part::Model, Part::Unsolicited] {
                 // WAIT: mqtt-request
-                left -= outputs.outbox.publish(shared, client, &[part], left).await;
+                left -= outputs.outbox.publish(shared, client, &[part], left, ctx.line.maximum_packet_size() as usize).await;
                 for slot in &mut outputs.slots {
                     // WAIT: mqtt-request
-                    left -= slot.batch.publish(shared, client, &[part], left).await;
+                    left -= slot.batch.publish(shared, client, &[part], left, ctx.line.maximum_packet_size() as usize).await;
                 }
             }
             let published = outputs.outbox.is_empty() && outputs.slots.iter().all(|slot| slot.batch.is_empty());
@@ -1112,7 +1151,8 @@ async fn flush(shared: &Shared, client: &AsyncClient, incoming: &mut Incoming, o
                 Ok(Some(_)) => {}
             }
         }
-        emit(shared, client, shared.topics.active(), true, b"false".to_vec(), properties()).await;
+        let ctx = Ctx { shared, client, line: incoming.line() };
+        emit(&ctx, shared.topics.active(), true, b"false".to_vec(), properties()).await;
         // Before the DISCONNECT, until the ack wait's deadline: every publish this session enqueued
         // written by the pump — a watermark, so the pump's count cannot be read stale before it
         // has taken the last ones — and none of them unacknowledged: the broker has the answers.

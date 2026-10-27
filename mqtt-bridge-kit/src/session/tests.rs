@@ -149,6 +149,12 @@ fn rig_on(port: u16) -> Rig {
     rig_with_buffers(port, None)
 }
 fn rig_with_buffers(port: u16, buffers: Option<Arc<crate::buffering::Buffers>>) -> Rig {
+    rig_with_options(port, buffers, false)
+}
+fn rig_with_packet_limits(port: u16) -> Rig {
+    rig_with_options(port, None, true)
+}
+fn rig_with_options(port: u16, buffers: Option<Arc<crate::buffering::Buffers>>, packet_limits: bool) -> Rig {
     let topics = Topics::new("T", "session").expect("topics");
     let ready = Arc::new(tokio::sync::Notify::new());
     let shared = Arc::new(Shared {
@@ -159,6 +165,7 @@ fn rig_with_buffers(port: u16, buffers: Option<Arc<crate::buffering::Buffers>>) 
         timing: MqttTiming::default(),
         request_lifetime_limit: None,
         request_queue_bytes: None,
+        packet_limits,
         version: "test".into(),
         outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         enqueued: std::sync::atomic::AtomicU64::new(0),
@@ -191,6 +198,155 @@ fn metadata_device() -> Device {
         request_lifetime_limit: Some(Duration::from_secs(20)),
         span: Span::none(),
     }
+}
+
+#[test]
+fn packet_accounting_matches_actual_qos_one_encoding_at_variable_length_boundaries() {
+    for payload in [0, 80, 127, 128, 16383, 16384, 1048576] {
+        for metadata in [0, 100, 16384] {
+            let properties = PublishProperties {
+                correlation_data: Some(bytes::Bytes::from(vec![3; metadata])),
+                user_properties: vec![("traceparent".into(), "00-11111111111111111111111111111111-2222222222222222-01".into())],
+                ..Default::default()
+            };
+            let payload = vec![1; payload];
+            let mut actual = Publish::new("Long/State/room/array", QoS::AtLeastOnce, payload.clone(), Some(properties.clone()));
+            actual.pkid = 123;
+            assert_eq!(
+                packet_size("Long/State/room/array", &payload, &properties),
+                actual.size(),
+                "packet size omitted a header/property byte"
+            );
+            assert!(
+                packet_admitted("Long/State/room/array", &payload, &properties, actual.size())
+                    == (actual.size() <= MAX_PACKET_SIZE as usize)
+            );
+            assert!(
+                !packet_admitted("Long/State/room/array", &payload, &properties, actual.size() - 1),
+                "one-byte packet overflow was admitted"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_subscription_latches_a_fault_instead_of_enqueuing_or_reconnecting() {
+    let broker = FakeBroker::start().await;
+    broker.advertise_maximum_packet_size(20);
+    let mut rig = rig_with_packet_limits(broker.port());
+    let capture = crate::test_support::Capture::start();
+    let (_stop, mut stopped) = watch::channel(false);
+    {
+        let active = session(&rig.shared, &mut rig.host, &mut rig.outputs, &mut rig.events, &mut stopped);
+        tokio::pin!(active);
+        tokio::select! {
+        result = &mut active => panic!("size fault ended the MQTT session: {}", matches!(result, SessionEnd::Ended { .. })),
+        _ = async {
+            assert!(broker.wait_until(Duration::from_secs(2), |_| !capture.of_kind("mqtt_packet_rejected").is_empty()).await,
+                "oversized subscription did not produce an explicit packet fault");
+        } => {}
+        }
+    }
+    assert!(!rig.host.recovery_output_open(), "packet fault left request/output admission open");
+    assert!(rig.host.next_wake().is_none(), "packet fault retained a reconnect or spinning timer");
+    assert!(
+        !broker.events().iter().any(|event| matches!(event, mqtt_test_broker::BrokerEvent::Subscribed(_))),
+        "oversized subscription reached the broker"
+    );
+    assert_eq!(broker.accepted(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_publications_check_the_peer_ceiling_before_enqueue() {
+    let broker = FakeBroker::start().await;
+    broker.advertise_maximum_packet_size(128);
+    let rig = rig_with_packet_limits(broker.port());
+    let (client, events) = client(&rig.shared);
+    let (_pump, mut incoming) = Pump::start(events, rig.shared.outage.clone(), Duration::from_secs(10), || {});
+    assert!(matches!(incoming.recv().await, Some(PumpEvent::Connected)));
+    let ctx = Ctx { shared: &rig.shared, client: &client, line: incoming.line() };
+    emit(&ctx, rig.shared.topics.version(), true, vec![b'x'; 128], properties()).await;
+    emit(&ctx, rig.shared.topics.active(), true, b"false".to_vec(), properties()).await;
+    assert!(broker.wait_until(Duration::from_secs(2), |broker| !broker.received_on(&rig.shared.topics.active()).is_empty()).await);
+    assert!(broker.received_on(&rig.shared.topics.version()).is_empty(), "oversized lifecycle publication reached the broker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bootstrap_packet_fault_clears_stale_active_when_false_fits_the_ceiling() {
+    let broker = FakeBroker::start().await;
+    // State/config/target subscriptions fit; the longer property filter does
+    // not. Active=false fits exactly and must clear a previous retained true.
+    broker.advertise_maximum_packet_size(28);
+    broker.retain("T/Active/session", "true", &mqtt_test_broker::SendOptions::default());
+    let rig = rig_with_packet_limits(broker.port());
+    let (stop, mut stopped) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rig = rig;
+        session(&rig.shared, &mut rig.host, &mut rig.outputs, &mut rig.events, &mut stopped).await
+    });
+    assert!(
+        broker.wait_until(Duration::from_secs(2), |broker| broker.retained_on("T/Active/session").as_deref() == Some(b"false")).await,
+        "bootstrap size fault left stale Active=true retained"
+    );
+    assert_eq!(broker.accepted(), 1);
+    stop.send_replace(true);
+    assert!(matches!(tokio::time::timeout(Duration::from_secs(3), task).await, Ok(Ok(SessionEnd::Shutdown))));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packet_refusal_releases_answer_capacity_and_first_publication_barriers() {
+    let broker = FakeBroker::start().await;
+    broker.advertise_maximum_packet_size(128);
+    let rig = rig_with_packet_limits(broker.port());
+    let (client, events) = client(&rig.shared);
+    let (_pump, mut incoming) = Pump::start(events, rig.shared.outage.clone(), Duration::from_secs(10), || {});
+    assert!(matches!(incoming.recv().await, Some(PumpEvent::Connected)));
+    let buffers = crate::buffering::Buffers::new(crate::BufferLimits { incoming_bytes: 100, reply_bytes: 100 });
+    let mut batch = Batch::default();
+    batch.push(
+        Part::Answers,
+        Out::new("Client/oversized".into(), false, vec![1; 128], None, None).charged(Some(buffers.reserve_reply(100).unwrap())).first(),
+    );
+    batch.push(Part::Model, Out::new("Client/small".into(), false, vec![2], None, None).first());
+    assert_eq!(batch.publish(&rig.shared, &client, &IN_TURN, 2, incoming.line().maximum_packet_size() as usize).await, 2);
+    assert_eq!(batch.firsts, 0, "packet refusal stranded the first-publication barrier");
+    assert!(batch.is_empty());
+    assert!(buffers.reserve_reply(100).is_some(), "packet refusal retained its terminal-answer capacity");
+    assert_eq!(rig.shared.enqueued.load(std::sync::atomic::Ordering::SeqCst), 1, "packet refusal fabricated an enqueue receipt");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_output_lane_refuses_oversized_packets_and_publishes_following_small_messages() {
+    let broker = FakeBroker::start().await;
+    broker.advertise_maximum_packet_size(256);
+    let rig = rig_with_packet_limits(broker.port());
+    let reports = rig.device.reports.clone();
+    let (stop, mut stopped) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut rig = rig;
+        session(&rig.shared, &mut rig.host, &mut rig.outputs, &mut rig.events, &mut stopped).await
+    });
+    assert!(broker.wait_for_subscription("T/Command/session", Duration::from_secs(2)).await);
+    reports.state("large", serde_json::json!({"data":"x".repeat(1024)}).as_object().unwrap().clone(), false);
+    for topic in [Some("Client/replies"), None] {
+        reports.event(Outbound {
+            context: crate::RequestContext::default(),
+            topic: topic.map(str::to_owned),
+            payload: vec![b'x'; 1024],
+            correlation: topic.map(|_| bytes::Bytes::from_static(b"id")),
+        });
+    }
+    reports.request_error(ErrorReport::new(Reason::Refused, "x".repeat(1024)));
+    reports.state("small", serde_json::json!({"level":3}).as_object().unwrap().clone(), false);
+    assert!(
+        broker.wait_until(Duration::from_secs(2), |broker| !broker.received_on("T/State/session/small").is_empty()).await,
+        "an oversized output blocked following state"
+    );
+    stop.send_replace(true);
+    assert!(matches!(tokio::time::timeout(Duration::from_secs(3), task).await, Ok(Ok(SessionEnd::Shutdown))));
+    let oversized: Vec<_> = broker.received().into_iter().filter(|message| message.payload.len() >= 1024).collect();
+    assert!(oversized.is_empty(), "oversized output reached the broker: {oversized:?}");
+    assert_eq!(broker.accepted(), 1, "output size refusal reconnected MQTT");
 }
 
 #[test]
@@ -472,7 +628,8 @@ async fn a_refused_publish_is_one_message_dropped() {
     };
     let mut batch = Batch::default();
     batch.add_model(&device, Sealed { snapshot: model, retractions: Default::default(), charges: Default::default() }, false);
-    let republished = tokio::time::timeout(Duration::from_secs(5), batch.publish(&shared, &client, &IN_TURN, usize::MAX)).await;
+    let republished =
+        tokio::time::timeout(Duration::from_secs(5), batch.publish(&shared, &client, &IN_TURN, usize::MAX, MAX_PACKET_SIZE as usize)).await;
     assert!(republished.is_ok(), "the republish did not end");
     let t1 = shared.topics.state("t1");
     assert!(
@@ -518,15 +675,15 @@ async fn the_rotation_turns_quanta_round_robin_over_sealed_batches() {
     second.reports.state("s1", state(1), false);
     let handed = |shared: &Shared| shared.enqueued.load(std::sync::atomic::Ordering::SeqCst);
     let mut served = Vec::new();
-    served.push(rig.outputs.turn(&shared, &client).await);
+    served.push(rig.outputs.turn(&shared, &client, MAX_PACKET_SIZE as usize).await);
     assert_eq!(handed(&shared), 32, "a turn handed over more than a quantum of one device's messages");
-    served.push(rig.outputs.turn(&shared, &client).await);
+    served.push(rig.outputs.turn(&shared, &client, MAX_PACKET_SIZE as usize).await);
     // State reported after the first device's batch was taken: the next batch's.
     for t in 0..50 {
         first.reports.state(&format!("n{t:03}"), state(t), false);
     }
     for _ in 0..5 {
-        served.push(rig.outputs.turn(&shared, &client).await);
+        served.push(rig.outputs.turn(&shared, &client, MAX_PACKET_SIZE as usize).await);
     }
     assert_eq!(&served[..2], &[Some(0), Some(1)], "the second turn was not the next device's: the cursor stayed");
     let total = 100 + 1 + 1 + 50;
@@ -1055,7 +1212,12 @@ async fn an_old_sealed_cleanup_cannot_acknowledge_a_new_removal_of_the_same_name
             batch.add(&rig.device, sealed);
         }
         let newer = reports.model_sealed().retractions["RetiredLight"];
-        assert!(tokio::time::timeout(Duration::from_secs(5), batch.publish(&rig.shared, &client, &IN_TURN, usize::MAX)).await.is_ok());
+        assert!(tokio::time::timeout(
+            Duration::from_secs(5),
+            batch.publish(&rig.shared, &client, &IN_TURN, usize::MAX, MAX_PACKET_SIZE as usize)
+        )
+        .await
+        .is_ok());
         assert!(broker.wait_until(Duration::from_secs(5), |_| incoming.line().acknowledged() >= 1).await);
         reports.retire_acknowledged_removals(incoming.line().acknowledged());
         assert_eq!(reports.model_sealed().retractions["RetiredLight"], newer, "old sealed model={full_model} retired the newer removal");

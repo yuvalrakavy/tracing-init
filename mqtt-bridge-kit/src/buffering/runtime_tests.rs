@@ -91,6 +91,31 @@ async fn buffer_limits_refuse_zero_before_starting_the_managed_service() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_packet_policy_keeps_the_engine_ticking_during_a_control_size_fault() {
+    let broker = FakeBroker::start().await;
+    broker.advertise_maximum_packet_size(20);
+    let activity = Activity::default();
+    let running = Bridge::new("PacketPolicy")
+        .instance("i")
+        .broker(&broker.address())
+        .packet_limits()
+        .start_managed(Owner(activity.clone()))
+        .await
+        .unwrap();
+    assert!(
+        broker.wait_until(Duration::from_secs(2), |_| activity.ticks.load(Ordering::SeqCst) >= 20).await,
+        "control size fault stopped the managed engine"
+    );
+    assert_eq!(broker.accepted(), 1, "public packet policy was ignored or the size fault reconnected MQTT");
+    assert_eq!(activity.starts.load(Ordering::SeqCst), 1);
+    assert!(
+        !broker.events().iter().any(|event| matches!(event, mqtt_test_broker::BrokerEvent::Subscribed(_))),
+        "public packet policy enqueued an oversized subscription"
+    );
+    assert!(running.stop().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launched_mailbox_limit_refuses_large_commands_without_restarting_mqtt_or_engine() {
     let broker = FakeBroker::start().await;
     let activity = Activity::default();

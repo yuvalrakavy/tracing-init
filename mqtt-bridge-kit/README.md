@@ -107,6 +107,22 @@ If those terminal answers exhaust the separately configured reply budget, the MQ
 retry policy above applies. Driver-owned allocations and temporary ingress parsing
 are outside the mailbox budget and need their own bounds.
 
+With `Bridge::packet_limits()`, queued output and direct lifecycle PUBLISH packets are checked before enqueue
+against both the local 1 MiB ceiling and the current broker's advertised maximum.
+Sizing includes the topic, QoS 1 packet id, properties/correlation and MQTT length
+headers. An oversized message logs `mqtt_packet_rejected`, drops its reservation
+and cannot receive a publish/cleanup receipt. Following smaller messages continue.
+
+SUBSCRIBE and UNSUBSCRIBE use the same effective ceiling. If a required control
+cannot fit, the connection latches a size fault: admission/output close, Active is
+cleared when publishable, and the managed engine keeps running. There is no size-
+driven reconnect loop or expired-timer spin. An actual later connection resets the
+fault and uses its newly advertised ceiling. Repair the broker ceiling or topic
+configuration before reconnecting. The pre-CONNACK CONNECT cannot use a ceiling
+the broker has not advertised yet; keepalive and disconnect remain protocol control.
+This policy is opt-in so existing bridges retain their outgoing-packet behavior.
+Recovery snapshots always retain their existing explicit size checks.
+
 These are accounted queue byte limits, not a process resident-memory measurement.
 Request-mailbox limits, model/unsolicited-report storage and aggregate engine/recovery
 allocation admission remain separate responsibilities; this API does not establish them.

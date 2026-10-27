@@ -1,0 +1,158 @@
+{
+ "rows": {
+  "bootstrap_fault_does_not_clear_stale_active": {
+   "last_real": {
+    "at": "2026-10-27T00:37:29Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:be2d51545d642806",
+     "guard": "item:1c155ce32b10aebb",
+     "row": "323bfc7d372e96c7",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 9.9,
+    "sha": "b94a91ca29bc7d3845f78e75610cc5a3c8883738",
+    "verdict": "RED"
+   }
+  },
+  "control_packet_admission_omitted": {
+   "last_real": {
+    "at": "2026-10-27T00:34:00Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:4777ad17a0a549e5",
+     "guard": "item:f73de78be6dcd7bc",
+     "row": "5c563f5e2b3e3ed7",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 7.3,
+    "sha": "b94a91ca29bc7d3845f78e75610cc5a3c8883738",
+    "verdict": "RED"
+   }
+  },
+  "lifecycle_packet_admission_omitted": {
+   "last_real": {
+    "at": "2026-10-27T00:33:53Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:9ebde65ffebf0123",
+     "guard": "item:a59bc6f1112b457f",
+     "row": "c8683e12b88ca8de",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 9.5,
+    "sha": "b94a91ca29bc7d3845f78e75610cc5a3c8883738",
+    "verdict": "RED"
+   }
+  },
+  "local_packet_ceiling_not_applied": {
+   "last_real": {
+    "at": "2026-10-27T00:24:48Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:701e14fd24403c56",
+     "guard": "item:1e110d3cbe45dc10",
+     "row": "b67cc0a0f08f9076",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.9,
+    "sha": "b94a91ca29bc7d3845f78e75610cc5a3c8883738",
+    "verdict": "RED"
+   }
+  },
+  "ordinary_output_packet_admission_omitted": {
+   "last_real": {
+    "at": "2026-10-27T00:33:43Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:9ebde65ffebf0123",
+     "guard": "item:ed7632f00cd894fb",
+     "row": "7b35c58bf58a412a",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 10.0,
+    "sha": "b94a91ca29bc7d3845f78e75610cc5a3c8883738",
+    "verdict": "RED"
+   }
+  },
+  "oversized_first_publication_keeps_its_barrier": {
+   "last_real": {
+    "at": "2026-10-27T00:25:15Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:701e14fd24403c56",
+     "guard": "item:40c1f8554e72a300",
+     "row": "cfdbd1f0ea1b8eb0",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 8.3,
+    "sha": "b94a91ca29bc7d3845f78e75610cc5a3c8883738",
+    "verdict": "RED"
+   }
+  },
+  "packet_fault_keeps_expired_timers_armed": {
+   "last_real": {
+    "at": "2026-10-27T00:25:06Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:a7e040fc52eacb64",
+     "guard": "item:9040d4572aaed0a1",
+     "row": "ab6b09d9e8b61058",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 10.3,
+    "sha": "b94a91ca29bc7d3845f78e75610cc5a3c8883738",
+    "verdict": "RED"
+   }
+  },
+  "packet_size_omits_qos_one_identifier": {
+   "last_real": {
+    "at": "2026-10-27T00:24:43Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:701e14fd24403c56",
+     "guard": "item:4f914e9dbbea00db",
+     "row": "23ae6e1dda6493ca",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 8.1,
+    "sha": "b94a91ca29bc7d3845f78e75610cc5a3c8883738",
+    "verdict": "RED"
+   }
+  },
+  "public_packet_setting_not_passed_to_session": {
+   "last_real": {
+    "at": "2026-10-27T00:33:33Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:9bab70a41aec2172",
+     "guard": "item:1be8ab5d58ce63a9",
+     "row": "5db36998281ec87a",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.7,
+    "sha": "b94a91ca29bc7d3845f78e75610cc5a3c8883738",
+    "verdict": "RED"
+   }
+  }
+ },
+ "version": 1
+}

@@ -86,6 +86,7 @@ fn session_part() -> Arc<session::Shared> {
         timing: MqttTiming::default(),
         request_lifetime_limit: None,
         request_queue_bytes: None,
+        packet_limits: false,
         version: "kind test".into(),
         outage: Arc::new(crate::pump::BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         enqueued: std::sync::atomic::AtomicU64::new(0),

@@ -375,6 +375,16 @@ enum Request {
     Unsubscribe(String),
 }
 
+impl Request {
+    fn packet_size(&self) -> usize {
+        use rumqttc::v5::mqttbytes::v5::{Subscribe, Unsubscribe};
+        match self {
+            Self::Subscribe(filters) => Subscribe::new_many(filters.iter().cloned(), None).size(),
+            Self::Unsubscribe(filter) => Unsubscribe::new(filter.clone(), None).size(),
+        }
+    }
+}
+
 /// A request not yet handed to rumqttc (`Lifecycle::drive` hands them over).
 struct Control {
     purpose: Purpose,
@@ -411,6 +421,9 @@ struct Pending {
 #[derive(Default)]
 struct Conn {
     connected: bool,
+    /// Required control cannot fit this connection's ceiling. Keep the socket
+    /// and managed engine alive; no automatic replay/reconnect can fix its size.
+    packet_fault: bool,
     /// Requests not yet handed to rumqttc, in order.
     waiting: VecDeque<Control>,
     /// Requests handed to rumqttc whose packet id the pump has not seen written yet, in order.
@@ -523,7 +536,7 @@ pub(crate) struct Lifecycle {
 
 impl Lifecycle {
     pub(crate) fn recovery_output_open(&self) -> bool {
-        self.recovery.as_ref().map_or(true, |recovery| recovery.readiness().is_some())
+        !self.conn.packet_fault && self.recovery.as_ref().map_or(true, |recovery| recovery.readiness().is_some())
     }
     pub(crate) fn on_publication(&self, event: PumpEvent) {
         if let Some(recovery) = &self.recovery {
@@ -712,6 +725,9 @@ impl Lifecycle {
     /// When a timer falls due: an outstanding grant's bound, the replay's fallback, a failed
     /// instance's retry, the sweep.
     pub(crate) fn next_wake(&self) -> Option<Instant> {
+        if self.conn.packet_fault {
+            return None;
+        }
         // The fallback is a timer only until it passes: then `Active=true` waits for the grants
         // still pending, each SUBACK checking it — a wake at a past instant would spin.
         let fallback = (!self.conn.active)
@@ -730,7 +746,7 @@ impl Lifecycle {
     /// Subscribe `filters` for `purpose`: queued, handed to rumqttc in its turn (`drive`), then
     /// awaited.
     async fn request_subscription(&mut self, ctx: Option<&Ctx<'_>>, purpose: Purpose, filters: Vec<Filter>) -> Result<(), Failed> {
-        if ctx.is_some() && self.conn.connected {
+        if ctx.is_some() && self.conn.connected && !self.conn.packet_fault {
             self.conn.waiting.push_back(Control { purpose, request: Request::Subscribe(filters) });
         }
         Ok(())
@@ -738,7 +754,7 @@ impl Lifecycle {
 
     /// Unsubscribe `filter` for `purpose`; whether it is asked for (a connection holds it).
     async fn request_unsubscription(&mut self, ctx: Option<&Ctx<'_>>, purpose: Purpose, filter: String) -> Result<bool, Failed> {
-        if ctx.is_some() && self.conn.connected {
+        if ctx.is_some() && self.conn.connected && !self.conn.packet_fault {
             self.conn.waiting.push_back(Control { purpose, request: Request::Unsubscribe(filter) });
             return Ok(true);
         }
@@ -763,6 +779,10 @@ impl Lifecycle {
     /// (see [`Conn`]) — then `Active` if it is due, then set the publication's budget. Called after
     /// every event the lifecycle handles.
     async fn drive(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<(), Failed> {
+        if self.conn.packet_fault {
+            outputs.set_budget(Some(0));
+            return Ok(());
+        }
         self.conn.line_wait = false;
         while self.conn.connected && !self.conn.waiting.is_empty() {
             if !ctx.line_clear() {
@@ -775,6 +795,27 @@ impl Lifecycle {
             let Some(control) = self.conn.waiting.pop_front() else {
                 break;
             };
+            let size = control.request.packet_size();
+            let maximum = ctx.line.maximum_packet_size() as usize;
+            if ctx.shared.packet_limits && size > maximum {
+                info!(kind = "mqtt_packet_rejected", packet_bytes = size, maximum_bytes = maximum,
+                    purpose = ?control.purpose, "MQTT control exceeds the packet ceiling; connection admission is suspended");
+                self.conn.packet_fault = true;
+                self.conn.line_wait = false;
+                self.conn.waiting.clear();
+                self.conn.unnumbered.clear();
+                self.conn.numbered.clear();
+                self.recovery_bootstrap = None;
+                if let Some(recovery) = &self.recovery {
+                    recovery.lost();
+                }
+                // Clear an older retained true even if this connection never
+                // reached activation. The normal packet guard still applies.
+                session::emit(ctx, self.shared.topics.active(), true, b"false".to_vec(), session::properties()).await;
+                self.conn.active = false;
+                outputs.set_budget(Some(0));
+                return Ok(());
+            }
             self.conn.controls += 1;
             let pending = Pending {
                 purpose: control.purpose,
@@ -1028,6 +1069,9 @@ impl Lifecycle {
 
     /// A SUBSCRIBE or UNSUBSCRIBE written (its packet id), or its acknowledgement.
     pub(crate) async fn on_ack(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs, event: PumpEvent) -> Result<Flow, Failed> {
+        if self.conn.packet_fault {
+            return Ok(Flow::Continue);
+        }
         let flow = self.ack(ctx, outputs, event).await?;
         if flow == Flow::Continue {
             self.drive(ctx, outputs).await?;
@@ -1347,8 +1391,12 @@ impl Lifecycle {
     /// The fixed instance's `Active=true` is R1's: once its requests are subscribed — handed over,
     /// not granted — and before its model, which follows `Active` and the `Version` through the
     /// rotation (Bridge Runtime spec §9: nothing published before the subscriptions, the first
-    /// publish `Active=true`). No barrier: a fixed host owns nothing by Config.
+    /// publish `Active=true`). A size fault may clear stale Active with false before activation.
+    /// No barrier: a fixed host owns nothing by Config.
     async fn maybe_active(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) {
+        if self.conn.packet_fault {
+            return;
+        }
         if self.recovery.as_ref().is_some_and(|recovery| recovery.readiness().is_none()) {
             return;
         }
@@ -1383,8 +1431,8 @@ impl Lifecycle {
         }
         self.conn.active = true;
         let shared = ctx.shared;
-        session::emit(shared, ctx.client, shared.topics.active(), true, b"true".to_vec(), session::properties()).await;
-        session::emit(shared, ctx.client, shared.topics.version(), true, shared.version.clone().into_bytes(), session::properties()).await;
+        session::emit(ctx, shared.topics.active(), true, b"true".to_vec(), session::properties()).await;
+        session::emit(ctx, shared.topics.version(), true, shared.version.clone().into_bytes(), session::properties()).await;
         // The fixed instance's whole retained model again, from its own state — a broker restarted
         // without persistence lost it (the fleet's F4) — then its reports from now on.
         if let Some((id, _, device)) = fixed {
@@ -1422,6 +1470,9 @@ impl Lifecycle {
         publish: &Publish,
         received: Instant,
     ) -> Result<Flow, Failed> {
+        if self.conn.packet_fault {
+            return Ok(Flow::Continue);
+        }
         // The fixed instance takes every publish, as R1's one device did: its own grammar answers
         // what is none of its lanes (on `Error`); no Config, slot or tag is read.
         if let Some(device) = self.fixed_name().and_then(|name| self.rt_of(&name).map(|(rt, _)| rt.device.clone())) {
@@ -1559,6 +1610,9 @@ impl Lifecycle {
     /// A timer: the fixed instance's read-back, late, ends the session; so does an overdue grant; the
     /// replay's fallback; a failed instance's retry; the sweep of failed instances' held requests.
     pub(crate) async fn on_timer(&mut self, ctx: &Ctx<'_>, outputs: &mut Outputs) -> Result<Flow, Failed> {
+        if self.conn.packet_fault {
+            return Ok(Flow::Continue);
+        }
         let now = Instant::now();
         if self.recovery.as_ref().and_then(|recovery| recovery.install_deadline()).is_some_and(|until| until <= now) {
             info!(
