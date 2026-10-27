@@ -1,0 +1,19 @@
+[[control]]
+name = "large_reply_correlation_not_charged"
+guard = "mailbox reply correlation storage"
+file = "mqtt-bridge-kit/src/mailbox/budget.rs"
+anchor = 'reply.correlation.as_ref().map_or(0, bytes::Bytes::len)'
+replacement = '0'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(large_reply_metadata_cannot_replace)"]
+expect_text = "large reply correlation bypassed mailbox admission"
+
+[[control]]
+name = "nonempty_request_context_not_charged"
+guard = "mailbox captured request context"
+file = "mqtt-bridge-kit/src/mailbox/budget.rs"
+anchor = '128usize.saturating_add(crate::buffering::context_bytes(context))'
+replacement = '{ let _ = context; 128usize }'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(request_metadata_is_counted)"]
+expect_text = "request metadata bypassed the mailbox byte limit"

@@ -1,0 +1,39 @@
+{
+ "rows": {
+  "large_reply_correlation_not_charged": {
+   "last_real": {
+    "at": "2026-10-27T10:03:54Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:46da049b53780d49",
+     "guard": "item:4b5194f5f84ed320",
+     "row": "0ca4e96ef554ba21",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.5,
+    "sha": "f94d5103f158d13e9d0372c8ab6d29d21be72042",
+    "verdict": "RED"
+   }
+  },
+  "nonempty_request_context_not_charged": {
+   "last_real": {
+    "at": "2026-10-27T10:03:59Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:46da049b53780d49",
+     "guard": "item:4abb5302a1b012de",
+     "row": "118398a36b65b03b",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 4.8,
+    "sha": "f94d5103f158d13e9d0372c8ab6d29d21be72042",
+    "verdict": "RED"
+   }
+  }
+ },
+ "version": 1
+}

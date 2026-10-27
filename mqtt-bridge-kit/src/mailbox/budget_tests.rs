@@ -19,6 +19,39 @@ fn command(bytes: usize) -> CommandCall {
 }
 
 #[test]
+fn large_reply_metadata_cannot_replace_a_small_admitted_caller() {
+    for read in [false, true] {
+        let mailbox = Mailbox::with_byte_limit(Some(8192));
+        mailbox.connected();
+        let reply = ReplyTo { topic: "Client/replies".into(), correlation: Some(bytes::Bytes::from(vec![3; 16384])), traceparent: None };
+        let posted = if read {
+            let call = CommandCall { command: "read".into(), ..command(1) };
+            mailbox.post_read(ReadKey::Command { target: None, command: "read".into() }, Some(call), Some(reply), None)
+        } else {
+            mailbox.post_command(None, command(1), Some(reply), None)
+        };
+        assert!(matches!(posted, Posted::Refused(Refusal::ByteLimit)), "large reply correlation bypassed mailbox admission, read={read}");
+        assert_eq!(mailbox.post_command(None, command(1), None, None), Posted::Queued, "refused metadata retained its budget");
+    }
+}
+
+#[test]
+fn request_metadata_is_counted_beside_small_parameters() {
+    let mailbox = Mailbox::with_byte_limit(Some(1024));
+    mailbox.connected();
+    assert_eq!(mailbox.post_command(None, command(200), None, None), Posted::Queued);
+    assert!(matches!(mailbox.try_take(), Some(Work::Execute { .. })));
+    assert!(mailbox.command_done());
+    let context = RequestContext::new("g".repeat(128)).unwrap().with_request_id(Some(&"a".repeat(64))).unwrap();
+    assert!(
+        matches!(mailbox.post_command_with_context(None, command(200), None, None, context), Posted::Refused(Refusal::ByteLimit)),
+        "request metadata bypassed the mailbox byte limit"
+    );
+    assert!(!mailbox.waiting(), "refused metadata left queued work");
+    assert_eq!(mailbox.post_command(None, command(200), None, None), Posted::Queued);
+}
+
+#[test]
 fn oversized_property_and_target_updates_preserve_the_old_queue_and_copy_state() {
     let mailbox = Mailbox::with_byte_limit(Some(8192));
     mailbox.connected();
