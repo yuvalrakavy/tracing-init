@@ -24,5 +24,10 @@ was rerun. The failed compilation is not counted as a valid control.
 
 Full runtime 308/308, unchanged compatibility 176/176, all-target clippy with warnings
 denied and wait-registry tests pass. Only owned loopback brokers were used. Review
-remains pending; the DMX adapter still pins the earlier reviewed runtime until this
-option is reviewed and published.
+completed on frozen `ef2f12c`. The independent mutation pass detected all three
+additional mutants: missing end-of-input check, skipped array traversal and lost
+malformed-command correlation. Baseline and restored strict suites passed 5/5 in
+its isolated archive. Depth review found no further issues in the visitor, routing,
+admission bookkeeping, metadata or expiry flow. Reviews used GPT-6.1 Sol and
+GPT-6 Astra; no different model-family coverage is available. The DMX adapter may
+now pin this reviewed option; service-level acceptance remains pending.
