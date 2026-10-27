@@ -25,9 +25,11 @@ struct RequestMetadata {
     trace_captured: bool,
     deadline: Option<std::time::Instant>,
     request_id: Option<String>,
+    observation: Option<std::sync::Arc<()>>,
 }
 // Expiry and diagnostic metadata do not participate in authority, mailbox
-// coalescing or cache keys. Expiry is enforced separately on each request.
+// coalescing or cache keys. Expiry and the internal observation lease are checked
+// separately. The lease is never read from or written to MQTT properties.
 impl PartialEq for RequestContext {
     fn eq(&self, other: &Self) -> bool {
         self.target_generation == other.target_generation
@@ -53,6 +55,20 @@ pub(crate) fn valid_traceparent(parent: &str) -> bool {
     parent.len() <= 512 && tracing_init::traceparent::set_remote_parent(&tracing::Span::none(), parent)
 }
 impl RequestContext {
+    pub(crate) fn with_observation(mut self, observation: std::sync::Arc<()>) -> Self {
+        self.metadata_mut().observation = Some(observation);
+        self
+    }
+    pub(crate) fn observing(mut self, source: &Self) -> Self {
+        self.metadata_mut().observation = source.metadata.as_ref().and_then(|metadata| metadata.observation.clone());
+        self
+    }
+    pub(crate) fn observation_is_current(&self, current: &std::sync::Arc<()>) -> bool {
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.observation.as_ref())
+            .map_or(true, |original| std::sync::Arc::ptr_eq(original, current))
+    }
     fn metadata_mut(&mut self) -> &mut RequestMetadata {
         std::sync::Arc::make_mut(self.metadata.get_or_insert_with(Default::default))
     }

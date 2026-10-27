@@ -1,0 +1,39 @@
+[[control]]
+name = "retired_observation_is_accepted"
+guard = "atomic observation identity check under model lock"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = 'if !context.observation_is_current(&self.observation) {'
+replacement = 'if false {'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_replacement_retires_observations)"]
+expect_text = "retired observation changed exact model"
+
+[[control]]
+name = "replacement_keeps_observation_identity"
+guard = "exact replacement retires outstanding observations"
+file = "mqtt-bridge-kit/src/reports.rs"
+anchor = 'state.observation = Arc::new(());'
+replacement = 'state.observation = state.observation.clone();'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(exact_replacement_retires_observations)"]
+expect_text = "retired observation changed exact model"
+
+[[control]]
+name = "read_fold_loses_original_observation"
+guard = "all asynchronous read folds retain their observation lease"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = 'state.context = std::mem::take(&mut state.context).observing(observation);'
+replacement = 'let _ = observation;'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(depth_recovery_replacement_fences_delayed_refresh)"]
+expect_text = "retired refresh observation overwrote recovery seed"
+
+[[control]]
+name = "apply_loses_original_observation"
+guard = "apply completions retain the pre-validation observation lease"
+file = "mqtt-bridge-kit/src/worker.rs"
+anchor = 'let context = batch_context(&values.last().expect("revalidated nonempty values").context, &values).observing(&observation);'
+replacement = 'let context = batch_context(&values.last().expect("revalidated nonempty values").context, &values);'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(depth_recovery_replacement_fences_delayed_same_generation)"]
+expect_text = "retired apply success overwrote"

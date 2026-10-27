@@ -12,6 +12,39 @@ fn values(pairs: &[(&str, Value)]) -> PropertyMap {
 }
 
 #[test]
+fn exact_replacement_retires_observations_but_accepts_fresh_same_generation_updates() {
+    let reports = Reports::new();
+    let table = crate::TargetGenerations { instance: "instance.1".into(), targets: [("u1".into(), "generation.a".into())].into() };
+    reports.install_policy(RequestPolicy::Fenced(table.clone()));
+    let generation = RequestContext::new("generation.a").unwrap();
+    let old = reports.observation(&generation);
+    let image = crate::RecoveryImage {
+        snapshot: None,
+        context: RequestContext::default(),
+        generations: table,
+        states: [("u1".into(), values(&[("temp", json!(99))]))].into(),
+        configurations: BTreeMap::new(),
+    };
+    reports.replace_recovery(&image).unwrap();
+    let other_owner = Reports::new().observation(&generation);
+    for stale in [old, other_owner] {
+        reports.state_with_context("u1", values(&[("temp", json!(22))]), false, &stale);
+        reports.read_back_with_context("u1", values(&[("temp", json!(22))]), &stale);
+        reports.written_with_context("u1", &values(&[("temp", json!(22))]), 0, &stale);
+        assert_eq!(reports.values_of("u1").unwrap()["temp"], json!(99), "retired observation changed exact model");
+        assert_eq!(reports.snapshot()["u1"]["temp"], json!(99), "retired observation changed exact conflict cache");
+        reports.remove_with_context("u1", &stale);
+        assert!(reports.values_of("u1").is_some(), "retired observation removed exact model");
+    }
+    let fresh = reports.observation(&generation);
+    assert_eq!(fresh, generation, "internal leases changed wire generation equality");
+    reports.state_with_context("u1", values(&[("temp", json!(100))]), false, &fresh);
+    reports.read_back_with_context("u1", values(&[("temp", json!(100))]), &fresh);
+    assert_eq!(reports.values_of("u1").unwrap()["temp"], json!(100));
+    assert_eq!(reports.snapshot()["u1"]["temp"], json!(100));
+}
+
+#[test]
 fn contextual_removals_publish_the_mutations_cause_including_absence() {
     let a = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
     let b = "00-222233445566778899aabbccddeeff00-1234567890abcdef-01";

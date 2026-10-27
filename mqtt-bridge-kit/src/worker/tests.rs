@@ -5,6 +5,135 @@ use serde_json::json;
 use super::*;
 use crate::test_support::Capture;
 
+struct DepthDelayedApply {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+impl DeviceDriver for DepthDelayedApply {
+    fn info(&self) -> DriverInfo {
+        DriverInfo::default()
+    }
+    async fn connect(&mut self, _: &mut LinkContext) -> Result<(), LinkError> {
+        Ok(())
+    }
+    async fn disconnect(&mut self) {}
+    async fn read_state(&mut self, _: Scope) -> Result<Vec<crate::TargetState>, OpError> {
+        Ok(vec![])
+    }
+    async fn read_state_with_context(&mut self, _: Scope) -> Result<Vec<ContextualState>, OpError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(vec![ContextualState {
+            state: crate::TargetState { target: "u1".into(), values: json!({"temp":22}).as_object().unwrap().clone() },
+            context: RequestContext::new("generation.a").unwrap(),
+        }])
+    }
+    async fn apply(&mut self, _: &str, _: &PropertyMap) -> Result<(), OpError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+    async fn execute(&mut self, _: Option<&str>, _: &crate::CommandCall) -> Result<Option<Value>, OpError> {
+        Ok(None)
+    }
+    async fn configure(&mut self, _: &str, _: Option<&Value>) -> Result<(), OpError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn depth_recovery_replacement_fences_delayed_same_generation_apply_success() {
+    let reports = depth_delayed_apply_after_recovery(Feedback::Assumed).await;
+    assert_eq!(reports.values_of("u1").unwrap()["temp"], json!(99), "retired apply success overwrote visible assumed recovery state");
+}
+
+#[tokio::test]
+async fn depth_recovery_replacement_fences_delayed_same_generation_written_cache() {
+    let reports = depth_delayed_apply_after_recovery(Feedback::Observed).await;
+    assert_eq!(reports.values_of("u1").unwrap()["temp"], json!(99), "observed model itself changed unexpectedly");
+    assert_eq!(reports.snapshot()["u1"]["temp"], json!(99), "retired apply success overwrote exact recovery conflict cache");
+}
+
+#[tokio::test]
+async fn depth_recovery_replacement_fences_delayed_refresh_observation() {
+    let mailbox = Mailbox::new();
+    let reports = Reports::new();
+    mailbox.bind_reports(&reports);
+    mailbox.connected();
+    let table = crate::TargetGenerations { instance: "instance.1".into(), targets: [("u1".into(), "generation.a".into())].into() };
+    reports.install_policy(RequestPolicy::Fenced(table.clone()));
+    mailbox.post_read_with_context(ReadKey::Refresh(Some("u1".into())), None, None, None, RequestContext::new("generation.a").unwrap());
+    let work = mailbox.try_take().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut worker = Worker::new(
+        DepthDelayedApply { entered: entered.clone(), release: release.clone() },
+        DriverInfo::default(),
+        "i",
+        mailbox.clone(),
+        reports.clone(),
+    );
+    let image = crate::RecoveryImage {
+        snapshot: None,
+        context: RequestContext::default(),
+        generations: table,
+        states: [("u1".into(), json!({"temp":99}).as_object().unwrap().clone())].into(),
+        configurations: BTreeMap::new(),
+    };
+    let handle = link_context().handle();
+    let replacing = async {
+        entered.notified().await;
+        mailbox.replace_recovery(&reports, &image, None).unwrap();
+        assert_eq!(reports.snapshot(), image.states);
+        release.notify_one();
+    };
+    let (outcome, ()) = tokio::join!(worker.work(&handle, work), replacing);
+    outcome.unwrap();
+    assert_eq!(
+        reports.values_of("u1").unwrap()["temp"],
+        json!(99),
+        "retired refresh observation overwrote recovery seed before suppressed reply"
+    );
+}
+
+async fn depth_delayed_apply_after_recovery(feedback: Feedback) -> Arc<Reports> {
+    let mailbox = Mailbox::new();
+    let reports = Reports::new();
+    mailbox.bind_reports(&reports);
+    mailbox.connected();
+    let table = crate::TargetGenerations { instance: "instance.1".into(), targets: [("u1".into(), "generation.a".into())].into() };
+    reports.install_policy(RequestPolicy::Fenced(table.clone()));
+    let context = RequestContext::new("generation.a").unwrap();
+    reports.state_with_context("u1", json!({"temp":1}).as_object().unwrap().clone(), true, &context);
+    assert_eq!(reports.reports_for("u1"), 1);
+    let mut value = request(json!(22), Conflict::RequestWins);
+    value.context = context;
+    mailbox.post_state(value, false);
+    let Work::Apply { target, values } = mailbox.try_take().unwrap() else { panic!("not Apply") };
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let info = DriverInfo { feedback, writes: Writes::Acknowledged, ..DriverInfo::default() };
+    let mut worker =
+        Worker::new(DepthDelayedApply { entered: entered.clone(), release: release.clone() }, info, "i", mailbox.clone(), reports.clone());
+    let image = crate::RecoveryImage {
+        snapshot: None,
+        context: RequestContext::default(),
+        generations: table,
+        states: [("u1".into(), json!({"temp":99}).as_object().unwrap().clone())].into(),
+        configurations: BTreeMap::new(),
+    };
+    let handle = link_context().handle();
+    let replacing = async {
+        entered.notified().await;
+        mailbox.replace_recovery(&reports, &image, None).unwrap();
+        assert_eq!(reports.snapshot(), image.states);
+        release.notify_one();
+    };
+    let (outcome, ()) = tokio::join!(worker.write_values(&handle, &target, values), replacing);
+    outcome.unwrap();
+    reports
+}
+
 fn request(value: Value, conflict: Conflict) -> StateValue {
     StateValue {
         context: crate::RequestContext::default(),

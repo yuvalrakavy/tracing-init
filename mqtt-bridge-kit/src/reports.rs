@@ -171,6 +171,7 @@ struct Removal {
 #[derive(Debug)]
 struct State {
     recovery_epoch: u64,
+    observation: Arc<()>,
     recovery_configurations: BTreeMap<String, Value>,
     request_policy: Option<RequestPolicy>,
     status: Option<LinkStatus>,
@@ -278,6 +279,11 @@ fn known(state: &State) -> BTreeMap<String, PropertyMap> {
 }
 
 impl Reports {
+    /// Capture before an asynchronous read/apply. Exact replacement invalidates
+    /// its model/cache completion even when mapping generations stay unchanged.
+    pub(crate) fn observation(&self, context: &RequestContext) -> RequestContext {
+        context.clone().with_observation(self.locked().observation.clone())
+    }
     pub(crate) fn bind_mailbox(&self, mailbox: &Arc<crate::mailbox::Mailbox>) {
         assert!(self.mailbox.set(Arc::downgrade(mailbox)).is_ok(), "reports mailbox bound twice");
     }
@@ -429,6 +435,7 @@ impl Reports {
         state.status_changed = state.status.is_some();
         state.recovery_configurations = image.configurations.clone();
         state.recovery_epoch = epoch;
+        state.observation = Arc::new(());
         Ok(retired)
     }
 
@@ -451,6 +458,9 @@ impl Reports {
 
 impl State {
     fn context_is_current(&self, target: Option<&str>, context: &RequestContext) -> bool {
+        if !context.observation_is_current(&self.observation) {
+            return false;
+        }
         match &self.request_policy {
             None | Some(RequestPolicy::Unfenced) => true,
             Some(RequestPolicy::Fenced(table)) => {
@@ -483,6 +493,7 @@ impl Reports {
                 "reports-lock",
                 State {
                     recovery_epoch: 0,
+                    observation: Arc::new(()),
                     recovery_configurations: BTreeMap::new(),
                     request_policy: None,
                     status: None,

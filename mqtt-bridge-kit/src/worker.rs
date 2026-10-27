@@ -415,11 +415,12 @@ impl<D: DeviceDriver> Worker<D> {
     /// that answers with something unusable has answered: that proves it alive too.
     async fn prove(&mut self, handle: &LinkHandle) -> Result<Option<Vec<ContextualState>>, LinkError> {
         let timing = self.info.timing;
+        let observation = self.reports.observation(&RequestContext::default());
         // WAIT: device-op
         match op(handle, timing.operation, "read_state", self.driver.read_state_with_context(Scope::All)).await {
-            Ok(states) => {
+            Ok(mut states) => {
                 self.proven();
-                self.fold(&states);
+                self.fold(&mut states, &observation);
                 Ok(Some(states))
             }
             Err(OpError::Link(e)) => Err(e),
@@ -558,8 +559,9 @@ impl<D: DeviceDriver> Worker<D> {
     }
 
     /// Fold a read into the retained model.
-    fn fold(&self, states: &[ContextualState]) {
+    fn fold(&self, states: &mut [ContextualState], observation: &RequestContext) {
         for state in states {
+            state.context = std::mem::take(&mut state.context).observing(observation);
             self.reports.state_with_context(&state.state.target, state.state.values.clone(), false, &state.context);
         }
     }
@@ -606,7 +608,8 @@ impl<D: DeviceDriver> Worker<D> {
             return Ok(0);
         }
         let map: PropertyMap = values.iter().map(|v| (v.property.clone(), v.value.clone())).collect();
-        let context = batch_context(&values.last().expect("nonempty values").context, &values);
+        let observation = self.reports.observation(&RequestContext::default());
+        let context = batch_context(&values.last().expect("nonempty values").context, &values).observing(&observation);
         match self.validate(handle, Some(target), &context, RequestKind::Apply(&map), true).await {
             Ok(()) => {}
             Err(OpError::Link(error)) => return Err(error),
@@ -621,7 +624,7 @@ impl<D: DeviceDriver> Worker<D> {
         }
         let map: PropertyMap = values.iter().map(|v| (v.property.clone(), v.value.clone())).collect();
         let feedback = self.mailbox.feedback(target, self.info.feedback);
-        let context = batch_context(&values.last().expect("revalidated nonempty values").context, &values);
+        let context = batch_context(&values.last().expect("revalidated nonempty values").context, &values).observing(&observation);
         let span = context.operation_span(handle.instance(), "apply");
         let operation = async {
             let reported_before = self.reports.reports_for(target);
@@ -832,12 +835,13 @@ impl<D: DeviceDriver> Worker<D> {
                 }
                 Step::Probe => self.probe(handle).await.map(|()| last_heard = Instant::now()),
                 Step::Poll => {
+                    let observation = self.reports.observation(&RequestContext::default());
                     // WAIT: device-op
                     let polled = match op(handle, timing.operation, "read_state", self.driver.read_state_with_context(Scope::All)).await {
-                        Ok(states) => {
+                        Ok(mut states) => {
                             last_heard = Instant::now();
                             self.proven();
-                            self.fold(&states);
+                            self.fold(&mut states, &observation);
                             Ok(())
                         }
                         Err(OpError::Link(e)) => Err(e),
@@ -926,12 +930,13 @@ impl<D: DeviceDriver> Worker<D> {
             Work::Read { key: ReadKey::Refresh(target), replies, expired, context, .. } => {
                 report_refused(&self.reports, expired, READ_EXPIRED);
                 let scope = target.clone().map_or(Scope::All, Scope::Target);
+                let observation = self.reports.observation(&context);
                 // WAIT: device-op
-                let result = op(handle, timing.operation, "read_state", self.driver.read_state_with_request_context(scope, &context))
+                let result = op(handle, timing.operation, "read_state", self.driver.read_state_with_request_context(scope, &observation))
                     .await
-                    .map(|states| {
+                    .map(|mut states| {
                         self.proven();
-                        self.fold(&states);
+                        self.fold(&mut states, &observation);
                         None
                     });
                 // A failure goes to Error too, as every command's does (review C13).
@@ -994,6 +999,7 @@ impl<D: DeviceDriver> Worker<D> {
             (Some(read.clone()), values)
         } else {
             let context = values.first().map(|value| batch_context(&value.context, &values)).unwrap_or_default();
+            let context = self.reports.observation(&context);
             // WAIT: device-op
             let current = match op(
                 handle,
@@ -1003,9 +1009,9 @@ impl<D: DeviceDriver> Worker<D> {
             )
             .await
             {
-                Ok(states) => {
+                Ok(mut states) => {
                     self.proven();
-                    self.fold(&states);
+                    self.fold(&mut states, &context);
                     let mut current: Option<PropertyMap> = None;
                     for state in states
                         .into_iter()

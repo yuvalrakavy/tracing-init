@@ -1,0 +1,73 @@
+{
+ "rows": {
+  "apply_loses_original_observation": {
+   "last_real": {
+    "at": "2026-10-27T10:46:12Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:0537677f93096c14",
+     "guard": "item:dfb336cf963d0731",
+     "row": "8394c07cb7fa5c8f",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 8.3,
+    "sha": "53b7a4c46e33591a714d8dda24cfd922647a83c4",
+    "verdict": "RED"
+   }
+  },
+  "read_fold_loses_original_observation": {
+   "last_real": {
+    "at": "2026-10-27T10:46:03Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:0537677f93096c14",
+     "guard": "item:a55d144f48867aa6",
+     "row": "38467ef6bf37dcec",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 9.7,
+    "sha": "53b7a4c46e33591a714d8dda24cfd922647a83c4",
+    "verdict": "RED"
+   }
+  },
+  "replacement_keeps_observation_identity": {
+   "last_real": {
+    "at": "2026-10-27T10:46:45Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:5ed75aa9fb93d018",
+     "guard": "item:9d275ed2f5c95ba5",
+     "row": "741a775c77be63ee",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 5.9,
+    "sha": "53b7a4c46e33591a714d8dda24cfd922647a83c4",
+    "verdict": "RED"
+   }
+  },
+  "retired_observation_is_accepted": {
+   "last_real": {
+    "at": "2026-10-27T10:46:39Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:5ed75aa9fb93d018",
+     "guard": "item:4222993a2841319e",
+     "row": "71c6076ecf8e7f80",
+     "test": "test:9cdd02a7d9a592e5"
+    },
+    "path": "command",
+    "secs": 7.0,
+    "sha": "53b7a4c46e33591a714d8dda24cfd922647a83c4",
+    "verdict": "RED"
+   }
+  }
+ },
+ "version": 1
+}
