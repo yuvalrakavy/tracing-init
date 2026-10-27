@@ -585,6 +585,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "rumqttc",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

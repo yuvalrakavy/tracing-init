@@ -142,6 +142,7 @@ pub(crate) struct Shared {
     pub request_lifetime_limit: Option<Duration>,
     pub request_queue_bytes: Option<usize>,
     pub packet_limits: bool,
+    pub strict_json: bool,
     /// The text of the retained `Version`.
     pub version: String,
     pub outage: Arc<BrokerOutage>,
@@ -1232,17 +1233,30 @@ pub(crate) fn traced(publish: &Publish, owner: &str) -> (String, Span) {
 
 /// An incoming publish for `device`, received at `now`, handled without waiting: requests go to the
 /// mailbox, what must be answered to the reports. Every deadline counts from `now`.
+#[cfg(test)]
 pub(crate) fn route(device: &Device, topic: &str, publish: &Publish, now: Instant) {
     route_with_config_admission(device, topic, publish, now, |_, _, _| {});
 }
 
 /// Configuration bookkeeping observes successful wire/table/mailbox admission,
 /// never an invalid delivery and never a later driver/hardware verdict.
+#[cfg(test)]
 pub(crate) fn route_with_config_admission(
     device: &Device,
     topic: &str,
     publish: &Publish,
     now: Instant,
+    admitted: impl FnMut(&str, &crate::RequestContext, bool),
+) {
+    route_with_json_policy(device, topic, publish, now, false, admitted);
+}
+
+pub(crate) fn route_with_json_policy(
+    device: &Device,
+    topic: &str,
+    publish: &Publish,
+    now: Instant,
+    strict_json: bool,
     mut admitted: impl FnMut(&str, &crate::RequestContext, bool),
 ) {
     let properties = publish.properties.as_ref();
@@ -1264,7 +1278,7 @@ pub(crate) fn route_with_config_admission(
         }
         Inbound::DesiredProperty { target, property } => {
             let report = blank().target(Some(&target)).property(&property);
-            match wire::decode_desired_property(payload) {
+            match crate::strict_json::decode(strict_json, payload, wire::decode_desired_property) {
                 Err(e) => malformed(e, report),
                 Ok(None) => {
                     // The key's assumption is settled — unless a write of it is still unproven: the
@@ -1317,7 +1331,9 @@ pub(crate) fn route_with_config_admission(
             if publish.retain {
                 return malformed("a target-level Desired is never retained".into(), report);
             }
-            match wire::decode_desired_target(payload).and_then(|values| Ok((values, device.request_meta(properties, now, false)?))) {
+            match crate::strict_json::decode(strict_json, payload, wire::decode_desired_target)
+                .and_then(|values| Ok((values, device.request_meta(properties, now, false)?)))
+            {
                 Err(e) => malformed(e, report),
                 Ok((values, meta)) => {
                     let values = values
@@ -1371,7 +1387,7 @@ pub(crate) fn route_with_config_admission(
                 Err(e) => return malformed(e.clone(), blank()),
                 Ok(reply) => reply.clone(),
             };
-            let (target, call) = match wire::decode_command(payload) {
+            let (target, call) = match crate::strict_json::decode(strict_json, payload, wire::decode_command) {
                 Err(e) => return refuse(e),
                 Ok(decoded) => decoded,
             };
@@ -1389,7 +1405,9 @@ pub(crate) fn route_with_config_admission(
             command(device, target, call, reply, deadline, context.with_deadline(deadline));
         }
         Inbound::Config { target } => {
-            match wire::decode_config(payload).and_then(|config| Ok((config, wire::request_context(properties)?))) {
+            match crate::strict_json::decode(strict_json, payload, wire::decode_config)
+                .and_then(|config| Ok((config, wire::request_context(properties)?)))
+            {
                 Err(e) => malformed(e, blank().target(Some(&target))),
                 Ok((config, context)) => {
                     let present = config.is_some();

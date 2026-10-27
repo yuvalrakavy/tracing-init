@@ -55,7 +55,7 @@ fn dynamic_routing_and_terminal_refusals_keep_the_ingress_cause() {
         assert!(session::traced(&readback, "host").1.is_disabled(), "State readback exports an INFO carrier");
         let _entered = ingress.enter();
         let expected = tracing_init::traceparent::current().expect("actual OTel ingress context");
-        host.route_instance(&mut outputs, "Lamp", topic, &publish, Instant::now());
+        host.route_instance(&mut outputs, "Lamp", topic, &publish, Instant::now(), false);
         assert_eq!(device.reports.take().states[0].2.traceparent(), Some(expected.as_str()), "routing entered an unrelated device trace");
         let terminal_cause = "00-222233445566778899aabbccddeeff00-1234567890abcdef-01";
         publish.properties = Some(rumqttc::v5::mqttbytes::v5::PublishProperties {
@@ -87,6 +87,7 @@ fn session_part() -> Arc<session::Shared> {
         request_lifetime_limit: None,
         request_queue_bytes: None,
         packet_limits: false,
+        strict_json: false,
         version: "kind test".into(),
         outage: Arc::new(crate::pump::BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         enqueued: std::sync::atomic::AtomicU64::new(0),

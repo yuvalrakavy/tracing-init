@@ -1542,7 +1542,7 @@ impl Lifecycle {
                     return Ok(Flow::Continue);
                 }
             }
-            session::route(&device, topic, publish, received);
+            session::route_with_json_policy(&device, topic, publish, received, ctx.shared.strict_json, |_, _, _| {});
             self.drive(ctx, outputs).await?;
             return Ok(Flow::Continue);
         }
@@ -1560,7 +1560,9 @@ impl Lifecycle {
         match segments.as_slice() {
             ["Config", instance] => self.config(Some(ctx), outputs, instance, publish).await?,
             ["_barrier", ..] => {}
-            [_, instance, ..] if self.instances.contains_key(*instance) => self.route_instance(outputs, instance, topic, publish, received),
+            [_, instance, ..] if self.instances.contains_key(*instance) => {
+                self.route_instance(outputs, instance, topic, publish, received, ctx.shared.strict_json)
+            }
             // A cleanup's read-back of an instance this process does not own.
             ["State" | "Status", instance, ..] if self.sweeps.contains_key(*instance) => {
                 if let Some(sweep) = self.sweeps.get_mut(*instance) {
@@ -2564,7 +2566,7 @@ impl Lifecycle {
     // ---- Routing ---------------------------------------------------------------------------
 
     /// A publish on one of an owned instance's lanes.
-    fn route_instance(&mut self, outputs: &mut Outputs, name: &str, topic: &str, publish: &Publish, received: Instant) {
+    fn route_instance(&mut self, outputs: &mut Outputs, name: &str, topic: &str, publish: &Publish, received: Instant, strict_json: bool) {
         let id = self.settings.id.clone();
         let Some(instance) = self.instances.get_mut(name) else {
             return;
@@ -2594,7 +2596,7 @@ impl Lifecycle {
                 if failed && matches!(inbound, Inbound::DesiredTarget { .. }) {
                     return terminal(&device, outputs, topic, publish, "the instance's device could not be built from its Config");
                 }
-                session::route_with_config_admission(&device, topic, publish, received, |target, context, present| {
+                session::route_with_json_policy(&device, topic, publish, received, strict_json, |target, context, present| {
                     if present {
                         instance.installed.insert(target.to_owned(), context.clone());
                         instance.replayed.insert(target.to_owned(), context.clone());

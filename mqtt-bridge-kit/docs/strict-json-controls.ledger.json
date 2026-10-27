@@ -1,0 +1,73 @@
+{
+ "rows": {
+  "duplicate_key_guard_missing": {
+   "last_real": {
+    "at": "2026-10-27T12:10:26Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:6c5d423e0a297829",
+     "guard": "item:98a25dd3c7d04cda",
+     "row": "793fc5c99167fc88",
+     "test": "test:c916c12798e2aba1"
+    },
+    "path": "command",
+    "secs": 5.4,
+    "sha": "c3044cd5fa8f047385146062533b6113fb6b9322",
+    "verdict": "RED"
+   }
+  },
+  "strict_builder_flag_lost": {
+   "last_real": {
+    "at": "2026-10-27T12:08:48Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:5cf2fb127bb6da15",
+     "guard": "item:6c951b154e2734bf",
+     "row": "3b978a9c37ea5543",
+     "test": "test:c916c12798e2aba1"
+    },
+    "path": "command",
+    "secs": 6.8,
+    "sha": "c3044cd5fa8f047385146062533b6113fb6b9322",
+    "verdict": "RED"
+   }
+  },
+  "strict_mode_breaks_empty_retractions": {
+   "last_real": {
+    "at": "2026-10-27T12:08:53Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:6c5d423e0a297829",
+     "guard": "item:322d1c8b2833b68e",
+     "row": "676f33d13a4539b0",
+     "test": "test:c916c12798e2aba1"
+    },
+    "path": "command",
+    "secs": 4.7,
+    "sha": "c3044cd5fa8f047385146062533b6113fb6b9322",
+    "verdict": "RED"
+   }
+  },
+  "strict_policy_not_enforced": {
+   "last_real": {
+    "at": "2026-10-27T12:08:42Z",
+    "dirty": true,
+    "expected": "RED",
+    "fingerprints": {
+     "files": "files:6c5d423e0a297829",
+     "guard": "item:322d1c8b2833b68e",
+     "row": "9b265f5f1f047561",
+     "test": "test:c916c12798e2aba1"
+    },
+    "path": "command",
+    "secs": 8.0,
+    "sha": "c3044cd5fa8f047385146062533b6113fb6b9322",
+    "verdict": "RED"
+   }
+  }
+ },
+ "version": 1
+}

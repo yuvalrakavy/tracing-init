@@ -705,6 +705,7 @@ dependencies = [
  "bytes",
  "lock-order",
  "rumqttc",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

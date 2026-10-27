@@ -123,6 +123,16 @@ the broker has not advertised yet; keepalive and disconnect remain protocol cont
 This policy is opt-in so existing bridges retain their outgoing-packet behavior.
 Recovery snapshots always retain their existing explicit size checks.
 
+`Bridge::strict_json()` rejects duplicate object keys in ordinary Config, Desired
+and Command payloads before generic JSON decoding discards that distinction.
+It checks nested objects and decoded key names, so `"x"` and `"\u0078"` conflict
+within one object. Keys may repeat in different objects. The check visits values
+without building a second JSON tree; it adds a parsing pass and keeps each object's
+keys during that visit. Empty retractions retain their existing meaning. This
+option does not impose driver schemas, canonical ordering or interpretation of
+JSON encoded inside strings. Recovery documents remain the owning engine's
+validation responsibility. The default remains unchanged for existing bridges.
+
 These are accounted queue byte limits, not a process resident-memory measurement.
 Request-mailbox limits, model/unsolicited-report storage and aggregate engine/recovery
 allocation admission remain separate responsibilities; this API does not establish them.

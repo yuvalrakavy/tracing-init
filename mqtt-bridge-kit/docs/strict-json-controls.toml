@@ -1,0 +1,39 @@
+[[control]]
+name = "duplicate_key_guard_missing"
+guard = "object-local decoded key uniqueness"
+file = "mqtt-bridge-kit/src/strict_json.rs"
+anchor = 'if !keys.insert(key) {'
+replacement = 'if { keys.insert(key); false } {'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(duplicate_keys_are_rejected_before_generic)"]
+expect_text = "strict JSON accepted duplicate configuration keys"
+
+[[control]]
+name = "strict_policy_not_enforced"
+guard = "strict ordinary-request decoding before key loss"
+file = "mqtt-bridge-kit/src/strict_json.rs"
+anchor = 'if strict && !payload.is_empty() {'
+replacement = 'if false {'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(launched_strict_bridge)"]
+expect_text = "strict flag failed to reach an ordinary decoder"
+
+[[control]]
+name = "strict_builder_flag_lost"
+guard = "Bridge opt-in reaches the shared runtime"
+file = "mqtt-bridge-kit/src/host.rs"
+anchor = 'strict_json: self.strict_json,'
+replacement = 'strict_json: false,'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(launched_strict_bridge)"]
+expect_text = "strict flag failed to reach an ordinary decoder"
+
+[[control]]
+name = "strict_mode_breaks_empty_retractions"
+guard = "empty retractions bypass JSON object validation"
+file = "mqtt-bridge-kit/src/strict_json.rs"
+anchor = 'if strict && !payload.is_empty() {'
+replacement = 'if strict {'
+target = "command"
+argv = ["cargo", "nextest", "run", "--offline", "--manifest-path", "mqtt-bridge-kit/Cargo.toml", "--lib", "-E", "test(strict_mode_preserves_empty_retractions)"]
+expect_text = 'called `Result::unwrap()` on an `Err` value'

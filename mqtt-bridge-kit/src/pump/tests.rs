@@ -167,6 +167,7 @@ fn mqtt_side_through(relay: &Relay, timing: MqttTiming, stop: tokio::sync::watch
         request_lifetime_limit: None,
         request_queue_bytes: None,
         packet_limits: false,
+        strict_json: false,
         version: "test".into(),
         outage: Arc::new(BrokerOutage::new(timing.warn_after, timing.stable_after)),
         enqueued: std::sync::atomic::AtomicU64::new(0),

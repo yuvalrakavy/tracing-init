@@ -79,6 +79,7 @@ pub mod recovery;
 pub mod replies;
 pub mod reports;
 pub mod session;
+mod strict_json;
 pub mod topics;
 pub mod wire;
 pub mod worker;

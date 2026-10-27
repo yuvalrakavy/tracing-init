@@ -189,6 +189,12 @@ impl PanicReports {
 pub struct Bridge(Host);
 
 impl Bridge {
+    /// Reject duplicate object keys in ordinary Config, Desired and Command
+    /// payloads before generic decoding can discard them. Empty retractions
+    /// retain their existing meaning; legacy bridges remain unchanged.
+    pub fn strict_json(self) -> Bridge {
+        Bridge(self.0.strict_json())
+    }
     /// Check outgoing publications and subscription controls against the local
     /// 1 MiB and current broker ceilings before enqueue. Legacy defaults remain.
     pub fn packet_limits(self) -> Bridge {
