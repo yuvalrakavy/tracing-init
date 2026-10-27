@@ -353,6 +353,12 @@ oversized replay. The engine validates its own snapshot format and chooses its r
 policy. Race this wait with service cancellation; MQTT loss does not stop the service.
 
 The engine calls `complete(connection, image, readiness, command_completion).await`.
+An actuator loop can instead call synchronous `begin_complete(...)`, perform its
+non-failing local activation, then select the returned ticket's `wait()` alongside
+frame ticks and cancellation. Staging validates the current connection, original
+deadline and any active command capability; the ticket confirms runtime installation,
+not broker replication. Keep it alive through the result; a lost connection cannot
+roll back lighting already committed locally.
 `RecoveryImage` contains the complete generation table, assumed target model, accepted
 target configurations, optional immutable snapshot and original request context. Installation replaces old state,
 acknowledged writes, conflict/readback caches, setup caches and queued work, including
@@ -369,6 +375,13 @@ stays closed in RecoveryOnly; fenced assume stays unavailable. Refusals preserve
 command response topic and correlation data. An install abandoned before commit,
 stale connection, invalid image or expired request cannot open the gates. RecoveryOnly
 can promote to Ready on the current connection through another exact installation.
+An explicitly declared `DiscoveryRead` command is a parameterless instance read. It
+may omit generation to discover initial setup metadata; the runtime captures the
+current generation and model cut once before queueing it. Supplied generations remain
+subject to normal fencing. The driver must keep discovery read-only; no mutating
+command gains this exception. Queued drivers can use `Reporter::request_is_current`
+with the unchanged dequeued context immediately before an actuator commit. Exact
+recovery replacement retires that context even when visible generations match.
 Shutdown keeps output gated if no image was installed.
 Keep the engine's staged installation job alive until its result is known, even if
 the originating command caller disappears. Cancellation after commit cannot undo
@@ -490,7 +503,8 @@ trait DeviceDriver: Send + 'static
 ```
 
 `DriverInfo` declares `writes` (`Acknowledged` or `Unacknowledged`), `feedback` (`Observed` or
-`Assumed`), the `commands` (each `Momentary`, `Read` or `WithReply`) and the `Timing` defaults. The
+`Assumed`), the `commands` (`Momentary`, `Read`, `WithReply`, or the opt-in `DiscoveryRead`)
+and the `Timing` defaults. The
 `LinkContext` given to `connect` has the `Reporter` (`state`, `event`, `remove`, `remove_property`),
 the helper spawners (`spawn`, `spawn_transient`), `link_lost`, `blocking` (a synchronous call held to
 the deadline), `read_back` (the previous run's retained `State`) and `handle()`, a cloneable

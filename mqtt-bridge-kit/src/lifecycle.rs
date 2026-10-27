@@ -669,6 +669,9 @@ impl Lifecycle {
             span: span.clone(),
         });
         device.mailbox.bind_reports(&device.reports);
+        if let Some(recovery) = &self.recovery {
+            recovery.bind_mailbox(&device.mailbox)?;
+        }
         device.reports.install_policy(*info.policy);
         self.spawner.start(FIXED_ID, name, false, driver, info.info, device.mailbox.clone(), device.reports.clone(), span)?;
         self.insert_fixed(outputs, device);

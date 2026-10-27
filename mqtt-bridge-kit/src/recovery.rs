@@ -6,7 +6,7 @@ pub use publication::{RecoveryReceipt, RecoverySnapshot};
 use bytes::Bytes;
 use lock_order::sync::Mutex;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::{oneshot, watch, Notify};
 
 /// Maximum wait for the engine's initial decision after a connection's replay.
@@ -69,7 +69,10 @@ pub struct RecoveryImage {
 }
 impl RecoveryImage {
     pub(crate) fn check_deadline(&self) -> Result<(), String> {
-        if self.context.deadline().is_some_and(|deadline| deadline <= std::time::Instant::now()) {
+        self.check_deadline_at(std::time::Instant::now())
+    }
+    fn check_deadline_at(&self, now: std::time::Instant) -> Result<(), String> {
+        if self.context.deadline().is_some_and(|deadline| deadline <= now) {
             return Err("the original recovery request expired before installation".into());
         }
         Ok(())
@@ -128,6 +131,21 @@ pub struct RecoveryHandle {
     readback: watch::Receiver<Option<RecoveryReadback>>,
     initial: bool,
 }
+
+/// A staged recovery installation's asynchronous runtime acknowledgement.
+/// Dropping it cancels an installation that has not been applied yet; it cannot
+/// roll back an image already installed by the runtime.
+#[derive(Debug)]
+pub struct RecoveryInstall {
+    result: oneshot::Receiver<Result<(), String>>,
+}
+impl RecoveryInstall {
+    /// Await runtime installation; never await this from an actuator's frame branch.
+    pub async fn wait(self) -> Result<(), String> {
+        // WAIT: recovery-install
+        self.result.await.map_err(|_| "recovery installation was abandoned".to_owned())?
+    }
+}
 impl RecoveryHandle {
     /// Replace the pending snapshot on the current Ready connection. This does
     /// not wait for MQTT or imply broker acceptance.
@@ -148,20 +166,55 @@ impl RecoveryHandle {
         ready: RecoveryReady,
         completion: Option<crate::CommandCompletion>,
     ) -> Result<(), String> {
+        // WAIT: recovery-install
+        self.begin_complete(connection, image, ready, completion)?.wait().await
+    }
+    /// Stage an already prepared image on the current connection without an
+    /// await. Owners can then perform a non-failing local swap before yielding
+    /// and wait for acknowledgement outside their frame loop. Success here
+    /// confirms staging, not runtime installation or broker replication. A
+    /// later connection failure must not roll back already committed lighting.
+    pub fn begin_complete(
+        &self,
+        connection: RecoveryConnection,
+        image: RecoveryImage,
+        ready: RecoveryReady,
+        completion: Option<crate::CommandCompletion>,
+    ) -> Result<RecoveryInstall, String> {
+        self.begin_complete_with_clock(connection, image, ready, completion, std::time::Instant::now)
+    }
+    fn begin_complete_with_clock(
+        &self,
+        connection: RecoveryConnection,
+        image: RecoveryImage,
+        ready: RecoveryReady,
+        completion: Option<crate::CommandCompletion>,
+        clock: impl Fn() -> std::time::Instant,
+    ) -> Result<RecoveryInstall, String> {
         image.validate(&self.shared.options, ready)?;
         let (reply, result) = oneshot::channel();
         {
             // WAIT: recovery-state
             let mut state = self.shared.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             state.check_install(connection, ready)?;
+            if let Some(completion) = &completion {
+                self.shared
+                    .mailbox
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .ok_or("the recovery runtime mailbox is unavailable for the command capability")?
+                    .validate_completion(completion)?;
+            }
+            // The original deadline can expire during image validation or
+            // acquisition of the coordinator lock. Check at staging as well.
+            image.check_deadline_at(clock())?;
             if state.pending.as_ref().is_some_and(|pending| !pending.reply.is_closed()) {
                 return Err("a recovery installation is already pending".into());
             }
             state.pending = Some(Install { connection, image, ready, completion, reply });
         }
         self.shared.changed.notify_one();
-        // WAIT: recovery-install
-        result.await.map_err(|_| "recovery installation was abandoned".to_owned())?
+        Ok(RecoveryInstall { result })
     }
     /// Wait for a completed replay. Race this with service cancellation.
     pub async fn readback(&mut self) -> Result<RecoveryReadback, String> {
@@ -230,6 +283,7 @@ pub(crate) struct RecoveryShared {
     state: Mutex<State>,
     readback: watch::Sender<Option<RecoveryReadback>>,
     changed: Notify,
+    mailbox: OnceLock<Weak<crate::mailbox::Mailbox>>,
 }
 impl RecoveryShared {
     pub(crate) fn new(options: RecoveryOptions) -> Result<Arc<Self>, String> {
@@ -258,10 +312,14 @@ impl RecoveryShared {
             ),
             readback,
             changed: Notify::new(),
+            mailbox: OnceLock::new(),
         }))
     }
     pub(crate) fn handle(self: &Arc<Self>) -> RecoveryHandle {
         RecoveryHandle { shared: self.clone(), readback: self.readback.subscribe(), initial: true }
+    }
+    pub(crate) fn bind_mailbox(&self, mailbox: &Arc<crate::mailbox::Mailbox>) -> Result<(), String> {
+        self.mailbox.set(Arc::downgrade(mailbox)).map_err(|_| "recovery runtime mailbox was bound twice".into())
     }
     pub(crate) fn begin(&self) -> Result<RecoveryConnection, String> {
         // WAIT: recovery-state
@@ -496,6 +554,64 @@ mod tests {
         assert_eq!(output.states[0].2.generation(), Some("generation.a"), "the old request token relabeled recovery output");
         assert!(output.errors.is_empty());
         assert!(output.answer_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn synchronous_staging_keeps_gates_closed_and_acknowledges_only_exact_installation() {
+        let shared = RecoveryShared::new(RecoveryOptions { target: "_recovery".into(), max_bytes: 1024 }).unwrap();
+        let connection = shared.begin().unwrap();
+        shared.readback(connection, None).unwrap();
+        let handle = shared.handle();
+        let ticket = handle.begin_complete(connection, empty_image(), RecoveryReady::Ready, None).unwrap();
+        assert_eq!(shared.readiness(), None);
+        assert!(handle.begin_complete(connection, empty_image(), RecoveryReady::Ready, None).is_err());
+        assert!(shared.install_pending(|_| Ok(())).unwrap());
+        ticket.wait().await.unwrap();
+        assert_eq!(shared.readiness(), Some(RecoveryReady::Ready));
+
+        let next = shared.begin().unwrap();
+        shared.readback(next, None).unwrap();
+        assert!(handle.begin_complete(connection, empty_image(), RecoveryReady::Ready, None).is_err());
+        let ticket = handle.begin_complete(next, empty_image(), RecoveryReady::Ready, None).unwrap();
+        drop(ticket);
+        assert!(!shared.install_pending(|_| panic!("dropped stage reached installation")).unwrap());
+        assert_eq!(shared.readiness(), None);
+    }
+
+    #[test]
+    fn recovery_only_setup_rejects_foreign_or_cut_off_command_capabilities() {
+        let shared = RecoveryShared::new(RecoveryOptions { target: "_recovery".into(), max_bytes: 1024 }).unwrap();
+        let mailbox = crate::mailbox::Mailbox::new();
+        shared.bind_mailbox(&mailbox).unwrap();
+        let connection = shared.begin().unwrap();
+        shared.readback(connection, None).unwrap();
+        shared.finish(connection, RecoveryReady::RecoveryOnly).unwrap();
+        let handle = shared.handle();
+        assert!(handle.begin_complete(connection, empty_image(), RecoveryReady::Ready, Some(crate::CommandCompletion::new())).is_err());
+        mailbox.connected();
+        mailbox.post_command(None, crate::CommandCall { command: "recover".into(), params: Default::default() }, None, None);
+        assert!(matches!(mailbox.try_take(), Some(crate::mailbox::Work::Execute { .. })));
+        let active = mailbox.command_completion().unwrap();
+        let ticket = handle.begin_complete(connection, empty_image(), RecoveryReady::Ready, Some(active.clone())).unwrap();
+        drop(ticket);
+        mailbox.command_done();
+        assert!(handle.begin_complete(connection, empty_image(), RecoveryReady::Ready, Some(active)).is_err());
+    }
+
+    #[test]
+    fn synchronous_staging_rechecks_original_deadline_after_validation() {
+        let shared = RecoveryShared::new(RecoveryOptions { target: "_recovery".into(), max_bytes: 1024 }).unwrap();
+        let connection = shared.begin().unwrap();
+        shared.readback(connection, None).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut image = empty_image();
+        image.context = image.context.with_deadline(Some(deadline));
+        assert!(shared
+            .handle()
+            .begin_complete_with_clock(connection, image, RecoveryReady::Ready, None, || deadline)
+            .unwrap_err()
+            .contains("expired"));
+        assert!(!shared.install_pending(|_| panic!("expired stage reached installation")).unwrap());
     }
 
     #[tokio::test]

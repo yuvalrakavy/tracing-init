@@ -95,7 +95,7 @@ selects on, and a death goes to a channel `Running::ended` reads.
 |---|---|---|---|
 | `mqtt-buffer-state` | acyclic | connection epoch, overflow and charged publication map | Short synchronous critical sections. Reports may reserve an answer under its lock; buffering never takes Reports, the mailbox, or recovery locks, and never awaits or invokes callbacks under its lock. Charge destruction changes atomic counters only. |
 | `mqtt-buffer-overflow` | acyclic | overflow notification, or disabled pending future | Session selects this independently of publication work and shutdown. Producers latch overflow without waiting on consumers; registering the notification precedes reading the latch. A disabled future is always raced against normal work and shutdown. |
-| `recovery-state` | acyclic | recovery phase, pending installation, snapshot publication state | No awaited I/O or engine/driver call under the lock. Installation is taken out before mailbox/Reports replacement. Watch receivers release their borrows before acquiring this lock. |
+| `recovery-state` | acyclic | recovery phase, pending installation, snapshot publication state | No awaited I/O or engine/driver call under the lock. Runtime installation and command-capability checks follow recovery-state → mailbox-lock → reports-lock; neither mailbox nor Reports takes recovery-state. Watch receivers release their borrows before acquiring this lock. |
 | `recovery-identity` | acyclic | process-local owner identity counter | Checked increment only; no other locks, callbacks, or waits under the lock. Exhaustion returns an error. |
 | `recovery-snapshot-identity` | acyclic | immutable snapshot identity counter | Checked increment only; no other locks, callbacks, or waits under the lock. Exhaustion returns an error. |
 | `recovery-install` | acyclic | session installation request/result notification | Engine and session run independently; the session takes installation requests without waiting on the engine. The initial decision has INSTALL_WAIT (10 s); session loss abandons the request and closes its result. Service code races completion with cancellation. Disabled session notification is pending and raced with shutdown. |
@@ -208,10 +208,11 @@ process-launch src/process.rs serve_with
 recovery-identity src/recovery.rs RecoveryShared::new
 recovery-install src/lifecycle.rs Lifecycle::recovery_changed
 recovery-install src/recovery.rs RecoveryHandle::complete
+recovery-install src/recovery.rs RecoveryInstall::wait
 recovery-install src/recovery.rs RecoveryShared::changed
 recovery-readback src/recovery.rs RecoveryHandle::readback
 recovery-snapshot-identity src/recovery/publication.rs RecoverySnapshot::new
-recovery-state src/recovery.rs RecoveryHandle::complete
+recovery-state src/recovery.rs RecoveryHandle::begin_complete_with_clock
 recovery-state src/recovery.rs RecoveryHandle::receipt
 recovery-state src/recovery.rs RecoveryShared::begin
 recovery-state src/recovery.rs RecoveryShared::install_deadline

@@ -206,6 +206,10 @@ impl Feedback {
 /// a driver does not list them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandClass {
+    /// A parameterless, instance-level read used to discover current routing
+    /// metadata. May omit its generation; it must never change actuator state.
+    /// The runtime captures the current model cut once before queueing it.
+    DiscoveryRead,
     /// Act once; queued in order while the device is up (at most 64), refused while it is down.
     Momentary,
     /// A read: coalesced per target and command; dropped while the device is down.

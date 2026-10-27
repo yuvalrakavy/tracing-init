@@ -788,6 +788,15 @@ impl Mailbox {
     pub(crate) fn command_completion(&self) -> Option<crate::CommandCompletion> {
         self.locked().command_completion.clone()
     }
+    pub(crate) fn validate_completion(&self, completion: &crate::CommandCompletion) -> Result<(), String> {
+        let inner = self.locked();
+        if !inner.command_completion.as_ref().is_some_and(|active| active.same(completion))
+            || !inner.in_flight_command.as_ref().is_some_and(|command| command.momentary)
+        {
+            return Err("the committing command is no longer active or its capability was used".into());
+        }
+        Ok(())
+    }
 
     /// The same, and if the command was still in flight, `answer` — its answer queued — run in the
     /// same step, under the mailbox's lock: a stop's flush, which refuses what is in flight and
@@ -1056,7 +1065,7 @@ impl Mailbox {
         let (held, expired) = {
             let mut inner = self.locked();
             let mut expired = 0;
-            let held = loop {
+            let mut held = loop {
                 // Every held config before any held value: a target's setup comes first.
                 if let Some(i) = inner.pending.iter().position(|e| matches!(e, Entry::Config { held: true, .. })) {
                     if let Some(Entry::Config { target, config, context, .. }) = inner.pending.remove(i) {
@@ -1084,6 +1093,17 @@ impl Mailbox {
                 inner.in_flight = values.clone();
                 break Some(Held::Values(HeldValues { target, values }));
             };
+            if let Some(reports) = self.reports.get().and_then(Weak::upgrade).filter(|reports| reports.fenced()) {
+                match &mut held {
+                    Some(Held::Config { context, .. }) => *context = reports.observation(context),
+                    Some(Held::Values(values)) => {
+                        for value in &mut values.values {
+                            value.context = reports.observation(&value.context);
+                        }
+                    }
+                    None => {}
+                }
+            }
             (held, expired)
         };
         if expired > 0 {
@@ -1193,7 +1213,21 @@ impl Mailbox {
         let mut dropped = 0;
         let work = {
             let mut inner = self.locked();
-            Mailbox::next(&mut inner, Instant::now(), &mut dropped)
+            let mut work = Mailbox::next(&mut inner, Instant::now(), &mut dropped);
+            if let Some(reports) = self.reports.get().and_then(Weak::upgrade).filter(|reports| reports.fenced()) {
+                match &mut work {
+                    Some(Work::Configure { context, .. } | Work::Execute { context, .. } | Work::Read { context, .. }) => {
+                        *context = reports.observation(context);
+                    }
+                    Some(Work::Apply { values, .. }) => {
+                        for value in values {
+                            value.context = reports.observation(&value.context);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            work
         };
         if dropped > 0 {
             debug!(dropped, "Requests dropped at their deadline");

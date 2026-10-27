@@ -12,6 +12,60 @@ fn values(pairs: &[(&str, Value)]) -> PropertyMap {
 }
 
 #[test]
+fn dequeued_configuration_and_commands_keep_their_original_model_cut() {
+    use crate::mailbox::{Held, Mailbox, ReadKey, Work};
+    for kind in ["configuration", "held_configuration", "command", "read"] {
+        let reports = Reports::new();
+        let mailbox = Mailbox::new();
+        mailbox.bind_reports(&reports);
+        let table = crate::TargetGenerations { instance: "instance.1".into(), targets: [("u1".into(), "generation.a".into())].into() };
+        reports.install_policy(RequestPolicy::Fenced(table.clone()));
+        let target = (kind == "configuration" || kind == "held_configuration").then_some("u1");
+        let context = RequestContext::new(if target.is_some() { "generation.a" } else { "instance.1" }).unwrap();
+        if kind != "held_configuration" {
+            mailbox.connected();
+        }
+        match kind {
+            "configuration" | "held_configuration" => {
+                mailbox.post_config_with_context("u1", Some(json!({"level":1})), context);
+            }
+            "command" => {
+                mailbox.post_command_with_context(
+                    None,
+                    crate::CommandCall { command: "Initialize".into(), params: PropertyMap::new() },
+                    None,
+                    None,
+                    context,
+                );
+            }
+            _ => {
+                mailbox.post_read_with_context(ReadKey::Command { target: None, command: "inspect".into() }, None, None, None, context);
+            }
+        }
+        let context = if kind == "held_configuration" {
+            let Held::Config { context, .. } = mailbox.take_held().unwrap() else { panic!("not configuration") };
+            context
+        } else {
+            match mailbox.try_take().unwrap() {
+                Work::Configure { context, .. } | Work::Execute { context, .. } | Work::Read { context, .. } => context,
+                _ => panic!("unexpected work"),
+            }
+        };
+        assert!(reports.context_is_current(target, &context));
+        let image = crate::RecoveryImage {
+            snapshot: None,
+            context: RequestContext::default(),
+            generations: table,
+            states: BTreeMap::new(),
+            configurations: BTreeMap::new(),
+        };
+        mailbox.replace_recovery(&reports, &image, None).unwrap();
+        assert!(!reports.context_is_current(target, &context), "dequeued {kind} was blessed by a later exact recovery");
+        assert!(!reports.context_is_current(target, &reports.observation(&context)), "recapturing a context revived retired {kind}");
+    }
+}
+
+#[test]
 fn exact_replacement_retires_observations_but_accepts_fresh_same_generation_updates() {
     let reports = Reports::new();
     let table = crate::TargetGenerations { instance: "instance.1".into(), targets: [("u1".into(), "generation.a".into())].into() };

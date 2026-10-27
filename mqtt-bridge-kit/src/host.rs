@@ -278,7 +278,7 @@ impl Host {
     /// [`Bridge::usage_exit`](crate::Bridge::usage_exit).
     pub fn usage_exit(&self) -> Option<ExitCode> {
         let usage = || match self.fixed {
-            true => config::usage(&self.program, &self.kind, &self.declared),
+            true => config::usage(&self.program, &self.kind, &self.settings.root, &self.declared),
             false => config::usage_host(&self.program, &self.kind, &self.settings.root, &self.declared),
         };
         match &self.problem {

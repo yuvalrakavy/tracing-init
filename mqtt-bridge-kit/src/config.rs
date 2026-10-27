@@ -206,12 +206,12 @@ pub fn broker_host_port(broker: &str) -> Result<(String, u16), String> {
 }
 
 /// The usage text, for the family and the driver's declared options.
-pub fn usage(program: &str, family: &str, options: &[(String, String)]) -> String {
+pub fn usage(program: &str, family: &str, root: &str, options: &[(String, String)]) -> String {
     let mut text = format!(
         "Usage: {program} --instance <name> --broker <host[:port]> [options]\n\n\
          The {family} bridge, on the Bridge Runtime (mqtt-bridge-kit).\n\n\
          Options:\n\
-         \x20 --root <Root>                MQTT root (default: {family})\n\
+         \x20 --root <Root>                MQTT root (default: {root})\n\
          \x20 --instance <name>            this bridge's instance\n\
          \x20 --broker <host[:port]>       the MQTT broker (port 1883 by default)\n\
          \x20 --log-config <path>          tracing-init's logging.toml\n\
@@ -239,7 +239,7 @@ pub fn usage(program: &str, family: &str, options: &[(String, String)]) -> Strin
 /// A multi-device host's usage text (multi-device spec §4): its kind, its default root, and its
 /// drivers' declared options. `--name` in place of `--instance`, and `--factory-timeout`.
 pub fn usage_host(program: &str, kind: &str, root: &str, options: &[(String, String)]) -> String {
-    let fixed = usage(program, kind, options);
+    let fixed = usage(program, kind, root, options);
     let mut text = format!(
         "Usage: {program} --broker <host[:port]> [options]\n\n\
          The {kind} bridge, a multi-device host on the Bridge Runtime (mqtt-bridge-kit): it serves\n\
@@ -454,7 +454,7 @@ mod tests {
     /// options' help, and the option shows a value placeholder (the mqtt_ac v2 build).
     #[test]
     fn a_drivers_options_line_up_in_the_usage_text_with_a_value_placeholder() {
-        let text = usage("bridge", "A", &[("coolmaster".to_owned(), "its address".to_owned())]);
+        let text = usage("bridge", "A", "A", &[("coolmaster".to_owned(), "its address".to_owned())]);
         let column = |line: &str, help: &str| line.find(help).unwrap_or_else(|| panic!("`{help}` not in `{line}`"));
         let root = text.lines().find(|l| l.contains("--root")).expect("the --root line");
         let option = text.lines().find(|l| l.contains("--coolmaster")).expect("the driver's option's line");

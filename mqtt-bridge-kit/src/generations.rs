@@ -55,6 +55,13 @@ pub(crate) fn valid_traceparent(parent: &str) -> bool {
     parent.len() <= 512 && tracing_init::traceparent::set_remote_parent(&tracing::Span::none(), parent)
 }
 impl RequestContext {
+    pub(crate) fn discovered(mut self, generation: &str, observation: std::sync::Arc<()>) -> Self {
+        self.target_generation = Some(generation.to_owned());
+        self.with_observation(observation)
+    }
+    pub(crate) fn has_observation(&self) -> bool {
+        self.metadata.as_ref().is_some_and(|metadata| metadata.observation.is_some())
+    }
     pub(crate) fn with_observation(mut self, observation: std::sync::Arc<()>) -> Self {
         self.metadata_mut().observation = Some(observation);
         self

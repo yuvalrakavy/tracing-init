@@ -279,10 +279,23 @@ fn known(state: &State) -> BTreeMap<String, PropertyMap> {
 }
 
 impl Reports {
+    pub(crate) fn discovery_context(&self, context: &RequestContext) -> RequestContext {
+        let state = self.locked();
+        match &state.request_policy {
+            Some(RequestPolicy::Fenced(table)) if context.generation().is_none() => {
+                context.clone().discovered(&table.instance, state.observation.clone())
+            }
+            _ => context.clone(),
+        }
+    }
     /// Capture before an asynchronous read/apply. Exact replacement invalidates
     /// its model/cache completion even when mapping generations stay unchanged.
     pub(crate) fn observation(&self, context: &RequestContext) -> RequestContext {
-        context.clone().with_observation(self.locked().observation.clone())
+        if context.has_observation() {
+            context.clone()
+        } else {
+            context.clone().with_observation(self.locked().observation.clone())
+        }
     }
     pub(crate) fn bind_mailbox(&self, mailbox: &Arc<crate::mailbox::Mailbox>) {
         assert!(self.mailbox.set(Arc::downgrade(mailbox)).is_ok(), "reports mailbox bound twice");

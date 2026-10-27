@@ -79,6 +79,12 @@ pub struct ReadBack {
 }
 
 impl Reporter {
+    /// Check the original dequeued request immediately before an actuator commit.
+    /// Exact model replacement retires it even when visible generations match.
+    /// Keep this context unchanged through any driver-owned preparation queue.
+    pub fn request_is_current(&self, target: Option<&str>, context: &crate::RequestContext) -> bool {
+        self.reports.context_is_current(target, context)
+    }
     /// Capture the exact active momentary command, only while its execute future
     /// is being polled. Helpers, validation and reads receive none. Forward this
     /// explicitly to an inventory owner; it is not an MQTT generation token.

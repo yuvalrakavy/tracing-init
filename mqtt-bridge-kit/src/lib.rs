@@ -100,7 +100,8 @@ pub use link::{LinkContext, LinkHandle, ReadBack, Reporter};
 pub use managed::{ProcessService, ServiceContext, ServiceTiming};
 pub use process::{install_panic_hook, Bridge, Died, Running};
 pub use recovery::{
-    RecoveryConnection, RecoveryHandle, RecoveryImage, RecoveryOptions, RecoveryReadback, RecoveryReady, RecoveryReceipt, RecoverySnapshot,
+    RecoveryConnection, RecoveryHandle, RecoveryImage, RecoveryInstall, RecoveryOptions, RecoveryReadback, RecoveryReady, RecoveryReceipt,
+    RecoverySnapshot,
 };
 pub use session::MqttTiming;
 pub use wire::Conflict;

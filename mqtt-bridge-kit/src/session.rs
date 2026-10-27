@@ -1402,6 +1402,17 @@ pub(crate) fn route_with_json_policy(
                 Ok(deadline) => deadline,
                 Err(error) => return refuse(error),
             };
+            let discovery = device.commands.get().is_some_and(|commands| {
+                commands.iter().any(|command| command.name == call.command && command.class == CommandClass::DiscoveryRead)
+            });
+            let context = if discovery {
+                if target.is_some() || !call.params.is_empty() {
+                    return refuse("discovery is an instance read without parameters".into());
+                }
+                device.reports.discovery_context(&context)
+            } else {
+                context
+            };
             command(device, target, call, reply, deadline, context.with_deadline(deadline));
         }
         Inbound::Config { target } => {
@@ -1489,7 +1500,7 @@ fn command(
                 info!(command = name, "A command the driver does not declare; answered on Error");
                 refused(Reason::Unsupported, "no such command");
             }
-            Some(CommandClass::Read) => {
+            Some(CommandClass::Read | CommandClass::DiscoveryRead) => {
                 let key = ReadKey::Command { target: target.clone(), command: name.to_owned() };
                 match device.mailbox.post_read_with_context(key, Some(call.clone()), reply.clone(), deadline, context.clone()) {
                     Posted::Dropped => refused(Reason::Refused, "the device is not connected"),
