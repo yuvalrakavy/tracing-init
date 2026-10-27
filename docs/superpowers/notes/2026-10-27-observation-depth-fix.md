@@ -24,4 +24,9 @@ assertion test independently green. Four guard-removal controls fail for their
 named stale-update assertion and are restored. The first two control attempts
 initially failed at a later unwrap after removal; their assertion order was corrected
 and only those rows rerun. Those initial outcomes are not counted as valid controls.
-Confirming review over the full engine/runtime fix delta remains pending.
+The required round-2 confirming reader reviewed frozen runtime `bbf8d83` and engine
+`5c3adc0`, found no further issues, and independently passed all four observation
+regressions in an isolated SDK archive. A suspected proving-cache gap was excluded
+after tracing mailbox retirement and catch-up routing. This was GPT-6.1 Sol at
+medium effort; a different model family was unavailable. No hardware or network
+acceptance is claimed by this review.
