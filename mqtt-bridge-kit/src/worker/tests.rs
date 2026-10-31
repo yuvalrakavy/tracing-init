@@ -456,7 +456,7 @@ fn a_device_outage_is_one_episode() {
     let error = LinkError::new("refused");
     outage.failed(&error);
     outage.failed(&error);
-    std::thread::sleep(Duration::from_millis(1100));
+    std::thread::sleep(Duration::from_millis(60));
     outage.failed(&error);
     outage.failed(&error);
     outage.recovered(2, 1, 0);
@@ -866,7 +866,7 @@ fn a_device_that_drops_right_after_its_catch_up_is_one_outage() {
     outage.failed(&error);
     outage.recovered(1, 0, 0);
     outage.failed(&error);
-    std::thread::sleep(Duration::from_millis(1100));
+    std::thread::sleep(Duration::from_millis(60));
     outage.recovered(0, 0, 0);
     outage.failed(&error);
     let kinds: Vec<(tracing::Level, String)> =
