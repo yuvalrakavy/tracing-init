@@ -517,6 +517,22 @@ the deadline), `read_back` (the previous run's retained `State`) and `handle()`,
 `LinkHandle` to keep for later operations. `Bridge` is the builder `main` uses; `Running` is a bridge
 started in-process (`Bridge::start`), for tests and embedders.
 
+## State equality with command annotations
+
+`DeviceDriver::state_values_equal(target, property, left, right)` optionally defines
+endpoint equality for outage resolution. The runtime uses it both to recognize an
+already-satisfied request and to compare current state with its pre-outage baseline.
+For example, an output string can carry a measured level and a remembered fade
+duration; a driver can compare the level without treating the duration as a physical
+device change. Reject malformed inputs rather than making them equal.
+
+The default, also exported as `default_state_values_equal`, preserves numeric-value
+comparison for JSON numbers and exact comparison otherwise. Delegate other properties
+to that helper. The hook is pure, performs no I/O, and runs under the normal operation
+deadline/watchdog. It changes neither wire values nor coalescing, expiry, tracing or
+mapping authority. Existing drivers and stdio plugins retain the default. Request
+validation still runs before comparison and must reject unsupported intent.
+
 ## Controllers whose target mappings can change
 
 A fixed `Bridge` can opt into generation fencing with

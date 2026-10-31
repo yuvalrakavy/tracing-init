@@ -18,6 +18,24 @@ use crate::link::LinkContext;
 /// Property values by name: a target's state, or the values of one atomic write.
 pub type PropertyMap = serde_json::Map<String, Value>;
 
+/// Compare state values using the runtime's default semantics: JSON numbers by
+/// numeric value, and all other values exactly. Driver overrides can delegate here
+/// for properties that do not need a device-specific endpoint comparison.
+pub fn default_state_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            let integer = |value: &serde_json::Number| {
+                value.as_i64().map(i128::from).or_else(|| value.as_u64().map(i128::from))
+            };
+            match (integer(left), integer(right)) {
+                (Some(left), Some(right)) => left == right,
+                _ => left == right || left.as_f64().zip(right.as_f64()).is_some_and(|(left, right)| left == right),
+            }
+        }
+        _ => left == right,
+    }
+}
+
 /// What the runtime asks the driver to read (`read_state`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
@@ -333,6 +351,19 @@ pub trait DeviceDriver: Send + 'static {
     /// start, on a blocking thread raced against the stop signals; it must be pure and quick (no
     /// I/O): one that does not return cannot hold up a stop, but the bridge does not start.
     fn info(&self) -> DriverInfo;
+
+    /// Compare two values of a target property for outage resolution. The runtime
+    /// uses this both to recognize an already-satisfied request and to detect a
+    /// change since the pre-outage observation. For example, an observed endpoint
+    /// may be equal even when an accompanying command-duration annotation differs.
+    ///
+    /// Pure and quick: no I/O or mutation. Execution is covered by the normal
+    /// operation deadline/watchdog. This does not alter wire values, request
+    /// coalescing, deadlines, or mapping authority. Invalid values must not compare
+    /// equal. Delegate other properties to [`default_state_values_equal`].
+    fn state_values_equal(&self, _target: &str, _property: &str, left: &Value, right: &Value) -> bool {
+        default_state_values_equal(left, right)
+    }
 
     /// Original inventory mapping versions, captured once alongside [`Self::info`].
     /// Pure and quick, with no I/O. Fencing currently requires a fixed [`crate::Bridge`];

@@ -183,8 +183,18 @@ fn batch_context(original: &RequestContext, values: &[StateValue]) -> RequestCon
 ///    `RequestWins` applied;
 /// 4. changed since before → `DeviceWins` supersedes, `RequestWins` applies;
 /// 5. otherwise → applied.
+#[cfg(test)]
 pub(crate) fn resolve(value: &StateValue, current: Option<&Value>, before: Option<&Value>) -> Resolution {
-    if current.is_some_and(|current| same_value(current, &value.value)) {
+    resolve_by(value, current, before, crate::default_state_values_equal)
+}
+
+fn resolve_by(
+    value: &StateValue,
+    current: Option<&Value>,
+    before: Option<&Value>,
+    equal: impl Fn(&Value, &Value) -> bool,
+) -> Resolution {
+    if current.is_some_and(|current| equal(current, &value.value)) {
         return Resolution::Satisfied;
     }
     let Some(before) = before else {
@@ -196,31 +206,13 @@ pub(crate) fn resolve(value: &StateValue, current: Option<&Value>, before: Optio
             Conflict::RequestWins => Resolution::Apply,
         };
     };
-    if same_value(before, current) {
+    if equal(before, current) {
         return Resolution::Apply;
     }
     match value.conflict {
         Conflict::DeviceWins => Resolution::Superseded,
         Conflict::RequestWins => Resolution::Apply,
     }
-}
-
-/// Whether two JSON values are the same value: numbers by value — `24` and `24.0` are one, as a
-/// device may report what was asked written another way — the rest as written. Two integers
-/// compare exactly; only a float goes through `f64`.
-fn same_value(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => match (integer(x), integer(y)) {
-            (Some(x), Some(y)) => x == y,
-            _ => x == y || x.as_f64().zip(y.as_f64()).is_some_and(|(x, y)| x == y),
-        },
-        _ => a == b,
-    }
-}
-
-/// A JSON integer, exactly.
-fn integer(n: &serde_json::Number) -> Option<i128> {
-    n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from))
 }
 
 /// Values by target and property, for the conflict rule.
@@ -1044,20 +1036,32 @@ impl<D: DeviceDriver> Worker<D> {
             }
         }
         let befores = self.befores();
-        let (mut apply, mut superseded, mut unknown, mut satisfied) = (Vec::new(), Vec::new(), Vec::new(), 0);
-        for value in values {
-            if !value.check.any() {
-                // A live value, taken with a checked one: applied as it is (review MINOR 3).
-                apply.push(value);
-                continue;
+        // A comparison is driver code too: arm the operation watchdog before
+        // polling it, just as validation does, even though the hook is synchronous.
+        let comparison = async {
+            let (mut apply, mut superseded, mut unknown, mut satisfied) = (Vec::new(), Vec::new(), Vec::new(), 0);
+            for value in values {
+                if !value.check.any() {
+                    // Live values keep their existing admission policy.
+                    apply.push(value);
+                    continue;
+                }
+                let decision = resolve_by(
+                    &value,
+                    current.as_ref().and_then(|c| c.get(&value.property)),
+                    befores.of(&value),
+                    |left, right| self.driver.state_values_equal(&value.target, &value.property, left, right),
+                );
+                match decision {
+                    Resolution::Apply => apply.push(value),
+                    Resolution::Satisfied => satisfied += 1,
+                    Resolution::Superseded => superseded.push(value),
+                    Resolution::Unknown => unknown.push(value),
+                }
             }
-            match resolve(&value, current.as_ref().and_then(|c| c.get(&value.property)), befores.of(&value)) {
-                Resolution::Apply => apply.push(value),
-                Resolution::Satisfied => satisfied += 1,
-                Resolution::Superseded => superseded.push(value),
-                Resolution::Unknown => unknown.push(value),
-            }
-        }
+            Ok((apply, superseded, unknown, satisfied))
+        };
+        let (apply, superseded, unknown, satisfied) = op(handle, timing.operation, "compare_state", comparison).await.map_err(link_error)?;
         if satisfied > 0 {
             debug!(target, satisfied, "Checked requests the device already has");
         }

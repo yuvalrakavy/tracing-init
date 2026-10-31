@@ -92,6 +92,21 @@ lost link, never a hang.
 | `configure(target, config)` | when a `Config` intent arrives or is retracted (`none`) | accept the setup | ok or an error class |
 | `probe()` | for drivers with `writes: unacknowledged`: idle and while busy | prove the device is alive (Lutron's `DLMON`) | ok or `LinkError`; defaults to a read. `Unsupported` proves nothing: from an unacknowledged driver it is a contract violation (its writes are still taken as proven) |
 
+#### Optional state-value comparison
+
+`DeviceDriver::state_values_equal(target, property, left, right) -> bool` is a pure,
+optional Rust hook. Its default is exported as `default_state_values_equal`: JSON
+numbers compare by numeric value, two integers exactly, and other values exactly.
+Drivers may compare a measured endpoint while ignoring a remembered command
+annotation, such as a fade duration. Malformed driver-specific values are unequal.
+
+Both current/requested satisfaction and before/current physical-change checks use
+this hook, preserving the existing resolution branch order. The comparison phase
+runs inside the operation deadline/watchdog; it may not perform I/O or mutation.
+Wire values, mailbox keys/coalescing, expiry, generation authority and trace context
+are unchanged. Existing Rust drivers and stdio plugins use the default; no stdio
+protocol operation is added. Pure request validation still precedes comparison.
+
 ### 4.2 The link context
 
 - `ctx.report.state(target, values, assumed?)`: observed or assumed state, from an operation or a

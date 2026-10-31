@@ -148,6 +148,87 @@ fn request(value: Value, conflict: Conflict) -> StateValue {
     }
 }
 
+struct EndpointComparisonDriver {
+    comparison_clock: Arc<OpClock>,
+}
+
+impl DeviceDriver for EndpointComparisonDriver {
+    fn info(&self) -> DriverInfo { DriverInfo::default() }
+    fn state_values_equal(&self, target: &str, property: &str, left: &Value, right: &Value) -> bool {
+        assert!(self.comparison_clock.deadline().is_some(), "driver comparison ran outside the operation watchdog");
+        assert_eq!((target, property), ("u1", "output"));
+        let endpoint = |value: &Value| -> Option<u32> {
+            let (level, duration) = value.as_str()?.split_once('@')?;
+            let level = level.parse::<u32>().ok()?;
+            duration.parse::<u32>().ok()?;
+            (level <= 100).then_some(level)
+        };
+        match (endpoint(left), endpoint(right)) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        }
+    }
+    async fn connect(&mut self, _: &mut LinkContext) -> Result<(), LinkError> { Ok(()) }
+    async fn disconnect(&mut self) {}
+    async fn read_state(&mut self, _: Scope) -> Result<Vec<crate::TargetState>, OpError> {
+        panic!("the proving observation should satisfy the conflict read")
+    }
+    async fn apply(&mut self, _: &str, _: &PropertyMap) -> Result<(), OpError> { Ok(()) }
+    async fn execute(&mut self, _: Option<&str>, _: &crate::CommandCall) -> Result<Option<Value>, OpError> { Ok(None) }
+    async fn configure(&mut self, _: &str, _: Option<&Value>) -> Result<(), OpError> { Ok(()) }
+}
+
+async fn endpoint_decision(before: Option<&str>, current: &str, wanted: &str, conflict: Conflict) -> (usize, usize) {
+    let mailbox = Mailbox::new();
+    let reports = Reports::new();
+    mailbox.bind_reports(&reports);
+    let mut value = request(json!(wanted), conflict);
+    value.property = "output".into();
+    mailbox.post_state(value, false);
+    mailbox.connected();
+    let Work::Apply { target, values } = mailbox.try_take().unwrap() else { panic!("expected held apply") };
+    assert!(values[0].check.held, "fixture must reach outage resolution");
+    let comparison_clock = Arc::new(OpClock::new());
+    let driver = EndpointComparisonDriver { comparison_clock: comparison_clock.clone() };
+    let mut worker = Worker::new(driver, DriverInfo::default(), "i", mailbox, reports.clone());
+    worker.clock = comparison_clock.clone();
+    worker.before = before.map(|value| (Instant::now(), BTreeMap::from([("u1".into(), json!({"output": value}).as_object().unwrap().clone())])));
+    let proving = BTreeMap::from([(("u1".into(), RequestContext::default()), json!({"output": current}).as_object().unwrap().clone())]);
+    let ctx = LinkContext::new(1, "i", reports.clone(), Arc::new(crate::link::Abandoned::default()), comparison_clock.clone());
+    let apply = worker.decide(&ctx.handle(), &target, values, &proving).await.unwrap();
+    assert!(comparison_clock.deadline().is_none(), "completed comparison left its watchdog armed");
+    (apply.len(), reports.take().answer_errors.len())
+}
+
+#[tokio::test]
+async fn endpoint_comparison_satisfies_same_level_with_different_annotation() {
+    for conflict in [Conflict::DeviceWins, Conflict::RequestWins] {
+        assert_eq!(endpoint_decision(Some("10@0"), "37@1", "37@8", conflict).await, (0, 0),
+            "an already-observed endpoint must not be reapplied because its duration differs");
+    }
+}
+
+#[tokio::test]
+async fn endpoint_comparison_ignores_annotation_when_detecting_outage_changes() {
+    assert_eq!(endpoint_decision(Some("10@2"), "10@0", "37@8", Conflict::DeviceWins).await, (1, 0),
+        "a remembered duration change is not a physical device change");
+    assert_eq!(endpoint_decision(Some("10@2"), "12@0", "37@8", Conflict::DeviceWins).await, (0, 1),
+        "a genuinely different endpoint must still supersede the request");
+    assert_eq!(endpoint_decision(Some("10@2"), "12@0", "37@8", Conflict::RequestWins).await, (1, 0));
+    assert_eq!(endpoint_decision(None, "10@0", "37@8", Conflict::DeviceWins).await, (1, 0),
+        "the hook must preserve the no-baseline admission rule");
+}
+
+#[test]
+fn endpoint_comparison_default_preserves_numeric_and_exact_value_semantics() {
+    use crate::default_state_values_equal as equal;
+    assert!(equal(&json!(24), &json!(24.0)));
+    assert!(!equal(&json!(9007199254740992_u64), &json!(9007199254740993_u64)));
+    assert!(!equal(&json!("37@1"), &json!("37@8")));
+    assert!(!equal(&json!(false), &json!(0)));
+    assert!(equal(&json!({"a":[1,true]}), &json!({"a":[1,true]})));
+}
+
 #[derive(Default)]
 struct RequestMetadataDriver {
     seen: Vec<RequestContext>,

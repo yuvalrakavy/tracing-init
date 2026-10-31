@@ -350,6 +350,20 @@ That is **`OpError::Unusable`**, and it is not a reason to reconnect: the runtim
 once and passes the request over. (Reconnecting for an unreadable answer was a hot loop in the bridges
 this runtime replaced.) Reserve `Link` for the connection failing.
 
+### When state carries a command annotation
+
+Keep observed endpoints distinct from command annotations. If a state value encodes
+both a measured level and a remembered fade duration, a changed duration alone must
+not look like somebody changed the physical device during an outage.
+
+Override the optional pure `state_values_equal(target, property, left, right)` hook
+for that property. Decode both values, compare their endpoint, and return false for
+malformed values. Delegate other properties to the exported
+`default_state_values_equal` helper. Both the already-satisfied check and the
+pre-outage/current comparison use this hook, under the normal operation watchdog.
+The hook changes no stored or transmitted value and performs no I/O. The tutorial
+lamp needs no override: its plain numbers already use numeric-value equality.
+
 ## 7. `apply`, and `Partial`
 
 A request can arrive for several properties at once (a target-level `Desired`), and the driver should
