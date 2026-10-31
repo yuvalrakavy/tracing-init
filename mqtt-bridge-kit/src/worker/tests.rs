@@ -150,6 +150,7 @@ fn request(value: Value, conflict: Conflict) -> StateValue {
 
 struct EndpointComparisonDriver {
     comparison_clock: Arc<OpClock>,
+    during_comparison: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl DeviceDriver for EndpointComparisonDriver {
@@ -157,6 +158,7 @@ impl DeviceDriver for EndpointComparisonDriver {
     fn state_values_equal(&self, target: &str, property: &str, left: &Value, right: &Value) -> bool {
         assert!(self.comparison_clock.deadline().is_some(), "driver comparison ran outside the operation watchdog");
         assert_eq!((target, property), ("u1", "output"));
+        if let Some(action) = &self.during_comparison { action(); }
         let endpoint = |value: &Value| -> Option<u32> {
             let (level, duration) = value.as_str()?.split_once('@')?;
             let level = level.parse::<u32>().ok()?;
@@ -189,7 +191,7 @@ async fn endpoint_decision(before: Option<&str>, current: &str, wanted: &str, co
     let Work::Apply { target, values } = mailbox.try_take().unwrap() else { panic!("expected held apply") };
     assert!(values[0].check.held, "fixture must reach outage resolution");
     let comparison_clock = Arc::new(OpClock::new());
-    let driver = EndpointComparisonDriver { comparison_clock: comparison_clock.clone() };
+    let driver = EndpointComparisonDriver { comparison_clock: comparison_clock.clone(), during_comparison: None };
     let mut worker = Worker::new(driver, DriverInfo::default(), "i", mailbox, reports.clone());
     worker.clock = comparison_clock.clone();
     worker.before = before.map(|value| (Instant::now(), BTreeMap::from([("u1".into(), json!({"output": value}).as_object().unwrap().clone())])));
@@ -217,6 +219,73 @@ async fn endpoint_comparison_ignores_annotation_when_detecting_outage_changes() 
     assert_eq!(endpoint_decision(Some("10@2"), "12@0", "37@8", Conflict::RequestWins).await, (1, 0));
     assert_eq!(endpoint_decision(None, "10@0", "37@8", Conflict::DeviceWins).await, (1, 0),
         "the hook must preserve the no-baseline admission rule");
+}
+
+// The comparator runs synchronously while the MQTT thread can change ownership.
+// Coordinate an actual other thread rather than simulating the change before decide.
+#[tokio::test]
+async fn endpoint_comparison_revalidates_after_cancellation_replacement_and_expiry() {
+    for mutation in ["retract", "replace", "expire"] {
+        for current in [Some("12@0"), Some("37@0")] {
+            let mailbox = Mailbox::new();
+            let reports = Reports::new();
+            mailbox.bind_reports(&reports);
+            let mut value = request(json!("37@8"), Conflict::DeviceWins);
+            value.property = "output".into();
+            if mutation == "expire" { value.deadline = Some(Instant::now() + Duration::from_secs(1)); }
+            let mut unknown = value.clone();
+            unknown.property = "unknown".into();
+            mailbox.post_state(value, false);
+            mailbox.post_state(unknown, false);
+            mailbox.connected();
+            let Work::Apply { target, values } = mailbox.try_take().unwrap() else { panic!("expected held apply") };
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let other_mailbox = mailbox.clone();
+            let thread = std::thread::spawn(move || {
+                entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                match mutation {
+                    "retract" => {
+                        other_mailbox.retract("u1", "output");
+                        other_mailbox.retract("u1", "unknown");
+                    }
+                    "replace" => {
+                        let mut replacement = request(json!("42@0"), Conflict::DeviceWins);
+                        replacement.property = "output".into();
+                        let mut unknown = replacement.clone();
+                        unknown.property = "unknown".into();
+                        other_mailbox.post_state(replacement, false);
+                        other_mailbox.post_state(unknown, false);
+                    }
+                    "expire" => std::thread::sleep(Duration::from_millis(1100)),
+                    _ => unreachable!(),
+                }
+                done_tx.send(()).unwrap();
+            });
+            let once = std::sync::atomic::AtomicBool::new(false);
+            let done_rx = std::sync::Mutex::new(done_rx);
+            let action = move || {
+                if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    entered_tx.send(()).unwrap();
+                    done_rx.lock().unwrap().recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+            };
+            let clock = Arc::new(OpClock::new());
+            let driver = EndpointComparisonDriver { comparison_clock: clock.clone(), during_comparison: Some(Box::new(action)) };
+            let mut worker = Worker::new(driver, DriverInfo::default(), "i", mailbox.clone(), reports.clone());
+            worker.before = Some((Instant::now(), BTreeMap::from([("u1".into(), json!({"output":"10@0","unknown":"10@0"}).as_object().unwrap().clone())])));
+            // The absent second property's Unknown result must also be discarded
+            // when the first property's callback permits ownership to change.
+            let state = json!({"output":current.unwrap()});
+            let proving = BTreeMap::from([(("u1".into(), RequestContext::default()), state.as_object().unwrap().clone())]);
+            let ctx = LinkContext::new(1, "i", reports.clone(), Arc::new(crate::link::Abandoned::default()), clock);
+            let apply = worker.decide(&ctx.handle(), &target, values, &proving).await.unwrap();
+            thread.join().unwrap();
+            assert!(apply.is_empty(), "{mutation}, {current:?}: obsolete request applied");
+            assert!(reports.take().answer_errors.is_empty(), "{mutation}, {current:?}: obsolete request reported superseded");
+            if mutation == "expire" { assert_eq!(mailbox.take_expired(), 2, "expired satisfied request lost accounting"); }
+        }
+    }
 }
 
 #[test]
@@ -387,7 +456,7 @@ fn a_device_outage_is_one_episode() {
     let error = LinkError::new("refused");
     outage.failed(&error);
     outage.failed(&error);
-    std::thread::sleep(Duration::from_millis(60));
+    std::thread::sleep(Duration::from_millis(1100));
     outage.failed(&error);
     outage.failed(&error);
     outage.recovered(2, 1, 0);
@@ -797,7 +866,7 @@ fn a_device_that_drops_right_after_its_catch_up_is_one_outage() {
     outage.failed(&error);
     outage.recovered(1, 0, 0);
     outage.failed(&error);
-    std::thread::sleep(Duration::from_millis(60));
+    std::thread::sleep(Duration::from_millis(1100));
     outage.recovered(0, 0, 0);
     outage.failed(&error);
     let kinds: Vec<(tracing::Level, String)> =

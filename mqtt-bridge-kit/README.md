@@ -531,7 +531,9 @@ comparison for JSON numbers and exact comparison otherwise. Delegate other prope
 to that helper. The hook is pure, performs no I/O, and runs under the normal operation
 deadline/watchdog. It changes neither wire values nor coalescing, expiry, tracing or
 mapping authority. Existing drivers and stdio plugins retain the default. Request
-validation still runs before comparison and must reject unsupported intent.
+validation still runs before comparison and must reject unsupported intent. Requests
+are revalidated after comparison before any outcome is committed: withdrawal,
+replacement and expiry during the callback still take effect.
 
 ## Controllers whose target mappings can change
 

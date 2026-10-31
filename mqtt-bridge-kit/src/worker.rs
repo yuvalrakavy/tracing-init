@@ -1039,29 +1039,37 @@ impl<D: DeviceDriver> Worker<D> {
         // A comparison is driver code too: arm the operation watchdog before
         // polling it, just as validation does, even though the hook is synchronous.
         let comparison = async {
-            let (mut apply, mut superseded, mut unknown, mut satisfied) = (Vec::new(), Vec::new(), Vec::new(), 0);
-            for value in values {
-                if !value.check.any() {
+            let mut decisions = BTreeMap::new();
+            for value in &values {
+                let decision = if !value.check.any() {
                     // Live values keep their existing admission policy.
-                    apply.push(value);
-                    continue;
-                }
-                let decision = resolve_by(
-                    &value,
-                    current.as_ref().and_then(|c| c.get(&value.property)),
-                    befores.of(&value),
-                    |left, right| self.driver.state_values_equal(&value.target, &value.property, left, right),
-                );
-                match decision {
-                    Resolution::Apply => apply.push(value),
-                    Resolution::Satisfied => satisfied += 1,
-                    Resolution::Superseded => superseded.push(value),
-                    Resolution::Unknown => unknown.push(value),
-                }
+                    Resolution::Apply
+                } else {
+                    resolve_by(
+                        value,
+                        current.as_ref().and_then(|c| c.get(&value.property)),
+                        befores.of(value),
+                        |left, right| self.driver.state_values_equal(&value.target, &value.property, left, right),
+                    )
+                };
+                decisions.insert(value.property.clone(), decision);
             }
-            Ok((apply, superseded, unknown, satisfied))
+            Ok(decisions)
         };
-        let (apply, superseded, unknown, satisfied) = op(handle, timing.operation, "compare_state", comparison).await.map_err(link_error)?;
+        let decisions = op(handle, timing.operation, "compare_state", comparison).await.map_err(link_error)?;
+        // Synchronous driver code may run while another thread retracts or replaces
+        // requests, or their deadlines pass. Keep the originals until all outcomes
+        // have been revalidated, including satisfied values for expiry accounting.
+        let values = self.mailbox.revalidate(values);
+        let (mut apply, mut superseded, mut unknown, mut satisfied) = (Vec::new(), Vec::new(), Vec::new(), 0);
+        for value in values {
+            match decisions[&value.property] {
+                Resolution::Apply => apply.push(value),
+                Resolution::Satisfied => satisfied += 1,
+                Resolution::Superseded => superseded.push(value),
+                Resolution::Unknown => unknown.push(value),
+            }
+        }
         if satisfied > 0 {
             debug!(target, satisfied, "Checked requests the device already has");
         }
