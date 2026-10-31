@@ -36,6 +36,17 @@ pub fn default_state_values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+/// Admission policy for the standard, metadata-only `assume` command.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AssumePolicy {
+    /// Preserve the historical behavior, including unconfigured targets.
+    #[default]
+    Unrestricted,
+    /// Require an accepted target Config whose feedback is explicitly assumed.
+    /// Pending, rejected, withdrawn, or absent Configs do not grant this capability.
+    ConfiguredAssumed,
+}
+
 /// What the runtime asks the driver to read (`read_state`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {

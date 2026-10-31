@@ -168,6 +168,7 @@ fn mqtt_side_through(relay: &Relay, timing: MqttTiming, stop: tokio::sync::watch
         request_queue_bytes: None,
         packet_limits: false,
         strict_json: false,
+        assume_policy: crate::AssumePolicy::Unrestricted,
         version: "test".into(),
         outage: Arc::new(BrokerOutage::new(timing.warn_after, timing.stable_after)),
         enqueued: std::sync::atomic::AtomicU64::new(0),
@@ -175,6 +176,7 @@ fn mqtt_side_through(relay: &Relay, timing: MqttTiming, stop: tokio::sync::watch
         devices: lock_order::sync::Mutex::new("session-devices", Vec::new()),
     });
     let device = Arc::new(crate::session::Device {
+        assume_policy: crate::AssumePolicy::Unrestricted,
         topics: topics.clone(),
         commands: Vec::new().into(),
         mailbox: crate::mailbox::Mailbox::new(),

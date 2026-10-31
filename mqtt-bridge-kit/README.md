@@ -517,6 +517,21 @@ the deadline), `read_back` (the previous run's retained `State`) and `handle()`,
 `LinkHandle` to keep for later operations. `Bridge` is the builder `main` uses; `Running` is a bridge
 started in-process (`Bridge::start`), for tests and embedders.
 
+## Restricting metadata-only assumptions
+
+The standard `assume` command historically accepts any unfenced target. That remains
+the default. A `Bridge` or `Host` can opt into
+`.assume_policy(AssumePolicy::ConfiguredAssumed)` to admit it only for targets whose
+accepted Config explicitly sets `feedback` to `assumed`. Unknown, observed, pending,
+rejected and withdrawn mappings grant no capability. A rejected replacement preserves
+the last accepted Config; a queued withdrawal takes effect when delivered. The check
+uses accepted configuration at command admission and never invokes device I/O.
+Generation-fenced devices continue to refuse `assume` under either policy.
+
+This allows a mixed-feedback bridge such as Lutron to expose assumptions only for
+its CCO targets, while observed levels and LEDs must come from hardware reports.
+The bridge must independently reject Config feedback incompatible with its target kind.
+
 ## State equality with command annotations
 
 `DeviceDriver::state_values_equal(target, property, left, right)` optionally defines

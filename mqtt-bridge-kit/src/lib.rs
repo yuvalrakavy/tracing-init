@@ -91,7 +91,7 @@ pub use buffering::BufferLimits;
 pub use completion::CommandCompletion;
 pub use config::TimingOverrides;
 pub use driver::{
-    default_state_values_equal, CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkError, OpError, PropertyFailure,
+    default_state_values_equal, AssumePolicy, CommandCall, CommandClass, CommandSpec, DeviceDriver, DriverInfo, FailureClass, Feedback, LinkError, OpError, PropertyFailure,
     PropertyMap, Scope, TargetState, Timing, Value, Writes,
 };
 pub use generations::{ContextualState, RequestContext, RequestKind, RequestPolicy, TargetGenerations};

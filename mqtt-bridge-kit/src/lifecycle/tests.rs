@@ -20,6 +20,7 @@ fn dynamic_routing_and_terminal_refusals_keep_the_ingress_cause() {
         let mut host = lifecycle();
         let topics = Topics::new("T", "Lamp").unwrap();
         let device = Arc::new(Device {
+            assume_policy: crate::AssumePolicy::Unrestricted,
             topics: topics.clone(),
             commands: Vec::new().into(),
             mailbox: Mailbox::new(),
@@ -88,6 +89,7 @@ fn session_part() -> Arc<session::Shared> {
         request_queue_bytes: None,
         packet_limits: false,
         strict_json: false,
+        assume_policy: crate::AssumePolicy::Unrestricted,
         version: "kind test".into(),
         outage: Arc::new(crate::pump::BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         enqueued: std::sync::atomic::AtomicU64::new(0),
@@ -126,6 +128,7 @@ fn a_retired_runtimes_answers_go_to_the_outbox() {
     let shared = session_part();
     let device = || {
         Arc::new(Device {
+            assume_policy: crate::AssumePolicy::Unrestricted,
             topics: Topics::new("T", "Lamp").expect("topics"),
             commands: Vec::new().into(),
             mailbox: Mailbox::new(),

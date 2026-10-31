@@ -4,6 +4,7 @@ use serde_json::json;
 
 fn device(limit: Option<Duration>) -> Device {
     Device {
+        assume_policy: crate::AssumePolicy::Unrestricted,
         topics: Topics::new("T", "limited").unwrap(),
         commands: Vec::new().into(),
         mailbox: Mailbox::new(),

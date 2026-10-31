@@ -37,6 +37,48 @@ fn builtin_assume_preserves_the_incoming_cause() {
 }
 
 #[test]
+fn restricted_assume_requires_an_accepted_assumed_feedback_config() {
+    let mut device = metadata_device();
+    device.assume_policy = crate::AssumePolicy::ConfiguredAssumed;
+    device.mailbox.connected();
+    let topic = device.topics.command();
+    let assume = || {
+        let publish = Publish::new(topic.clone(), QoS::AtLeastOnce, br#"{"target":"t1","command":"assume","closed":true}"#.to_vec(), None);
+        route(&device, &topic, &publish, Instant::now());
+        device.reports.take()
+    };
+    let denied = assume();
+    assert!(denied.states.is_empty(), "unknown target admitted an assumption");
+    assert_eq!(denied.answer_errors.len(), 1);
+    let config = serde_json::json!({"feedback":"assumed"});
+    device.mailbox.post_config("t1", Some(config.clone()));
+    // Merely posted configuration is not a capability.
+    assert!(assume().states.is_empty(), "undelivered configuration admitted an assumption");
+    let crate::mailbox::Work::Configure { .. } = device.mailbox.try_take().unwrap() else { panic!("configuration not delivered") };
+    device.mailbox.failed();
+    assert!(assume().states.is_empty(), "rejected configuration admitted an assumption");
+    device.mailbox.post_config("t1", Some(config.clone()));
+    let crate::mailbox::Work::Configure { .. } = device.mailbox.try_take().unwrap() else { panic!("configuration not delivered") };
+    device.mailbox.configured("t1", Some(&config));
+    assert_eq!(assume().states.len(), 1, "accepted assumed target refused metadata");
+    let replacement = serde_json::json!({"feedback":"observed"});
+    device.mailbox.post_config("t1", Some(replacement));
+    let crate::mailbox::Work::Configure { .. } = device.mailbox.try_take().unwrap() else { panic!("replacement not delivered") };
+    device.mailbox.failed();
+    assert!(assume().answer_errors.is_empty(), "rejected replacement revoked the accepted configuration");
+    device.mailbox.post_config("t1", None);
+    assert!(assume().answer_errors.is_empty(), "queued withdrawal revoked the configuration before delivery");
+    let crate::mailbox::Work::Configure { .. } = device.mailbox.try_take().unwrap() else { panic!("withdrawal not delivered") };
+    device.mailbox.configured("t1", None);
+    assert!(assume().states.is_empty(), "withdrawn target retained assumption capability");
+    let observed = serde_json::json!({"feedback":"observed"});
+    device.mailbox.post_config("t1", Some(observed.clone()));
+    let crate::mailbox::Work::Configure { .. } = device.mailbox.try_take().unwrap() else { panic!("configuration not delivered") };
+    device.mailbox.configured("t1", Some(&observed));
+    assert!(assume().states.is_empty(), "observed target admitted an assumption");
+}
+
+#[test]
 fn an_original_trace_survives_the_request_queue_and_output_seal() {
     let trace = "00-112233445566778899aabbccddeeff00-1234567890abcdef-01";
     let properties = PublishProperties {
@@ -167,6 +209,7 @@ fn rig_with_options(port: u16, buffers: Option<Arc<crate::buffering::Buffers>>, 
         request_queue_bytes: None,
         packet_limits,
         strict_json: false,
+        assume_policy: crate::AssumePolicy::Unrestricted,
         version: "test".into(),
         outage: Arc::new(BrokerOutage::new(Duration::from_secs(30), Duration::from_secs(5))),
         enqueued: std::sync::atomic::AtomicU64::new(0),
@@ -174,6 +217,7 @@ fn rig_with_options(port: u16, buffers: Option<Arc<crate::buffering::Buffers>>, 
         devices: lock_order::sync::Mutex::new("session-devices", Vec::new()),
     });
     let device = Arc::new(Device {
+        assume_policy: crate::AssumePolicy::Unrestricted,
         topics,
         commands: Vec::new().into(),
         mailbox: Mailbox::new(),
@@ -190,6 +234,7 @@ fn rig_with_options(port: u16, buffers: Option<Arc<crate::buffering::Buffers>>, 
 
 fn metadata_device() -> Device {
     Device {
+        assume_policy: crate::AssumePolicy::Unrestricted,
         topics: Topics::new("Meta", "i").unwrap(),
         commands: vec![crate::CommandSpec::new("pulse", CommandClass::Momentary), crate::CommandSpec::new("inspect", CommandClass::Read)]
             .into(),
@@ -649,6 +694,7 @@ async fn the_rotation_turns_quanta_round_robin_over_sealed_batches() {
     let mut rig = rig_on(broker.port());
     let (shared, first) = (rig.shared.clone(), rig.device.clone());
     let second = Arc::new(Device {
+        assume_policy: crate::AssumePolicy::Unrestricted,
         topics: Topics::new("T", "second").expect("topics"),
         commands: Vec::new().into(),
         mailbox: Mailbox::new(),

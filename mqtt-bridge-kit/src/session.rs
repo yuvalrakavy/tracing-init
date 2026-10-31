@@ -143,6 +143,7 @@ pub(crate) struct Shared {
     pub request_queue_bytes: Option<usize>,
     pub packet_limits: bool,
     pub strict_json: bool,
+    pub assume_policy: crate::AssumePolicy,
     /// The text of the retained `Version`.
     pub version: String,
     pub outage: Arc<BrokerOutage>,
@@ -175,6 +176,7 @@ pub(crate) struct Device {
     /// The commands its driver declares, once its driver is known (a host's device runtime may
     /// receive requests before its construction is done).
     pub commands: std::sync::OnceLock<Vec<CommandSpec>>,
+    pub assume_policy: crate::AssumePolicy,
     pub mailbox: Arc<Mailbox>,
     pub reports: Arc<Reports>,
     /// A configured instance's: every `Status` and `State` it publishes carries the MQTT v5 user
@@ -1477,6 +1479,10 @@ fn command(
             }
         }
         "assume" if device.reports.fenced() => refused(Reason::Refused, "assume is unavailable for a generation-fenced device"),
+        "assume" if device.assume_policy == crate::AssumePolicy::ConfiguredAssumed
+            && target.as_ref().map_or(true, |target| device.mailbox.feedback(target, crate::Feedback::Observed) != crate::Feedback::Assumed) => {
+            refused(Reason::Refused, "assume requires an accepted assumed-feedback target Config");
+        }
         "assume" => match &target {
             // The Store's input: a property that cannot stand as a topic segment is malformed, not
             // a driver's contract violation (Claude's re-gate minor 6).

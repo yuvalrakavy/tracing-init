@@ -350,6 +350,15 @@ That is **`OpError::Unusable`**, and it is not a reason to reconnect: the runtim
 once and passes the request over. (Reconnecting for an unreadable answer was a hot loop in the bridges
 this runtime replaced.) Reserve `Link` for the connection failing.
 
+### Restricting the standard assume command
+
+If only some configured targets may have assumed state, select
+`.assume_policy(mqtt_bridge_kit::AssumePolicy::ConfiguredAssumed)` on the `Bridge`
+or `Host` builder. It requires an accepted Config with explicit assumed feedback;
+merely receiving a Config cannot authorize an assumption. Validate the Config's
+feedback against the target kind in your driver. The compatibility default leaves
+`assume` unrestricted; neither mode calls `apply` or `execute` for this command.
+
 ### When state carries a command annotation
 
 Keep observed endpoints distinct from command annotations. If a state value encodes

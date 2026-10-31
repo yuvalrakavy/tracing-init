@@ -301,6 +301,12 @@ impl Bridge {
         Bridge(self.0.request_lifetime_limit(limit))
     }
 
+    /// Set admission for the standard metadata-only `assume` command.
+    /// The default preserves existing unrestricted behavior.
+    pub fn assume_policy(self, policy: crate::AssumePolicy) -> Self {
+        Self(self.0.assume_policy(policy))
+    }
+
     /// Read the process's command line.
     pub fn from_cli(self) -> Bridge {
         Bridge(self.0.from_cli())

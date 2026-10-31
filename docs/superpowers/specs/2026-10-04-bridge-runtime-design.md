@@ -184,7 +184,12 @@ capped queue whose overflow is counted and logged once per episode.
   `"assumed": true` unless the driver reports otherwise.
 - **`commands`:** each with a class: `momentary`, `read` (coalesced; dropped while down), or
   `with_reply`. `refresh` (a `read_state`) and `assume` (set the assumed state without calling the
-  driver) are standard and handled by the runtime.
+  driver) are standard and handled by the runtime. `Bridge::assume_policy` and
+  `Host::assume_policy` optionally select `ConfiguredAssumed`: only an accepted
+  explicit assumed-feedback target Config admits `assume`, at command admission.
+  Pending/rejected/absent/withdrawn Configs grant nothing; rejected replacement
+  preserves accepted policy and queued withdrawal is effective at delivery.
+  The default `Unrestricted` and fenced-device refusal remain unchanged.
 - **`timing`:** defaults for connect, operation, retry pacing, the outage WARN threshold (30 s), the poll
   interval, and the probe interval and deadline. Each can be overridden on the command line.
 - **No restore in R1.** Restoring a one-way device that comes back dark (DMX, DALI) from the

@@ -662,6 +662,7 @@ impl Lifecycle {
         let device = Arc::new(Device {
             topics: Topics::new(&self.settings.root, name)?,
             commands: info.info.commands.clone().into(),
+            assume_policy: self.shared.assume_policy,
             mailbox: Mailbox::with_byte_limit(self.shared.request_queue_bytes),
             reports: Reports::with_buffers(self.ready.clone(), self.shared.buffers.clone()),
             tag: None,
@@ -2291,6 +2292,7 @@ impl Lifecycle {
         let device = Arc::new(Device {
             topics: instance.topics.clone(),
             commands: std::sync::OnceLock::new(),
+            assume_policy: self.shared.assume_policy,
             mailbox: Mailbox::new(),
             reports,
             tag: Some(self.settings.id.clone()),
