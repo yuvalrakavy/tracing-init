@@ -485,6 +485,11 @@ pub trait DeviceDriver: Send + 'static {
     /// retracted. Called only while the link is up; a config identical to the one last taken on this
     /// link is not handed over again, and a lost link forgets what was taken. A config's `feedback`
     /// override takes effect once this has returned `Ok`. Bounded by [`Timing::operation`].
+    ///
+    /// A device-link reconnect alone does not replay settled Config; MQTT reconnect does. Keep
+    /// accepted registrations across transport reconnects, resetting freshness separately, or
+    /// restore the device setup from the driver's own accepted model during `connect`.
+
     async fn configure(&mut self, target: &str, config: Option<&Value>) -> Result<(), OpError>;
 
     /// Configure a target with the original packet or installed context.

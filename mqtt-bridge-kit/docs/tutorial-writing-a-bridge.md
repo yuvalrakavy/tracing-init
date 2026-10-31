@@ -483,7 +483,12 @@ An unknown command cannot reach the driver (the runtime answers `unsupported` fo
 not list), but the `match` keeps the driver honest about its own list.
 
 `configure` is called when a target's `Config` arrives or is retracted (`None`), only while the link is
-up. LampNet has no per-lamp setup:
+up. A device-link reconnect alone does not replay settled target Config; MQTT reconnect
+does. Retain accepted target registrations across transport reconnects and reset
+observation freshness separately. If hardware setup must be restored, use the
+driver's accepted model during `connect`; do not depend on another Config delivery.
+
+LampNet has no per-lamp setup:
 
 ```rust
 /// A lamp needs no setup.

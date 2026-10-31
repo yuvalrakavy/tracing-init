@@ -92,6 +92,11 @@ lost link, never a hang.
 | `configure(target, config)` | when a `Config` intent arrives or is retracted (`none`) | accept the setup | ok or an error class |
 | `probe()` | for drivers with `writes: unacknowledged`: idle and while busy | prove the device is alive (Lutron's `DLMON`) | ok or `LinkError`; defaults to a read. `Unsupported` proves nothing: from an unacknowledged driver it is a contract violation (its writes are still taken as proven) |
 
+A device-link reconnect alone does not replay settled target Config; MQTT reconnect
+does. Retain accepted target registrations across transport reconnects and reset
+observation freshness separately. If hardware setup must be restored, use the
+driver's accepted model during `connect`; do not depend on another Config delivery.
+
 #### Optional state-value comparison
 
 `DeviceDriver::state_values_equal(target, property, left, right) -> bool` is a pure,

@@ -517,6 +517,11 @@ the deadline), `read_back` (the previous run's retained `State`) and `handle()`,
 `LinkHandle` to keep for later operations. `Bridge` is the builder `main` uses; `Running` is a bridge
 started in-process (`Bridge::start`), for tests and embedders.
 
+A device-link reconnect alone does not replay settled target Config; MQTT reconnect
+does. Retain accepted target registrations across transport reconnects and reset
+observation freshness separately. If hardware setup must be restored, use the
+driver's accepted model during `connect`; do not depend on another Config delivery.
+
 ## Restricting metadata-only assumptions
 
 The standard `assume` command historically accepts any unfenced target. That remains

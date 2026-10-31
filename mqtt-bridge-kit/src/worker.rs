@@ -290,8 +290,9 @@ pub(crate) struct Worker<D: DeviceDriver> {
     /// Whether the current link has recovered: proven, and its catch-up done.
     recovered: bool,
     /// The config `configure` last took for each target on this link: one identical is not handed
-    /// over again while the link stays up (every reconnect replays the retained configs; review
-    /// MINOR 5). Forgotten when the link is lost — the device may have lost its setup with it.
+    /// over again while the link stays up. MQTT reconnect replays retained Config; device-link
+    /// reconnect alone does not replay settled Config. This dedup cache is forgotten on link loss;
+    /// drivers retain their accepted registrations independently of transport freshness.
     configured: HashMap<String, (RequestContext, Option<Value>)>,
     recovery_epoch: u64,
     /// Whether the driver's `Unsupported` probe was said (once per process).
