@@ -447,11 +447,7 @@ The crate tracks recent stable Rust (2021 edition). The 0.x line may make breaki
 
 Issues and PRs are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the short version: open an issue first for non-trivial changes, run `cargo test --all-features` before submitting, and prefer one logical change per PR.
 
-## License
-
-MIT — see [`LICENSE`](LICENSE).
-
-### Instrument a Rust test attempt
+## Instrument a Rust test attempt
 
 Enable the `logmon-test` feature on a test dependency to use the `logmon_test`
 attribute. The attribute supplies the Rust test harness for synchronous tests
@@ -484,3 +480,9 @@ their own native trace ID and the same attempt attribute.
 `http://127.0.0.1:4318`). The default level is INFO and `RUST_LOG` controls the
 filter. A process that exits abruptly may lose its last telemetry batch. The
 nextest wrapper independently reports the test verdict and captured output.
+
+See the [nextest wrapper guide](nextest-wrapper/README.md) for installation, profile configuration, retries and failure output.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
