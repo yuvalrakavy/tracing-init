@@ -450,3 +450,37 @@ Issues and PRs are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the sho
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+
+### Instrument a Rust test attempt
+
+Enable the `logmon-test` feature on a test dependency to use the `logmon_test`
+attribute. The attribute supplies the Rust test harness for synchronous tests
+and accepts the usual Tokio test options for async tests. Async tests need a
+direct Tokio dependency with its test macros enabled.
+
+```rust
+#[tracing_init::logmon_test]
+fn rejects_empty_input() {
+    tracing::info!("checking empty input");
+}
+
+#[tracing_init::logmon_test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_task() {
+    tokio::spawn(async { tracing::info!("running in a detached task") }).await.unwrap();
+}
+```
+
+The nextest wrapper sets `LOGMON_TEST_TRACE_ID` to a fresh 32-hex-digit
+nonzero trace ID for each process. Without that variable, the test executes
+with its ordinary tracing configuration. With it, the attribute installs a
+process-wide subscriber, opens a `rust.test` span, and flushes the OTLP batch
+when the test returns or unwinds. Each GELF record and OTLP span carries
+`test_attempt_id`, including work on detached threads and tasks. New root spans
+use the supplied trace ID. Explicitly propagated external parent contexts keep
+their own native trace ID and the same attempt attribute.
+
+`LOGMON_TEST_GELF_ADDR` selects the UDP destination (default `127.0.0.1:12201`).
+`LOGMON_TEST_OTLP_ENDPOINT` selects the OTLP/HTTP base URL (default
+`http://127.0.0.1:4318`). The default level is INFO and `RUST_LOG` controls the
+filter. A process that exits abruptly may lose its last telemetry batch. The
+nextest wrapper independently reports the test verdict and captured output.

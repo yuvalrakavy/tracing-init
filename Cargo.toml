@@ -11,6 +11,7 @@ keywords = ["tracing", "logging", "gelf", "opentelemetry", "subscriber"]
 categories = ["development-tools::debugging"]
 
 [features]
+logmon-test = ["gelf", "otel", "dep:logmon-test-macros"]
 default = ["config", "file", "gelf"]
 config = ["dep:toml", "dep:serde"]
 # The rotating file destination. tracing-appender itself is not optional: its lossy
@@ -36,6 +37,7 @@ otel-grpc = ["otel", "opentelemetry-otlp/grpc-tonic"]
 tokio-console = ["dep:console-subscriber"]
 
 [dependencies]
+logmon-test-macros = { version = "0.1", path = "logmon-test-macros", optional = true }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 bitflags = "2"
@@ -67,6 +69,7 @@ tokio = { version = "1", features = ["net", "time", "rt"], optional = true }
 futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 log = "0.4"
 
