@@ -64,9 +64,10 @@ with tempfile.TemporaryDirectory(prefix="nextest-logmon-") as scratch:
     assert any(r["transport"]=="breaker_open" for r in rows)
     # A directly signalled child must be signalled from nextest's perspective too.
     proc=subprocess.run([wrapper,"/bin/sh","-c","kill -TERM $$"],env=dict(env,
-        NEXTEST_BINARY_ID="fixture",NEXTEST_TEST_NAME="abort"),timeout=10)
+        LOGMON_TEST_SELECTOR="trace_id", NEXTEST_BINARY_ID="fixture",NEXTEST_TEST_NAME="abort"),timeout=10)
     assert proc.returncode==-signal.SIGTERM, proc.returncode
     event=json.loads((root/"journal").read_text().splitlines()[-1])["event"]
+    assert event["selector"]=={"field":"trace_id","value":event["execution_id"]}
     assert event["verdict"]=="ABORTED" and event["fields"]["signal"]==signal.SIGTERM
     for name, expected in [("retained_descriptor",b"LEAK"),("long_sleep",b"TIMEOUT")]:
         result=subprocess.run(["cargo","nextest","run","--offline","-E",f"test({name})"],cwd=root,

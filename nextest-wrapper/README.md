@@ -38,6 +38,7 @@ After the driver opens a logmon test-log, launch nextest with these variables:
 
 | Variable | Purpose |
 |---|---|
+| `LOGMON_TEST_SELECTOR` | Defaults to `test_attempt_id` for process attribution, including work that adopts a different trace. Set `trace_id` when the attempt owns the end-to-end trace and you want standard focused case loading or evidence from downstream services that inherit the trace. Records following another trace are outside this selection. |
 | `STORE_TEST_LOG_RUN_ID` | Identity used at begin. With no run ID the wrapper executes the test directly. |
 | `STORE_TEST_LOG_DOMAIN` | Broker domain. When omitted, a numeric `STORE_DEV_TRACK` selects `t<track>`; otherwise use the broker default. |
 | `STORE_TEST_LOG_EVENTS_PATH` | Local append-only journal for starts, original end payloads, delivery decisions and latency. Choose a path inside this run's directory. |

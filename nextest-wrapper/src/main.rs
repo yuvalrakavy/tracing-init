@@ -106,8 +106,12 @@ async fn wait_child(child: &mut tokio::process::Child) -> io::Result<ExitStatus>
 
 async fn wrap(mut run: Run, argv: Vec<OsString>) -> io::Result<ExitStatus> {
     let id = uuid::Uuid::new_v4().simple().to_string();
+    let field = match env::var("LOGMON_TEST_SELECTOR").as_deref() {
+        Ok("trace_id") => "trace_id",
+        _ => "test_attempt_id",
+    };
     let mut event = json!({"run_id":run.id,"execution_id":id,"name":run.name,
-        "selector":{"field":"test_attempt_id","value":id},"started_at":Utc::now(),"rerun_of":run.rerun});
+        "selector":{"field":field,"value":id},"started_at":Utc::now(),"rerun_of":run.rerun});
     let mut start_event = event.clone();
     start_event["estimated_ms"] = json!(run.estimated_ms);
     start_event["test_timeout_ms"] = json!(run.test_timeout_ms);

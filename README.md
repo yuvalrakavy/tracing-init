@@ -473,7 +473,10 @@ process-wide subscriber, opens a `rust.test` span, and flushes the OTLP batch
 when the test returns or unwinds. Each GELF record and OTLP span carries
 `test_attempt_id`, including work on detached threads and tasks. New root spans
 use the supplied trace ID. Explicitly propagated external parent contexts keep
-their own native trace ID and the same attempt attribute.
+their own native trace ID and the same attempt attribute. When the test owns
+the end-to-end trace, set `LOGMON_TEST_SELECTOR=trace_id` on the wrapper to
+produce cases that support `load_case(scope="focus")`. The default selector
+`test_attempt_id` also counts process work that adopts an external trace.
 
 `LOGMON_TEST_GELF_ADDR` selects the UDP destination (default `127.0.0.1:12201`).
 `LOGMON_TEST_OTLP_ENDPOINT` selects the OTLP/HTTP base URL (default
