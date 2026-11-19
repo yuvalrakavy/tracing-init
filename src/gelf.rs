@@ -52,6 +52,8 @@ use crate::sink::{LineCounts, Watch};
 /// Create with [`GelfLayer::new`] and register it with a
 /// [`tracing_subscriber::Registry`].
 pub struct GelfLayer {
+    #[cfg(feature = "logmon-test")]
+    pub(crate) test_attempt_id: Option<String>,
     socket: UdpSocket,
     addr: SocketAddr,
     base_fields: Map<String, Value>,
@@ -100,6 +102,8 @@ impl GelfLayer {
         }
 
         Ok(GelfLayer {
+            #[cfg(feature = "logmon-test")]
+            test_attempt_id: None,
             socket,
             addr: resolved,
             base_fields,
@@ -395,6 +399,12 @@ where
             skip_log_carriers: normalized.is_some(),
         };
         event.record(&mut visitor);
+
+        #[cfg(feature = "logmon-test")]
+        if let Some(attempt) = &self.test_attempt_id {
+            fields.insert("_test_attempt_id".into(), json!(attempt));
+            fields.entry("_trace_id").or_insert_with(|| json!(attempt));
+        }
 
         // GELF requires short_message
         if !fields.contains_key("short_message") {

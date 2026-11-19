@@ -115,6 +115,11 @@ pub mod traceparent;
 mod tests;
 
 pub use guard::TracingGuard;
+#[cfg(feature = "logmon-test")]
+pub use logmon_test_macros::logmon_test;
+#[cfg(feature = "logmon-test")]
+#[doc(hidden)]
+pub mod logmon_test_runtime;
 pub use loss::{telemetry_loss, TelemetryLoss};
 
 pub mod dest_config;

@@ -1,0 +1,20 @@
+[package]
+name = "logmon-nextest-wrapper"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+description = "Report individual cargo-nextest attempts to a logmon test-log"
+
+[workspace]
+
+[dependencies]
+chrono = "0.4"
+libc = "0.2"
+logmon-broker-sdk = { git = "https://github.com/yuvalrakavy/logmon-mcp.git", rev = "5b2599f3" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt","time","net","macros","io-util","process","signal"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
